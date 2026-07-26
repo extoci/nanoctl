@@ -10,7 +10,7 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     UsageType,
 };
-use openh264::formats::{RgbSliceU8, YUVBuffer};
+use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
 use xcap::Monitor;
 
 use std::sync::{Arc, Condvar, Mutex};
@@ -64,6 +64,7 @@ pub struct CaptureEncoder {
     max_fps: u16,
     latency_mode: LatencyMode,
     rgb: Vec<u8>,
+    yuv: Option<YUVBuffer>,
 }
 
 impl CaptureEncoder {
@@ -85,6 +86,7 @@ impl CaptureEncoder {
             max_fps,
             latency_mode,
             rgb: Vec::new(),
+            yuv: None,
         })
     }
 
@@ -105,7 +107,11 @@ impl CaptureEncoder {
         Ok(())
     }
 
-    pub fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
+    pub fn apply_bitrate_estimate(
+        &mut self,
+        estimate_kbps: u32,
+        ceiling_kbps: u32,
+    ) -> Result<bool> {
         let floor_kbps = 250.min(ceiling_kbps);
         let Some(target_kbps) =
             bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
@@ -138,14 +144,21 @@ impl CaptureEncoder {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
         }
+        let dimensions = (width as usize, height as usize);
         self.rgb.clear();
-        self.rgb.reserve((width as usize) * (height as usize) * 3);
+        self.rgb.reserve(dimensions.0 * dimensions.1 * 3);
         for pixel in image.as_raw().chunks_exact(4) {
             self.rgb.extend_from_slice(&pixel[..3]);
         }
-        let source = RgbSliceU8::new(&self.rgb, (width as usize, height as usize));
-        let yuv = YUVBuffer::from_rgb_source(source);
-        let stream = self.encoder.encode(&yuv).context("H.264 encode failed")?;
+        let source = RgbSliceU8::new(&self.rgb, dimensions);
+        let yuv = self
+            .yuv
+            .get_or_insert_with(|| YUVBuffer::new(dimensions.0, dimensions.1));
+        if yuv.dimensions() != dimensions {
+            *yuv = YUVBuffer::new(dimensions.0, dimensions.1);
+        }
+        yuv.read_rgb8(source);
+        let stream = self.encoder.encode(yuv).context("H.264 encode failed")?;
         Ok(EncodedFrame {
             bytes: stream.to_vec(),
         })
@@ -156,25 +169,25 @@ fn start_capture(monitor: &Monitor) -> Result<(xcap::VideoRecorder, Arc<LatestFr
     let (recorder, native_frames) = monitor
         .video_recorder()
         .context("continuous display capture is unavailable")?;
-        let latest_frame = Arc::new(LatestFrame::default());
-        let forwarding_slot = Arc::downgrade(&latest_frame);
-        std::thread::Builder::new()
-            .name("nanoctl-capture".to_owned())
-            .spawn(move || {
-                while let Ok(frame) = native_frames.recv() {
-                    let Some(latest_frame) = forwarding_slot.upgrade() else {
-                        break;
-                    };
-                    // Replacement, rather than append, makes this queue exactly one frame deep.
-                    if !latest_frame.replace(frame) {
-                        break;
-                    }
+    let latest_frame = Arc::new(LatestFrame::default());
+    let forwarding_slot = Arc::downgrade(&latest_frame);
+    std::thread::Builder::new()
+        .name("nanoctl-capture".to_owned())
+        .spawn(move || {
+            while let Ok(frame) = native_frames.recv() {
+                let Some(latest_frame) = forwarding_slot.upgrade() else {
+                    break;
+                };
+                // Replacement, rather than append, makes this queue exactly one frame deep.
+                if !latest_frame.replace(frame) {
+                    break;
                 }
-            })
-            .context("capture forwarding thread could not start")?;
-        recorder
-            .start()
-            .context("continuous display capture could not start")?;
+            }
+        })
+        .context("capture forwarding thread could not start")?;
+    recorder
+        .start()
+        .context("continuous display capture could not start")?;
     Ok((recorder, latest_frame))
 }
 
@@ -274,8 +287,7 @@ pub fn spawn_video(
                         );
                     }
                 }
-                let frame =
-                    encoder.next_access_unit(quality.max_width, quality.max_height)?;
+                let frame = encoder.next_access_unit(quality.max_width, quality.max_height)?;
                 match sender.try_send(frame) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Closed(_)) => break,

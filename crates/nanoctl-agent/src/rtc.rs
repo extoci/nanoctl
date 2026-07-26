@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 #[cfg(feature = "media")]
 use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
@@ -398,11 +398,7 @@ impl HostPeer {
     pub async fn fail(&self, reason: &str) -> Result<()> {
         let reason = reason.chars().take(256).collect::<String>();
         let index = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let envelope = serialize(
-            &self.session_id,
-            index,
-            OutgoingPayload::End { reason },
-        )?;
+        let envelope = serialize(&self.session_id, index, OutgoingPayload::End { reason })?;
         let signal_result = self
             .control_plane
             .send_signal(&self.token, &self.session_id, index, &envelope)
