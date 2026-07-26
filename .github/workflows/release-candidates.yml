@@ -88,7 +88,7 @@ jobs:
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
             libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
-      - run: bun run scripts/cargo.ts build --release --locked --features media
+      - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix package
         if: matrix.platform != 'windows'
         shell: bash

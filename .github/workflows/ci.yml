@@ -43,9 +43,9 @@ jobs:
           toolchain: 1.96.1
           components: rustfmt, clippy
       - run: bun install --frozen-lockfile
-      - run: bun run scripts/cargo.ts fmt -- --check
-      - run: bun run scripts/cargo.ts clippy --all-targets --features rtc -- -D warnings
-      - run: bun run scripts/cargo.ts test --features rtc
+      - run: cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
+      - run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - run: cargo test --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Validate POSIX package scripts
         if: runner.os != 'Windows'
         shell: bash
@@ -93,9 +93,9 @@ jobs:
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
             libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
             nasm pkg-config
-      - run: bun run scripts/cargo.ts clippy --all-targets --features media -- -D warnings
-      - run: bun run scripts/cargo.ts test --features media
-      - run: bun run scripts/cargo.ts build --release --features media
+      - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
     strategy:
@@ -113,9 +113,9 @@ jobs:
           toolchain: 1.96.1
           components: clippy
       - run: bun install --frozen-lockfile
-      - run: bun run scripts/cargo.ts clippy --all-targets --features media -- -D warnings
-      - run: bun run scripts/cargo.ts test --features media
-      - run: bun run scripts/cargo.ts build --release --features media
+      - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   security:
     runs-on: ubuntu-latest
