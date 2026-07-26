@@ -166,6 +166,7 @@ case ":$PATH:" in
       *) shell_profile="" ;;
     esac
     if [ -n "$shell_profile" ]; then
+      # shellcheck disable=SC2016 # Keep HOME and PATH literal for the user's future shell.
       path_line='export PATH="$HOME/.local/bin:$PATH"'
       if ! grep -F "$path_line" "$shell_profile" >/dev/null 2>&1; then
         {
