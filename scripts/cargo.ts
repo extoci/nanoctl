@@ -23,6 +23,9 @@ const cargo = cargoFromHome && existsSync(cargoFromHome) ? cargoFromHome : "carg
 
 const subprocess = spawn(cargo, cargoArgs, {
   cwd: new URL("..", import.meta.url).pathname,
+  // Bun 1.3 on Windows cannot launch Rust's rustup proxy executables directly even when the
+  // absolute path exists. Route that platform through ComSpec; other platforms stay direct.
+  shell: process.platform === "win32",
   env: {
     ...process.env,
     // Some development shells expose `cc` as a cross-target wrapper. Prefer the conventional
