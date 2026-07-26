@@ -653,6 +653,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_host_rejects_malformed_sdp() {
+        let malformed_offer = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "sessionId": "malformed-session",
+            "sequence": 0,
+            "sender": "controller",
+            "sentAt": 1,
+            "payload": {"type": "offer", "sdp": "not-an-sdp"},
+        })
+        .to_string();
+        let (signals_tx, _signals_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = HostPeer::answer_with_publisher(
+            SignalPublisher::test(signals_tx),
+            "malformed-session".to_owned(),
+            &malformed_offer,
+            Vec::new(),
+            RTCIceTransportPolicy::All,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "malformed SDP must not create a host peer");
+    }
+
+    #[tokio::test]
     async fn production_host_peer_connects_to_a_real_controller_peer() {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
@@ -769,6 +795,27 @@ mod tests {
             .await
             .expect("negotiated control channel did not open");
 
+        let malformed_candidate = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "sessionId": session_id,
+            "sequence": 1,
+            "sender": "controller",
+            "sentAt": 2,
+            "payload": {
+                "type": "ice-candidate",
+                "candidate": "",
+                "sdpMid": "0",
+                "sdpMLineIndex": 0,
+            },
+        })
+        .to_string();
+        assert!(
+            host.add_signal(&malformed_candidate, session_id, 1)
+                .await
+                .is_err(),
+            "malformed ICE candidate must be rejected"
+        );
+
         while signals_rx.try_recv().is_ok() {}
         let initial_remote_sdp = controller.remote_description().await.unwrap().sdp;
         let restart_offer = controller
@@ -788,14 +835,14 @@ mod tests {
         let restart_envelope = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "sessionId": session_id,
-            "sequence": 1,
+            "sequence": 2,
             "sender": "controller",
-            "sentAt": 2,
+            "sentAt": 3,
             "payload": {"type": "offer", "sdp": restart_offer.sdp},
         })
         .to_string();
         assert!(
-            host.add_signal(&restart_envelope, session_id, 1)
+            host.add_signal(&restart_envelope, session_id, 2)
                 .await
                 .unwrap()
         );
