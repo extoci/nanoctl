@@ -19,6 +19,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
 
 #[derive(Default)]
@@ -305,6 +306,8 @@ impl SoftwareEncoder {
         let stream = self.encoder.encode(yuv).context("H.264 encode failed")?;
         Ok(EncodedFrame {
             bytes: stream.to_vec(),
+            width: image.width(),
+            height: image.height(),
         })
     }
 }
@@ -433,6 +436,166 @@ impl Drop for CaptureEncoder {
 
 pub struct EncodedFrame {
     pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MediaSmokeReport {
+    pub schema_version: u8,
+    pub passed: bool,
+    pub agent_version: &'static str,
+    pub target_os: &'static str,
+    pub target_arch: &'static str,
+    pub started_unix_seconds: u64,
+    pub backend: &'static str,
+    pub requested_seconds: u64,
+    pub requested_fps: u16,
+    pub requested_max_bitrate_kbps: u32,
+    pub requested_max_width: u32,
+    pub requested_max_height: u32,
+    pub elapsed_milliseconds: u128,
+    pub frames: u64,
+    pub frames_per_second: f64,
+    pub encoded_bytes: u64,
+    pub average_bitrate_kbps: f64,
+    pub width: u32,
+    pub height: u32,
+    pub idr_frames: u64,
+    pub sps_units: u64,
+    pub pps_units: u64,
+}
+
+impl MediaSmokeReport {
+    pub fn print(&self) {
+        println!(
+            "media-smoke={} version={} target={}-{} backend={} frames={} fps={:.2} bitrate_kbps={:.2} \
+             dimensions={}x{} idr={} sps={} pps={}",
+            if self.passed { "pass" } else { "fail" },
+            self.agent_version,
+            self.target_os,
+            self.target_arch,
+            self.backend,
+            self.frames,
+            self.frames_per_second,
+            self.average_bitrate_kbps,
+            self.width,
+            self.height,
+            self.idr_frames,
+            self.sps_units,
+            self.pps_units
+        );
+    }
+}
+
+pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeReport> {
+    if !(1..=3_600).contains(&seconds) {
+        bail!("media smoke duration must be between 1 and 3600 seconds");
+    }
+    let mut encoder = CaptureEncoder::primary(
+        quality.max_bitrate_kbps,
+        quality.max_fps,
+        quality.latency_mode,
+        quality.encoder,
+    )?;
+    let started_unix_seconds = crate::update::unix_time_now()?;
+    let backend = encoder.encoder.name();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
+    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
+    let mut next_frame = started;
+    let mut frames = 0_u64;
+    let mut encoded_bytes = 0_u64;
+    let mut idr_frames = 0_u64;
+    let mut sps_units = 0_u64;
+    let mut pps_units = 0_u64;
+    let mut dimensions = (0_u32, 0_u32);
+    while Instant::now() < deadline {
+        let now = Instant::now();
+        if now < next_frame {
+            std::thread::sleep(next_frame - now);
+        }
+        next_frame = Instant::now() + frame_interval;
+        let frame = encoder.next_access_unit(quality.max_width, quality.max_height)?;
+        if frame.bytes.is_empty() {
+            continue;
+        }
+        let nal_types = annex_b_nal_types(&frame.bytes)?;
+        if nal_types.contains(&5) {
+            idr_frames += 1;
+        }
+        sps_units += nal_types.iter().filter(|&&kind| kind == 7).count() as u64;
+        pps_units += nal_types.iter().filter(|&&kind| kind == 8).count() as u64;
+        encoded_bytes = encoded_bytes
+            .checked_add(frame.bytes.len() as u64)
+            .context("encoded byte counter overflow")?;
+        frames += 1;
+        if dimensions == (0, 0) {
+            dimensions = (frame.width, frame.height);
+        }
+    }
+    let elapsed = started.elapsed();
+    let elapsed_seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let frames_per_second = frames as f64 / elapsed_seconds;
+    let average_bitrate_kbps = encoded_bytes as f64 * 8.0 / elapsed_seconds / 1_000.0;
+    let minimum_frames = (seconds as f64 * f64::from(quality.max_fps) * 0.75).floor() as u64;
+    let passed = frames >= minimum_frames
+        && encoded_bytes > 0
+        && idr_frames > 0
+        && sps_units > 0
+        && pps_units > 0;
+    Ok(MediaSmokeReport {
+        schema_version: 1,
+        passed,
+        agent_version: env!("CARGO_PKG_VERSION"),
+        target_os: std::env::consts::OS,
+        target_arch: std::env::consts::ARCH,
+        started_unix_seconds,
+        backend,
+        requested_seconds: seconds,
+        requested_fps: quality.max_fps,
+        requested_max_bitrate_kbps: quality.max_bitrate_kbps,
+        requested_max_width: quality.max_width,
+        requested_max_height: quality.max_height,
+        elapsed_milliseconds: elapsed.as_millis(),
+        frames,
+        frames_per_second,
+        encoded_bytes,
+        average_bitrate_kbps,
+        width: dimensions.0,
+        height: dimensions.1,
+        idr_frames,
+        sps_units,
+        pps_units,
+    })
+}
+
+fn annex_b_nal_types(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() > 32 * 1024 * 1024 {
+        bail!("H.264 access unit exceeds the smoke-test safety bound");
+    }
+    let mut types = Vec::new();
+    let mut offset = 0_usize;
+    while offset + 3 < bytes.len() {
+        let start_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            offset += 1;
+            continue;
+        };
+        let header = offset + start_length;
+        let byte = *bytes
+            .get(header)
+            .context("H.264 access unit ends after a start code")?;
+        types.push(byte & 0x1f);
+        offset = header + 1;
+    }
+    if types.is_empty() {
+        bail!("H.264 access unit contains no Annex-B NAL units");
+    }
+    Ok(types)
 }
 
 #[derive(Clone, Copy)]
@@ -531,7 +694,10 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{EncoderBackend, LatestFrame, avcc_to_annex_b, bitrate_target, fit_dimensions};
+    use super::{
+        EncoderBackend, LatestFrame, annex_b_nal_types, avcc_to_annex_b, bitrate_target,
+        fit_dimensions,
+    };
     use crate::config::{EncoderPreference, LatencyMode};
     use std::time::Duration;
 
@@ -561,18 +727,16 @@ mod tests {
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn required_hardware_never_silently_falls_back() {
-        assert!(
-            EncoderBackend::new(
-                EncoderPreference::Hardware,
-                4_000,
-                60,
-                LatencyMode::Balanced,
-            )
-            .is_err()
-        );
+        if let Ok(backend) = EncoderBackend::new(
+            EncoderPreference::Hardware,
+            4_000,
+            60,
+            LatencyMode::Balanced,
+        ) {
+            assert_ne!(backend.name(), "OpenH264");
+        }
     }
 
     #[test]
@@ -594,5 +758,15 @@ mod tests {
         assert!(avcc_to_annex_b(&[0, 0, 0, 0], 4, &[]).is_err());
         assert!(avcc_to_annex_b(&[0, 0, 0, 4, 0x65], 4, &[]).is_err());
         assert!(avcc_to_annex_b(&[1, 0x65], 0, &[]).is_err());
+    }
+
+    #[test]
+    fn indexes_annex_b_parameter_sets_and_frames() {
+        let types =
+            annex_b_nal_types(&[0, 0, 0, 1, 0x67, 4, 0, 0, 1, 0x68, 5, 0, 0, 0, 1, 0x65, 6])
+                .unwrap();
+        assert_eq!(types, [7, 8, 5]);
+        assert!(annex_b_nal_types(&[0, 0, 0, 2, 0x65]).is_err());
+        assert!(annex_b_nal_types(&[0, 0, 0, 1]).is_err());
     }
 }

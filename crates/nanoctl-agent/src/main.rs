@@ -57,6 +57,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Capture and encode real frames for a bounded native media acceptance run.
+    #[cfg(feature = "media")]
+    MediaSmoke {
+        /// Duration of the run in seconds.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        seconds: u64,
+        /// Fail instead of falling back to the software encoder.
+        #[arg(long)]
+        require_hardware: bool,
+        /// Print the acceptance record as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the effective redacted configuration.
     Config,
     /// Print the configuration path used by this invocation.
@@ -143,6 +156,27 @@ async fn main() -> Result<()> {
                 report.print();
             }
             if !report.ready {
+                std::process::exit(2);
+            }
+        }
+        #[cfg(feature = "media")]
+        Command::MediaSmoke {
+            seconds,
+            require_hardware,
+            json,
+        } => {
+            let mut config = AgentConfig::load_or_default(&config_path)?;
+            config.validate()?;
+            if require_hardware {
+                config.quality.encoder = crate::config::EncoderPreference::Hardware;
+            }
+            let report = crate::media::run_smoke(&config.quality, seconds)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                report.print();
+            }
+            if !report.passed {
                 std::process::exit(2);
             }
         }

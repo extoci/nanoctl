@@ -108,12 +108,20 @@ impl MacOsEncoder {
             .context("VideoToolbox H.264 encode failed")?;
         self.frame_index = self.frame_index.saturating_add(1);
         if encoded.data.is_empty() {
-            return Ok(EncodedFrame { bytes: Vec::new() });
+            return Ok(EncodedFrame {
+                bytes: Vec::new(),
+                width: image.width(),
+                height: image.height(),
+            });
         }
         let (parameter_sets, nal_length_size) = h264_format(encoded.cm_sample_buffer_ptr())?;
         let parameter_refs = parameter_sets.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let bytes = avcc_to_annex_b(&encoded.data, nal_length_size, &parameter_refs)?;
-        Ok(EncodedFrame { bytes })
+        Ok(EncodedFrame {
+            bytes,
+            width: image.width(),
+            height: image.height(),
+        })
     }
 }
 

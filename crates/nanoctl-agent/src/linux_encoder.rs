@@ -145,6 +145,8 @@ impl LinuxEncoder {
             .map_err(|error| anyhow!("VA-API H.264 output failed: {error}"))?
             .map(|coded| EncodedFrame {
                 bytes: coded.bitstream,
+                width: image.width(),
+                height: image.height(),
             })
             .context("blocking VA-API encode returned no access unit")
     }

@@ -57,6 +57,20 @@ audio drift over 50 ms, or latency creep. Soak for eight hours at 1080p30. Measu
 first-frame latency, input-to-photon using a high-speed camera, and quality under constrained
 bandwidth. Averages cannot hide p95/p99 stalls.
 
+Run the native capture/encoder gate from the signed candidate on every physical host:
+
+```shell
+nanoctl --config ./acceptance.toml media-smoke --require-hardware --seconds 1800 --json > media-smoke.json
+```
+
+The command opens the real platform capture session, requires the hardware backend, encodes at the
+configured dimensions/FPS/bitrate, rejects malformed or non-Annex-B output, and requires observed
+IDR, SPS, and PPS units. It exits 2 when it produces fewer than 75% of the requested frames or any
+required bitstream evidence is absent. Use `--seconds 3600` for the longest single invocation and
+repeat under the network/controller soak for the eight-hour gate. Preserve the JSON together with
+external process RSS/GPU/thermal traces; this command does not substitute for input-to-photon,
+browser decode, memory-growth, or network measurements.
+
 ## Manual release checklist
 
 1. Build candidates from the exact reviewed tag and verify every provenance attestation, SBOM, and

@@ -4,6 +4,15 @@ Release packages wrap the platform registrations in `packaging/`. Until signed p
 produced, build the agent with `cargo build --release --features media`, enroll it as the
 interactive desktop user, run `nanoctl doctor`, and then register the background agent.
 
+Before registration, exercise native capture and encoding on the interactive desktop:
+
+```shell
+nanoctl media-smoke --require-hardware --seconds 30
+```
+
+Use `--json` when collecting the acceptance record from a signed release candidate. Screen-capture
+permission prompts must be completed by the candidate identity before this command can pass.
+
 The enrollment user and background-agent user must be identical. Screen capture, input permission,
 and the OS credential entry belong to that interactive identity. None of the v1 registrations opens
 an inbound port.

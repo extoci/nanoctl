@@ -139,7 +139,11 @@ impl WindowsEncoder {
         active.needs_input = false;
         let bytes = wait_for_output(active)?;
         validate_annex_b(&bytes)?;
-        Ok(EncodedFrame { bytes })
+        Ok(EncodedFrame {
+            bytes,
+            width,
+            height,
+        })
     }
 
     fn create_active(&self, width: u32, height: u32) -> Result<ActiveEncoder> {
