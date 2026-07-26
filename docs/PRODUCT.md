@@ -74,6 +74,11 @@ disablement. Unknown keys, unsafe remote HTTP, unsupported codecs, reserved audi
 and out-of-range values fail startup. TURN endpoints and credentials remain server-issued so local
 configuration cannot embed a shared relay secret.
 
+`responsiveness` selects low encoder complexity and permits rate-control frame skipping;
+`balanced` uses medium complexity with skipping; `quality` uses high complexity without encoder
+frame skipping. All modes retain the one-frame capture and WebRTC queues, and all use bitrate-mode
+rate control bounded by the configured ceiling and REMB feedback.
+
 It does not permit arbitrary command execution, arbitrary FFmpeg arguments, disabling authentication,
 exporting secrets, weakening TLS verification, or making the control API listen on a public socket.
 Unknown keys fail startup so typos cannot silently weaken behavior.

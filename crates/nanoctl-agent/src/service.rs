@@ -254,6 +254,7 @@ async fn reconcile_sessions(
                             max_fps: _config.quality.max_fps,
                             max_width: _config.quality.max_width,
                             max_height: _config.quality.max_height,
+                            latency_mode: _config.quality.latency_mode,
                         },
                     );
                     active.insert(

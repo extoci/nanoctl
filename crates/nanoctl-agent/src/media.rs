@@ -7,7 +7,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
 use openh264::encoder::{
-    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+    UsageType,
 };
 use openh264::formats::{RgbSliceU8, YUVBuffer};
 use xcap::Monitor;
@@ -17,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::config::LatencyMode;
 
 #[derive(Default)]
 struct LatestFrame {
@@ -59,11 +62,12 @@ pub struct CaptureEncoder {
     encoder: Encoder,
     bitrate_kbps: u32,
     max_fps: u16,
+    latency_mode: LatencyMode,
     rgb: Vec<u8>,
 }
 
 impl CaptureEncoder {
-    pub fn primary(max_bitrate_kbps: u32, max_fps: u16) -> Result<Self> {
+    pub fn primary(max_bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
         let monitor = monitors
             .iter()
@@ -71,7 +75,7 @@ impl CaptureEncoder {
             .or_else(|| monitors.first())
             .cloned()
             .context("no display is available")?;
-        let encoder = create_encoder(max_bitrate_kbps, max_fps)?;
+        let encoder = create_encoder(max_bitrate_kbps, max_fps, latency_mode)?;
         let (recorder, latest_frame) = start_capture(&monitor)?;
         Ok(Self {
             recorder,
@@ -79,6 +83,7 @@ impl CaptureEncoder {
             encoder,
             bitrate_kbps: max_bitrate_kbps,
             max_fps,
+            latency_mode,
             rgb: Vec::new(),
         })
     }
@@ -107,7 +112,7 @@ impl CaptureEncoder {
         else {
             return Ok(false);
         };
-        self.encoder = create_encoder(target_kbps, self.max_fps)?;
+        self.encoder = create_encoder(target_kbps, self.max_fps, self.latency_mode)?;
         self.bitrate_kbps = target_kbps;
         Ok(true)
     }
@@ -173,12 +178,20 @@ fn start_capture(monitor: &Monitor) -> Result<(xcap::VideoRecorder, Arc<LatestFr
     Ok((recorder, latest_frame))
 }
 
-fn create_encoder(bitrate_kbps: u32, max_fps: u16) -> Result<Encoder> {
+fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
+    let (complexity, skip_frames) = match latency_mode {
+        LatencyMode::Responsiveness => (Complexity::Low, true),
+        LatencyMode::Balanced => (Complexity::Medium, true),
+        LatencyMode::Quality => (Complexity::High, false),
+    };
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
-        .usage_type(UsageType::ScreenContentRealTime);
+        .usage_type(UsageType::ScreenContentRealTime)
+        .rate_control_mode(RateControlMode::Bitrate)
+        .complexity(complexity)
+        .skip_frames(skip_frames);
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
 }
@@ -210,6 +223,7 @@ pub struct VideoQuality {
     pub max_fps: u16,
     pub max_width: u32,
     pub max_height: u32,
+    pub latency_mode: LatencyMode,
 }
 
 pub fn spawn_video(
@@ -222,7 +236,11 @@ pub fn spawn_video(
     tokio::spawn(async move {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<EncodedFrame>(1);
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut encoder = CaptureEncoder::primary(quality.max_bitrate_kbps, quality.max_fps)?;
+            let mut encoder = CaptureEncoder::primary(
+                quality.max_bitrate_kbps,
+                quality.max_fps,
+                quality.latency_mode,
+            )?;
             let mut keyframe_requests = keyframe_requests;
             let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
             let mut display_selection = display_selection;

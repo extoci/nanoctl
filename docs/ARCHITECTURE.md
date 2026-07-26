@@ -73,6 +73,8 @@ existing recorder; the next encoded frame is an IDR.
 The portable path consumes receiver-estimated maximum bitrate (REMB), clamps it between 250 kbps and
 the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% increase. Recreating
 the encoder also produces a clean recovery point; the hysteresis avoids reinitialization churn.
+OpenH264 runs in bitrate-control mode. Advanced latency policy maps responsiveness/balanced/quality
+to low/medium/high encoder complexity and controls whether the encoder may skip frames.
 Zero-copy GPU surfaces, hardware encoding, capture timestamps, and adaptive resolution/frame rate
 remain native performance-path release gates, not properties claimed for the portable backend.
 
