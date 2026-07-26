@@ -17,6 +17,7 @@ import type * as maintenance from "../maintenance.js";
 import type * as rateLimits from "../rateLimits.js";
 import type * as sessions from "../sessions.js";
 import type * as signals from "../signals.js";
+import type * as turn from "../turn.js";
 
 import type {
   ApiFromModules,
@@ -34,6 +35,7 @@ declare const fullApi: ApiFromModules<{
   rateLimits: typeof rateLimits;
   sessions: typeof sessions;
   signals: typeof signals;
+  turn: typeof turn;
 }>;
 
 /**

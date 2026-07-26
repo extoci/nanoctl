@@ -1,6 +1,7 @@
 import { httpRouter } from "convex/server";
 import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { mintTurnCredentials } from "./turn";
 
 const http = httpRouter();
 
@@ -219,31 +220,6 @@ function base64Url(bytes: Uint8Array): string {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
-}
-
-async function mintTurnCredentials(sessionId: string) {
-  const secret = process.env.TURN_AUTH_SECRET;
-  const urls = (process.env.TURN_URLS ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  if (!secret || urls.length === 0) return null;
-  const expiresAtSeconds = Math.floor(Date.now() / 1000) + 20 * 60;
-  const username = `${expiresAtSeconds}:${sessionId}`;
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-1" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
-  return {
-    urls,
-    username,
-    credential: btoa(String.fromCharCode(...new Uint8Array(signature))),
-    expiresAt: expiresAtSeconds * 1000,
-  };
 }
 
 export default http;

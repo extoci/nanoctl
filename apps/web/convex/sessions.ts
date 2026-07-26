@@ -3,6 +3,7 @@ import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { parseDeviceDisplays, requireIdentity } from "./lib";
 import { consumeRateLimit } from "./rateLimits";
+import { mintTurnCredentials } from "./turn";
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
 
@@ -119,31 +120,6 @@ export const turnCredentials = action({
       ownerId: identity.subject,
     });
     if (!authorized) throw new ConvexError("Session not found");
-    const secret = process.env.TURN_AUTH_SECRET;
-    const urls = (process.env.TURN_URLS ?? "")
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean);
-    if (!secret || urls.length === 0) return null;
-    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 20 * 60;
-    const username = `${expiresAtSeconds}:${args.sessionId}`;
-    const key = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(secret),
-      { name: "HMAC", hash: "SHA-1" },
-      false,
-      ["sign"],
-    );
-    const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
-    return {
-      urls,
-      username,
-      credential: bytesToBase64(new Uint8Array(signature)),
-      expiresAt: expiresAtSeconds * 1000,
-    };
+    return mintTurnCredentials(String(args.sessionId));
   },
 });
-
-function bytesToBase64(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes));
-}
