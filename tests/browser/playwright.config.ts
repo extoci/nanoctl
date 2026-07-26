@@ -13,7 +13,8 @@ export default defineConfig({
   },
   webServer: {
     cwd: "../..",
-    command: "node apps/web/node_modules/next/dist/bin/next dev apps/web --hostname 127.0.0.1",
+    command:
+      "NANOCTL_E2E_FIXTURES=1 node apps/web/node_modules/next/dist/bin/next dev apps/web --hostname 127.0.0.1",
     url: "http://127.0.0.1:3000",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

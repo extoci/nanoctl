@@ -35,10 +35,13 @@ the current automated suite:
 ## Browser tests
 
 The checked-in Chromium suite covers the unauthenticated gate, Shoo origin/redirect binding,
-malformed callback containment, and response CSP/nonces. Authenticated dashboard states, pairing,
-session cleanup, emergency keyboard release, display switching, and reconnect UI still require
-browser automation. Firefox and WebKit interoperability plus real Chrome and Edge performance
-remain release gates because synthetic media is insufficient for decoder performance.
+malformed callback containment, response CSP/nonces, authenticated dashboard loading/empty/device
+states, readiness affordances, activity history, pairing, rename, removal, sign-out, and operation
+failure containment. The authenticated fixtures reuse the production dashboard view through an
+explicit test-server gate; production preflight rejects that gate. Session cleanup, emergency
+keyboard release, display switching, and reconnect UI still require browser automation. Firefox
+and WebKit interoperability plus real Chrome and Edge performance remain release gates because
+synthetic media is insufficient for decoder performance.
 
 ## Native tests
 

@@ -32,6 +32,9 @@ function productionHttpsUrl(name: string, value: string | undefined): URL {
 export function validateProductionEnvironment(
   environment: Readonly<Record<string, string | undefined>>,
 ): void {
+  if (environment.NANOCTL_E2E_FIXTURES) {
+    throw new Error("NANOCTL_E2E_FIXTURES must not be set for a production build");
+  }
   const convex = productionHttpsUrl("NEXT_PUBLIC_CONVEX_URL", environment.NEXT_PUBLIC_CONVEX_URL);
   if (!convex.hostname.endsWith(".convex.cloud")) {
     throw new Error("NEXT_PUBLIC_CONVEX_URL must use a Convex cloud deployment");

@@ -32,4 +32,14 @@ describe("production deployment preflight", () => {
       }),
     ).toThrow("credential-free HTTPS origin");
   });
+
+  test("rejects the browser fixture gate in production", () => {
+    expect(() =>
+      validateProductionEnvironment({
+        NEXT_PUBLIC_CONVEX_URL: "https://nanoctl.convex.cloud",
+        NEXT_PUBLIC_APP_ORIGIN: "https://remote.nanoctl.dev",
+        NANOCTL_E2E_FIXTURES: "1",
+      }),
+    ).toThrow("must not be set");
+  });
 });
