@@ -15,10 +15,14 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") {
   throw "This installer supports Windows. On Linux or macOS, use install.sh."
 }
 
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-$target = switch ($architecture) {
-  "X64" { "windows-x64" }
-  "Arm64" { "windows-arm64" }
+$architecture = if ($env:PROCESSOR_ARCHITEW6432) {
+  $env:PROCESSOR_ARCHITEW6432
+} else {
+  $env:PROCESSOR_ARCHITECTURE
+}
+$target = switch ($architecture.ToUpperInvariant()) {
+  "AMD64" { "windows-x64" }
+  "ARM64" { "windows-arm64" }
   default { throw "Unsupported Windows architecture: $architecture" }
 }
 $baseUrl = if ($Version -eq "latest") {

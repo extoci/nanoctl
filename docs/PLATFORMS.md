@@ -2,8 +2,9 @@
 
 ## Windows
 
-Target Windows 11. The backend keeps xcap's Windows.Graphics.Capture recorder alive for the session,
-retains only the newest RGBA frame, and uses enigo's Windows input backend. It enumerates only
+Target Windows 10 version 1903 or newer and Windows 11. The backend keeps xcap's
+Windows.Graphics.Capture recorder alive for the session, retains only the newest RGBA frame, and
+uses enigo's Windows input backend. It enumerates only
 hardware Media Foundation NV12-to-H.264 transforms, unlocks their asynchronous event protocol,
 requires low-latency mode, and falls back to OpenH264 unless `quality.encoder = "hardware"` makes
 hardware mandatory. The H.264 subtype guarantees Annex-B samples with interleaved SPS/PPS, and the
