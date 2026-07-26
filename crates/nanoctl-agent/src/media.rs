@@ -86,6 +86,7 @@ pub struct EncodedFrame {
 
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
+    keyframe_requests: tokio::sync::watch::Receiver<u64>,
     max_bitrate_kbps: u32,
     max_fps: u16,
     max_width: u32,
@@ -95,6 +96,7 @@ pub fn spawn_video(
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<EncodedFrame>(1);
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut encoder = CaptureEncoder::primary(max_bitrate_kbps, max_fps)?;
+            let mut keyframe_requests = keyframe_requests;
             let frame_interval = Duration::from_secs_f64(1.0 / f64::from(max_fps));
             let mut next_frame = Instant::now();
             loop {
@@ -105,6 +107,10 @@ pub fn spawn_video(
                 // Advance from the actual clock when capture/encode overruns. This prevents a burst
                 // of catch-up frames after a slow encode or a suspended machine.
                 next_frame = Instant::now() + frame_interval;
+                if keyframe_requests.has_changed().unwrap_or(false) {
+                    keyframe_requests.borrow_and_update();
+                    encoder.encoder.force_intra_frame();
+                }
                 let frame = encoder.next_access_unit(max_width, max_height)?;
                 match sender.try_send(frame) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}

@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
+#[cfg(feature = "media")]
+use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+#[cfg(feature = "media")]
+use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -34,6 +38,8 @@ pub struct HostPeer {
     token: Arc<Zeroizing<String>>,
     session_id: String,
     sequence: Arc<AtomicU64>,
+    #[cfg(feature = "media")]
+    keyframe_requests: tokio::sync::watch::Sender<u64>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
 }
@@ -215,9 +221,22 @@ impl HostPeer {
             "nanoctl".to_owned(),
         ));
         let sender = peer.add_track(video.clone()).await?;
+        #[cfg(feature = "media")]
+        let (keyframe_requests, _) = tokio::sync::watch::channel(0_u64);
+        #[cfg(feature = "media")]
+        let keyframe_feedback = keyframe_requests.clone();
         tokio::spawn(async move {
-            let mut buffer = vec![0_u8; 1500];
-            while sender.read(&mut buffer).await.is_ok() {}
+            while let Ok((_packets, _attributes)) = sender.read_rtcp().await {
+                #[cfg(feature = "media")]
+                if _packets.iter().any(|packet| {
+                    packet.as_any().is::<PictureLossIndication>()
+                        || packet.as_any().is::<FullIntraRequest>()
+                }) {
+                    keyframe_feedback.send_modify(|generation| {
+                        *generation = generation.wrapping_add(1);
+                    });
+                }
+            }
         });
 
         let sequence = Arc::new(AtomicU64::new(1));
@@ -272,6 +291,8 @@ impl HostPeer {
             token,
             session_id,
             sequence,
+            #[cfg(feature = "media")]
+            keyframe_requests,
             video,
         })
     }
@@ -343,6 +364,11 @@ impl HostPeer {
     #[cfg(feature = "media")]
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn keyframe_requests(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.keyframe_requests.subscribe()
     }
 }
 

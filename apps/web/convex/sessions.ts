@@ -62,6 +62,14 @@ export const end = mutation({
       updatedAt: now,
       endReason: args.reason.slice(0, 256),
     });
+    await ctx.db.insert("auditEvents", {
+      ownerId: session.ownerId,
+      deviceId: session.deviceId,
+      sessionId: args.sessionId,
+      action: "session.ended",
+      detail: args.reason.slice(0, 256),
+      createdAt: now,
+    });
     return null;
   },
 });

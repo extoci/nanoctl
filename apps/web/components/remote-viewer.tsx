@@ -70,7 +70,6 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     });
     const controlChannel = peer.createDataChannel("nanoctl.control.v1");
     peer.addTransceiver("video", { direction: "recvonly" });
-    peer.addTransceiver("audio", { direction: "recvonly" });
 
     peer.ontrack = ({ streams }) => {
       const stream = streams[0];

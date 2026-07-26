@@ -72,12 +72,16 @@ export const heartbeat = internalMutation({
 export const pendingSessions = internalQuery({
   args: { deviceId: v.id("devices") },
   handler: async (ctx, args) => {
-    const sessions = await ctx.db
-      .query("sessions")
-      .withIndex("by_device_state", (q) =>
-        q.eq("deviceId", args.deviceId).eq("state", "negotiating"),
+    const sessions = (
+      await Promise.all(
+        (["negotiating", "connected"] as const).map((state) =>
+          ctx.db
+            .query("sessions")
+            .withIndex("by_device_state", (q) => q.eq("deviceId", args.deviceId).eq("state", state))
+            .collect(),
+        ),
       )
-      .collect();
+    ).flat();
     return Promise.all(
       sessions
         .filter((session) => session.expiresAt > Date.now())
@@ -147,6 +151,17 @@ export const sendSignal = internalMutation({
         createdAt: Date.now(),
         expiresAt: session.expiresAt,
       });
+      if (parsed.kind === "answer" && session.state === "negotiating") {
+        const now = Date.now();
+        await ctx.db.patch(args.sessionId, { state: "connected", updatedAt: now });
+        await ctx.db.insert("auditEvents", {
+          ownerId: session.ownerId,
+          deviceId: session.deviceId,
+          sessionId: args.sessionId,
+          action: "session.connected",
+          createdAt: now,
+        });
+      }
     }
     return true;
   },

@@ -8,7 +8,7 @@ description = "Headless nanoctl remote desktop agent"
 [features]
 default = []
 capture = ["dep:openh264", "dep:xcap"]
-media = ["capture", "dep:enigo", "rtc"]
+media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
 rtc = ["dep:interceptor", "dep:webrtc"]
 
 [[bin]]
@@ -24,6 +24,7 @@ futures-util = "=0.3.32"
 hostname = "0.4"
 interceptor = { version = "0.15.0", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+rtcp = { version = "0.14.0", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "time"] }
