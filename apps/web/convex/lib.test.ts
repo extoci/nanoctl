@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseSignalEnvelope } from "./lib";
+import { parseDeviceDisplays, parseSignalEnvelope } from "./lib";
 
 function envelope(sender: "controller" | "host", type: string) {
   return JSON.stringify({
@@ -29,5 +29,36 @@ describe("signal envelope indexing", () => {
     expect(() =>
       parseSignalEnvelope(envelope("controller", "renegotiate"), "controller"),
     ).toThrow();
+  });
+});
+
+describe("device capability parsing", () => {
+  test("accepts bounded display metadata and drops malformed rows", () => {
+    const displays = parseDeviceDisplays(
+      JSON.stringify({
+        displays: [
+          {
+            id: "42",
+            name: "Studio Display",
+            width: 2560,
+            height: 1440,
+            scaleFactor: 2,
+            primary: true,
+          },
+          { id: "", name: "invalid" },
+        ],
+      }),
+    );
+    expect(displays).toEqual([
+      {
+        id: "42",
+        name: "Studio Display",
+        width: 2560,
+        height: 1440,
+        scaleFactor: 2,
+        primary: true,
+      },
+    ]);
+    expect(parseDeviceDisplays("not json")).toEqual([]);
   });
 });

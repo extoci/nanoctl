@@ -1,7 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { requireIdentity } from "./lib";
+import { parseDeviceDisplays, requireIdentity } from "./lib";
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
 
@@ -12,10 +12,12 @@ export const getState = query({
     const session = await ctx.db.get(args.sessionId);
     if (!session || session.ownerId !== identity.subject)
       throw new ConvexError("Session not found");
+    const device = await ctx.db.get(session.deviceId);
     return {
       state: session.state,
       expiresAt: session.expiresAt,
       endReason: session.endReason,
+      displays: device ? parseDeviceDisplays(device.capabilitiesJson) : [],
     };
   },
 });

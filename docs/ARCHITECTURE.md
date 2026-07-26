@@ -66,7 +66,9 @@ dedicated forwarding thread replaces a single pending frame atomically: if captu
 encoding, obsolete frames are discarded rather than accumulated. RGBA frames are scaled and
 converted to I420 for bounded OpenH264 software encoding, then emitted directly to the WebRTC RTP
 packetizer. Decoder PLI/FIR feedback forces an IDR, with a two-second periodic IDR as a recovery
-backstop.
+backstop. Display metadata is refreshed in the signed-in owner’s device capability view. A display
+switch updates input origin/geometry and starts the replacement recorder before stopping the
+existing recorder; the next encoded frame is an IDR.
 
 The portable path consumes receiver-estimated maximum bitrate (REMB), clamps it between 250 kbps and
 the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% increase. Recreating

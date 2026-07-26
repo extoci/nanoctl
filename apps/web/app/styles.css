@@ -306,6 +306,19 @@ dd {
   padding: 0.4rem 0.75rem;
 }
 
+.display-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.display-picker select {
+  min-height: 2.2rem;
+  max-width: 15rem;
+}
+
 .viewer-bar button {
   background: transparent;
   color: var(--text);

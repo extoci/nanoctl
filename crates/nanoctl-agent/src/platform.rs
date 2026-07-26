@@ -28,6 +28,18 @@ pub struct Capabilities {
     input: bool,
     clipboard: bool,
     system_audio: bool,
+    displays: Vec<DisplayCapability>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DisplayCapability {
+    id: String,
+    name: String,
+    width: u32,
+    height: u32,
+    scale_factor: f32,
+    primary: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +68,35 @@ pub fn capabilities() -> Capabilities {
         input: cfg!(feature = "media"),
         clipboard: false,
         system_audio: false,
+        displays: display_capabilities(),
+    }
+}
+
+fn display_capabilities() -> Vec<DisplayCapability> {
+    #[cfg(feature = "media")]
+    {
+        xcap::Monitor::all()
+            .unwrap_or_default()
+            .into_iter()
+            .take(16)
+            .filter_map(|monitor| {
+                Some(DisplayCapability {
+                    id: monitor.id().ok()?.to_string(),
+                    name: monitor
+                        .friendly_name()
+                        .or_else(|_| monitor.name())
+                        .unwrap_or_else(|_| "Display".to_owned()),
+                    width: monitor.width().ok()?,
+                    height: monitor.height().ok()?,
+                    scale_factor: monitor.scale_factor().unwrap_or(1.0),
+                    primary: monitor.is_primary().unwrap_or(false),
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        Vec::new()
     }
 }
 

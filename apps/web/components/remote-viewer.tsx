@@ -28,6 +28,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const restartAttemptsRef = useRef(0);
   const inputEnabledRef = useRef(true);
   const releaseInputRef = useRef<() => void>(() => {});
+  const selectDisplayRef = useRef<(displayId: string) => boolean>(() => false);
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
   const getTurnCredentials = useAction(functions.sessions.turnCredentials);
@@ -40,6 +41,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
   const [ending, setEnding] = useState(false);
   const [inputEnabled, setInputEnabled] = useState(true);
+  const [selectedDisplay, setSelectedDisplay] = useState("");
   const [metrics, setMetrics] = useState<ViewerMetrics | null>(null);
 
   useEffect(() => {
@@ -53,6 +55,13 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       peerRef.current?.close();
     }
   }, [session]);
+
+  useEffect(() => {
+    if (selectedDisplay || !session?.displays.length) return;
+    setSelectedDisplay(
+      session.displays.find((display) => display.primary)?.id ?? session.displays[0]?.id ?? "",
+    );
+  }, [selectedDisplay, session]);
 
   async function leaveSession() {
     if (ending) return;
@@ -207,6 +216,11 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       video?.blur();
     };
     releaseInputRef.current = releaseInput;
+    selectDisplayRef.current = (displayId) => {
+      if (!inputEnabledRef.current || controlChannel.readyState !== "open") return false;
+      controlChannel.send(JSON.stringify({ type: "display", displayId } satisfies ControlMessage));
+      return true;
+    };
     const normalizedPosition = (event: MouseEvent) => {
       if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
       const rect = video.getBoundingClientRect();
@@ -384,6 +398,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       document.removeEventListener("visibilitychange", releaseWhenHidden);
       releaseInput();
       releaseInputRef.current = () => {};
+      selectDisplayRef.current = () => false;
       statsStopped = true;
       window.clearInterval(keepalive);
       window.clearInterval(statsTimer);
@@ -438,6 +453,26 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
           ) : null}
         </div>
         <div className="viewer-actions">
+          {session && session.displays.length > 1 ? (
+            <label className="display-picker">
+              <span>Display</span>
+              <select
+                value={selectedDisplay}
+                disabled={!inputEnabled}
+                onChange={(event) => {
+                  if (selectDisplayRef.current(event.target.value)) {
+                    setSelectedDisplay(event.target.value);
+                  }
+                }}
+              >
+                {session.displays.map((display) => (
+                  <option key={display.id} value={display.id}>
+                    {display.name} ({display.width}×{display.height})
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <button
             type="button"
             title="Emergency release: Ctrl+Alt+Shift+Escape"

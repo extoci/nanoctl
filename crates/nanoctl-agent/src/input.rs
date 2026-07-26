@@ -16,6 +16,8 @@ pub enum InputLane {
 
 pub struct InputController {
     enigo: Enigo,
+    origin_x: i32,
+    origin_y: i32,
     width: u32,
     height: u32,
     held_keys: HashSet<Key>,
@@ -44,6 +46,10 @@ enum ControlMessage {
     },
     Release,
     Ping,
+    Display {
+        #[serde(rename = "displayId")]
+        display_id: String,
+    },
     #[serde(other)]
     Unsupported,
 }
@@ -74,6 +80,8 @@ impl InputController {
             .context("no display available for input")?;
         Ok(Self {
             enigo: Enigo::new(&Settings::default()).context("input injection is unavailable")?,
+            origin_x: monitor.x()?,
+            origin_y: monitor.y()?,
             width: monitor.width()?,
             height: monitor.height()?,
             held_keys: HashSet::new(),
@@ -82,7 +90,7 @@ impl InputController {
         })
     }
 
-    pub fn dispatch(&mut self, bytes: &[u8], lane: InputLane) -> Result<()> {
+    pub fn dispatch(&mut self, bytes: &[u8], lane: InputLane) -> Result<Option<String>> {
         if bytes.len() > MAX_CONTROL_BYTES {
             anyhow::bail!("control message exceeds maximum size");
         }
@@ -121,20 +129,47 @@ impl InputController {
                 button,
                 delta_x,
                 delta_y,
-            } => self.pointer(action, x, y, button, delta_x, delta_y),
+            } => {
+                self.pointer(action, x, y, button, delta_x, delta_y)?;
+                Ok(None)
+            }
             ControlMessage::Key {
                 action,
                 code,
                 key,
                 repeat,
-            } => self.keyboard(action, &code, &key, repeat),
+            } => {
+                self.keyboard(action, &code, &key, repeat)?;
+                Ok(None)
+            }
             ControlMessage::Release => {
                 self.release_all();
-                Ok(())
+                Ok(None)
             }
-            ControlMessage::Ping => Ok(()),
-            ControlMessage::Unsupported => Ok(()),
+            ControlMessage::Ping => Ok(None),
+            ControlMessage::Display { display_id } => {
+                self.select_display(&display_id)?;
+                Ok(Some(display_id))
+            }
+            ControlMessage::Unsupported => Ok(None),
         }
+    }
+
+    fn select_display(&mut self, display_id: &str) -> Result<()> {
+        if display_id.len() > 128 {
+            anyhow::bail!("display identifier is too long");
+        }
+        let monitor = Monitor::all()
+            .context("cannot enumerate displays for input")?
+            .into_iter()
+            .find(|monitor| monitor.id().is_ok_and(|id| id.to_string() == display_id))
+            .context("selected display is unavailable")?;
+        self.release_all();
+        self.origin_x = monitor.x()?;
+        self.origin_y = monitor.y()?;
+        self.width = monitor.width()?;
+        self.height = monitor.height()?;
+        Ok(())
     }
 
     fn pointer(
@@ -146,8 +181,8 @@ impl InputController {
         delta_x: Option<f64>,
         delta_y: Option<f64>,
     ) -> Result<()> {
-        let x = normalized_pixel(x, self.width);
-        let y = normalized_pixel(y, self.height);
+        let x = display_pixel(x, self.width, self.origin_x);
+        let y = display_pixel(y, self.height, self.origin_y);
         match action {
             PointerAction::Move => self.enigo.move_mouse(x, y, Coordinate::Abs)?,
             PointerAction::Down => {
@@ -229,6 +264,10 @@ fn normalized_pixel(value: f64, extent: u32) -> i32 {
     (normalized * f64::from(extent.saturating_sub(1))).round() as i32
 }
 
+fn display_pixel(value: f64, extent: u32, origin: i32) -> i32 {
+    origin.saturating_add(normalized_pixel(value, extent))
+}
+
 fn bounded_scroll(value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -283,6 +322,8 @@ mod tests {
         assert_eq!(normalized_pixel(-2.0, 1920), 0);
         assert_eq!(normalized_pixel(1.0, 1920), 1919);
         assert_eq!(normalized_pixel(f64::NAN, 1920), 0);
+        assert_eq!(display_pixel(0.5, 1920, -1920), -960);
+        assert_eq!(display_pixel(1.0, 1080, 1920), 2999);
     }
 
     #[test]
@@ -299,5 +340,11 @@ mod tests {
         let ping: ControlMessage =
             serde_json::from_slice(br#"{"type":"ping","nonce":7,"sentAt":123}"#).unwrap();
         assert!(matches!(ping, ControlMessage::Ping));
+        let display: ControlMessage =
+            serde_json::from_slice(br#"{"type":"display","displayId":"42"}"#).unwrap();
+        assert!(matches!(
+            display,
+            ControlMessage::Display { display_id } if display_id == "42"
+        ));
     }
 }

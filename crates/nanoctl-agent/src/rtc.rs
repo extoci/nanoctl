@@ -44,6 +44,8 @@ pub struct HostPeer {
     keyframe_requests: tokio::sync::watch::Sender<u64>,
     #[cfg(feature = "media")]
     bitrate_estimate_kbps: tokio::sync::watch::Sender<u32>,
+    #[cfg(feature = "media")]
+    display_selection: tokio::sync::watch::Sender<String>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
 }
@@ -134,6 +136,8 @@ impl HostPeer {
             .await?,
         );
         #[cfg(feature = "media")]
+        let (display_selection, _) = tokio::sync::watch::channel(String::new());
+        #[cfg(feature = "media")]
         {
             let input = if allow_remote_input {
                 match crate::input::InputController::new() {
@@ -168,11 +172,13 @@ impl HostPeer {
                     control_receiver,
                     input.clone(),
                     crate::input::InputLane::Reliable,
+                    Some(display_selection.clone()),
                 );
                 spawn_input_worker(
                     pointer_receiver,
                     input.clone(),
                     crate::input::InputLane::PointerMotion,
+                    None,
                 );
             }
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
@@ -315,6 +321,8 @@ impl HostPeer {
             keyframe_requests,
             #[cfg(feature = "media")]
             bitrate_estimate_kbps,
+            #[cfg(feature = "media")]
+            display_selection,
             video,
         })
     }
@@ -397,6 +405,11 @@ impl HostPeer {
     pub fn bitrate_estimate_kbps(&self) -> tokio::sync::watch::Receiver<u32> {
         self.bitrate_estimate_kbps.subscribe()
     }
+
+    #[cfg(feature = "media")]
+    pub fn display_selection(&self) -> tokio::sync::watch::Receiver<String> {
+        self.display_selection.subscribe()
+    }
 }
 
 #[cfg(feature = "media")]
@@ -404,6 +417,7 @@ fn spawn_input_worker(
     mut receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
     input: Arc<std::sync::Mutex<crate::input::InputController>>,
     lane: crate::input::InputLane,
+    display_selection: Option<tokio::sync::watch::Sender<String>>,
 ) {
     tokio::spawn(async move {
         while let Some(bytes) = receiver.recv().await {
@@ -416,7 +430,12 @@ fn spawn_input_worker(
             })
             .await;
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(Some(display_id))) => {
+                    if let Some(selection) = &display_selection {
+                        selection.send_replace(display_id);
+                    }
+                }
+                Ok(Ok(None)) => {}
                 Ok(Err(error)) => tracing::warn!(error = %error, "control message rejected"),
                 Err(error) => {
                     tracing::warn!(error = %error, "input worker stopped unexpectedly");

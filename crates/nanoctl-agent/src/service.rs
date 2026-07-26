@@ -248,10 +248,13 @@ async fn reconcile_sessions(
                         peer.video_track(),
                         peer.keyframe_requests(),
                         peer.bitrate_estimate_kbps(),
-                        _config.quality.max_bitrate_kbps,
-                        _config.quality.max_fps,
-                        _config.quality.max_width,
-                        _config.quality.max_height,
+                        peer.display_selection(),
+                        crate::media::VideoQuality {
+                            max_bitrate_kbps: _config.quality.max_bitrate_kbps,
+                            max_fps: _config.quality.max_fps,
+                            max_width: _config.quality.max_width,
+                            max_height: _config.quality.max_height,
+                        },
                     );
                     active.insert(
                         session.session_id.clone(),

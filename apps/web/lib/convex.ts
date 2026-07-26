@@ -32,6 +32,14 @@ export const functions = {
         state: "requested" | "ringing" | "negotiating" | "connected" | "ended" | "failed";
         expiresAt: number;
         endReason?: string;
+        displays: {
+          id: string;
+          name: string;
+          width: number;
+          height: number;
+          scaleFactor: number;
+          primary: boolean;
+        }[];
       }
     >("sessions:getState"),
     create: makeFunctionReference<

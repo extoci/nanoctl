@@ -20,6 +20,64 @@ export function assertActiveDeadline(expiresAt: number): void {
   if (expiresAt <= Date.now()) throw new Error("Expired");
 }
 
+export type DeviceDisplay = {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  scaleFactor: number;
+  primary: boolean;
+};
+
+export function parseDeviceDisplays(capabilitiesJson: string): DeviceDisplay[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(capabilitiesJson);
+  } catch {
+    return [];
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const displays = (value as Record<string, unknown>).displays;
+  if (!Array.isArray(displays)) return [];
+  return displays.slice(0, 16).flatMap((display) => {
+    if (!display || typeof display !== "object" || Array.isArray(display)) return [];
+    const row = display as Record<string, unknown>;
+    if (
+      typeof row.id !== "string" ||
+      row.id.length < 1 ||
+      row.id.length > 128 ||
+      typeof row.name !== "string" ||
+      row.name.length < 1 ||
+      row.name.length > 256 ||
+      typeof row.width !== "number" ||
+      !Number.isInteger(row.width) ||
+      row.width < 1 ||
+      row.width > 16_384 ||
+      typeof row.height !== "number" ||
+      !Number.isInteger(row.height) ||
+      row.height < 1 ||
+      row.height > 16_384 ||
+      typeof row.scaleFactor !== "number" ||
+      !Number.isFinite(row.scaleFactor) ||
+      row.scaleFactor <= 0 ||
+      row.scaleFactor > 8 ||
+      typeof row.primary !== "boolean"
+    ) {
+      return [];
+    }
+    return [
+      {
+        id: row.id,
+        name: row.name,
+        width: row.width,
+        height: row.height,
+        scaleFactor: row.scaleFactor,
+        primary: row.primary,
+      },
+    ];
+  });
+}
+
 export type SignalKind = "offer" | "answer" | "ice-candidate" | "ice-complete" | "end";
 
 export function parseSignalEnvelope(

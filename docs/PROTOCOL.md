@@ -34,7 +34,10 @@ session identify protocol v1; unknown message variants are ignored and every mes
 64 KiB.
 
 Normalized coordinates are finite numbers clamped to `[0, 1]` and map to the selected display’s
-current logical bounds. A reliable `release` message releases all held keys and buttons immediately.
+pixel bounds plus its virtual-desktop origin. Display identifiers come from the authenticated
+agent’s bounded capability document. A reliable display-selection message first updates input
+geometry, then replaces the capture recorder and forces an IDR; capture replacement failure retains
+the existing stream. A reliable `release` message releases all held keys and buttons immediately.
 The browser sends it on control disable, blur, visibility loss, and teardown. A 2-second input
 watchdog is the final backstop.
 

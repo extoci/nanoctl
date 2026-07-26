@@ -71,29 +71,8 @@ impl CaptureEncoder {
             .or_else(|| monitors.first())
             .cloned()
             .context("no display is available")?;
-        let (recorder, native_frames) = monitor
-            .video_recorder()
-            .context("continuous display capture is unavailable")?;
         let encoder = create_encoder(max_bitrate_kbps, max_fps)?;
-        let latest_frame = Arc::new(LatestFrame::default());
-        let forwarding_slot = Arc::downgrade(&latest_frame);
-        std::thread::Builder::new()
-            .name("nanoctl-capture".to_owned())
-            .spawn(move || {
-                while let Ok(frame) = native_frames.recv() {
-                    let Some(latest_frame) = forwarding_slot.upgrade() else {
-                        break;
-                    };
-                    // Replacement, rather than append, makes this queue exactly one frame deep.
-                    if !latest_frame.replace(frame) {
-                        break;
-                    }
-                }
-            })
-            .context("capture forwarding thread could not start")?;
-        recorder
-            .start()
-            .context("continuous display capture could not start")?;
+        let (recorder, latest_frame) = start_capture(&monitor)?;
         Ok(Self {
             recorder,
             latest_frame,
@@ -102,6 +81,23 @@ impl CaptureEncoder {
             max_fps,
             rgb: Vec::new(),
         })
+    }
+
+    pub fn select_display(&mut self, display_id: &str) -> Result<()> {
+        if display_id.len() > 128 {
+            bail!("display identifier is too long");
+        }
+        let monitor = Monitor::all()
+            .context("cannot enumerate displays for capture")?
+            .into_iter()
+            .find(|monitor| monitor.id().is_ok_and(|id| id.to_string() == display_id))
+            .context("selected display is unavailable")?;
+        let (recorder, latest_frame) = start_capture(&monitor)?;
+        let _ = self.recorder.stop();
+        self.recorder = recorder;
+        self.latest_frame = latest_frame;
+        self.encoder.force_intra_frame();
+        Ok(())
     }
 
     pub fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
@@ -151,6 +147,32 @@ impl CaptureEncoder {
     }
 }
 
+fn start_capture(monitor: &Monitor) -> Result<(xcap::VideoRecorder, Arc<LatestFrame>)> {
+    let (recorder, native_frames) = monitor
+        .video_recorder()
+        .context("continuous display capture is unavailable")?;
+        let latest_frame = Arc::new(LatestFrame::default());
+        let forwarding_slot = Arc::downgrade(&latest_frame);
+        std::thread::Builder::new()
+            .name("nanoctl-capture".to_owned())
+            .spawn(move || {
+                while let Ok(frame) = native_frames.recv() {
+                    let Some(latest_frame) = forwarding_slot.upgrade() else {
+                        break;
+                    };
+                    // Replacement, rather than append, makes this queue exactly one frame deep.
+                    if !latest_frame.replace(frame) {
+                        break;
+                    }
+                }
+            })
+            .context("capture forwarding thread could not start")?;
+        recorder
+            .start()
+            .context("continuous display capture could not start")?;
+    Ok((recorder, latest_frame))
+}
+
 fn create_encoder(bitrate_kbps: u32, max_fps: u16) -> Result<Encoder> {
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
@@ -182,22 +204,29 @@ pub struct EncodedFrame {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub struct VideoQuality {
+    pub max_bitrate_kbps: u32,
+    pub max_fps: u16,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     bitrate_estimate_kbps: tokio::sync::watch::Receiver<u32>,
-    max_bitrate_kbps: u32,
-    max_fps: u16,
-    max_width: u32,
-    max_height: u32,
+    display_selection: tokio::sync::watch::Receiver<String>,
+    quality: VideoQuality,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<EncodedFrame>(1);
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut encoder = CaptureEncoder::primary(max_bitrate_kbps, max_fps)?;
+            let mut encoder = CaptureEncoder::primary(quality.max_bitrate_kbps, quality.max_fps)?;
             let mut keyframe_requests = keyframe_requests;
             let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
-            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(max_fps));
+            let mut display_selection = display_selection;
+            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
             let mut next_frame = Instant::now();
             loop {
                 let now = Instant::now();
@@ -213,9 +242,22 @@ pub fn spawn_video(
                 }
                 if bitrate_estimate_kbps.has_changed().unwrap_or(false) {
                     let estimate = *bitrate_estimate_kbps.borrow_and_update();
-                    encoder.apply_bitrate_estimate(estimate, max_bitrate_kbps)?;
+                    encoder.apply_bitrate_estimate(estimate, quality.max_bitrate_kbps)?;
                 }
-                let frame = encoder.next_access_unit(max_width, max_height)?;
+                if display_selection.has_changed().unwrap_or(false) {
+                    let display_id = display_selection.borrow_and_update().clone();
+                    if !display_id.is_empty()
+                        && let Err(error) = encoder.select_display(&display_id)
+                    {
+                        tracing::warn!(
+                            display_id,
+                            error = %error,
+                            "display switch rejected; retaining current capture"
+                        );
+                    }
+                }
+                let frame =
+                    encoder.next_access_unit(quality.max_width, quality.max_height)?;
                 match sender.try_send(frame) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Closed(_)) => break,
@@ -223,7 +265,7 @@ pub fn spawn_video(
             }
             Ok(())
         });
-        let duration = Duration::from_secs_f64(1.0 / f64::from(max_fps));
+        let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
         while let Some(frame) = receiver.recv().await {
             track
                 .write_sample(&Sample {
