@@ -4,6 +4,7 @@ import { PROTOCOL_VERSION, type ControlMessage } from "@nanoctl/protocol";
 import { useAction, useMutation, useQuery } from "convex/react";
 import { useEffect, useRef, useState } from "react";
 import { functions } from "../lib/convex";
+import { reliableControlBufferIsSaturated } from "../lib/control-backpressure";
 import { processHostSignals } from "../lib/remote-signals";
 
 type ViewerMetrics = {
@@ -211,6 +212,19 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       const isMotion = payload.type === "pointer" && payload.action === "move";
       const channel = isMotion ? pointerChannel : controlChannel;
       if (isMotion && channel.bufferedAmount > 64 * 1024) return;
+      if (!isMotion && reliableControlBufferIsSaturated(channel.bufferedAmount)) {
+        if (peer.connectionState !== "closed") {
+          inputEnabledRef.current = false;
+          setInputEnabled(false);
+          setStatus("control channel stalled");
+          peer.close();
+          void endSession({
+            sessionId,
+            reason: "reliable control channel stalled",
+          }).catch(() => {});
+        }
+        return;
+      }
       if (channel.readyState === "open") channel.send(JSON.stringify(payload));
     }
     const video = videoRef.current;

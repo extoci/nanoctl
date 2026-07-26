@@ -45,7 +45,10 @@ the session failed, so an abandoned browser cannot reserve a device for the full
 button/wheel events, release, and keepalive messages. `nanoctl.pointer.v1` is unordered with zero
 retransmissions and carries pointer movement samples. Channel labels and the authenticated WebRTC
 session identify protocol v1; unknown message variants are ignored and every message is capped at
-64 KiB.
+64 KiB. The browser drops obsolete pointer motion above a 64 KiB lossy-channel backlog. A reliable
+control backlog above 256 KiB is terminal: the browser disables input, closes the peer, and ends the
+control-plane session instead of allowing key, wheel, or keepalive traffic to grow without bound.
+The host input watchdog releases held state when keepalives stop.
 
 Normalized coordinates are finite numbers clamped to `[0, 1]` and map to the selected display’s
 pixel bounds plus its virtual-desktop origin. Display identifiers come from the authenticated
