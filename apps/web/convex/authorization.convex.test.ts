@@ -50,6 +50,22 @@ function asOwner(t: ReturnType<typeof convexTest>, subject: string) {
 }
 
 describe("control-plane authorization", () => {
+  test("enforces authentication on every agent HTTP route except one-time enrollment", async () => {
+    const t = convexTest(schema, modules);
+    const protectedRequests: Array<[string, RequestInit | undefined]> = [
+      ["/v1/agent/heartbeat", { method: "POST", body: "{}" }],
+      ["/v1/agent/sessions", undefined],
+      ["/v1/agent/signal", { method: "POST", body: "{}" }],
+      ["/v1/agent/turn?sessionId=unknown", undefined],
+    ];
+    for (const [path, init] of protectedRequests) {
+      const response = await t.fetch(path, init);
+      expect(response.status, path).toBe(401);
+      expect(response.headers.get("cache-control"), path).toBe("no-store");
+      await expect(response.json(), path).resolves.toEqual({ error: "unauthorized" });
+    }
+  });
+
   test("requires Shoo identity on every public control-plane operation", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");

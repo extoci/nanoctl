@@ -18,9 +18,10 @@ SBOM, and GitHub build-provenance attestations. These artifacts are deliberately
 Current automated coverage includes bounded protocol and signaling parsing, role/session identity,
 duplicate/replayed enrollment and signaling, deliberate sequence gaps, expiry, owner and device
 isolation, wrong-role rejection, revoked-token rejection, terminal mutation idempotency,
-rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer and
-bitstream transforms, property-generated signaling/input bounds, fail-safe input release behavior,
-packaging transactions,
+unauthenticated rejection across every public Convex operation and protected agent HTTP route,
+rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer
+and bitstream transforms, property-generated signaling/input bounds, fail-safe input release
+behavior, packaging transactions,
 production configuration, CSP nonces, media/network/performance-evidence validation, agent log
 redaction snapshots (including bearer, clipboard, SDP, ICE, and TURN-shaped secrets), malformed
 SDP/candidate rejection, bounded control-queue admission, and an in-process connection between the
@@ -33,7 +34,6 @@ The following remain mandatory before a supported release; they are requirements
 the current automated suite:
 
 - coverage-guided fuzzing and model-based state-transition tests;
-- authorization tests around every public Convex function and HTTP action;
 - end-to-end data-channel flood/backpressure tests with a real input backend;
 
 ## Browser tests
