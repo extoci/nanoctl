@@ -3,7 +3,7 @@ set -eu
 
 REPOSITORY="${NANOCTL_REPOSITORY:-extoci/nanoctl}"
 VERSION="${NANOCTL_VERSION:-latest}"
-CONTROL_PLANE="${NANOCTL_CONTROL_PLANE:-https://dapper-hornet-380.convex.site}"
+CONTROL_PLANE="${NANOCTL_CONTROL_PLANE:-https://nanoctl.vercel.app}"
 
 fail() {
   printf 'nanoctl installer: %s\n' "$*" >&2
@@ -159,7 +159,25 @@ printf '\nnanoctl is installed, enrolled, and running.\n'
 printf 'Run this installer again at any time to update.\n'
 case ":$PATH:" in
   *":$install_dir:"*) ;;
-  *) printf 'Add %s to PATH to run nanoctl directly.\n' "$install_dir" ;;
+  *)
+    case "${SHELL:-}" in
+      */zsh) shell_profile="$HOME/.zshrc" ;;
+      */bash) shell_profile="$HOME/.bashrc" ;;
+      *) shell_profile="" ;;
+    esac
+    if [ -n "$shell_profile" ]; then
+      path_line='export PATH="$HOME/.local/bin:$PATH"'
+      if ! grep -F "$path_line" "$shell_profile" >/dev/null 2>&1; then
+        {
+          printf '\n# nanoctl\n'
+          printf '%s\n' "$path_line"
+        } >>"$shell_profile"
+      fi
+      printf 'Added nanoctl to PATH for new terminals (%s).\n' "$shell_profile"
+    else
+      printf 'Add %s to PATH to run nanoctl directly.\n' "$install_dir"
+    fi
+    ;;
 esac
 if [ "$platform" = macos ]; then
   printf 'macOS may ask you to allow Screen Recording and Accessibility for nanoctl.\n'

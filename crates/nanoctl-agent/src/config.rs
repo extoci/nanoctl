@@ -84,7 +84,7 @@ pub enum IceTransport {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            control_plane_url: Url::parse("https://dapper-hornet-380.convex.site")
+            control_plane_url: Url::parse("https://nanoctl.vercel.app")
                 .expect("static URL is valid"),
             device_id: None,
             quality: QualityConfig::default(),
@@ -113,8 +113,8 @@ impl Default for NetworkConfig {
         Self {
             ice_transport: IceTransport::All,
             stun_urls: vec!["stun:stun.cloudflare.com:3478".into()],
-            heartbeat_seconds: 15,
-            poll_milliseconds: 750,
+            heartbeat_seconds: 30,
+            poll_milliseconds: 2_000,
         }
     }
 }

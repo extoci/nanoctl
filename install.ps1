@@ -8,7 +8,7 @@ $Version = if ($env:NANOCTL_VERSION) { $env:NANOCTL_VERSION } else { "latest" }
 $ControlPlane = if ($env:NANOCTL_CONTROL_PLANE) {
   $env:NANOCTL_CONTROL_PLANE
 } else {
-  "https://dapper-hornet-380.convex.site"
+  "https://nanoctl.vercel.app"
 }
 
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") {
@@ -105,8 +105,10 @@ try {
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1)
+    -MultipleInstances IgnoreNew `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Seconds 30) `
+    -StartWhenAvailable
   Register-ScheduledTask `
     -TaskName $taskName `
     -Action $action `

@@ -17,7 +17,8 @@ irm https://extoci.lol/nanoctl/install | iex
 
 The installer selects the correct x64 or arm64 executable, verifies its SHA-256 checksum, asks for
 the setup code on first install, and starts the background agent. Run the same command again to
-update to the latest release without enrolling again.
+update to the latest release without enrolling again. It also adds `nanoctl` to the current user's
+PATH for new terminals.
 
 If automatic platform selection is undesirable, use
 `https://extoci.lol/nanoctl/install.sh` or
@@ -26,6 +27,9 @@ If automatic platform selection is undesirable, use
 Linux uses a systemd user service, macOS uses a per-user LaunchAgent, and Windows uses a
 non-elevated Scheduled Task. The agent must run in the enrolled interactive user's session so it
 can access that user's credential store, screen, and input APIs. It does not open an inbound port.
+The registration starts at login and restarts after failures. While idle, the agent does not
+capture the screen or initialize a media session; it only performs lightweight control-plane
+checks while waiting for an authorized session.
 
 macOS may ask for Screen Recording and Accessibility. Wayland may ask through its desktop portal.
 Complete those prompts as the user who ran the installer.

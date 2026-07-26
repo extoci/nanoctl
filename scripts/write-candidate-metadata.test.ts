@@ -53,7 +53,7 @@ describe("release candidate identity", () => {
       signingRequirements: string[];
     };
     expect(metadata).toMatchObject({
-      version: "1.0.5",
+      version: "1.0.6",
       commit,
       target: { platform: "linux", architecture: "x64" },
       binary: { size: 17 },
