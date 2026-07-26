@@ -1,5 +1,6 @@
 import { ConvexError, v } from "convex/values";
-import { mutation } from "./_generated/server";
+import { action, internalQuery, mutation } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { requireIdentity } from "./lib";
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
@@ -16,6 +17,15 @@ export const create = mutation({
       Date.now() - device.lastSeenAt > 45_000
     ) {
       throw new ConvexError("Device is unavailable");
+    }
+    for (const state of ["requested", "ringing", "negotiating", "connected"] as const) {
+      const existing = await ctx.db
+        .query("sessions")
+        .withIndex("by_device_state", (q) => q.eq("deviceId", args.deviceId).eq("state", state))
+        .first();
+      if (existing && existing.expiresAt > Date.now()) {
+        throw new ConvexError("Device already has an active session");
+      }
     }
     const now = Date.now();
     const expiresAt = now + SESSION_TTL_MS;
@@ -55,3 +65,56 @@ export const end = mutation({
     return null;
   },
 });
+
+export const authorizeTurn = internalQuery({
+  args: { sessionId: v.id("sessions"), ownerId: v.string() },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    return Boolean(
+      session &&
+      session.ownerId === args.ownerId &&
+      session.expiresAt > Date.now() &&
+      session.state !== "ended" &&
+      session.state !== "failed",
+    );
+  },
+});
+
+export const turnCredentials = action({
+  args: { sessionId: v.id("sessions") },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new ConvexError("Unauthenticated");
+    const authorized = await ctx.runQuery(internal.sessions.authorizeTurn, {
+      sessionId: args.sessionId,
+      ownerId: identity.subject,
+    });
+    if (!authorized) throw new ConvexError("Session not found");
+    const secret = process.env.TURN_AUTH_SECRET;
+    const urls = (process.env.TURN_URLS ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (!secret || urls.length === 0) return null;
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 5 * 60;
+    const username = `${expiresAtSeconds}:${args.sessionId}`;
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-1" },
+      false,
+      ["sign"],
+    );
+    const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
+    return {
+      urls,
+      username,
+      credential: bytesToBase64(new Uint8Array(signature)),
+      expiresAt: expiresAtSeconds * 1000,
+    };
+  },
+});
+
+function bytesToBase64(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes));
+}

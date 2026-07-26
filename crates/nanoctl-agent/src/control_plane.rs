@@ -39,6 +39,15 @@ pub struct SignalRow {
     pub envelope: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCredentials {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+    pub expires_at: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EnrollmentRequest {
@@ -111,7 +120,7 @@ impl ControlPlane {
             .context("invalid session response")
     }
 
-    #[cfg(feature = "media")]
+    #[cfg(feature = "rtc")]
     pub async fn send_signal(
         &self,
         token: &Zeroizing<String>,
@@ -131,6 +140,31 @@ impl ControlPlane {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    #[cfg(feature = "rtc")]
+    pub async fn turn_credentials(
+        &self,
+        token: &Zeroizing<String>,
+        session_id: &str,
+    ) -> Result<Option<TurnCredentials>> {
+        let mut url = self.endpoint("/v1/agent/turn")?;
+        url.query_pairs_mut().append_pair("sessionId", session_id);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token.as_str())
+            .send()
+            .await?
+            .error_for_status()?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        response
+            .json()
+            .await
+            .map(Some)
+            .context("invalid TURN credential response")
     }
 
     fn endpoint(&self, path: &str) -> Result<Url> {

@@ -27,8 +27,8 @@ by the WebRTC implementation.
 
 ## Data channels
 
-`nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, clipboard,
-display selection, peer status, ping/pong, and capability negotiation. `nanoctl.pointer.v1` is
+`nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, display selection,
+peer status, ping/pong, and capability negotiation. `nanoctl.pointer.v1` is
 unordered with zero retransmissions and carries pointer movement/wheel samples. Both begin with a
 hello containing protocol version, session nonce, capabilities, and maximum accepted message size.
 
@@ -39,7 +39,7 @@ and buttons.
 
 Keyboard events use DOM `code` for physical location plus `key` for meaning. The agent maps `code`
 using the active OS layout and treats text input separately in future protocol versions. Modifier
-bits are Shift=1, Control=2, Alt=4, Meta=8. Clipboard text is UTF-8, opt-in, and at most 1 MiB.
+bits are Shift=1, Control=2, Alt=4, Meta=8. Clipboard variants are reserved and rejected in v1.
 
 ## Codec negotiation
 

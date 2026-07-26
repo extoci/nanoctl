@@ -54,8 +54,8 @@ pub fn capabilities() -> Capabilities {
             Vec::new()
         },
         input: cfg!(feature = "media"),
-        clipboard: cfg!(feature = "media"),
-        system_audio: cfg!(any(target_os = "windows", target_os = "macos")),
+        clipboard: false,
+        system_audio: false,
     }
 }
 

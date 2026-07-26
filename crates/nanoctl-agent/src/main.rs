@@ -2,8 +2,12 @@ mod config;
 mod control_plane;
 mod credential;
 #[cfg(feature = "media")]
+mod input;
+#[cfg(feature = "media")]
 mod media;
 mod platform;
+#[cfg(feature = "rtc")]
+mod rtc;
 mod service;
 
 use std::path::PathBuf;

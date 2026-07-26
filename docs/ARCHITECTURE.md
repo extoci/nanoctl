@@ -69,10 +69,10 @@ Congestion control consumes WebRTC statistics and receiver feedback. A controlle
 first, then resolution, then frame rate. It uses hysteresis to avoid oscillation and never allows
 encoder output to build an unbounded queue.
 
-Audio is Opus at 48 kHz with a bounded jitter path. Input uses a separate unordered, zero-retransmit
-data channel for pointer motion and a reliable ordered channel for key/button transitions,
-clipboard, and lifecycle messages. Pointer motion is coalesced; key-up and button-up are never
-dropped and are synthesized on disconnect.
+Input uses an unordered, zero-retransmit channel for pointer motion and a reliable ordered channel
+for key/button transitions and lifecycle messages. Pointer motion is coalesced; key-up and button-up
+are never dropped and are synthesized on disconnect. System audio and clipboard synchronization are
+reserved for a later protocol capability and are never advertised by a v1 agent.
 
 ## Connectivity
 

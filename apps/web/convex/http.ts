@@ -87,6 +87,24 @@ http.route({
   }),
 });
 
+http.route({
+  path: "/v1/agent/turn",
+  method: "GET",
+  handler: httpAction(async (ctx, request) => {
+    const auth = await authenticateAgent(ctx, request);
+    if (!auth) return json({ error: "unauthorized" }, 401);
+    const sessionId = new URL(request.url).searchParams.get("sessionId");
+    if (!sessionId) return json({ error: "invalid_request" }, 400);
+    const authorized = await ctx.runQuery(internal.agent.authorizeSession, {
+      deviceId: auth.deviceId,
+      sessionId: sessionId as never,
+    });
+    if (!authorized) return json({ error: "session_unavailable" }, 404);
+    const credentials = await mintTurnCredentials(sessionId);
+    return credentials ? json(credentials) : new Response(null, { status: 204 });
+  }),
+});
+
 async function authenticateAgent(
   ctx: Parameters<Parameters<typeof httpAction>[0]>[0],
   request: Request,
@@ -140,6 +158,31 @@ function base64Url(bytes: Uint8Array): string {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
+}
+
+async function mintTurnCredentials(sessionId: string) {
+  const secret = process.env.TURN_AUTH_SECRET;
+  const urls = (process.env.TURN_URLS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (!secret || urls.length === 0) return null;
+  const expiresAtSeconds = Math.floor(Date.now() / 1000) + 5 * 60;
+  const username = `${expiresAtSeconds}:${sessionId}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
+  return {
+    urls,
+    username,
+    credential: btoa(String.fromCharCode(...new Uint8Array(signature))),
+    expiresAt: expiresAtSeconds * 1000,
+  };
 }
 
 export default http;

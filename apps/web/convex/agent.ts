@@ -131,3 +131,17 @@ export const sendSignal = internalMutation({
     return true;
   },
 });
+
+export const authorizeSession = internalQuery({
+  args: { deviceId: v.id("devices"), sessionId: v.id("sessions") },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    return Boolean(
+      session &&
+      session.deviceId === args.deviceId &&
+      session.expiresAt > Date.now() &&
+      session.state !== "ended" &&
+      session.state !== "failed",
+    );
+  },
+});

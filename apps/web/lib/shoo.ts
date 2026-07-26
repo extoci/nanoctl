@@ -6,10 +6,16 @@ import { useCallback } from "react";
 const options = { callbackPath: "/auth/callback" } as const;
 
 export function useShooConvexAuth() {
-  const { identity, loading } = useShooAuth(options);
+  const { identity, claims, loading, clearIdentity } = useShooAuth(options);
   const fetchAccessToken = useCallback(
-    async (_options: { forceRefreshToken: boolean }) => identity.token ?? null,
-    [identity.token],
+    async (_request: { forceRefreshToken: boolean }) => {
+      if (typeof claims?.exp === "number" && claims.exp * 1000 <= Date.now() + 30_000) {
+        clearIdentity();
+        return null;
+      }
+      return identity.token ?? null;
+    },
+    [claims?.exp, clearIdentity, identity.token],
   );
   return {
     isLoading: loading,

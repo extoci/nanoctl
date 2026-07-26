@@ -33,6 +33,16 @@ export const functions = {
     end: makeFunctionReference<"mutation", { sessionId: string; reason: string }, null>(
       "sessions:end",
     ),
+    turnCredentials: makeFunctionReference<
+      "action",
+      { sessionId: string },
+      {
+        urls: string[];
+        username: string;
+        credential: string;
+        expiresAt: number;
+      } | null
+    >("sessions:turnCredentials"),
   },
   signals: {
     list: makeFunctionReference<"query", { sessionId: string; afterSequence: number }, unknown[]>(

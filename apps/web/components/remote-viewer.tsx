@@ -1,7 +1,7 @@
 "use client";
 
 import { PROTOCOL_VERSION, assertSignalEnvelope, type SignalEnvelope } from "@nanoctl/protocol";
-import { useMutation, useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import { useEffect, useRef, useState } from "react";
 import { functions } from "../lib/convex";
 
@@ -11,29 +11,51 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const sendSequenceRef = useRef(0);
   const processedSignalsRef = useRef(new Set<number>());
   const sendSignal = useMutation(functions.signals.send);
+  const endSession = useMutation(functions.sessions.end);
+  const getTurnCredentials = useAction(functions.sessions.turnCredentials);
   const incoming = useQuery(functions.signals.list, {
     sessionId,
     afterSequence: -1,
   });
   const [status, setStatus] = useState("Negotiating");
+  const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
 
   useEffect(() => {
-    const turnUrls = (process.env.NEXT_PUBLIC_TURN_URLS ?? "")
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean);
+    let cancelled = false;
+    void getTurnCredentials({ sessionId })
+      .then((turn) => {
+        if (cancelled) return;
+        setIceServers([
+          { urls: "stun:stun.cloudflare.com:3478" },
+          ...(turn
+            ? [{ urls: turn.urls, username: turn.username, credential: turn.credential }]
+            : []),
+        ]);
+      })
+      .catch(() => {
+        if (!cancelled) setIceServers([{ urls: "stun:stun.cloudflare.com:3478" }]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [getTurnCredentials, sessionId]);
+
+  useEffect(() => {
+    if (!iceServers) return;
     const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.cloudflare.com:3478" },
-        ...(turnUrls.length > 0 ? [{ urls: turnUrls }] : []),
-      ],
+      iceServers,
       bundlePolicy: "max-bundle",
     });
     peerRef.current = peer;
-    const control = peer.createDataChannel("control", {
+    const endOnPageHide = () => {
+      void endSession({ sessionId, reason: "controller disconnected" });
+    };
+    window.addEventListener("pagehide", endOnPageHide, { once: true });
+    const pointerChannel = peer.createDataChannel("nanoctl.pointer.v1", {
       ordered: false,
       maxRetransmits: 0,
     });
+    const controlChannel = peer.createDataChannel("nanoctl.control.v1");
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.addTransceiver("audio", { direction: "recvonly" });
 
@@ -65,7 +87,14 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     };
 
     function sendControl(payload: object) {
-      if (control.readyState === "open") control.send(JSON.stringify(payload));
+      const isMotion =
+        "type" in payload &&
+        payload.type === "pointer" &&
+        "action" in payload &&
+        payload.action === "move";
+      const channel = isMotion ? pointerChannel : controlChannel;
+      if (isMotion && channel.bufferedAmount > 64 * 1024) return;
+      if (channel.readyState === "open") channel.send(JSON.stringify(payload));
     }
     const video = videoRef.current;
     const pointer = (event: PointerEvent) => {
@@ -123,11 +152,13 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       video?.removeEventListener("pointerup", pointer);
       video?.removeEventListener("keydown", key);
       video?.removeEventListener("keyup", key);
-      control.close();
+      pointerChannel.close();
+      controlChannel.close();
       peer.close();
       peerRef.current = null;
+      window.removeEventListener("pagehide", endOnPageHide);
     };
-  }, [sendSignal, sessionId]);
+  }, [endSession, iceServers, sendSignal, sessionId]);
 
   useEffect(() => {
     const peer = peerRef.current;

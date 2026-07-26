@@ -10,6 +10,11 @@ use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
 use openh264::formats::{RgbSliceU8, YUVBuffer};
 use xcap::Monitor;
 
+use std::sync::Arc;
+use std::time::Duration;
+use webrtc::media::Sample;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
 pub struct CaptureEncoder {
     monitor: Monitor,
     encoder: Encoder,
@@ -38,11 +43,24 @@ impl CaptureEncoder {
         })
     }
 
-    pub fn next_access_unit(&mut self) -> Result<EncodedFrame> {
-        let image = self
+    pub fn next_access_unit(&mut self, max_width: u32, max_height: u32) -> Result<EncodedFrame> {
+        let source = self
             .monitor
             .capture_image()
             .context("display capture failed")?;
+        let (source_width, source_height) = source.dimensions();
+        let (target_width, target_height) =
+            fit_dimensions(source_width, source_height, max_width, max_height);
+        let image = if target_width == source_width && target_height == source_height {
+            source
+        } else {
+            xcap::image::imageops::resize(
+                &source,
+                target_width,
+                target_height,
+                xcap::image::imageops::FilterType::Triangle,
+            )
+        };
         let (width, height) = image.dimensions();
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
@@ -67,4 +85,58 @@ pub struct EncodedFrame {
     pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+pub fn spawn_video(
+    track: Arc<TrackLocalStaticSample>,
+    max_bitrate_kbps: u32,
+    max_fps: u16,
+    max_width: u32,
+    max_height: u32,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<EncodedFrame>(1);
+        let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut encoder = CaptureEncoder::primary(max_bitrate_kbps, max_fps)?;
+            while sender
+                .blocking_send(encoder.next_access_unit(max_width, max_height)?)
+                .is_ok()
+            {}
+            Ok(())
+        });
+        let duration = Duration::from_secs_f64(1.0 / f64::from(max_fps));
+        while let Some(frame) = receiver.recv().await {
+            track
+                .write_sample(&Sample {
+                    data: frame.bytes.into(),
+                    duration,
+                    ..Default::default()
+                })
+                .await?;
+        }
+        producer.await??;
+        Ok(())
+    })
+}
+
+fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    let scale = (f64::from(max_width) / f64::from(width))
+        .min(f64::from(max_height) / f64::from(height))
+        .min(1.0);
+    let fitted_width = ((f64::from(width) * scale).floor() as u32).max(2) & !1;
+    let fitted_height = ((f64::from(height) * scale).floor() as u32).max(2) & !1;
+    (fitted_width, fitted_height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_dimensions;
+
+    #[test]
+    fn preserves_aspect_ratio_and_even_dimensions() {
+        assert_eq!(fit_dimensions(3840, 2160, 1920, 1080), (1920, 1080));
+        let (width, height) = fit_dimensions(1921, 1081, 1920, 1080);
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+    }
 }

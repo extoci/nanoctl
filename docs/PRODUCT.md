@@ -17,7 +17,8 @@ v1 includes:
 
 - Windows 11 x64/arm64, macOS 14+ x64/arm64, and current Linux x64/arm64.
 - One owner per device. One active controller per device.
-- Primary or selected display, pointer, keyboard, wheel, clipboard text, and optional system audio.
+- Primary display, pointer, keyboard, and wheel. Display selection is available where the platform
+  backend exposes stable display identifiers.
 - H.264 baseline compatibility, with VP9/AV1 offered only when both endpoints and the encoder support
   them.
 - Adaptive bitrate, 30/60 FPS presets, 120 FPS advanced maximum, resolution scaling, and automatic
@@ -28,8 +29,9 @@ v1 includes:
 
 v1 intentionally excludes:
 
-- file transfer, remote shell, multi-controller collaboration, recording, mobile host capture,
-  wake-on-LAN brokerage, organization/RBAC features, and hidden installation;
+- file transfer, clipboard synchronization, system audio, remote shell, multi-controller
+  collaboration, recording, mobile host capture, wake-on-LAN brokerage, organization/RBAC features,
+  and hidden installation;
 - bypassing Windows UAC secure desktop, macOS TCC, Wayland portals, lock screens, or other operating
   system boundaries;
 - end-to-end identity verification independent of the authenticated control plane. WebRTC media is
