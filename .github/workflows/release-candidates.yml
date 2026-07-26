@@ -89,6 +89,10 @@ jobs:
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
             libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Record Rust toolchain identity
+        id: rust-toolchain
+        shell: bash
+        run: echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
       - name: Stage Unix package
         if: matrix.platform != 'windows'
         shell: bash
@@ -106,6 +110,8 @@ jobs:
           Copy-Item LICENSE, README.md stage/
           Copy-Item packaging/windows stage/ -Recurse
       - name: Record candidate identity and signing requirements
+        env:
+          NANOCTL_RUSTC_VERSION: ${{ steps.rust-toolchain.outputs.version }}
         run: >-
           bun run scripts/write-candidate-metadata.ts
           stage

@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 const repository = resolve(import.meta.dir, "..");
 const temporaryDirectories: string[] = [];
 const commit = "a".repeat(40);
+const rustVersion = "rustc 1.96.1 (31fca3adb 2026-06-26)";
 
 afterEach(async () => {
   await Promise.all(
@@ -27,7 +28,12 @@ async function fixture(): Promise<string> {
 function generate(stage: string, environment: Record<string, string>): Bun.Subprocess {
   return Bun.spawn(["bun", "run", "scripts/write-candidate-metadata.ts", stage, "linux", "x64"], {
     cwd: repository,
-    env: { ...process.env, GITHUB_SHA: commit, ...environment },
+    env: {
+      ...process.env,
+      GITHUB_SHA: commit,
+      NANOCTL_RUSTC_VERSION: rustVersion,
+      ...environment,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });

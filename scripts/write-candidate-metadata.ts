@@ -19,13 +19,6 @@ function cargoVersion(text: string): string {
   return version;
 }
 
-async function commandVersion(command: string[]): Promise<string> {
-  const child = Bun.spawn(command, { stdout: "pipe", stderr: "inherit" });
-  const [exitCode, output] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-  if (exitCode !== 0) throw new Error(`${command[0]} version command failed`);
-  return output.trim();
-}
-
 const [stageArgument, platformArgument, architecture] = process.argv.slice(2);
 if (!stageArgument || !["linux", "macos", "windows"].includes(platformArgument ?? "")) {
   throw new Error("usage: write-candidate-metadata.ts STAGE (linux|macos|windows) ARCH");
@@ -54,6 +47,10 @@ const commit = process.env.GITHUB_SHA;
 if (!commit || !/^[0-9a-f]{40}$/.test(commit)) {
   throw new Error("GITHUB_SHA must identify the exact candidate commit");
 }
+const rustVersion = process.env.NANOCTL_RUSTC_VERSION?.trim();
+if (!rustVersion || !/^rustc \d+\.\d+\.\d+ \([0-9a-f]+ \d{4}-\d{2}-\d{2}\)$/.test(rustVersion)) {
+  throw new Error("NANOCTL_RUSTC_VERSION must contain the exact candidate rustc version");
+}
 
 const digest = new Bun.CryptoHasher("sha256")
   .update(await Bun.file(binary).arrayBuffer())
@@ -76,7 +73,7 @@ const metadata = {
   },
   toolchain: {
     bun: Bun.version,
-    rust: await commandVersion(["rustc", "--version"]),
+    rust: rustVersion,
   },
   unsigned: true,
   signingRequirements: signingRequirements[platform],
