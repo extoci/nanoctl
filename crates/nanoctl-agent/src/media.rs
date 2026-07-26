@@ -63,9 +63,11 @@ pub struct CaptureEncoder {
 }
 
 enum EncoderBackend {
+    #[cfg(target_os = "linux")]
+    VaApi(Box<crate::linux_encoder::LinuxEncoder>),
     #[cfg(target_os = "macos")]
-    VideoToolbox(crate::macos_encoder::MacOsEncoder),
-    Software(SoftwareEncoder),
+    VideoToolbox(Box<crate::macos_encoder::MacOsEncoder>),
+    Software(Box<SoftwareEncoder>),
 }
 
 struct SoftwareEncoder {
@@ -159,10 +161,22 @@ impl EncoderBackend {
         max_fps: u16,
         latency_mode: LatencyMode,
     ) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if !matches!(preference, EncoderPreference::Software) {
+            match crate::linux_encoder::LinuxEncoder::new(bitrate_kbps, max_fps, latency_mode) {
+                Ok(encoder) => return Ok(Self::VaApi(Box::new(encoder))),
+                Err(error) if matches!(preference, EncoderPreference::Hardware) => {
+                    return Err(error).context("required VA-API encoder is unavailable");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "VA-API unavailable; using OpenH264");
+                }
+            }
+        }
         #[cfg(target_os = "macos")]
         if !matches!(preference, EncoderPreference::Software) {
             match crate::macos_encoder::MacOsEncoder::new(bitrate_kbps, max_fps, latency_mode) {
-                Ok(encoder) => return Ok(Self::VideoToolbox(encoder)),
+                Ok(encoder) => return Ok(Self::VideoToolbox(Box::new(encoder))),
                 Err(error) if matches!(preference, EncoderPreference::Hardware) => {
                     return Err(error).context("required VideoToolbox encoder is unavailable");
                 }
@@ -174,15 +188,17 @@ impl EncoderBackend {
         if matches!(preference, EncoderPreference::Hardware) {
             bail!("hardware encoding was required but no verified native backend is available");
         }
-        Ok(Self::Software(SoftwareEncoder::new(
+        Ok(Self::Software(Box::new(SoftwareEncoder::new(
             bitrate_kbps,
             max_fps,
             latency_mode,
-        )?))
+        )?)))
     }
 
     fn force_keyframe(&mut self) {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::VaApi(encoder) => encoder.force_keyframe(),
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => encoder.force_keyframe(),
             Self::Software(encoder) => encoder.encoder.force_intra_frame(),
@@ -191,6 +207,8 @@ impl EncoderBackend {
 
     fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::VaApi(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => {
                 encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
@@ -201,6 +219,8 @@ impl EncoderBackend {
 
     fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::VaApi(encoder) => encoder.encode(image),
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => encoder.encode(image),
             Self::Software(encoder) => encoder.encode(image),
@@ -209,6 +229,8 @@ impl EncoderBackend {
 
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::VaApi(_) => "VA-API",
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(_) => "VideoToolbox",
             Self::Software(_) => "OpenH264",

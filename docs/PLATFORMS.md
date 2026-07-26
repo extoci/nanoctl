@@ -29,11 +29,16 @@ for the user. Fast user switching and lock behavior are tested explicitly.
 
 ## Linux
 
-The portable backend keeps xcap's PipeWire or X11 recorder alive, retains only the newest RGBA
-frame, uses bounded OpenH264 software encoding, and uses enigo input where the session permits it.
-The release performance path uses
-xdg-desktop-portal/PipeWire with VA-API, and RemoteDesktop portal input where supported. Portal
-restore tokens are non-secret configuration and may still require renewed consent.
+The backend keeps xcap's PipeWire or X11 recorder alive and retains only the newest RGBA frame. It
+prefers the ChromeOS `cros-codecs` constrained-baseline H.264 VA-API encoder, converts RGBA to NV12,
+honors driver-reported surface pitches, and falls back to bounded OpenH264 unless
+`quality.encoder = "hardware"` makes hardware mandatory. Building requires libva headers; runtime
+requires a working `/dev/dri/renderD*` device and a driver that advertises constrained-baseline
+slice encoding. The current VA-API boundary uploads system-memory NV12 into a hardware surface;
+direct PipeWire DMA-BUF import remains a physical performance gate.
+
+RemoteDesktop portal input and reusable portal restore tokens remain future compositor integration
+work. Portal restore tokens are non-secret configuration and may still require renewed consent.
 
 X11 cannot provide strong per-application input isolation, so diagnostics must label it as a weaker
 environment. The current package is a hardened systemd user service so capture, input, and the

@@ -3,6 +3,8 @@ mod control_plane;
 mod credential;
 #[cfg(feature = "media")]
 mod input;
+#[cfg(all(feature = "media", target_os = "linux"))]
+mod linux_encoder;
 #[cfg(all(feature = "media", target_os = "macos"))]
 mod macos_encoder;
 #[cfg(feature = "media")]

@@ -57,7 +57,7 @@ jobs:
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
+            libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
       - run: bun run scripts/cargo.ts build --release --locked --features media
       - name: Stage Unix package
         if: matrix.platform != 'windows'

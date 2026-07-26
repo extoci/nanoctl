@@ -7,7 +7,14 @@ description = "Headless nanoctl remote desktop agent"
 
 [features]
 default = []
-capture = ["dep:apple-cf", "dep:openh264", "dep:videotoolbox", "dep:xcap"]
+capture = [
+  "dep:apple-cf",
+  "dep:cros-codecs",
+  "dep:cros-libva",
+  "dep:openh264",
+  "dep:videotoolbox",
+  "dep:xcap",
+]
 media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
 rtc = ["dep:interceptor", "dep:webrtc"]
 
@@ -42,6 +49,8 @@ xcap = { version = "0.9.7", optional = true }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
+cros-libva = { version = "0.0.12", optional = true }
 keyring = { version = "3.6", features = ["linux-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -84,6 +84,13 @@ buffer while those parameter-set pointers are copied.
 
 Implication: macOS can use VideoToolbox immediately after copying the portable xcap RGBA frame into
 a BGRA IOSurface. This moves H.264 compression to hardware but is not yet a zero-copy capture path.
+
+ChromeOS `cros-codecs` provides a lightweight Linux VA-API H.264 encoder with low-delay prediction,
+CBR/CQP controls, forced keyframes, and VA surface import. Its companion `cros-libva` binding is
+used directly rather than spawning FFmpeg or GStreamer. Driver support is capability-tested at
+runtime; libva availability alone does not imply that H.264 encoding exists. The current capture
+API yields RGBA system memory, so v1 converts to NV12 before a pitched VA surface upload. A future
+PipeWire DMA-BUF capture path can remove that copy without changing signaling or RTP.
 Direct ScreenCaptureKit IOSurface handoff remains a separate physical performance gate.
 
 Sources:
@@ -92,3 +99,5 @@ Sources:
 - <https://developer.apple.com/documentation/coremedia/cmvideoformatdescriptiongeth264parametersetatindex(_:parametersetindex:parametersetpointerout:parametersetsizeout:parametersetcountout:nalunitheaderlengthout:)>
 - <https://docs.rs/videotoolbox/0.18.1/videotoolbox/>
 - <https://docs.rs/apple-cf/0.9.3/apple_cf/iosurface/>
+- <https://github.com/chromeos/cros-codecs>
+- <https://github.com/intel/libva>

@@ -77,9 +77,11 @@ OpenH264 runs in bitrate-control mode. Advanced latency policy maps responsivene
 to low/medium/high encoder complexity and controls whether the encoder may skip frames.
 On macOS, the same hysteresis recreates a hardware-confirmed VideoToolbox session, which also forces
 a recovery frame. Its AVCC samples are length-checked and converted to Annex-B with copied SPS/PPS
-before reaching the RTP packetizer. Direct capture-to-encoder GPU surfaces, Windows Media
-Foundation, Linux VA-API, capture timestamps, and adaptive resolution/frame rate remain native
-performance-path release gates, not properties claimed for the portable backend.
+before reaching the RTP packetizer. On Linux, a VA-API backend uses low-delay prediction, forced
+keyframes, dynamic CBR tuning, and constrained-baseline Annex-B output from `cros-codecs`; RGBA is
+converted to NV12 and uploaded using the driver's declared plane layout. Direct capture-to-encoder
+GPU surfaces, Windows Media Foundation, capture timestamps, and adaptive resolution/frame rate
+remain native performance-path release gates, not properties claimed for the portable backend.
 
 `quality.encoder` is a fail-closed policy rather than a hint. `auto` prefers a verified native
 backend and may fall back to OpenH264, `software` forces the portable backend, and `hardware` fails
