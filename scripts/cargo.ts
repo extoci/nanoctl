@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -20,7 +21,7 @@ const cargoFromHome = cargoHome
   : undefined;
 const cargo = cargoFromHome && existsSync(cargoFromHome) ? cargoFromHome : "cargo";
 
-const subprocess = Bun.spawn([cargo, ...cargoArgs], {
+const subprocess = spawn(cargo, cargoArgs, {
   cwd: new URL("..", import.meta.url).pathname,
   env: {
     ...process.env,
@@ -28,9 +29,17 @@ const subprocess = Bun.spawn([cargo, ...cargoArgs], {
     // compiler name for crates that build portable C/assembly sources.
     ...(process.platform === "linux" && !process.env.CC ? { CC: "gcc" } : {}),
   },
-  stdin: "inherit",
-  stdout: "inherit",
-  stderr: "inherit",
+  stdio: "inherit",
 });
 
-process.exit(await subprocess.exited);
+const exitCode = await new Promise<number>((resolve, reject) => {
+  subprocess.once("error", reject);
+  subprocess.once("exit", (code, signal) => {
+    if (signal) {
+      reject(new Error(`cargo terminated by ${signal}`));
+      return;
+    }
+    resolve(code ?? 1);
+  });
+});
+process.exit(exitCode);
