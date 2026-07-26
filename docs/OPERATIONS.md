@@ -48,6 +48,13 @@ Apply backward-compatible Convex schema/functions first, then web, then agent. N
 requiring a protocol version the control plane does not accept. Destructive schema migrations use a
 backfill plus dual-read/write window. Rollback must not re-enable revoked credentials.
 
+The hosted web artifact uses the official OpenNext Cloudflare adapter. Set the production
+`NEXT_PUBLIC_CONVEX_URL` in the build environment, run `bun run build:sites`, package `dist` with
+the Sites packaging helper, and publish only that exact committed build. `APP_ORIGIN`, `TURN_URLS`,
+and `TURN_AUTH_SECRET` belong to the Convex deployment rather than the web runtime. Because the
+Convex URL is a browser-visible Next variable, changing it requires rebuilding and publishing a new
+web version.
+
 ## Readiness
 
 A production launch is blocked until canonical domains, private security contact, signing

@@ -3,6 +3,8 @@ node_modules/
 
 # generated JavaScript / framework output
 .next/
+.open-next/
+.wrangler/
 out/
 dist/
 coverage/
