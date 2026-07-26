@@ -19,6 +19,18 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   });
   const [status, setStatus] = useState("Negotiating");
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
+  const [ending, setEnding] = useState(false);
+
+  async function leaveSession() {
+    if (ending) return;
+    setEnding(true);
+    peerRef.current?.close();
+    try {
+      await endSession({ sessionId, reason: "ended by controller" });
+    } finally {
+      window.location.assign("/dashboard");
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -192,9 +204,19 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       <div className="viewer-bar">
         <a href="/dashboard">← Devices</a>
         <span>{status}</span>
-        <button type="button" onClick={() => void videoRef.current?.requestFullscreen()}>
-          Fullscreen
-        </button>
+        <div className="viewer-actions">
+          <button type="button" onClick={() => void videoRef.current?.requestFullscreen()}>
+            Fullscreen
+          </button>
+          <button
+            className="danger"
+            type="button"
+            disabled={ending}
+            onClick={() => void leaveSession()}
+          >
+            {ending ? "Ending…" : "End session"}
+          </button>
+        </div>
       </div>
       <video ref={videoRef} autoPlay playsInline tabIndex={0} />
     </main>

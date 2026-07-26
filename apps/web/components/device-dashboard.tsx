@@ -9,18 +9,56 @@ export function DeviceDashboard() {
   const devices = useQuery(functions.devices.list, {});
   const createPairingCode = useAction(functions.devices.createPairingCode);
   const createSession = useMutation(functions.sessions.create);
+  const renameDevice = useMutation(functions.devices.rename);
+  const removeDevice = useMutation(functions.devices.remove);
   const [pairing, setPairing] = useState<{ code: string; expiresAt: number } | null>(null);
   const [busyDevice, setBusyDevice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   async function addDevice() {
-    setPairing(await createPairingCode({}));
+    setError(null);
+    try {
+      setPairing(await createPairingCode({}));
+    } catch {
+      setError("Could not create a setup code. Try again.");
+    }
   }
 
   async function connect(deviceId: string) {
+    setError(null);
     setBusyDevice(deviceId);
     try {
       const session = await createSession({ deviceId });
       window.location.assign(`/connect/${encodeURIComponent(session.sessionId)}`);
+    } catch {
+      setError("Could not start the remote session.");
+    } finally {
+      setBusyDevice(null);
+    }
+  }
+
+  async function rename(deviceId: string, currentName: string) {
+    const name = window.prompt("Device name", currentName)?.trim();
+    if (!name || name === currentName) return;
+    setError(null);
+    setBusyDevice(deviceId);
+    try {
+      await renameDevice({ deviceId, name });
+    } catch {
+      setError("Could not rename the device.");
+    } finally {
+      setBusyDevice(null);
+    }
+  }
+
+  async function remove(deviceId: string, name: string) {
+    if (!window.confirm(`Remove ${name}? It must be paired again before it can reconnect.`)) return;
+    setError(null);
+    setBusyDevice(deviceId);
+    try {
+      await removeDevice({ deviceId });
+    } catch {
+      setError("Could not remove the device.");
     } finally {
       setBusyDevice(null);
     }
@@ -42,6 +80,12 @@ export function DeviceDashboard() {
           </button>
         </div>
       </header>
+
+      {error ? (
+        <p className="inline-error" role="alert">
+          {error}
+        </p>
+      ) : null}
 
       {pairing ? (
         <section className="pairing-card" aria-live="polite">
@@ -92,14 +136,32 @@ export function DeviceDashboard() {
                 <dd>{new Date(device.lastSeenAt).toLocaleString()}</dd>
               </div>
             </dl>
-            <button
-              className="primary connect"
-              type="button"
-              disabled={device.status !== "online" || busyDevice === device._id}
-              onClick={() => void connect(device._id)}
-            >
-              {busyDevice === device._id ? "Connecting…" : "Connect"}
-            </button>
+            <div className="device-actions">
+              <button
+                className="primary connect"
+                type="button"
+                disabled={device.status !== "online" || busyDevice === device._id}
+                onClick={() => void connect(device._id)}
+              >
+                {busyDevice === device._id ? "Working…" : "Connect"}
+              </button>
+              <button
+                className="secondary"
+                type="button"
+                disabled={busyDevice === device._id}
+                onClick={() => void rename(device._id, device.name)}
+              >
+                Rename
+              </button>
+              <button
+                className="danger"
+                type="button"
+                disabled={busyDevice === device._id || device.status === "disabled"}
+                onClick={() => void remove(device._id, device.name)}
+              >
+                Remove
+              </button>
+            </div>
           </article>
         ))}
       </section>

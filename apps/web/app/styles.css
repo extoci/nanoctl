@@ -100,7 +100,8 @@ h2 {
 }
 
 .primary,
-.secondary {
+.secondary,
+.danger {
   min-height: 2.8rem;
   border-radius: 0.65rem;
   padding: 0.7rem 1rem;
@@ -116,6 +117,20 @@ h2 {
   border: 1px solid var(--line);
   background: var(--panel);
   color: var(--text);
+}
+
+.danger {
+  border: 1px solid rgb(255 121 110 / 45%);
+  background: rgb(255 121 110 / 9%);
+  color: var(--danger);
+}
+
+.inline-error {
+  border: 1px solid rgb(255 121 110 / 45%);
+  border-radius: 0.75rem;
+  background: rgb(255 121 110 / 8%);
+  padding: 0.8rem 1rem;
+  color: var(--danger);
 }
 
 .shell {
@@ -232,7 +247,23 @@ dd {
 }
 
 .connect {
-  width: 100%;
+  flex: 1;
+}
+
+.device-actions,
+.viewer-actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.device-actions {
+  flex-wrap: wrap;
+}
+
+.device-actions .secondary,
+.device-actions .danger {
+  min-height: 2.4rem;
+  padding: 0.55rem 0.75rem;
 }
 
 .viewer {
@@ -256,6 +287,11 @@ dd {
 .viewer-bar span {
   color: var(--muted);
   text-transform: capitalize;
+}
+
+.viewer-actions button {
+  min-height: 2.2rem;
+  padding: 0.4rem 0.75rem;
 }
 
 .viewer-bar button {
