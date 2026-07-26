@@ -19,9 +19,9 @@ Current automated coverage includes bounded protocol and signaling parsing, role
 duplicate/replayed enrollment and signaling, deliberate sequence gaps, expiry, owner and device
 isolation, wrong-role rejection, revoked-token rejection, terminal mutation idempotency,
 unauthenticated rejection across every public Convex operation and protected agent HTTP route,
-rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer
-and bitstream transforms, property-generated signaling/input bounds, fail-safe input release
-behavior, packaging transactions,
+generated session state-machine transitions, rate-limit windows, TURN configuration, update
+signature/digest/rollback behavior, media buffer and bitstream transforms, property-generated
+signaling/input bounds, fail-safe input release behavior, packaging transactions,
 production configuration, CSP nonces, media/network/performance-evidence validation, agent log
 redaction snapshots (including bearer, clipboard, SDP, ICE, and TURN-shaped secrets), malformed
 SDP/candidate rejection, bounded control-queue admission, and an in-process connection between the
@@ -33,7 +33,7 @@ control-channel opening.
 The following remain mandatory before a supported release; they are requirements, not claims about
 the current automated suite:
 
-- coverage-guided fuzzing and model-based state-transition tests;
+- coverage-guided fuzzing;
 - end-to-end data-channel flood/backpressure tests with a real input backend;
 
 ## Browser tests

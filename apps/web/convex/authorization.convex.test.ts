@@ -422,6 +422,79 @@ describe("control-plane authorization", () => {
     expect(evidence.revokedEvents).toBe(1);
   });
 
+  test("matches the terminal session model across generated signaling transitions", async () => {
+    type State = "requested" | "negotiating" | "connected" | "ended" | "failed";
+    type Command = "controller-offer" | "controller-end" | "host-answer" | "host-end";
+    const commands: Command[] = ["controller-offer", "controller-end", "host-answer", "host-end"];
+
+    for (let seed = 1; seed <= 8; seed += 1) {
+      const t = convexTest(schema, modules);
+      const deviceId = await seedDevice(t, `owner-${seed}`);
+      const owner = asOwner(t, `owner-${seed}`);
+      const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+      let model: State = "requested";
+      let random = seed;
+      let controllerSequence = 0;
+      let hostSequence = 0;
+      for (let step = 0; step < 12; step += 1) {
+        random = (random * 1_664_525 + 1_013_904_223) >>> 0;
+        const command = commands[random % commands.length]!;
+        const terminal = model === "ended" || model === "failed";
+        if (command.startsWith("controller")) {
+          const kind = command === "controller-offer" ? "offer" : "end";
+          const sequence = controllerSequence++;
+          const operation = owner.mutation(api.signals.send, {
+            sessionId,
+            envelope: JSON.stringify({
+              version: 1,
+              sessionId,
+              sequence,
+              sender: "controller",
+              sentAt: Date.now(),
+              payload:
+                kind === "offer"
+                  ? { type: kind, sdp: `v=0\r\na=x-seed:${seed}-${step}` }
+                  : { type: kind, reason: "model terminal" },
+            }),
+          });
+          if (terminal) {
+            await expect(operation).rejects.toThrow();
+          } else {
+            await operation;
+            if (kind === "end") model = "ended";
+            else if (model === "requested") model = "negotiating";
+          }
+        } else {
+          const kind = command === "host-answer" ? "answer" : "end";
+          const sequence = hostSequence++;
+          const accepted = await t.mutation(internal.agent.sendSignal, {
+            deviceId,
+            sessionId,
+            sequence,
+            envelope: JSON.stringify({
+              version: 1,
+              sessionId,
+              sequence,
+              sender: "host",
+              sentAt: Date.now(),
+              payload:
+                kind === "answer"
+                  ? { type: kind, sdp: `v=0\r\na=x-seed:${seed}-${step}` }
+                  : { type: kind, reason: "model media failure" },
+            }),
+          });
+          expect(accepted).toBe(!terminal);
+          if (!terminal) {
+            if (kind === "end") model = "failed";
+            else if (model === "negotiating") model = "connected";
+          }
+        }
+        const actual = await t.run(async (ctx) => (await ctx.db.get(sessionId))?.state);
+        expect(actual).toBe(model);
+      }
+    }
+  });
+
   test("treats malformed and terminal host session IDs as unavailable", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");
