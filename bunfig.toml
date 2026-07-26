@@ -1,0 +1,6 @@
+[install]
+exact = true
+
+[test]
+coverage = true
+coverageReporter = ["text"]

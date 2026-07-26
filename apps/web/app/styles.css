@@ -1,0 +1,400 @@
+:root {
+  color-scheme: dark;
+  --bg: #080a09;
+  --panel: #111512;
+  --panel-raised: #171c18;
+  --line: #283029;
+  --text: #f2f6f1;
+  --muted: #9ca79d;
+  --accent: #b8f36b;
+  --accent-ink: #10170a;
+  --danger: #ff796e;
+  font-family: Inter, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 15% -10%, rgb(184 243 107 / 10%), transparent 35rem), var(--bg);
+  color: var(--text);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.centered,
+.configuration-error {
+  min-height: 100vh;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  max-width: 64rem;
+  margin: auto;
+  padding: 3rem;
+}
+
+.configuration-error {
+  color: var(--danger);
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  max-width: 16ch;
+  margin-bottom: 1rem;
+  font-size: clamp(2.75rem, 7vw, 6.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.055em;
+}
+
+h2 {
+  margin-bottom: 0.35rem;
+  font-size: 1.15rem;
+}
+
+.eyebrow {
+  color: var(--accent);
+  font:
+    600 0.72rem/1.2 ui-monospace,
+    "SFMono-Regular",
+    monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.lede {
+  max-width: 48rem;
+  color: var(--muted);
+  font-size: clamp(1rem, 2vw, 1.3rem);
+  line-height: 1.55;
+}
+
+.primary,
+.secondary,
+.danger {
+  min-height: 2.8rem;
+  border-radius: 0.65rem;
+  padding: 0.7rem 1rem;
+  font-weight: 700;
+}
+
+.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.secondary {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.danger {
+  border: 1px solid rgb(255 121 110 / 45%);
+  background: rgb(255 121 110 / 9%);
+  color: var(--danger);
+}
+
+.inline-error {
+  border: 1px solid rgb(255 121 110 / 45%);
+  border-radius: 0.75rem;
+  background: rgb(255 121 110 / 8%);
+  padding: 0.8rem 1rem;
+  color: var(--danger);
+}
+
+.shell {
+  width: min(100% - 2rem, 84rem);
+  margin: auto;
+  padding: 3rem 0;
+}
+
+.topbar,
+.actions,
+.device-heading,
+.pairing-card {
+  display: flex;
+  align-items: center;
+}
+
+.topbar {
+  justify-content: space-between;
+  margin-bottom: 3rem;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: clamp(2.5rem, 5vw, 4.5rem);
+}
+
+.actions {
+  gap: 0.75rem;
+}
+
+.pairing-card {
+  justify-content: space-between;
+  gap: 2rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 1rem;
+  background: rgb(184 243 107 / 6%);
+  padding: 1.3rem;
+}
+
+.pairing-card p {
+  max-width: 38rem;
+  margin-bottom: 0;
+  color: var(--muted);
+}
+
+.pairing-code {
+  font:
+    700 2rem/1 ui-monospace,
+    "SFMono-Regular",
+    monospace;
+  letter-spacing: 0.18em;
+}
+
+.device-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  gap: 1rem;
+}
+
+.device-card,
+.empty-state {
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: linear-gradient(145deg, var(--panel-raised), var(--panel));
+  padding: 1.3rem;
+}
+
+.device-heading {
+  gap: 0.75rem;
+}
+
+.device-heading p,
+.empty-state p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.presence {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 0.25rem rgb(156 167 157 / 10%);
+}
+
+.presence.online {
+  background: var(--accent);
+  box-shadow: 0 0 0 0.25rem rgb(184 243 107 / 12%);
+}
+
+.presence.disabled {
+  background: var(--danger);
+}
+
+.presence.unready {
+  background: #f5c451;
+  box-shadow: 0 0 0 0.25rem rgb(245 196 81 / 12%);
+}
+
+dl {
+  display: grid;
+  gap: 0.5rem;
+  margin: 1.5rem 0;
+}
+
+dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+dt {
+  color: var(--muted);
+}
+
+dd {
+  margin: 0;
+}
+
+.connect {
+  flex: 1;
+}
+
+.device-actions,
+.viewer-actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.device-actions {
+  flex-wrap: wrap;
+}
+
+.device-actions .secondary,
+.device-actions .danger {
+  min-height: 2.4rem;
+  padding: 0.55rem 0.75rem;
+}
+
+.activity {
+  margin-top: 2rem;
+  border-top: 1px solid var(--line);
+  padding-top: 1.5rem;
+}
+
+.activity h2 {
+  margin-top: 0.2rem;
+}
+
+.activity-list {
+  display: grid;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--line);
+  padding: 0.8rem 0;
+}
+
+.activity-list li div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.activity-list span,
+.activity-list time {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.activity-list time {
+  white-space: nowrap;
+}
+
+.viewer {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  overflow: hidden;
+  background: #000;
+}
+
+.viewer-bar {
+  min-height: 3.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  padding: 0.6rem 1rem;
+}
+
+.viewer-bar span {
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.viewer-health {
+  display: grid;
+  justify-items: center;
+  gap: 0.1rem;
+}
+
+.viewer-health small {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.viewer-actions button {
+  min-height: 2.2rem;
+  padding: 0.4rem 0.75rem;
+}
+
+.display-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.display-picker select {
+  min-height: 2.2rem;
+  max-width: 15rem;
+}
+
+.viewer-bar button {
+  background: transparent;
+  color: var(--text);
+}
+
+.viewer video {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+  outline: none;
+}
+
+@media (max-width: 700px) {
+  .centered {
+    padding: 1.25rem;
+  }
+
+  .topbar,
+  .pairing-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topbar {
+    gap: 1.5rem;
+  }
+
+  .activity-list li {
+    align-items: start;
+    flex-direction: column;
+  }
+}

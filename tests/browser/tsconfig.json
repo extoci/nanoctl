@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "lib": ["ES2024", "DOM"],
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "strict": true,
+    "types": ["node", "@playwright/test"]
+  },
+  "include": ["./**/*.ts"]
+}

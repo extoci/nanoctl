@@ -1,2 +1,34 @@
-node_modules
-dist
+# dependencies and package-manager state
+node_modules/
+
+# generated JavaScript / framework output
+.next/
+.open-next/
+.wrangler/
+out/
+dist/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# native builds
+target/
+
+# local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.toml
+config.toml
+
+# operating-system and editor state
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# runtime state and credentials
+.nanoctl/
+*.log
+.vercel/

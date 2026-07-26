@@ -1,0 +1,85 @@
+[package]
+name = "nanoctl-agent"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Headless nanoctl remote desktop agent"
+
+[features]
+default = []
+capture = [
+  "dep:apple-cf",
+  "dep:cros-codecs",
+  "dep:cros-libva",
+  "dep:openh264",
+  "dep:videotoolbox",
+  "dep:windows",
+  "dep:xcap",
+]
+media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
+rtc = ["dep:interceptor", "dep:webrtc"]
+
+[[bin]]
+name = "nanoctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+ed25519-dalek = "3.0"
+enigo = { version = "0.6.1", optional = true }
+futures-util = "=0.3.32"
+hostname = "0.4"
+interceptor = { version = "0.15.0", optional = true }
+nanoctl-update = { path = "../nanoctl-update" }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls-no-provider",
+  "http2",
+] }
+rtcp = { version = "0.14.0", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+semver = "1.0"
+sha2 = "0.11"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2.5", features = ["serde"] }
+openh264 = { version = "0.9.7", optional = true }
+webrtc = { version = "0.14.0", optional = true }
+xcap = { version = "0.9.7", optional = true }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
+cros-libva = { version = "0.0.12", optional = true }
+keyring = { version = "3.6", features = ["linux-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-cf = { version = "0.9.3", optional = true }
+keyring = { version = "3.6", features = ["apple-native"] }
+videotoolbox = { version = "0.18.1", default-features = false, features = [
+  "compression",
+], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
+windows = { version = "0.62.2", features = [
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+], optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.24"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

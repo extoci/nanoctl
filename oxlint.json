@@ -1,0 +1,9 @@
+{
+  "plugins": ["typescript", "react", "react-perf", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn"
+  },
+  "ignorePatterns": ["apps/web/convex/_generated/**", ".next/**", "target/**"]
+}

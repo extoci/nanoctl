@@ -1,98 +1,63 @@
-# nanoctl v0
+# nanoctl
 
-`nanoctl` is `nanoshare`, but with a minimal remote-control path on top.
+nanoctl is a fast, headless remote-desktop service with a browser controller. The host agent runs
+as an operating-system service on Windows, macOS, or Linux. The web application authenticates with
+[Shoo](https://shoo.dev), stores control-plane state in Convex, and negotiates an encrypted WebRTC
+connection directly to the host. A TURN relay is used only when a direct connection cannot be made.
 
-v0 is intentionally small:
+This repository is the v1 rewrite. The original LAN demo remains available on the `master` branch.
 
-- bun + typescript app for signaling, auth, pages, and capture management
-- webrtc screen/audio stream to the remote viewer
-- a webrtc data channel for control events
-- a tiny go helper that injects host input events
+## Repository
 
-## status
+| Path                   | Purpose                                                                      |
+| ---------------------- | ---------------------------------------------------------------------------- |
+| `apps/web`             | Next.js dashboard, browser controller, Convex schema/functions               |
+| `crates/nanoctl-agent` | Native headless capture, input, WebRTC, and service process                  |
+| `packages/protocol`    | Versioned signaling and control protocol                                     |
+| `infra/coturn`         | Reference TURN deployment                                                    |
+| `docs`                 | Product, architecture, security, platform, protocol, testing, and operations |
 
-this is a demo-focused v0. it aims to prove the full flow, not solve every platform or security edge case yet.
+## Prerequisites
 
-current control support:
+- Bun 1.3.14 or newer
+- Rust 1.96 or newer
+- a Convex project
+- a Shoo-supported HTTPS origin
+- a public TURN service for production
 
-- linux/x11 host: supported through X11/XTEST
-- macos/windows host: stream still works, control channel is disabled for now
+## Development
 
-## requirements
-
-- [bun](https://bun.com)
-- [go](https://go.dev)
-- `ffmpeg` in `PATH`
-- linux/x11 hosts need an active `DISPLAY` with the XTEST extension available
-- host and viewer on the same network
-
-## run
-
-install deps:
-
-```bash
+```sh
 bun install
+cp apps/web/.env.example apps/web/.env.local
+bun run convex:dev
+bun run dev
 ```
 
-start the host:
+In another terminal:
 
-```bash
-bun run src/index.ts
+```sh
+cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- doctor
+cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- enroll ABCDE-FGHJK-MNPQR-STVWX
+cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- run
 ```
 
-or with a test pattern:
+Run all repository checks with `bun run check`.
 
-```bash
-bun run src/index.ts --source testsrc
-```
+Host registration and removal instructions are in [docs/SETUP.md](docs/SETUP.md).
 
-open the printed LAN URL on the other machine, enter the PIN, and the viewer page will connect automatically.
+## Security posture
 
-## host controls
+nanoctl is designed for device-owner-authorized access. It does not hide its installation, bypass
+OS consent, capture a locked secure desktop without supported system APIs, or provide an arbitrary
+remote shell. Media and input travel over DTLS-SRTP/SCTP. The control plane sees device metadata,
+session metadata, and encrypted transport addresses, but not unencrypted desktop content.
 
-- `Ctrl+C` stops the host
-- press `a` in the host terminal to toggle audio on and off
+Read [docs/SECURITY.md](docs/SECURITY.md) before deploying.
 
-## viewer controls
+## Current deployment boundary
 
-when control is enabled on the host:
-
-- click the video to focus it
-- move the mouse to move the host pointer
-- click to click on the host
-- type for basic key presses
-- press `f` for fullscreen
-
-## flags
-
-- `--port <number>`
-- `--pin <pin>`
-- `--fps <number>`
-- `--video-bitrate <bitrate>`
-- `--use-hwaccel`
-- `--source <screen|testsrc>`
-- `--rtp-port <number>`
-- `--audio`
-- `--audio-device <value>`
-- `--audio-rtp-port <number>`
-- `--no-control`
-- `--control-bridge-path <path>`
-
-## env vars
-
-- `NANOCTL_PORT`
-- `NANOCTL_PIN`
-- `NANOCTL_FPS`
-- `NANOCTL_VIDEO_BITRATE`
-- `NANOCTL_USE_HWACCEL=1`
-- `NANOCTL_SOURCE=screen|testsrc`
-- `NANOCTL_RTP_PORT`
-- `NANOCTL_AUDIO=1`
-- `NANOCTL_AUDIO_DEVICE`
-- `NANOCTL_AUDIO_RTP_PORT`
-- `NANOCTL_DISPLAY`
-- `NANOCTL_CONTROL_BRIDGE_PATH`
-
-## notes
-
-the control helper is built on first run if you do not provide `--control-bridge-path`.
+The source is production-oriented, but a release is not considered supported until its platform
+package has passed the physical-machine matrix in [docs/TESTING.md](docs/TESTING.md). VM-only tests
+cannot validate hardware encoders, macOS TCC prompts, Windows secure desktop behavior, Wayland
+portals, or hostile NAT traversal.
