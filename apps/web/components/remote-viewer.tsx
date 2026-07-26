@@ -1,14 +1,10 @@
 "use client";
 
-import {
-  PROTOCOL_VERSION,
-  assertSignalEnvelope,
-  type ControlMessage,
-  type SignalEnvelope,
-} from "@nanoctl/protocol";
+import { PROTOCOL_VERSION, type ControlMessage } from "@nanoctl/protocol";
 import { useAction, useMutation, useQuery } from "convex/react";
 import { useEffect, useRef, useState } from "react";
 import { functions } from "../lib/convex";
+import { processHostSignals } from "../lib/remote-signals";
 
 type ViewerMetrics = {
   resolution: string;
@@ -25,6 +21,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const sendSequenceRef = useRef(0);
   const processedSignalsRef = useRef(new Set<number>());
+  const signalTaskRef = useRef<Promise<void>>(Promise.resolve());
   const restartAttemptsRef = useRef(0);
   const inputEnabledRef = useRef(true);
   const releaseInputRef = useRef<() => void>(() => {});
@@ -149,11 +146,15 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     const restart = () => {
       if (restartAttemptsRef.current >= 3 || peer.signalingState === "closed") {
         setStatus("failed");
+        peer.close();
+        void endSession({ sessionId, reason: "controller connection failed" }).catch(() => {});
         return;
       }
       restartAttemptsRef.current += 1;
       setStatus(`reconnecting (${restartAttemptsRef.current}/3)`);
-      void sendOffer(true);
+      void sendOffer(true).catch(() => {
+        setStatus("signaling failed");
+      });
     };
     peer.onconnectionstatechange = () => {
       const state = peer.connectionState;
@@ -170,6 +171,8 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
         if (restartTimer !== null) window.clearTimeout(restartTimer);
         restartTimer = null;
         restart();
+        return;
+      } else if (state === "closed") {
         return;
       }
       setStatus(state);
@@ -193,6 +196,8 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
           sentAt: Date.now(),
           payload,
         }),
+      }).catch(() => {
+        setStatus("signaling failed");
       });
     };
 
@@ -307,6 +312,8 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     video?.addEventListener("pointermove", pointer);
     video?.addEventListener("pointerdown", pointer);
     video?.addEventListener("pointerup", pointer);
+    video?.addEventListener("pointercancel", releaseInput);
+    video?.addEventListener("lostpointercapture", releaseInput);
     video?.addEventListener("wheel", wheel, { passive: false });
     video?.addEventListener("contextmenu", contextMenu);
     video?.addEventListener("keydown", key);
@@ -383,12 +390,16 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
         });
     }, 1_000);
 
-    void sendOffer(false);
+    void sendOffer(false).catch(() => {
+      setStatus("signaling failed");
+    });
 
     return () => {
       video?.removeEventListener("pointermove", pointer);
       video?.removeEventListener("pointerdown", pointer);
       video?.removeEventListener("pointerup", pointer);
+      video?.removeEventListener("pointercancel", releaseInput);
+      video?.removeEventListener("lostpointercapture", releaseInput);
       video?.removeEventListener("wheel", wheel);
       video?.removeEventListener("contextmenu", contextMenu);
       video?.removeEventListener("keydown", key);
@@ -414,29 +425,16 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     const peer = peerRef.current;
     if (!peer || !incoming) return;
-    for (const row of incoming) {
-      if (!row || typeof row !== "object" || !("envelope" in row)) continue;
-      let envelope: unknown;
-      try {
-        envelope = JSON.parse(String(row.envelope));
-        assertSignalEnvelope(envelope);
-      } catch {
-        continue;
-      }
-      const signal = envelope as SignalEnvelope;
-      if (signal.sender !== "host") continue;
-      if (processedSignalsRef.current.has(signal.sequence)) continue;
-      processedSignalsRef.current.add(signal.sequence);
-      if (signal.payload.type === "answer") {
-        void peer.setRemoteDescription({ type: "answer", sdp: signal.payload.sdp });
-      } else if (signal.payload.type === "ice-candidate") {
-        void peer.addIceCandidate(signal.payload);
-      } else if (signal.payload.type === "end") {
-        setStatus(`ended: ${signal.payload.reason}`);
-        peer.close();
-      }
-    }
-  }, [incoming]);
+    signalTaskRef.current = signalTaskRef.current
+      .then(() =>
+        processHostSignals(peer, sessionId, incoming, processedSignalsRef.current, (reason) => {
+          setStatus(`ended: ${reason}`);
+        }),
+      )
+      .catch(() => {
+        setStatus("signaling failed");
+      });
+  }, [incoming, sessionId]);
 
   return (
     <main className="viewer">

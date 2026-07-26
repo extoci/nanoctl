@@ -195,8 +195,10 @@ impl HostPeer {
                     "nanoctl.pointer.v1" => (pointer_sender.clone(), true),
                     _ => return Box::pin(async {}),
                 };
+                let message_input = input.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
                     let sender = sender.clone();
+                    let input = message_input.clone();
                     Box::pin(async move {
                         if !message.is_string {
                             return;
@@ -205,6 +207,14 @@ impl HostPeer {
                             && !drop_when_full
                         {
                             tracing::warn!(error = %error, "reliable input queue is full");
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Some(input) = input
+                                    && let Ok(mut input) = input.lock()
+                                {
+                                    input.release_all();
+                                }
+                            })
+                            .await;
                         }
                     })
                 }));

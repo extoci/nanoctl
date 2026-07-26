@@ -4,6 +4,7 @@
     "composite": true,
     "noEmit": true,
     "jsx": "preserve",
+    "types": ["bun"],
     "plugins": [{ "name": "next" }],
     "incremental": true
   },

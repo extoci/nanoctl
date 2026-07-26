@@ -62,9 +62,11 @@ export const functions = {
     >("sessions:turnCredentials"),
   },
   signals: {
-    list: makeFunctionReference<"query", { sessionId: string; afterSequence: number }, unknown[]>(
-      "signals:list",
-    ),
+    list: makeFunctionReference<
+      "query",
+      { sessionId: string; afterSequence: number },
+      { sequence: number; envelope: string }[]
+    >("signals:list"),
     send: makeFunctionReference<"mutation", { sessionId: string; envelope: string }, null>(
       "signals:send",
     ),
