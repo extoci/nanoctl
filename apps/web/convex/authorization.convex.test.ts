@@ -145,4 +145,28 @@ describe("control-plane authorization", () => {
     expect(evidence.session?.state).toBe("ended");
     expect(evidence.session?.endReason).toBe("device revoked");
   });
+
+  test("rejects controller signaling after a terminal failure", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const ownerA = asOwner(t, "owner-a");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+    await t.run(async (ctx) => {
+      await ctx.db.patch(sessionId, {
+        state: "failed",
+        endedAt: Date.now(),
+        updatedAt: Date.now(),
+        endReason: "media failed",
+      });
+    });
+    const envelope = JSON.stringify({
+      version: 1,
+      sessionId,
+      sequence: 0,
+      sender: "controller",
+      sentAt: Date.now(),
+      payload: { type: "offer", sdp: "v=0" },
+    });
+    await expect(ownerA.mutation(api.signals.send, { sessionId, envelope })).rejects.toThrow();
+  });
 });

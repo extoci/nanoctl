@@ -56,7 +56,6 @@ export async function processHostSignals(
         peer.close();
         break;
       case "offer":
-      case "renegotiate":
         continue;
     }
     processed.add(row.sequence);

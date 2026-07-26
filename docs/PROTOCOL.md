@@ -21,9 +21,9 @@ Sequences are strictly increasing independently for `controller` and `host`. Dup
 `(session, sender, sequence)` are idempotent. Gaps are allowed because ICE candidates may race HTTP
 retries. Messages outside the session deadline are rejected.
 
-Payloads are `offer`, `answer`, `ice-candidate`, `ice-complete`, `renegotiate`, and `end`. SDP is at
-most 1 MB, a candidate 8 KiB, and a reason 512 characters. SDP codec/media lines are validated again
-by the WebRTC implementation.
+Payloads are `offer`, `answer`, `ice-candidate`, `ice-complete`, and `end`. An ICE restart is a new
+controller `offer`, not a distinct wire variant. SDP is at most 1 MB, a candidate 8 KiB, and a
+reason 512 characters. SDP codec/media lines are validated again by the WebRTC implementation.
 
 ## Agent HTTP status semantics
 

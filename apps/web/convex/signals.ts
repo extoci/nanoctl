@@ -40,7 +40,8 @@ export const send = mutation({
       !session ||
       session.ownerId !== identity.subject ||
       session.expiresAt <= Date.now() ||
-      session.state === "ended"
+      session.state === "ended" ||
+      session.state === "failed"
     ) {
       throw new ConvexError("Session unavailable");
     }

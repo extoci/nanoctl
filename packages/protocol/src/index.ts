@@ -31,7 +31,6 @@ export type SignalPayload =
       readonly sdpMLineIndex: number | null;
     }
   | { readonly type: "ice-complete" }
-  | { readonly type: "renegotiate"; readonly reason: string }
   | { readonly type: "end"; readonly reason: string };
 
 export type ControlMessage =
@@ -134,7 +133,6 @@ export function assertSignalPayload(value: unknown): asserts value is SignalPayl
       return;
     case "ice-complete":
       return;
-    case "renegotiate":
     case "end":
       if (!isBoundedString(value.reason, 1, 512)) throw new Error("invalid reason");
       return;
