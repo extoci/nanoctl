@@ -48,9 +48,10 @@ RemoteDesktop portal input and reusable portal restore tokens remain future comp
 work. Portal restore tokens are non-secret configuration and may still require renewed consent.
 
 X11 cannot provide strong per-application input isolation, so diagnostics must label it as a weaker
-environment. The current package is a hardened systemd user service so capture, input, and the
-credential store share the enrolled graphical identity. Supported reference desktops are GNOME and
-KDE on current distributions; other compositors may be view-only.
+environment. The current package is a systemd user service so capture, input, and the credential
+store share the enrolled graphical identity. Release binaries target Ubuntu 24.04 or another
+distribution with glibc 2.39+ and a current PipeWire runtime. Supported reference desktops are
+GNOME and KDE; other compositors may be view-only.
 
 ## Packaging contract
 
