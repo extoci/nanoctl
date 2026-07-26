@@ -24,7 +24,7 @@ jobs:
       - run: bunx playwright install --with-deps chromium firefox webkit
       - run: bun run test:browser
       - run: bun run audit
-      - run: bun run build:sites
+      - run: bun run build:vercel
 
   agent:
     strategy:

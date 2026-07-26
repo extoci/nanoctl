@@ -13,6 +13,7 @@ import type * as audit from "../audit.js";
 import type * as crons from "../crons.js";
 import type * as devices from "../devices.js";
 import type * as http from "../http.js";
+import type * as httpSecurity from "../httpSecurity.js";
 import type * as httpValidation from "../httpValidation.js";
 import type * as lib from "../lib.js";
 import type * as maintenance from "../maintenance.js";
@@ -33,6 +34,7 @@ declare const fullApi: ApiFromModules<{
   crons: typeof crons;
   devices: typeof devices;
   http: typeof http;
+  httpSecurity: typeof httpSecurity;
   httpValidation: typeof httpValidation;
   lib: typeof lib;
   maintenance: typeof maintenance;

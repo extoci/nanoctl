@@ -12,7 +12,7 @@
     "dev": "bun --filter @nanoctl/web dev",
     "build": "bun run build:web && bun run build:agent",
     "build:web": "bun --filter @nanoctl/web build",
-    "build:sites": "bun run scripts/production-preflight.ts && bun run --cwd apps/web build:cloudflare && bun run scripts/stage-sites.ts",
+    "build:vercel": "bun run scripts/production-preflight.ts && bun run build:web",
     "build:agent": "bun run scripts/cargo.ts build --release --features media",
     "check": "bun run fmt:check && bun run lint && bun run typecheck && bun run typecheck:convex && bun run test && bun run test:convex && bun run test:agent",
     "fmt": "oxfmt --write .",

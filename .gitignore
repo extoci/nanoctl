@@ -31,3 +31,4 @@ Thumbs.db
 # runtime state and credentials
 .nanoctl/
 *.log
+.vercel/
