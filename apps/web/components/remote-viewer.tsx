@@ -17,7 +17,62 @@ type ViewerMetrics = {
   route: "direct" | "relay" | "unknown";
 };
 
+export type ViewerSession = {
+  state: "requested" | "ringing" | "negotiating" | "connected" | "ended" | "failed";
+  expiresAt: number;
+  endReason?: string;
+  displays: {
+    id: string;
+    name: string;
+    width: number;
+    height: number;
+    scaleFactor: number;
+    primary: boolean;
+  }[];
+};
+
+type ViewerOperations = {
+  sendSignal: (args: { sessionId: string; envelope: string }) => Promise<unknown>;
+  endSession: (args: { sessionId: string; reason: string }) => Promise<unknown>;
+  getTurnCredentials: (args: { sessionId: string }) => Promise<{
+    urls: string[];
+    username: string;
+    credential: string;
+    expiresAt: number;
+  } | null>;
+};
+
 export function RemoteViewer({ sessionId }: { sessionId: string }) {
+  const sendSignal = useMutation(functions.signals.send);
+  const endSession = useMutation(functions.sessions.end);
+  const getTurnCredentials = useAction(functions.sessions.turnCredentials);
+  const session = useQuery(functions.sessions.getState, { sessionId });
+  const incoming = useQuery(functions.signals.list, {
+    sessionId,
+    afterSequence: -1,
+  });
+
+  return (
+    <RemoteViewerCore
+      sessionId={sessionId}
+      session={session}
+      incoming={incoming}
+      operations={{ sendSignal, endSession, getTurnCredentials }}
+    />
+  );
+}
+
+export function RemoteViewerCore({
+  sessionId,
+  session,
+  incoming,
+  operations: { sendSignal, endSession, getTurnCredentials },
+}: {
+  sessionId: string;
+  session: ViewerSession | undefined;
+  incoming: { sequence: number; envelope: string }[] | undefined;
+  operations: ViewerOperations;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const sendSequenceRef = useRef(0);
@@ -27,14 +82,6 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const inputEnabledRef = useRef(true);
   const releaseInputRef = useRef<() => void>(() => {});
   const selectDisplayRef = useRef<(displayId: string) => boolean>(() => false);
-  const sendSignal = useMutation(functions.signals.send);
-  const endSession = useMutation(functions.sessions.end);
-  const getTurnCredentials = useAction(functions.sessions.turnCredentials);
-  const session = useQuery(functions.sessions.getState, { sessionId });
-  const incoming = useQuery(functions.signals.list, {
-    sessionId,
-    afterSequence: -1,
-  });
   const [status, setStatus] = useState("Negotiating");
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
   const [ending, setEnding] = useState(false);
