@@ -51,7 +51,10 @@ pub async fn run(config: AgentConfig) -> Result<()> {
             }
             _ = heartbeat.tick() => {
                 if Instant::now() >= next_heartbeat {
-                    if let Err(error) = client.heartbeat(token_ref(&token)).await {
+                    if let Err(error) = client
+                        .heartbeat(token_ref(&token), config.features.remote_input)
+                        .await
+                    {
                         warn!(error = %redact(&error), "heartbeat failed");
                     }
                     next_heartbeat = Instant::now() + Duration::from_secs(config.network.heartbeat_seconds);
@@ -402,11 +405,7 @@ async fn reconcile_sessions(
 }
 
 #[cfg(feature = "rtc")]
-fn failure_grace_elapsed(
-    failed: bool,
-    failed_since: &mut Option<Instant>,
-    now: Instant,
-) -> bool {
+fn failure_grace_elapsed(failed: bool, failed_since: &mut Option<Instant>, now: Instant) -> bool {
     if !failed {
         *failed_since = None;
         return false;

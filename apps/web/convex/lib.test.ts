@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseDeviceDisplays, parseSignalEnvelope } from "./lib";
+import { parseDeviceDisplays, parseDeviceReadiness, parseSignalEnvelope } from "./lib";
 
 function envelope(sender: "controller" | "host", type: string) {
   const payload =
@@ -77,5 +77,26 @@ describe("device capability parsing", () => {
       },
     ]);
     expect(parseDeviceDisplays("not json")).toEqual([]);
+  });
+
+  test("requires an explicit usable v1 media readiness capability", () => {
+    const capabilities = JSON.stringify({
+      protocolVersion: 1,
+      codecs: ["h264"],
+      ready: true,
+      displays: [
+        {
+          id: "42",
+          name: "Display",
+          width: 1920,
+          height: 1080,
+          scaleFactor: 1,
+          primary: true,
+        },
+      ],
+    });
+    expect(parseDeviceReadiness(capabilities)).toBe(true);
+    expect(parseDeviceReadiness(capabilities.replace('"ready":true', '"ready":false'))).toBe(false);
+    expect(parseDeviceReadiness("{}")).toBe(false);
   });
 });

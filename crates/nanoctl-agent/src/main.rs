@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
             let device_name = name.unwrap_or_else(platform::default_device_name);
             let client = ControlPlane::new(config.control_plane_url.clone())?;
             let enrollment = client
-                .enroll(code, device_name)
+                .enroll(code, device_name, config.features.remote_input)
                 .await
                 .context("enrollment failed")?;
             credential::store(&enrollment.device_id, &enrollment.token)?;

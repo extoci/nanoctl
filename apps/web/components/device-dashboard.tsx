@@ -126,7 +126,9 @@ export function DeviceDashboard() {
             <dl>
               <div>
                 <dt>Status</dt>
-                <dd>{device.status}</dd>
+                <dd>
+                  {device.status === "online" && !device.ready ? "needs attention" : device.status}
+                </dd>
               </div>
               <div>
                 <dt>Agent</dt>
@@ -141,7 +143,7 @@ export function DeviceDashboard() {
               <button
                 className="primary connect"
                 type="button"
-                disabled={device.status !== "online" || busyDevice === device._id}
+                disabled={device.status !== "online" || !device.ready || busyDevice === device._id}
                 onClick={() => void connect(device._id)}
               >
                 {busyDevice === device._id ? "Working…" : "Connect"}

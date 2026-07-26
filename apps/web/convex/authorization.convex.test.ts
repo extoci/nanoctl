@@ -25,6 +25,9 @@ async function seedDevice(t: ReturnType<typeof convexTest>, ownerId: string) {
       status: "online",
       tokenHash: `token-${ownerId}`,
       capabilitiesJson: JSON.stringify({
+        protocolVersion: 1,
+        codecs: ["h264"],
+        ready: true,
         displays: [
           {
             id: "display-1",
@@ -158,6 +161,24 @@ describe("control-plane authorization", () => {
       return { state: session?.state, signalCount: signals.length };
     });
     expect(evidence).toEqual({ state: "negotiating", signalCount: 1 });
+  });
+
+  test("does not offer sessions to a reachable but unready device", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    await t.run(async (ctx) => {
+      const device = await ctx.db.get(deviceId);
+      if (!device) throw new Error("seeded device disappeared");
+      const capabilities = JSON.parse(device.capabilitiesJson) as Record<string, unknown>;
+      await ctx.db.patch(deviceId, {
+        capabilitiesJson: JSON.stringify({ ...capabilities, ready: false }),
+      });
+    });
+    const ownerA = asOwner(t, "owner-a");
+    expect((await ownerA.query(api.devices.list))[0]?.ready).toBe(false);
+    await expect(ownerA.mutation(api.sessions.create, { deviceId })).rejects.toThrow(
+      "Device is unavailable",
+    );
   });
 
   test("revocation terminates sessions and invalidates the agent token", async () => {

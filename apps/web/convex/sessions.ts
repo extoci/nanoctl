@@ -1,7 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { parseDeviceDisplays, requireIdentity } from "./lib";
+import { parseDeviceDisplays, parseDeviceReadiness, requireIdentity } from "./lib";
 import { consumeRateLimit } from "./rateLimits";
 import { mintTurnCredentials } from "./turn";
 
@@ -36,6 +36,7 @@ export const create = mutation({
       !device ||
       device.ownerId !== identity.subject ||
       device.status === "disabled" ||
+      !parseDeviceReadiness(device.capabilitiesJson) ||
       Date.now() - device.lastSeenAt > 45_000
     ) {
       throw new ConvexError("Device is unavailable");

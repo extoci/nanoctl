@@ -27,6 +27,7 @@ pub struct Capabilities {
     architecture: &'static str,
     codecs: Vec<&'static str>,
     encoder_backends: Vec<&'static str>,
+    ready: bool,
     input: bool,
     clipboard: bool,
     system_audio: bool,
@@ -57,7 +58,9 @@ pub struct DoctorCheck {
     pub detail: String,
 }
 
-pub fn capabilities() -> Capabilities {
+pub fn capabilities(remote_input_enabled: bool) -> Capabilities {
+    let displays = display_capabilities();
+    let input = input_available();
     Capabilities {
         protocol_version: 1,
         platform: PLATFORM,
@@ -74,10 +77,22 @@ pub fn capabilities() -> Capabilities {
         } else {
             Vec::new()
         },
-        input: cfg!(feature = "media"),
+        ready: cfg!(feature = "media") && !displays.is_empty() && (!remote_input_enabled || input),
+        input: remote_input_enabled && input,
         clipboard: false,
         system_audio: false,
-        displays: display_capabilities(),
+        displays,
+    }
+}
+
+fn input_available() -> bool {
+    #[cfg(feature = "media")]
+    {
+        crate::input::probe().is_ok()
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        false
     }
 }
 
@@ -159,7 +174,9 @@ async fn control_plane_check(
     let result = async {
         let credential = credential.context("device credential is unavailable")?;
         let client = crate::control_plane::ControlPlane::new(config.control_plane_url.clone())?;
-        client.heartbeat(credential).await
+        client
+            .heartbeat(credential, config.features.remote_input)
+            .await
     }
     .await;
     DoctorCheck {

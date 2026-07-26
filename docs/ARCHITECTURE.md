@@ -42,6 +42,11 @@ owned by their Shoo `subject`. A session joins these identities for no more than
   envelope, and expiry.
 - `auditEvents`: append-only security-relevant ownership and session actions.
 
+Reachability and readiness are distinct. A fresh heartbeat makes a device online, while the
+authenticated capability document must also report protocol v1, H.264, at least one capturable
+display, and any locally enabled input permission before Convex permits a session. Permission
+revocation therefore disables new Connect actions without pretending the service itself is offline.
+
 Raw enrollment codes and agent bearer tokens are never stored. Signal rows and expired pairing rows
 must be deleted by scheduled maintenance. Audit retention is a deployment policy.
 

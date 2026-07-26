@@ -94,7 +94,12 @@ impl ControlPlane {
         Ok(Self { base_url, client })
     }
 
-    pub async fn enroll(&self, code: String, name: String) -> Result<Enrollment> {
+    pub async fn enroll(
+        &self,
+        code: String,
+        name: String,
+        remote_input_enabled: bool,
+    ) -> Result<Enrollment> {
         let response = self
             .client
             .post(self.endpoint("/v1/agent/enroll")?)
@@ -104,7 +109,7 @@ impl ControlPlane {
                 platform: platform::PLATFORM,
                 architecture: platform::ARCHITECTURE,
                 agent_version: env!("CARGO_PKG_VERSION"),
-                capabilities: platform::capabilities(),
+                capabilities: platform::capabilities(remote_input_enabled),
             })
             .send()
             .await?;
@@ -118,13 +123,17 @@ impl ControlPlane {
             .context("invalid enrollment response")
     }
 
-    pub async fn heartbeat(&self, token: &Zeroizing<String>) -> Result<()> {
+    pub async fn heartbeat(
+        &self,
+        token: &Zeroizing<String>,
+        remote_input_enabled: bool,
+    ) -> Result<()> {
         self.client
             .post(self.endpoint("/v1/agent/heartbeat")?)
             .bearer_auth(token.as_str())
             .json(&serde_json::json!({
                 "agentVersion": env!("CARGO_PKG_VERSION"),
-                "capabilities": platform::capabilities(),
+                "capabilities": platform::capabilities(remote_input_enabled),
             }))
             .send()
             .await?

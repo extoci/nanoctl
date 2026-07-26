@@ -7,6 +7,7 @@ export type DeviceSummary = {
   architecture: "x64" | "arm64";
   agentVersion: string;
   status: "online" | "offline" | "disabled";
+  ready: boolean;
   lastSeenAt: number;
   createdAt: number;
 };

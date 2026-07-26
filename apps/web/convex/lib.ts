@@ -78,6 +78,24 @@ export function parseDeviceDisplays(capabilitiesJson: string): DeviceDisplay[] {
   });
 }
 
+export function parseDeviceReadiness(capabilitiesJson: string): boolean {
+  let value: unknown;
+  try {
+    value = JSON.parse(capabilitiesJson);
+  } catch {
+    return false;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const capabilities = value as Record<string, unknown>;
+  return (
+    capabilities.ready === true &&
+    capabilities.protocolVersion === 1 &&
+    Array.isArray(capabilities.codecs) &&
+    capabilities.codecs.includes("h264") &&
+    parseDeviceDisplays(capabilitiesJson).length > 0
+  );
+}
+
 export type SignalKind = "offer" | "answer" | "ice-candidate" | "ice-complete" | "end";
 
 export function parseSignalEnvelope(
