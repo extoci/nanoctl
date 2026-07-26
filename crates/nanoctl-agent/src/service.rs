@@ -10,8 +10,10 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 #[cfg(feature = "rtc")]
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 
+#[cfg(feature = "rtc")]
+use crate::config::IceTransport;
 use crate::{
-    config::{AgentConfig, IceTransport},
+    config::AgentConfig,
     control_plane::{ControlPlane, SessionPollError},
     credential,
 };

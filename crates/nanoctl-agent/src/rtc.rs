@@ -105,6 +105,7 @@ enum OutgoingPayload {
         sdp_mline_index: Option<u16>,
     },
     IceComplete,
+    #[cfg(any(feature = "media", test))]
     End {
         reason: String,
     },

@@ -64,6 +64,7 @@ pub struct SignalRow {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "rtc")]
 pub struct TurnCredentials {
     pub urls: Vec<String>,
     pub username: String,

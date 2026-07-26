@@ -9,6 +9,7 @@ mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;
 mod service;
+mod update;
 
 use std::path::PathBuf;
 
@@ -56,6 +57,31 @@ enum Command {
     Paths,
     /// Delete this computer's local device credential and enrollment configuration.
     Unenroll,
+    /// Verify a signed update manifest and print the artifact for this executable.
+    VerifyUpdate {
+        manifest: PathBuf,
+        /// Base64-encoded 32-byte Ed25519 public key.
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Verify and download an update into a private staging directory.
+    StageUpdate {
+        manifest: PathBuf,
+        /// Base64-encoded 32-byte Ed25519 public key.
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Atomically activate a verified staged update (Unix; stop the service first).
+    ActivateUpdate {
+        manifest: PathBuf,
+        /// Base64-encoded 32-byte Ed25519 public key.
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Restore the binary retained by the last update activation.
+    RollbackUpdate,
+    /// Commit a healthy update and delete retained rollback binaries.
+    CommitUpdate,
 }
 
 #[tokio::main]
@@ -128,6 +154,71 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("cannot remove {}", config_path.display()))?;
             }
             println!("Local enrollment removed. Revoke the device in the web dashboard if needed.");
+        }
+        Command::VerifyUpdate {
+            manifest,
+            public_key,
+        } => {
+            let bytes = std::fs::read(&manifest)
+                .with_context(|| format!("cannot read {}", manifest.display()))?;
+            let artifact = update::verify_for_current_target(
+                &bytes,
+                &public_key,
+                env!("CARGO_PKG_VERSION"),
+                update::unix_time_now()?,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
+        }
+        Command::StageUpdate {
+            manifest,
+            public_key,
+        } => {
+            let bytes = std::fs::read(&manifest)
+                .with_context(|| format!("cannot read {}", manifest.display()))?;
+            let artifact = update::verify_for_current_target(
+                &bytes,
+                &public_key,
+                env!("CARGO_PKG_VERSION"),
+                update::unix_time_now()?,
+            )?;
+            let client = reqwest::Client::builder()
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::limited(3))
+                .build()
+                .context("cannot initialize update client")?;
+            let path =
+                update::stage_artifact(&client, &artifact, &update::default_staging_directory()?)
+                    .await?;
+            println!("Verified update staged at {}", path.display());
+        }
+        Command::ActivateUpdate {
+            manifest,
+            public_key,
+        } => {
+            let bytes = std::fs::read(&manifest)
+                .with_context(|| format!("cannot read {}", manifest.display()))?;
+            let artifact = update::verify_for_current_target(
+                &bytes,
+                &public_key,
+                env!("CARGO_PKG_VERSION"),
+                update::unix_time_now()?,
+            )?;
+            let installed = update::activate_staged(&artifact)?;
+            println!(
+                "Activated {}. Restart the nanoctl service and run `nanoctl doctor`.",
+                installed.display()
+            );
+        }
+        Command::RollbackUpdate => {
+            let installed = update::rollback_update()?;
+            println!(
+                "Restored {}. Restart the nanoctl service and run `nanoctl doctor`.",
+                installed.display()
+            );
+        }
+        Command::CommitUpdate => {
+            update::commit_update()?;
+            println!("Update committed; retained rollback binaries were removed.");
         }
     }
     Ok(())

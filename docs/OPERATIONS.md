@@ -62,6 +62,13 @@ macOS notarization, installer construction, update-manifest signing, and the phy
 matrix remain mandatory gates. Signing must attest the final signed bytes, not reuse the unsigned
 candidate attestation.
 
+The native updater verifies an exact-byte Ed25519 envelope before parsing it, rejects downgrade and
+expired manifests, streams into a bounded private staging file, and checks the signed length and
+SHA-256 digest. Unix package scripts stop the service before an atomic activation and retain the
+previous executable until the restarted agent passes `doctor`. Failed health checks roll back.
+Windows uses the same verifier and staging format, but final replacement must be performed by the
+signed installer bootstrap; the agent deliberately refuses in-process Windows activation.
+
 ## Readiness
 
 A production launch is blocked until canonical domains, private security contact, signing

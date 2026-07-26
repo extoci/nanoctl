@@ -60,3 +60,22 @@ portal interaction and compositor support. Remove it with
 5. Revoke from the dashboard and verify no new session can start.
 6. Uninstall, confirm the registration and credential are gone, and retain no diagnostic logs
    unless the owner explicitly requested them.
+
+## Signed updates
+
+Linux and macOS packages include `update-user-service.sh` or `update-agent.sh`. Each accepts the
+downloaded signed manifest and the base64 Ed25519 publisher public key installed through the trusted
+package channel. The script stops the user service, verifies and stages the target-specific
+artifact, activates it atomically, restarts, runs `doctor`, and either commits the update or restores
+the previous binary.
+
+For inspection without changing files:
+
+```sh
+nanoctl verify-update manifest.json --public-key "$NANOCTL_UPDATE_PUBLIC_KEY"
+```
+
+Do not copy a public key from the update server itself: that would make a compromised distribution
+server its own trust anchor. Windows can verify and stage the same manifest, but activation remains
+installer-managed because a running Windows image cannot safely replace itself. An unsigned local
+build must not be mixed with the signed update channel.
