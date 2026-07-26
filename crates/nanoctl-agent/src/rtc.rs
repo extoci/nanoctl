@@ -10,6 +10,8 @@ use interceptor::registry::Registry;
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 #[cfg(feature = "media")]
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+#[cfg(feature = "media")]
+use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -40,6 +42,8 @@ pub struct HostPeer {
     sequence: Arc<AtomicU64>,
     #[cfg(feature = "media")]
     keyframe_requests: tokio::sync::watch::Sender<u64>,
+    #[cfg(feature = "media")]
+    bitrate_estimate_kbps: tokio::sync::watch::Sender<u32>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
 }
@@ -225,16 +229,32 @@ impl HostPeer {
         let (keyframe_requests, _) = tokio::sync::watch::channel(0_u64);
         #[cfg(feature = "media")]
         let keyframe_feedback = keyframe_requests.clone();
+        #[cfg(feature = "media")]
+        let (bitrate_estimate_kbps, _) = tokio::sync::watch::channel(0_u32);
+        #[cfg(feature = "media")]
+        let bitrate_feedback = bitrate_estimate_kbps.clone();
         tokio::spawn(async move {
             while let Ok((_packets, _attributes)) = sender.read_rtcp().await {
                 #[cfg(feature = "media")]
-                if _packets.iter().any(|packet| {
-                    packet.as_any().is::<PictureLossIndication>()
-                        || packet.as_any().is::<FullIntraRequest>()
-                }) {
-                    keyframe_feedback.send_modify(|generation| {
-                        *generation = generation.wrapping_add(1);
-                    });
+                {
+                    if _packets.iter().any(|packet| {
+                        packet.as_any().is::<PictureLossIndication>()
+                            || packet.as_any().is::<FullIntraRequest>()
+                    }) {
+                        keyframe_feedback.send_modify(|generation| {
+                            *generation = generation.wrapping_add(1);
+                        });
+                    }
+                    if let Some(estimate) = _packets.iter().find_map(|packet| {
+                        packet
+                            .as_any()
+                            .downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                    }) && estimate.bitrate.is_finite()
+                        && estimate.bitrate > 0.0
+                    {
+                        let kbps = (estimate.bitrate / 1_000.0).min(u32::MAX as f32) as u32;
+                        bitrate_feedback.send_replace(kbps.max(1));
+                    }
                 }
             }
         });
@@ -293,6 +313,8 @@ impl HostPeer {
             sequence,
             #[cfg(feature = "media")]
             keyframe_requests,
+            #[cfg(feature = "media")]
+            bitrate_estimate_kbps,
             video,
         })
     }
@@ -369,6 +391,11 @@ impl HostPeer {
     #[cfg(feature = "media")]
     pub fn keyframe_requests(&self) -> tokio::sync::watch::Receiver<u64> {
         self.keyframe_requests.subscribe()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn bitrate_estimate_kbps(&self) -> tokio::sync::watch::Receiver<u32> {
+        self.bitrate_estimate_kbps.subscribe()
     }
 }
 

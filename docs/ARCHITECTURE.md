@@ -68,10 +68,11 @@ converted to I420 for bounded OpenH264 software encoding, then emitted directly 
 packetizer. Decoder PLI/FIR feedback forces an IDR, with a two-second periodic IDR as a recovery
 backstop.
 
-The current portable encoder has a configured bitrate ceiling but does not yet adapt its bitrate
-dynamically from receiver estimates. Zero-copy GPU surfaces, hardware encoding, capture timestamps,
-and the documented bitrate/resolution/frame-rate hysteresis controller are native performance-path
-release gates, not properties claimed for the portable backend.
+The portable path consumes receiver-estimated maximum bitrate (REMB), clamps it between 250 kbps and
+the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% increase. Recreating
+the encoder also produces a clean recovery point; the hysteresis avoids reinitialization churn.
+Zero-copy GPU surfaces, hardware encoding, capture timestamps, and adaptive resolution/frame rate
+remain native performance-path release gates, not properties claimed for the portable backend.
 
 Input uses an unordered, zero-retransmit channel for pointer motion and a reliable ordered channel
 for key/button transitions and lifecycle messages. Pointer motion is coalesced; key-up and button-up

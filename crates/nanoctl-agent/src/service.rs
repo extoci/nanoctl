@@ -247,6 +247,7 @@ async fn reconcile_sessions(
                     let media_task = crate::media::spawn_video(
                         peer.video_track(),
                         peer.keyframe_requests(),
+                        peer.bitrate_estimate_kbps(),
                         _config.quality.max_bitrate_kbps,
                         _config.quality.max_fps,
                         _config.quality.max_width,
