@@ -2382,6 +2382,7 @@ dependencies = [
  "hostname",
  "interceptor",
  "keyring",
+ "nanoctl-update",
  "openh264",
  "proptest",
  "reqwest",
@@ -2401,6 +2402,19 @@ dependencies = [
  "windows 0.62.2",
  "xcap",
  "zeroize",
+]
+
+[[package]]
+name = "nanoctl-update"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "semver",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

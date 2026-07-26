@@ -1,0 +1,19 @@
+[package]
+name = "nanoctl-agent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+nanoctl-update = { path = "../../nanoctl-update" }
+
+[[bin]]
+name = "update_envelope"
+path = "fuzz_targets/update_envelope.rs"
+test = false
+doc = false
+bench = false

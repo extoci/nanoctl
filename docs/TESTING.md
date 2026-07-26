@@ -26,14 +26,15 @@ production configuration, CSP nonces, media/network/performance-evidence validat
 redaction snapshots (including bearer, clipboard, SDP, ICE, and TURN-shaped secrets), malformed
 SDP/candidate rejection, bounded control-queue admission, and an in-process connection between the
 production host peer and a real WebRTC controller peer through SDP, ICE, DTLS/SCTP, and
-control-channel opening.
+control-channel opening. The exact signed-update envelope verifier also runs under a pinned,
+coverage-guided libFuzzer job on every rewrite-branch change and weekly; crash inputs are retained
+as CI artifacts.
 
 ## Required release-test expansion
 
 The following remain mandatory before a supported release; they are requirements, not claims about
 the current automated suite:
 
-- coverage-guided fuzzing;
 - end-to-end data-channel flood/backpressure tests with a real input backend;
 
 ## Browser tests

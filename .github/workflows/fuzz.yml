@@ -1,0 +1,50 @@
+name: coverage-guided fuzzing
+
+on:
+  pull_request:
+  push:
+    branches: [master, "rewrite/**"]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-envelope:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Fuzz signed update envelope parser
+        working-directory: crates/nanoctl-agent
+        env:
+          CC: gcc
+          CXX: g++
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc
+        run: |
+          mkdir -p fuzz/artifacts/update_envelope
+          cargo fuzz run update_envelope \
+            fuzz/corpus/update_envelope \
+            -- \
+            -max_total_time=60 \
+            -timeout=5 \
+            -rss_limit_mb=2048 \
+            -artifact_prefix=fuzz/artifacts/update_envelope/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: update-envelope-fuzz-crash
+          path: crates/nanoctl-agent/fuzz/artifacts/update_envelope
+          if-no-files-found: ignore
+          retention-days: 14
