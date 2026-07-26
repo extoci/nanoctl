@@ -56,12 +56,10 @@ preflight rejects loopback, non-HTTPS, credential-bearing, and non-origin values
 deployment rather than the Vercel runtime. Because both browser-visible variables are compiled into
 the Next.js bundle, changing either requires a new deployment.
 
-Native release candidates are produced by `.github/workflows/release-candidates.yml` for Linux,
-macOS, and Windows on x64 and arm64. The aggregate artifact includes normalized archives, SHA-256
-checksums, a CycloneDX SBOM, and provenance attestations. It is not a release: platform signing,
-macOS notarization, installer construction, update-manifest signing, and the physical acceptance
-matrix remain mandatory gates. Signing must attest the final signed bytes, not reuse the unsigned
-candidate attestation.
+Tagged releases are produced by `.github/workflows/release.yml` for Linux, macOS, and Windows on
+x64 and arm64. Public releases contain only the six platform executables, their individual SHA-256
+files, and the Unix and Windows installers. Platform signing, macOS notarization, and the physical
+acceptance matrix remain mandatory production gates.
 
 The native updater verifies an exact-byte Ed25519 envelope before parsing it, rejects downgrade and
 expired manifests, streams into a bounded private staging file, and checks the signed length and

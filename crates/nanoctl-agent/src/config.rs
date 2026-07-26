@@ -84,7 +84,8 @@ pub enum IceTransport {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            control_plane_url: Url::parse("http://127.0.0.1:3211").expect("static URL is valid"),
+            control_plane_url: Url::parse("https://dapper-hornet-380.convex.site")
+                .expect("static URL is valid"),
             device_id: None,
             quality: QualityConfig::default(),
             network: NetworkConfig::default(),

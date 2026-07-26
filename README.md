@@ -25,6 +25,24 @@ This repository is the v1 rewrite. The original LAN demo remains available on th
 - a Shoo-supported HTTPS origin
 - a public TURN service for production
 
+## Install
+
+Linux and macOS:
+
+```sh
+curl -fsSL https://extoci.lol/nanoctl/install | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://extoci.lol/nanoctl/install | iex
+```
+
+The installer downloads and verifies the latest release, asks for the setup code on first install,
+and starts nanoctl automatically in the current desktop session. Run the same command again to
+update to the latest release.
+
 ## Development
 
 ```sh

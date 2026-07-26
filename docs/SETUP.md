@@ -1,97 +1,56 @@
-# Host setup and removal
+# Host setup
 
-Release packages wrap the platform registrations in `packaging/`. Until signed packages are
-produced, build the agent with `cargo build --release --features media`, enroll it as the
-interactive desktop user, run `nanoctl doctor`, and then register the background agent.
+Create a setup code in the nanoctl dashboard, then run the installer as the desktop user that will
+share this computer.
 
-Before registration, exercise native capture and encoding on the interactive desktop:
+Linux and macOS:
 
-```shell
+```sh
+curl -fsSL https://extoci.lol/nanoctl/install | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://extoci.lol/nanoctl/install | iex
+```
+
+The installer selects the correct x64 or arm64 executable, verifies its SHA-256 checksum, asks for
+the setup code on first install, and starts the background agent. Run the same command again to
+update to the latest release without enrolling again.
+
+If automatic platform selection is undesirable, use
+`https://extoci.lol/nanoctl/install.sh` or
+`https://extoci.lol/nanoctl/install.ps1` explicitly.
+
+Linux uses a systemd user service, macOS uses a per-user LaunchAgent, and Windows uses a
+non-elevated Scheduled Task. The agent must run in the enrolled interactive user's session so it
+can access that user's credential store, screen, and input APIs. It does not open an inbound port.
+
+macOS may ask for Screen Recording and Accessibility. Wayland may ask through its desktop portal.
+Complete those prompts as the user who ran the installer.
+
+## Verification
+
+Run:
+
+```sh
+nanoctl doctor
 nanoctl media-smoke --require-hardware --seconds 30
 ```
 
-Use `--json` when collecting the acceptance record from a signed release candidate. Screen-capture
-permission prompts must be completed by the candidate identity before this command can pass.
+Then confirm the dashboard reports the device online and test a connection from another network.
+Use `--json` when collecting a machine-readable acceptance record.
 
-The enrollment user and background-agent user must be identical. Screen capture, input permission,
-and the OS credential entry belong to that interactive identity. None of the v1 registrations opens
-an inbound port.
+## Advanced and development setup
 
-## Windows 11
+The installer supports these environment overrides:
 
-Open an elevated PowerShell in the enrolled user's session:
+- `NANOCTL_VERSION=v1.2.3` installs a specific release instead of `latest`.
+- `NANOCTL_REPOSITORY=owner/repository` downloads from another GitHub repository.
+- `NANOCTL_CONTROL_PLANE=https://example.convex.site` enrolls against another deployment.
+- `NANOCTL_ENROLL_CODE=...` supplies the setup code without an interactive prompt.
+- `NANOCTL_BINARY=/path/to/nanoctl` uses a local Unix executable instead of downloading.
 
-```powershell
-$configPath = ((.\nanoctl.exe paths) -replace '^config=', '')
-.\packaging\windows\install-service.ps1 `
-  -BinaryPath .\nanoctl.exe `
-  -ConfigPath $configPath
-```
-
-UAC must elevate that same Windows account. If an administrator credential prompt is answered with
-a different account, installation fails before making changes: the scheduled task, desktop session,
-configuration, and Credential Manager enrollment must all belong to one identity.
-
-Despite the compatibility filename, the script copies the signed binary under Program Files and
-registers a headless, non-elevated Scheduled Task for the current interactive user. A LocalSystem
-Windows service runs in Session 0 and cannot capture or inject into that user's desktop or read
-their Credential Manager item. The task starts at logon and restarts after failure. Explicit ACLs
-prevent the agent identity from replacing its installed executable and restrict the configuration
-to the agent identity, SYSTEM, and local administrators. The signed installer supplies the exact
-generated config path.
-
-Remove it from the same user session with `uninstall-agent.ps1`. Removal deletes the local
-credential and configuration; revoke the device in the dashboard as well if it is still listed.
-
-## macOS 14+
-
-Grant Screen Recording and Accessibility to the signed nanoctl identity, then run:
-
-```sh
-packaging/macos/install-agent.sh target/release/nanoctl
-```
-
-This installs a per-user LaunchAgent because TCC grants and interactive capture are user-session
-scoped. Remove it with `packaging/macos/uninstall-agent.sh`. An unsigned locally built binary is for
-development only; changing its code signature may invalidate TCC approval.
-
-## Linux
-
-For an enrolled graphical user:
-
-```sh
-packaging/linux/install-user-service.sh target/release/nanoctl
-```
-
-This installs and enables a hardened systemd user service. Wayland capture/input may still require
-portal interaction and compositor support. Remove it with
-`packaging/linux/uninstall-user-service.sh`.
-
-## Verification after setup
-
-1. Reboot or sign out/in and confirm the background registration is running.
-2. Run `nanoctl doctor --json` as the enrolled user without printing any credential.
-3. Confirm the dashboard reports the device online within 45 seconds.
-4. Connect from a separate network, verify pointer, wheel, keyboard, fullscreen, and explicit end.
-5. Revoke from the dashboard and verify no new session can start.
-6. Uninstall, confirm the registration and credential are gone, and retain no diagnostic logs
-   unless the owner explicitly requested them.
-
-## Signed updates
-
-Linux and macOS packages include `update-user-service.sh` or `update-agent.sh`. Each accepts the
-downloaded signed manifest and the base64 Ed25519 publisher public key installed through the trusted
-package channel. The script stops the user service, verifies and stages the target-specific
-artifact, activates it atomically, restarts, runs `doctor`, and either commits the update or restores
-the previous binary.
-
-For inspection without changing files:
-
-```sh
-nanoctl verify-update manifest.json --public-key "$NANOCTL_UPDATE_PUBLIC_KEY"
-```
-
-Do not copy a public key from the update server itself: that would make a compromised distribution
-server its own trust anchor. On Windows, `update-agent.ps1` performs the same transaction outside
-the stopped Scheduled Task because a running Windows image cannot safely replace itself. An
-unsigned local build must not be mixed with the signed update channel.
+The scripts under `packaging/` remain low-level development and removal helpers. Normal
+installation and updates should use the one-command installer.

@@ -108,6 +108,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    control_plane::install_crypto_provider()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("nanoctl=info")),
@@ -138,9 +139,7 @@ async fn main() -> Result<()> {
             credential::store(&enrollment.device_id, &enrollment.token)?;
             config.device_id = Some(enrollment.device_id);
             config.save(&config_path)?;
-            println!(
-                "Enrolled successfully. Run `nanoctl doctor`, then install/start the service."
-            );
+            println!("Enrolled successfully.");
         }
         Command::Run => {
             let config = AgentConfig::load(&config_path)?;

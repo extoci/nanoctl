@@ -85,6 +85,7 @@ struct EnrollmentRequest {
 
 impl ControlPlane {
     pub fn new(base_url: Url) -> Result<Self> {
+        install_crypto_provider()?;
         let client = Client::builder()
             .https_only(base_url.scheme() == "https")
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -219,14 +220,34 @@ impl ControlPlane {
     }
 }
 
+pub fn install_crypto_provider() -> Result<()> {
+    static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INITIALIZED.get_or_init(|| {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+    });
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        bail!("nanoctl could not initialize its built-in TLS crypto provider");
+    }
+    Ok(())
+}
+
 fn credential_was_rejected(status: StatusCode) -> bool {
     matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::credential_was_rejected;
+    use super::{ControlPlane, credential_was_rejected};
     use reqwest::StatusCode;
+    use url::Url;
+
+    #[test]
+    fn constructs_https_client_with_a_crypto_provider() {
+        ControlPlane::new(Url::parse("https://example.com").unwrap())
+            .expect("the release TLS backend must include a crypto provider");
+    }
 
     #[test]
     fn distinguishes_revocation_from_retryable_control_plane_failures() {
