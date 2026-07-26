@@ -14,6 +14,8 @@ mod platform;
 mod rtc;
 mod service;
 mod update;
+#[cfg(all(feature = "media", target_os = "windows"))]
+mod windows_encoder;
 
 use std::path::PathBuf;
 

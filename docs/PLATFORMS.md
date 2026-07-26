@@ -2,11 +2,14 @@
 
 ## Windows
 
-Target Windows 11. The portable v1 backend keeps xcap's Windows.Graphics.Capture recorder alive for
-the session, retains only the newest RGBA frame, uses OpenH264 for the browser-compatible baseline
-stream, and uses enigo's Windows input backend. This avoids per-frame capture setup but still copies
-through system memory. The release performance path is D3D11 into Media Foundation without a
-GPU-to-CPU copy; that path must not be advertised until its physical release gate passes.
+Target Windows 11. The backend keeps xcap's Windows.Graphics.Capture recorder alive for the session,
+retains only the newest RGBA frame, and uses enigo's Windows input backend. It enumerates only
+hardware Media Foundation NV12-to-H.264 transforms, unlocks their asynchronous event protocol,
+requires low-latency mode, and falls back to OpenH264 unless `quality.encoder = "hardware"` makes
+hardware mandatory. The H.264 subtype guarantees Annex-B samples with interleaved SPS/PPS, and the
+agent validates each access unit before RTP. RGBA-to-NV12 and the hardware-surface boundary still
+copy through system memory. Direct D3D11 capture-surface import remains a physical performance gate
+and must not be advertised until it passes on signed release hardware.
 
 The current package registration is a headless per-user Scheduled Task because Session 0 cannot
 capture the user desktop or use the enrolling user's Credential Manager entry. A future

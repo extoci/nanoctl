@@ -13,6 +13,7 @@ capture = [
   "dep:cros-libva",
   "dep:openh264",
   "dep:videotoolbox",
+  "dep:windows",
   "dep:xcap",
 ]
 media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
@@ -62,6 +63,10 @@ videotoolbox = { version = "0.18.1", default-features = false, features = [
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", features = ["windows-native"] }
+windows = { version = "0.62.2", features = [
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+], optional = true }
 
 [dev-dependencies]
 tempfile = "3.24"

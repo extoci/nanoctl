@@ -93,6 +93,13 @@ API yields RGBA system memory, so v1 converts to NV12 before a pitched VA surfac
 PipeWire DMA-BUF capture path can remove that copy without changing signaling or RTP.
 Direct ScreenCaptureKit IOSurface handoff remains a separate physical performance gate.
 
+Windows hardware MFTs are a distinct Media Foundation enumeration category and always process
+asynchronously. The agent therefore uses `MFT_ENUM_FLAG_HARDWARE`, enables
+`MF_TRANSFORM_ASYNC_UNLOCK`, waits for `METransformNeedInput`/`METransformHaveOutput`, and bounds
+driver stalls with a watchdog. It does not instantiate the inbox software encoder under the
+hardware label. `MFVideoFormat_H264` samples are complete Annex-B pictures with start codes and
+interleaved SPS/PPS, which matches the WebRTC packetizer contract.
+
 Sources:
 
 - <https://developer.apple.com/documentation/videotoolbox/vtcompressionsession>
@@ -101,3 +108,6 @@ Sources:
 - <https://docs.rs/apple-cf/0.9.3/apple_cf/iosurface/>
 - <https://github.com/chromeos/cros-codecs>
 - <https://github.com/intel/libva>
+- <https://learn.microsoft.com/en-us/windows/win32/api/mfapi/ne-mfapi-_mft_enum_flag>
+- <https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts>
+- <https://learn.microsoft.com/en-us/windows/win32/medfound/video-subtype-guids>

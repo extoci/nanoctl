@@ -79,9 +79,12 @@ On macOS, the same hysteresis recreates a hardware-confirmed VideoToolbox sessio
 a recovery frame. Its AVCC samples are length-checked and converted to Annex-B with copied SPS/PPS
 before reaching the RTP packetizer. On Linux, a VA-API backend uses low-delay prediction, forced
 keyframes, dynamic CBR tuning, and constrained-baseline Annex-B output from `cros-codecs`; RGBA is
-converted to NV12 and uploaded using the driver's declared plane layout. Direct capture-to-encoder
-GPU surfaces, Windows Media Foundation, capture timestamps, and adaptive resolution/frame rate
-remain native performance-path release gates, not properties claimed for the portable backend.
+converted to NV12 and uploaded using the driver's declared plane layout. On Windows, hardware-only
+Media Foundation enumeration excludes the inbox software encoder, uses the asynchronous MFT event
+contract with bounded watchdogs, and rebuilds a low-latency baseline session for bitrate or
+keyframe changes. Direct capture-to-encoder GPU surfaces, capture timestamps, and adaptive
+resolution/frame rate remain native performance-path release gates, not properties claimed for the
+portable backend.
 
 `quality.encoder` is a fail-closed policy rather than a hint. `auto` prefers a verified native
 backend and may fall back to OpenH264, `software` forces the portable backend, and `hardware` fails

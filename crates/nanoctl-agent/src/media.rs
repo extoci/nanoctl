@@ -67,6 +67,8 @@ enum EncoderBackend {
     VaApi(Box<crate::linux_encoder::LinuxEncoder>),
     #[cfg(target_os = "macos")]
     VideoToolbox(Box<crate::macos_encoder::MacOsEncoder>),
+    #[cfg(target_os = "windows")]
+    MediaFoundation(Box<crate::windows_encoder::WindowsEncoder>),
     Software(Box<SoftwareEncoder>),
 }
 
@@ -185,6 +187,19 @@ impl EncoderBackend {
                 }
             }
         }
+        #[cfg(target_os = "windows")]
+        if !matches!(preference, EncoderPreference::Software) {
+            match crate::windows_encoder::WindowsEncoder::new(bitrate_kbps, max_fps, latency_mode) {
+                Ok(encoder) => return Ok(Self::MediaFoundation(Box::new(encoder))),
+                Err(error) if matches!(preference, EncoderPreference::Hardware) => {
+                    return Err(error)
+                        .context("required Media Foundation hardware encoder is unavailable");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Media Foundation hardware unavailable; using OpenH264");
+                }
+            }
+        }
         if matches!(preference, EncoderPreference::Hardware) {
             bail!("hardware encoding was required but no verified native backend is available");
         }
@@ -201,6 +216,8 @@ impl EncoderBackend {
             Self::VaApi(encoder) => encoder.force_keyframe(),
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => encoder.force_keyframe(),
+            #[cfg(target_os = "windows")]
+            Self::MediaFoundation(encoder) => encoder.force_keyframe(),
             Self::Software(encoder) => encoder.encoder.force_intra_frame(),
         }
     }
@@ -213,6 +230,10 @@ impl EncoderBackend {
             Self::VideoToolbox(encoder) => {
                 encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
             }
+            #[cfg(target_os = "windows")]
+            Self::MediaFoundation(encoder) => {
+                encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
+            }
             Self::Software(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
         }
     }
@@ -223,6 +244,8 @@ impl EncoderBackend {
             Self::VaApi(encoder) => encoder.encode(image),
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => encoder.encode(image),
+            #[cfg(target_os = "windows")]
+            Self::MediaFoundation(encoder) => encoder.encode(image),
             Self::Software(encoder) => encoder.encode(image),
         }
     }
@@ -233,6 +256,8 @@ impl EncoderBackend {
             Self::VaApi(_) => "VA-API",
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(_) => "VideoToolbox",
+            #[cfg(target_os = "windows")]
+            Self::MediaFoundation(_) => "Media Foundation hardware MFT",
             Self::Software(_) => "OpenH264",
         }
     }
