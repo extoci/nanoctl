@@ -4,9 +4,11 @@
 
 CI runs formatting, oxc lint, TypeScript 7 project checking, Bun unit tests, transactional Convex
 authorization tests, Rust format/clippy/tests, the native Vercel Next.js production build, dependency
-audits, and secret scanning. Native media builds run on Linux, macOS, and Windows. Local
+audits, secret scanning, and an authenticated packet relay through the hardened coturn container.
+Native media builds run on Linux, macOS, and Windows. Local
 `bun run check` is the fast pre-commit subset; it does not replace the browser, production-build,
-media-feature, or security jobs.
+media-feature, TURN-container, or security jobs. Run the relay gate with `bun run test:turn` on a
+Linux Docker host.
 
 The `release candidates` workflow compiles the full media agent on native x64 and arm64 runners for
 Linux, macOS, and Windows. It creates timestamp-normalized archives, SHA-256 checksums, a CycloneDX

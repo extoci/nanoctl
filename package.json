@@ -25,6 +25,7 @@
     "test:convex": "vitest run",
     "test:browser": "playwright test -c tests/browser/playwright.config.ts",
     "test:agent": "bun run scripts/cargo.ts test --features rtc",
+    "test:turn": "bun run scripts/verify-turn-container.ts",
     "evidence:media": "bun run scripts/verify-media-evidence.ts",
     "evidence:network": "bun run scripts/verify-network-evidence.ts",
     "evidence:performance": "bun run scripts/verify-performance-evidence.ts",
