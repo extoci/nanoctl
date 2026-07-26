@@ -124,7 +124,7 @@ fn capture_check() -> DoctorCheck {
     #[cfg(feature = "media")]
     {
         let result = xcap::Monitor::all();
-        return DoctorCheck {
+        DoctorCheck {
             name: "capture",
             ok: result.as_ref().is_ok_and(|monitors| !monitors.is_empty()),
             detail: match result {
@@ -134,7 +134,7 @@ fn capture_check() -> DoctorCheck {
                 Ok(_) => "no displays available in the interactive session".into(),
                 Err(error) => format!("{error}"),
             },
-        };
+        }
     }
     #[cfg(not(feature = "media"))]
     DoctorCheck {
@@ -150,11 +150,11 @@ fn capture_check() -> DoctorCheck {
 fn input_check() -> DoctorCheck {
     #[cfg(feature = "media")]
     {
-        return DoctorCheck {
+        DoctorCheck {
             name: "input",
             ok: true,
             detail: platform_input_guidance().into(),
-        };
+        }
     }
     #[cfg(not(feature = "media"))]
     DoctorCheck {

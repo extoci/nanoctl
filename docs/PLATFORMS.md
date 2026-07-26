@@ -2,10 +2,11 @@
 
 ## Windows
 
-Target Windows 11. The portable v1 backend uses xcap for interactive-session capture, OpenH264 for
-the browser-compatible baseline stream, and enigo's Windows input backend. The release performance
-path is Windows.Graphics.Capture/D3D11 into Media Foundation without a GPU-to-CPU copy; that path
-must not be advertised until its physical release gate passes.
+Target Windows 11. The portable v1 backend keeps xcap's Windows.Graphics.Capture recorder alive for
+the session, retains only the newest RGBA frame, uses OpenH264 for the browser-compatible baseline
+stream, and uses enigo's Windows input backend. This avoids per-frame capture setup but still copies
+through system memory. The release performance path is D3D11 into Media Foundation without a
+GPU-to-CPU copy; that path must not be advertised until its physical release gate passes.
 
 The current package registration is a headless per-user Scheduled Task because Session 0 cannot
 capture the user desktop or use the enrolling user's Credential Manager entry. A future
@@ -14,19 +15,20 @@ in the authorized user session. UAC secure desktop and Windows sign-in screens r
 
 ## macOS
 
-Target macOS 14+. The portable backend uses xcap, OpenH264, and enigo. The release performance path
-is ScreenCaptureKit into VideoToolbox, but it must not be advertised until the signed physical gate
-passes. Input requires Accessibility and capture requires Screen Recording permission. The current
-package installs a LaunchAgent because TCC permission is tied to an interactive code
-identity/session.
+Target macOS 14+. The portable backend keeps xcap's native recorder alive, retains only the newest
+RGBA frame, and uses OpenH264 plus enigo. The release performance path is ScreenCaptureKit into
+VideoToolbox, but it must not be advertised until the signed physical gate passes. Input requires
+Accessibility and capture requires Screen Recording permission. The current package installs a
+LaunchAgent because TCC permission is tied to an interactive code identity/session.
 
 The setup tool opens the correct System Settings pages and verifies grants. It cannot click consent
 for the user. Fast user switching and lock behavior are tested explicitly.
 
 ## Linux
 
-The portable backend uses xcap's compositor/X11 facilities, bounded OpenH264 software encoding, and
-enigo input where the session permits it. The release performance path uses
+The portable backend keeps xcap's PipeWire or X11 recorder alive, retains only the newest RGBA
+frame, uses bounded OpenH264 software encoding, and uses enigo input where the session permits it.
+The release performance path uses
 xdg-desktop-portal/PipeWire with VA-API, and RemoteDesktop portal input where supported. Portal
 restore tokens are non-secret configuration and may still require renewed consent.
 

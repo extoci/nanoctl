@@ -61,9 +61,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
-            libwayland-dev libx11-dev libxcb1-dev libxrandr-dev \
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
+            libxinerama-dev libxrandr-dev libxtst-dev \
             nasm pkg-config
       - run: bun run scripts/cargo.ts clippy --all-targets --features media -- -D warnings
+      - run: bun run scripts/cargo.ts test --features media
       - run: bun run scripts/cargo.ts build --release --features media
 
   agent-media-native:
@@ -83,6 +85,7 @@ jobs:
           components: clippy
       - run: bun install --frozen-lockfile
       - run: bun run scripts/cargo.ts clippy --all-targets --features media -- -D warnings
+      - run: bun run scripts/cargo.ts test --features media
       - run: bun run scripts/cargo.ts build --release --features media
 
   security:

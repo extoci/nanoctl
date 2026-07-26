@@ -197,10 +197,10 @@ impl HostPeer {
                 channel.on_close(Box::new(move || {
                     let input = input.clone();
                     Box::pin(async move {
-                        if let Some(input) = input {
-                            if let Ok(mut input) = input.lock() {
-                                input.release_all();
-                            }
+                        if let Some(input) = input
+                            && let Ok(mut input) = input.lock()
+                        {
+                            input.release_all();
                         }
                     })
                 }));

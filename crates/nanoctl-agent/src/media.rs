@@ -4,7 +4,7 @@
 //! is deliberately capacity one: a remote desktop should drop an obsolete frame under load rather
 //! than preserve it and grow latency.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType,
@@ -12,14 +12,50 @@ use openh264::encoder::{
 use openh264::formats::{RgbSliceU8, YUVBuffer};
 use xcap::Monitor;
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+#[derive(Default)]
+struct LatestFrame {
+    slot: Mutex<Option<xcap::Frame>>,
+    ready: Condvar,
+}
+
+impl LatestFrame {
+    fn replace(&self, frame: xcap::Frame) -> bool {
+        let Ok(mut slot) = self.slot.lock() else {
+            return false;
+        };
+        *slot = Some(frame);
+        self.ready.notify_one();
+        true
+    }
+
+    fn take(&self, timeout: Duration) -> Result<xcap::Frame> {
+        let slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow!("display capture queue was poisoned"))?;
+        let (mut slot, timeout) = self
+            .ready
+            .wait_timeout_while(slot, timeout, |frame| frame.is_none())
+            .map_err(|_| anyhow!("display capture queue was poisoned"))?;
+        if timeout.timed_out() && slot.is_none() {
+            bail!("display capture timed out");
+        }
+        slot.take()
+            .context("display capture stopped without a frame")
+    }
+}
+
 pub struct CaptureEncoder {
-    monitor: Monitor,
+    // Keeping the recorder alive preserves one native capture session instead of rebuilding the
+    // OS capture pipeline for every frame.
+    recorder: xcap::VideoRecorder,
+    latest_frame: Arc<LatestFrame>,
     encoder: Encoder,
     rgb: Vec<u8>,
 }
@@ -33,6 +69,9 @@ impl CaptureEncoder {
             .or_else(|| monitors.first())
             .cloned()
             .context("no display is available")?;
+        let (recorder, native_frames) = monitor
+            .video_recorder()
+            .context("continuous display capture is unavailable")?;
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(max_bitrate_kbps.saturating_mul(1_000)))
             .max_frame_rate(FrameRate::from_hz(max_fps as f32))
@@ -40,18 +79,37 @@ impl CaptureEncoder {
             .usage_type(UsageType::ScreenContentRealTime);
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("H.264 encoder is unavailable")?;
+        let latest_frame = Arc::new(LatestFrame::default());
+        let forwarding_slot = Arc::downgrade(&latest_frame);
+        std::thread::Builder::new()
+            .name("nanoctl-capture".to_owned())
+            .spawn(move || {
+                while let Ok(frame) = native_frames.recv() {
+                    let Some(latest_frame) = forwarding_slot.upgrade() else {
+                        break;
+                    };
+                    // Replacement, rather than append, makes this queue exactly one frame deep.
+                    if !latest_frame.replace(frame) {
+                        break;
+                    }
+                }
+            })
+            .context("capture forwarding thread could not start")?;
+        recorder
+            .start()
+            .context("continuous display capture could not start")?;
         Ok(Self {
-            monitor,
+            recorder,
+            latest_frame,
             encoder,
             rgb: Vec::new(),
         })
     }
 
     pub fn next_access_unit(&mut self, max_width: u32, max_height: u32) -> Result<EncodedFrame> {
-        let source = self
-            .monitor
-            .capture_image()
-            .context("display capture failed")?;
+        let frame = self.latest_frame.take(Duration::from_secs(5))?;
+        let source = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.raw)
+            .context("display capture returned an invalid RGBA frame")?;
         let (source_width, source_height) = source.dimensions();
         let (target_width, target_height) =
             fit_dimensions(source_width, source_height, max_width, max_height);
@@ -80,6 +138,12 @@ impl CaptureEncoder {
         Ok(EncodedFrame {
             bytes: stream.to_vec(),
         })
+    }
+}
+
+impl Drop for CaptureEncoder {
+    fn drop(&mut self) {
+        let _ = self.recorder.stop();
     }
 }
 
@@ -148,7 +212,8 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 
 #[cfg(test)]
 mod tests {
-    use super::fit_dimensions;
+    use super::{LatestFrame, fit_dimensions};
+    use std::time::Duration;
 
     #[test]
     fn preserves_aspect_ratio_and_even_dimensions() {
@@ -156,5 +221,14 @@ mod tests {
         let (width, height) = fit_dimensions(1921, 1081, 1920, 1080);
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
+    }
+
+    #[test]
+    fn capture_queue_replaces_obsolete_frames() {
+        let queue = LatestFrame::default();
+        assert!(queue.replace(xcap::Frame::new(1, 1, vec![1, 0, 0, 255])));
+        assert!(queue.replace(xcap::Frame::new(1, 1, vec![2, 0, 0, 255])));
+        let frame = queue.take(Duration::from_millis(1)).unwrap();
+        assert_eq!(frame.raw[0], 2);
     }
 }

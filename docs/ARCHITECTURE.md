@@ -60,14 +60,18 @@ states cannot transition back. One active session per device is enforced transac
 
 ## Media pipeline
 
-Each platform backend produces GPU-native frames when possible. A bounded latest-frame channel
-connects capture to the encoder: under pressure, old frames are dropped rather than accumulating
-latency. The encoder emits access units to the WebRTC RTP packetizer. Capture timestamps drive RTP
-timestamps. Keyframes are forced on join, display change, decoder request, and recovery.
+The portable backend keeps one long-lived native capture session open. xcap currently selects WGC
+on Windows and PipeWire on supported Wayland desktops, with platform fallbacks elsewhere. A
+dedicated forwarding thread replaces a single pending frame atomically: if capture outpaces
+encoding, obsolete frames are discarded rather than accumulated. RGBA frames are scaled and
+converted to I420 for bounded OpenH264 software encoding, then emitted directly to the WebRTC RTP
+packetizer. Decoder PLI/FIR feedback forces an IDR, with a two-second periodic IDR as a recovery
+backstop.
 
-Congestion control consumes WebRTC statistics and receiver feedback. A controller adjusts bitrate
-first, then resolution, then frame rate. It uses hysteresis to avoid oscillation and never allows
-encoder output to build an unbounded queue.
+The current portable encoder has a configured bitrate ceiling but does not yet adapt its bitrate
+dynamically from receiver estimates. Zero-copy GPU surfaces, hardware encoding, capture timestamps,
+and the documented bitrate/resolution/frame-rate hysteresis controller are native performance-path
+release gates, not properties claimed for the portable backend.
 
 Input uses an unordered, zero-retransmit channel for pointer motion and a reliable ordered channel
 for key/button transitions and lifecycle messages. Pointer motion is coalesced; key-up and button-up
