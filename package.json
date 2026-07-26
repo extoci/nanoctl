@@ -14,14 +14,15 @@
     "build:web": "bun --filter @nanoctl/web build",
     "build:sites": "bun run scripts/production-preflight.ts && bun run --cwd apps/web build:cloudflare && bun run scripts/stage-sites.ts",
     "build:agent": "bun run scripts/cargo.ts build --release --features media",
-    "check": "bun run fmt:check && bun run lint && bun run typecheck && bun run typecheck:convex && bun run test && bun run test:agent",
+    "check": "bun run fmt:check && bun run lint && bun run typecheck && bun run typecheck:convex && bun run test && bun run test:convex && bun run test:agent",
     "fmt": "oxfmt --write .",
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
     "audit": "bun audit --audit-level high",
     "typecheck": "node node_modules/@typescript/native/bin/tsc --build",
     "typecheck:convex": "bun --cwd apps/web tsc -p convex/tsconfig.json",
-    "test": "bun test apps packages scripts",
+    "test": "bun test apps packages scripts --path-ignore-patterns '**/*.convex.test.ts'",
+    "test:convex": "vitest run",
     "test:browser": "playwright test -c tests/browser/playwright.config.ts",
     "test:agent": "bun run scripts/cargo.ts test --features rtc",
     "evidence:media": "bun run scripts/verify-media-evidence.ts",
@@ -29,13 +30,17 @@
     "clean": "bun run scripts/clean.ts"
   },
   "devDependencies": {
+    "@edge-runtime/vm": "5.0.0",
     "@playwright/test": "1.62.0",
     "@types/bun": "1.3.14",
     "@types/node": "24.13.3",
     "@typescript/native": "npm:typescript@7.0.2",
+    "convex-test": "0.0.54",
     "oxfmt": "0.60.0",
     "oxlint": "1.75.0",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
   },
   "overrides": {
     "brace-expansion": "5.0.8",
