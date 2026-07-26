@@ -101,13 +101,14 @@ try {
     -UserId $currentUser `
     -LogonType Interactive `
     -RunLevel Limited
+  # Task Scheduler requires RestartOnFailure intervals of at least one minute.
   $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -MultipleInstances IgnoreNew `
     -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Seconds 30) `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable
   Register-ScheduledTask `
     -TaskName $taskName `

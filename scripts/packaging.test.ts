@@ -107,3 +107,11 @@ describe("one-command Linux installer", () => {
     expect(await Bun.file(join(home, ".config/systemd/user/nanoctl.service")).exists()).toBe(true);
   });
 });
+
+describe("one-command Windows installer", () => {
+  test("uses a Task Scheduler-compatible restart interval", async () => {
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    expect(installer).toContain("-RestartInterval (New-TimeSpan -Minutes 1)");
+    expect(installer).not.toContain("-RestartInterval (New-TimeSpan -Seconds");
+  });
+});
