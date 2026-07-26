@@ -88,9 +88,23 @@ and impairment configuration with the signed release record.
 ## Performance acceptance
 
 On reference hardware, sustain 1080p60 for 30 minutes without monotonic memory growth, queue growth,
-audio drift over 50 ms, or latency creep. Soak for eight hours at 1080p30. Measure idle resource use,
-first-frame latency, input-to-photon using a high-speed camera, and quality under constrained
-bandwidth. Averages cannot hide p95/p99 stalls.
+or latency creep. Soak for eight hours at 1080p30. Measure idle resource use, first-frame latency,
+input-to-photon using a high-speed camera, and quality under constrained bandwidth. Averages cannot
+hide p95/p99 stalls. System audio is explicitly outside protocol v1, so audio drift is not a v1
+acceptance metric.
+
+Collect both profiles on all six OS/architecture targets and validate the 12-record set:
+
+```shell
+bun run evidence:performance -- evidence/performance/*.json
+```
+
+The `interactive-1080p60` profile requires at least 30 minutes and 54 average FPS; the
+`soak-1080p30` profile requires eight hours and 27 average FPS. Both require at least 1920×1080,
+bounded one-frame capture and encode queues, finite first-frame/frame-time/input-to-photon/RSS
+metrics, consistent agent and web versions, and an explicit finding that monotonic memory growth was
+not observed. Preserve the time series used to reach that finding; the summary verifier cannot
+detect a dishonest or statistically weak measurement.
 
 Run the native capture/encoder gate from the signed candidate on every physical host:
 
