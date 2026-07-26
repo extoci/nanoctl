@@ -12,7 +12,7 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 
 use crate::{
     config::{AgentConfig, IceTransport},
-    control_plane::ControlPlane,
+    control_plane::{ControlPlane, SessionPollError},
     credential,
 };
 
@@ -91,10 +91,27 @@ pub async fn run(config: AgentConfig) -> Result<()> {
                             );
                         }
                     }
-                    Err(error) => warn!(error = %redact(&error), "session poll failed"),
+                    Err(SessionPollError::Revoked) => {
+                        #[cfg(feature = "rtc")]
+                        close_all_sessions(&mut active_sessions).await;
+                        info!("agent credential revoked; service stopped");
+                        return Ok(());
+                    }
+                    Err(SessionPollError::Request(error)) => {
+                        warn!(error = %redact(&error), "session poll failed");
+                    }
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "rtc")]
+async fn close_all_sessions(active: &mut HashMap<String, ActiveSession>) {
+    for (_, session) in active.drain() {
+        #[cfg(feature = "media")]
+        session.media_task.abort();
+        let _ = session.peer.close().await;
     }
 }
 

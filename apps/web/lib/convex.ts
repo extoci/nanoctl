@@ -25,6 +25,15 @@ export const functions = {
     ),
   },
   sessions: {
+    getState: makeFunctionReference<
+      "query",
+      { sessionId: string },
+      {
+        state: "requested" | "ringing" | "negotiating" | "connected" | "ended" | "failed";
+        expiresAt: number;
+        endReason?: string;
+      }
+    >("sessions:getState"),
     create: makeFunctionReference<
       "mutation",
       { deviceId: string },

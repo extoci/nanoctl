@@ -24,6 +24,29 @@ pub struct SessionList {
     pub sessions: Vec<PendingSession>,
 }
 
+#[derive(Debug)]
+pub enum SessionPollError {
+    Revoked,
+    Request(anyhow::Error),
+}
+
+impl std::fmt::Display for SessionPollError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Revoked => formatter.write_str("agent credential was revoked"),
+            Self::Request(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SessionPollError {}
+
+impl From<anyhow::Error> for SessionPollError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Request(error)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingSession {
@@ -108,16 +131,28 @@ impl ControlPlane {
         Ok(())
     }
 
-    pub async fn sessions(&self, token: &Zeroizing<String>) -> Result<SessionList> {
-        self.client
+    pub async fn sessions(
+        &self,
+        token: &Zeroizing<String>,
+    ) -> std::result::Result<SessionList, SessionPollError> {
+        let response = self
+            .client
             .get(self.endpoint("/v1/agent/sessions")?)
             .bearer_auth(token.as_str())
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(SessionPollError::Request)?;
+        if credential_was_rejected(response.status()) {
+            return Err(SessionPollError::Revoked);
+        }
+        response
+            .error_for_status()
+            .map_err(anyhow::Error::from)?
             .json()
             .await
             .context("invalid session response")
+            .map_err(SessionPollError::Request)
     }
 
     #[cfg(feature = "rtc")]
@@ -171,5 +206,23 @@ impl ControlPlane {
         self.base_url
             .join(path)
             .context("invalid control-plane URL")
+    }
+}
+
+fn credential_was_rejected(status: StatusCode) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credential_was_rejected;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn distinguishes_revocation_from_retryable_control_plane_failures() {
+        assert!(credential_was_rejected(StatusCode::UNAUTHORIZED));
+        assert!(credential_was_rejected(StatusCode::FORBIDDEN));
+        assert!(!credential_was_rejected(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!credential_was_rejected(StatusCode::SERVICE_UNAVAILABLE));
     }
 }

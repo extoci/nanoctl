@@ -14,6 +14,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
   const getTurnCredentials = useAction(functions.sessions.turnCredentials);
+  const session = useQuery(functions.sessions.getState, { sessionId });
   const incoming = useQuery(functions.signals.list, {
     sessionId,
     afterSequence: -1,
@@ -21,6 +22,18 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const [status, setStatus] = useState("Negotiating");
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
   const [ending, setEnding] = useState(false);
+
+  useEffect(() => {
+    if (!session) return;
+    if (
+      session.state === "ended" ||
+      session.state === "failed" ||
+      session.expiresAt <= Date.now()
+    ) {
+      setStatus(session.endReason ? `ended: ${session.endReason}` : session.state);
+      peerRef.current?.close();
+    }
+  }, [session]);
 
   async function leaveSession() {
     if (ending) return;

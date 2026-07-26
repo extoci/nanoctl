@@ -68,16 +68,39 @@ export const remove = mutation({
     const identity = await requireIdentity(ctx);
     const device = await ctx.db.get(args.deviceId);
     if (!device || device.ownerId !== identity.subject) throw new ConvexError("Device not found");
+    const now = Date.now();
     await ctx.db.patch(args.deviceId, {
       status: "disabled",
-      disabledAt: Date.now(),
+      disabledAt: now,
       tokenHash: `revoked:${device.tokenHash}`,
     });
+    for (const state of ["requested", "ringing", "negotiating", "connected"] as const) {
+      const sessions = await ctx.db
+        .query("sessions")
+        .withIndex("by_device_state", (q) => q.eq("deviceId", args.deviceId).eq("state", state))
+        .collect();
+      for (const session of sessions) {
+        await ctx.db.patch(session._id, {
+          state: "ended",
+          endedAt: now,
+          updatedAt: now,
+          endReason: "device revoked",
+        });
+        await ctx.db.insert("auditEvents", {
+          ownerId: identity.subject,
+          deviceId: args.deviceId,
+          sessionId: session._id,
+          action: "session.ended",
+          detail: "device revoked",
+          createdAt: now,
+        });
+      }
+    }
     await ctx.db.insert("auditEvents", {
       ownerId: identity.subject,
       deviceId: args.deviceId,
       action: "device.revoked",
-      createdAt: Date.now(),
+      createdAt: now,
     });
     return null;
   },

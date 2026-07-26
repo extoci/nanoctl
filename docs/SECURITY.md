@@ -27,10 +27,12 @@ subject validation by Convex. Client-side identity fields never make authorizati
 Because Shoo labels itself “super early WIP,” all Shoo-specific code stays behind one adapter. A
 production deployment must monitor issuer/JWKS availability and have a documented migration path.
 
-Enrollment codes contain about 40 bits of random entropy, expire after ten minutes, and are consumed
+Enrollment codes contain 100 bits of random entropy, expire after ten minutes, and are consumed
 atomically. The endpoint is additionally rate-limited at the edge. The resulting agent token is 256
 random bits, returned once over TLS, stored in the OS credential facility, and represented in Convex
-only by SHA-256. Revocation changes the indexed hash so subsequent calls fail.
+only by SHA-256. Revocation changes the indexed hash, ends active session records in the same
+transaction, closes the browser peer reactively, and causes the agent to close all peers and stop
+when its next bounded session poll is rejected.
 
 Session authorization is `(owner subject, device id, session id, expiry, role)`. IDs alone are never
 capabilities. Signal sequence numbers are scoped by sender. Replays are ignored. SDP, candidates,

@@ -98,6 +98,7 @@ and lints. The privileged media path does not embed a JavaScript runtime.
 - Capture revoked/locked: video pauses and a typed status travels over reliable control.
 - Encoder fails: one bounded restart, then session terminates with diagnostics.
 - Data channel closes: all injected input is released immediately.
-- Token revoked: next agent call stops new sessions; current session ends on policy notification or
-  deadline.
+- Token revoked: the revoke transaction ends active session records immediately; the browser closes
+  from the reactive state update, and the agent closes every peer on its next session poll (bounded
+  by `network.poll_milliseconds`) before exiting successfully.
 - TURN unavailable: direct paths still work; the UI reports reachability rather than spinning.

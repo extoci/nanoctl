@@ -1,9 +1,24 @@
 import { ConvexError, v } from "convex/values";
-import { action, internalQuery, mutation } from "./_generated/server";
+import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { requireIdentity } from "./lib";
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
+
+export const getState = query({
+  args: { sessionId: v.id("sessions") },
+  handler: async (ctx, args) => {
+    const identity = await requireIdentity(ctx);
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.ownerId !== identity.subject)
+      throw new ConvexError("Session not found");
+    return {
+      state: session.state,
+      expiresAt: session.expiresAt,
+      endReason: session.endReason,
+    };
+  },
+});
 
 export const create = mutation({
   args: { deviceId: v.id("devices") },
