@@ -7,6 +7,9 @@ import "./styles.css";
 export const metadata: Metadata = {
   title: "nanoctl",
   description: "Fast, secure remote access to your computers.",
+  icons: {
+    icon: [{ url: "/favicon.svg", type: "image/svg+xml" }],
+  },
 };
 
 export default async function RootLayout({

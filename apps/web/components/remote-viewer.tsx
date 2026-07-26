@@ -501,6 +501,7 @@ export function RemoteViewerCore({
     <main className="viewer">
       <div className="viewer-bar">
         <a
+          className="viewer-back"
           href="/dashboard"
           onClick={(event) => {
             event.preventDefault();
