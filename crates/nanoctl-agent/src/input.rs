@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -13,6 +14,7 @@ pub struct InputController {
     height: u32,
     held_keys: HashSet<Key>,
     held_buttons: HashSet<Button>,
+    last_activity: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +70,7 @@ impl InputController {
             height: monitor.height()?,
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
+            last_activity: Instant::now(),
         })
     }
 
@@ -77,6 +80,7 @@ impl InputController {
         }
         let message: ControlMessage =
             serde_json::from_slice(bytes).context("control message is invalid")?;
+        self.last_activity = Instant::now();
         match message {
             ControlMessage::Pointer {
                 action,
@@ -155,12 +159,20 @@ impl InputController {
         Ok(())
     }
 
-    fn release_all(&mut self) {
+    pub fn release_all(&mut self) {
         for key in self.held_keys.drain() {
             let _ = self.enigo.key(key, Direction::Release);
         }
         for button in self.held_buttons.drain() {
             let _ = self.enigo.button(button, Direction::Release);
+        }
+    }
+
+    pub fn release_if_idle(&mut self, timeout: Duration) {
+        if self.last_activity.elapsed() >= timeout
+            && (!self.held_keys.is_empty() || !self.held_buttons.is_empty())
+        {
+            self.release_all();
         }
     }
 }

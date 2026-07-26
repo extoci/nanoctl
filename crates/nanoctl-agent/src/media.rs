@@ -11,7 +11,8 @@ use openh264::formats::{RgbSliceU8, YUVBuffer};
 use xcap::Monitor;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::TrySendError;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -75,16 +76,12 @@ impl CaptureEncoder {
         let stream = self.encoder.encode(&yuv).context("H.264 encode failed")?;
         Ok(EncodedFrame {
             bytes: stream.to_vec(),
-            width,
-            height,
         })
     }
 }
 
 pub struct EncodedFrame {
     pub bytes: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
 }
 
 pub fn spawn_video(
@@ -98,10 +95,22 @@ pub fn spawn_video(
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<EncodedFrame>(1);
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut encoder = CaptureEncoder::primary(max_bitrate_kbps, max_fps)?;
-            while sender
-                .blocking_send(encoder.next_access_unit(max_width, max_height)?)
-                .is_ok()
-            {}
+            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(max_fps));
+            let mut next_frame = Instant::now();
+            loop {
+                let now = Instant::now();
+                if now < next_frame {
+                    std::thread::sleep(next_frame - now);
+                }
+                // Advance from the actual clock when capture/encode overruns. This prevents a burst
+                // of catch-up frames after a slow encode or a suspended machine.
+                next_frame = Instant::now() + frame_interval;
+                let frame = encoder.next_access_unit(max_width, max_height)?;
+                match sender.try_send(frame) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Closed(_)) => break,
+                }
+            }
             Ok(())
         });
         let duration = Duration::from_secs_f64(1.0 / f64::from(max_fps));

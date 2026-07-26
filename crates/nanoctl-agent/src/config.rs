@@ -31,6 +31,7 @@ pub struct QualityConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     pub ice_transport: IceTransport,
+    pub stun_urls: Vec<String>,
     pub heartbeat_seconds: u64,
     pub poll_milliseconds: u64,
 }
@@ -99,6 +100,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             ice_transport: IceTransport::All,
+            stun_urls: vec!["stun:stun.cloudflare.com:3478".into()],
             heartbeat_seconds: 15,
             poll_milliseconds: 750,
         }
@@ -109,7 +111,7 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             system_audio: false,
-            clipboard: true,
+            clipboard: false,
             remote_input: true,
         }
     }
@@ -181,6 +183,25 @@ impl AgentConfig {
         if !(250..=10_000).contains(&self.network.poll_milliseconds) {
             bail!("network.poll_milliseconds must be between 250 and 10000");
         }
+        if self.network.stun_urls.len() > 8 {
+            bail!("network.stun_urls cannot contain more than 8 endpoints");
+        }
+        for endpoint in &self.network.stun_urls {
+            if endpoint.len() > 512
+                || !(endpoint.starts_with("stun:") || endpoint.starts_with("stuns:"))
+            {
+                bail!("network.stun_urls entries must use stun: or stuns:");
+            }
+        }
+        if self.features.system_audio || self.features.clipboard {
+            bail!("system audio and clipboard are reserved and unavailable in protocol v1");
+        }
+        if !matches!(
+            self.quality.codec,
+            CodecPreference::Auto | CodecPreference::H264
+        ) {
+            bail!("this v1 build supports only quality.codec = auto or h264");
+        }
         Ok(())
     }
 
@@ -229,5 +250,27 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_v1_features() {
+        let mut config = AgentConfig::default();
+        config.features.clipboard = true;
+        assert!(config.validate().is_err());
+        config.features.clipboard = false;
+        config.features.system_audio = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_stun_endpoints_and_supported_codec() {
+        let mut config = AgentConfig::default();
+        config.network.stun_urls = vec!["https://not-an-ice-server.example".into()];
+        assert!(config.validate().is_err());
+        config.network.stun_urls = vec!["stuns:turn.example.test:5349".into()];
+        config.quality.codec = CodecPreference::Av1;
+        assert!(config.validate().is_err());
+        config.quality.codec = CodecPreference::H264;
+        assert!(config.validate().is_ok());
     }
 }

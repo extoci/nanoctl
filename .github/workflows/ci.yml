@@ -59,7 +59,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            clang libdbus-1-dev libgbm-dev libpipewire-0.3-dev \
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev \
             nasm pkg-config
       - run: bun run scripts/cargo.ts clippy --all-targets --features media -- -D warnings

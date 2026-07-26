@@ -165,14 +165,17 @@ fn input_check() -> DoctorCheck {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(not(feature = "media"))]
 fn platform_capture_guidance() -> &'static str {
     "backend requires PipeWire portal or X11 session probe"
 }
 #[cfg(target_os = "windows")]
+#[cfg(not(feature = "media"))]
 fn platform_capture_guidance() -> &'static str {
     "backend requires interactive Windows.Graphics.Capture probe"
 }
 #[cfg(target_os = "macos")]
+#[cfg(not(feature = "media"))]
 fn platform_capture_guidance() -> &'static str {
     "grant Screen Recording permission, then rerun doctor"
 }

@@ -109,18 +109,50 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       if (channel.readyState === "open") channel.send(JSON.stringify(payload));
     }
     const video = videoRef.current;
+    const normalizedPosition = (event: MouseEvent) => {
+      if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
+      const rect = video.getBoundingClientRect();
+      const sourceRatio = video.videoWidth / video.videoHeight;
+      const elementRatio = rect.width / rect.height;
+      const renderedWidth = sourceRatio > elementRatio ? rect.width : rect.height * sourceRatio;
+      const renderedHeight = sourceRatio > elementRatio ? rect.width / sourceRatio : rect.height;
+      const left = rect.left + (rect.width - renderedWidth) / 2;
+      const top = rect.top + (rect.height - renderedHeight) / 2;
+      return {
+        x: Math.max(0, Math.min(1, (event.clientX - left) / renderedWidth)),
+        y: Math.max(0, Math.min(1, (event.clientY - top) / renderedHeight)),
+      };
+    };
     const pointer = (event: PointerEvent) => {
       if (!video) return;
-      const rect = video.getBoundingClientRect();
+      const position = normalizedPosition(event);
+      if (!position) return;
+      if (event.type === "pointerdown") {
+        event.preventDefault();
+        video.focus();
+        video.setPointerCapture(event.pointerId);
+      }
       sendControl({
         type: "pointer",
         action:
           event.type === "pointermove" ? "move" : event.type === "pointerdown" ? "down" : "up",
-        x: (event.clientX - rect.left) / rect.width,
-        y: (event.clientY - rect.top) / rect.height,
+        ...position,
         button: event.button === 1 || event.button === 2 ? event.button : 0,
       });
     };
+    const wheel = (event: WheelEvent) => {
+      const position = normalizedPosition(event);
+      if (!position) return;
+      event.preventDefault();
+      sendControl({
+        type: "pointer",
+        action: "wheel",
+        ...position,
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+      });
+    };
+    const contextMenu = (event: MouseEvent) => event.preventDefault();
     const key = (event: KeyboardEvent) => {
       event.preventDefault();
       sendControl({
@@ -139,8 +171,11 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     video?.addEventListener("pointermove", pointer);
     video?.addEventListener("pointerdown", pointer);
     video?.addEventListener("pointerup", pointer);
+    video?.addEventListener("wheel", wheel, { passive: false });
+    video?.addEventListener("contextmenu", contextMenu);
     video?.addEventListener("keydown", key);
     video?.addEventListener("keyup", key);
+    const keepalive = window.setInterval(() => sendControl({ type: "ping" }), 1_000);
 
     void (async () => {
       const offer = await peer.createOffer();
@@ -162,8 +197,11 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       video?.removeEventListener("pointermove", pointer);
       video?.removeEventListener("pointerdown", pointer);
       video?.removeEventListener("pointerup", pointer);
+      video?.removeEventListener("wheel", wheel);
+      video?.removeEventListener("contextmenu", contextMenu);
       video?.removeEventListener("keydown", key);
       video?.removeEventListener("keyup", key);
+      window.clearInterval(keepalive);
       pointerChannel.close();
       controlChannel.close();
       peer.close();

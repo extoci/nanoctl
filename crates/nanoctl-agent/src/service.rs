@@ -5,8 +5,16 @@ use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use anyhow::{Context, Result};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
+#[cfg(feature = "rtc")]
+use webrtc::ice_transport::ice_server::RTCIceServer;
+#[cfg(feature = "rtc")]
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 
-use crate::{config::AgentConfig, control_plane::ControlPlane, credential};
+use crate::{
+    config::{AgentConfig, IceTransport},
+    control_plane::ControlPlane,
+    credential,
+};
 
 pub async fn run(config: AgentConfig) -> Result<()> {
     let device_id = config
@@ -148,7 +156,15 @@ async fn reconcile_sessions(
                 signal.sender == "controller" && signal.envelope.contains(r#""type":"offer""#)
             });
             let Some(offer) = offer else { continue };
-            let ice_servers = match client
+            let mut ice_servers = if _config.network.stun_urls.is_empty() {
+                Vec::new()
+            } else {
+                vec![RTCIceServer {
+                    urls: _config.network.stun_urls.clone(),
+                    ..Default::default()
+                }]
+            };
+            match client
                 .turn_credentials(token.as_ref(), &session.session_id)
                 .await
             {
@@ -158,24 +174,44 @@ async fn reconcile_sessions(
                             session_id = session.session_id,
                             "received expired TURN credentials"
                         );
-                        Vec::new()
+                        if matches!(_config.network.ice_transport, IceTransport::Relay) {
+                            warn!(
+                                session_id = session.session_id,
+                                "relay-only session has no valid TURN credentials"
+                            );
+                            continue;
+                        }
                     } else {
-                        vec![webrtc::ice_transport::ice_server::RTCIceServer {
+                        ice_servers.push(RTCIceServer {
                             urls: turn.urls,
                             username: turn.username,
                             credential: turn.credential,
-                        }]
+                        });
                     }
                 }
-                Ok(None) => Vec::new(),
+                Ok(None) => {
+                    if matches!(_config.network.ice_transport, IceTransport::Relay) {
+                        warn!(
+                            session_id = session.session_id,
+                            "relay-only session cannot start because TURN is not configured"
+                        );
+                        continue;
+                    }
+                }
                 Err(error) => {
                     warn!(
                         session_id = session.session_id,
                         error = %redact(&error),
                         "TURN credentials unavailable; trying direct ICE"
                     );
-                    Vec::new()
+                    if matches!(_config.network.ice_transport, IceTransport::Relay) {
+                        continue;
+                    }
                 }
+            }
+            let ice_transport_policy = match _config.network.ice_transport {
+                IceTransport::All => RTCIceTransportPolicy::All,
+                IceTransport::Relay => RTCIceTransportPolicy::Relay,
             };
             match crate::rtc::HostPeer::answer(
                 client.clone(),
@@ -183,6 +219,7 @@ async fn reconcile_sessions(
                 session.session_id.clone(),
                 &offer.envelope,
                 ice_servers,
+                ice_transport_policy,
                 _config.features.remote_input,
             )
             .await

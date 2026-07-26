@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+#[cfg(feature = "media")]
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,7 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -93,6 +96,7 @@ impl HostPeer {
         session_id: String,
         serialized_offer: &str,
         ice_servers: Vec<RTCIceServer>,
+        ice_transport_policy: RTCIceTransportPolicy,
         allow_remote_input: bool,
     ) -> Result<Self> {
         let offer = parse_offer(serialized_offer, &session_id)?;
@@ -104,35 +108,57 @@ impl HostPeer {
         let peer = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
+                ice_transport_policy,
                 ..Default::default()
             })
             .await?,
         );
         #[cfg(feature = "media")]
-        peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
-            Box::pin(async move {
-                if !matches!(
-                    channel.label().as_str(),
-                    "nanoctl.control.v1" | "nanoctl.pointer.v1"
-                ) || !allow_remote_input
-                {
-                    return;
-                }
-                let input = match crate::input::InputController::new() {
-                    Ok(input) => Arc::new(std::sync::Mutex::new(input)),
+        {
+            let input = if allow_remote_input {
+                match crate::input::InputController::new() {
+                    Ok(input) => Some(Arc::new(std::sync::Mutex::new(input))),
                     Err(error) => {
                         tracing::warn!(error = %error, "remote input is unavailable");
-                        return;
+                        None
                     }
-                };
+                }
+            } else {
+                None
+            };
+            if let Some(input) = &input {
+                let input = Arc::downgrade(input);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_millis(500));
+                    loop {
+                        interval.tick().await;
+                        let Some(input) = input.upgrade() else {
+                            break;
+                        };
+                        if let Ok(mut input) = input.lock() {
+                            input.release_if_idle(Duration::from_secs(2));
+                        }
+                    }
+                });
+            }
+            peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
+                let input = input.clone();
+                if !matches!(
+                    channel.label(),
+                    "nanoctl.control.v1" | "nanoctl.pointer.v1"
+                ) {
+                    return Box::pin(async {});
+                }
+                let message_input = input.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    let input = input.clone();
+                    let input = message_input.clone();
                     Box::pin(async move {
-                        if !message.is_string {
+                        if !message.is_string || input.is_none() {
                             return;
                         }
                         let result = tokio::task::spawn_blocking(move || {
                             input
+                                .expect("input availability checked")
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?
                                 .dispatch(&message.data)
@@ -143,8 +169,19 @@ impl HostPeer {
                         }
                     })
                 }));
-            })
-        }));
+                channel.on_close(Box::new(move || {
+                    let input = input.clone();
+                    Box::pin(async move {
+                        if let Some(input) = input {
+                            if let Ok(mut input) = input.lock() {
+                                input.release_all();
+                            }
+                        }
+                    })
+                }));
+                Box::pin(async {})
+            }));
+        }
         let video = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_owned(),
