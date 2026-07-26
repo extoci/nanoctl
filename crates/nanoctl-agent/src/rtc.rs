@@ -55,7 +55,9 @@ pub struct HostPeer {
 struct SignalEnvelope {
     version: u8,
     session_id: String,
+    sequence: u64,
     sender: String,
+    sent_at: u64,
     payload: SignalPayload,
 }
 
@@ -341,11 +343,21 @@ impl HostPeer {
         })
     }
 
-    pub async fn add_signal(&self, serialized: &str, expected_session: &str) -> Result<bool> {
+    pub async fn add_signal(
+        &self,
+        serialized: &str,
+        expected_session: &str,
+        expected_sequence: u64,
+    ) -> Result<bool> {
+        if serialized.len() > 1_100_000 {
+            anyhow::bail!("signal exceeds maximum size");
+        }
         let envelope: SignalEnvelope = serde_json::from_str(serialized)?;
         if envelope.version != PROTOCOL_VERSION
             || envelope.session_id != expected_session
+            || envelope.sequence != expected_sequence
             || envelope.sender != "controller"
+            || envelope.sent_at == 0
         {
             anyhow::bail!("signal identity does not match the session");
         }
@@ -355,6 +367,12 @@ impl HostPeer {
                 sdp_mid,
                 sdp_mline_index,
             } => {
+                if candidate.is_empty()
+                    || candidate.len() > 8_192
+                    || sdp_mid.as_ref().is_some_and(|value| value.len() > 256)
+                {
+                    anyhow::bail!("ICE candidate is invalid");
+                }
                 self.peer
                     .add_ice_candidate(RTCIceCandidateInit {
                         candidate,
@@ -367,6 +385,9 @@ impl HostPeer {
             }
             SignalPayload::IceComplete => Ok(true),
             SignalPayload::End { reason } => {
+                if reason.is_empty() || reason.len() > 512 {
+                    anyhow::bail!("end reason is invalid");
+                }
                 tracing::info!(reason = %reason, "controller ended session");
                 self.peer.close().await?;
                 Ok(false)
@@ -483,7 +504,9 @@ fn parse_offer(serialized: &str, expected_session: &str) -> Result<String> {
         serde_json::from_str(serialized).context("offer envelope is invalid")?;
     if envelope.version != PROTOCOL_VERSION
         || envelope.session_id != expected_session
+        || envelope.sequence != 0
         || envelope.sender != "controller"
+        || envelope.sent_at == 0
     {
         anyhow::bail!("offer identity does not match the session");
     }
@@ -518,6 +541,14 @@ mod tests {
     fn rejects_cross_session_offer() {
         let value = r#"{"version":1,"sessionId":"other","sequence":0,"sender":"controller","sentAt":1,"payload":{"type":"offer","sdp":"v=0"}}"#;
         assert!(parse_offer(value, "expected").is_err());
+    }
+
+    #[test]
+    fn rejects_noninitial_or_missing_timestamp_offer() {
+        let noninitial = r#"{"version":1,"sessionId":"session","sequence":7,"sender":"controller","sentAt":1,"payload":{"type":"offer","sdp":"v=0"}}"#;
+        let missing_timestamp = r#"{"version":1,"sessionId":"session","sequence":0,"sender":"controller","sentAt":0,"payload":{"type":"offer","sdp":"v=0"}}"#;
+        assert!(parse_offer(noninitial, "session").is_err());
+        assert!(parse_offer(missing_timestamp, "session").is_err());
     }
 
     #[test]

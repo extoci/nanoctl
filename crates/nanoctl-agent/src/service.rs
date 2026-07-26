@@ -339,7 +339,7 @@ async fn reconcile_sessions(
             }
             if let Err(error) = active_session
                 .peer
-                .add_signal(&signal.envelope, &session.session_id)
+                .add_signal(&signal.envelope, &session.session_id, signal.sequence)
                 .await
             {
                 warn!(
