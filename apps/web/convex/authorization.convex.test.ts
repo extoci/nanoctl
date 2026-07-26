@@ -273,6 +273,41 @@ describe("control-plane authorization", () => {
     ).toBe(false);
   });
 
+  test("surfaces the agent's terminal negotiation reason", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const envelope = (sender: "controller" | "host", payload: Record<string, unknown>) =>
+      JSON.stringify({
+        version: 1,
+        sessionId,
+        sequence: 0,
+        sender,
+        sentAt: Date.now(),
+        payload,
+      });
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: envelope("controller", { type: "offer", sdp: "v=0" }),
+    });
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 0,
+        envelope: envelope("host", {
+          type: "end",
+          reason: "agent could not initialize the remote desktop session",
+        }),
+      }),
+    ).toBe(true);
+    await expect(owner.query(api.sessions.getState, { sessionId })).resolves.toMatchObject({
+      state: "failed",
+      endReason: "agent could not initialize the remote desktop session",
+    });
+  });
+
   test("denies cross-owner session reads, ending, host signals, and TURN authorization", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");

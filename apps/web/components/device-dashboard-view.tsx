@@ -193,7 +193,9 @@ export function DeviceDashboardView({
                 <button
                   className="primary connect"
                   type="button"
-                  disabled={device.status !== "online" || !device.ready || busyDevice === device._id}
+                  disabled={
+                    device.status !== "online" || !device.ready || busyDevice === device._id
+                  }
                   onClick={() => void connect(device._id)}
                 >
                   {busyDevice === device._id ? "Working…" : "Connect"}

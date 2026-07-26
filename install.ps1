@@ -117,17 +117,30 @@ try {
     -Settings $settings `
     -Description "nanoctl remote desktop agent for the current desktop user." | Out-Null
   Start-ScheduledTask -TaskName $taskName
+  Start-Sleep -Seconds 2
+  $startedTask = Get-ScheduledTask -TaskName $taskName
+  if ($startedTask.State -ne "Running") {
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
+    throw "The nanoctl agent did not stay running (task result: $($taskInfo.LastTaskResult)). Run '$binaryPath doctor' for diagnostics."
+  }
 
   $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
   $pathEntries = @($userPath -split ";" | Where-Object { $_ })
   if ($pathEntries -notcontains $installRoot) {
     $newPath = (@($pathEntries) + $installRoot) -join ";"
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+  }
+  # Persistent environment changes are inherited only by new Windows processes. Always update the
+  # PowerShell process running the installer too, including when this is a reinstall and the
+  # persistent user PATH entry already exists.
+  $processPathEntries = @($env:Path -split ";" | Where-Object { $_ })
+  if ($processPathEntries -notcontains $installRoot) {
     $env:Path = "$installRoot;$env:Path"
   }
 
   Write-Host ""
   Write-Host "nanoctl is installed, enrolled, and running."
+  Write-Host "nanoctl is available in this PowerShell session and in newly opened terminals."
   Write-Host "Run this installer again at any time to update."
 }
 finally {

@@ -101,7 +101,13 @@ export type SignalKind = "offer" | "answer" | "ice-candidate" | "ice-complete" |
 export function parseSignalEnvelope(
   value: string,
   expectedSender: "controller" | "host",
-): { sessionId: string; sender: "controller" | "host"; sequence: number; kind: SignalKind } {
+): {
+  sessionId: string;
+  sender: "controller" | "host";
+  sequence: number;
+  kind: SignalKind;
+  reason?: string;
+} {
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
@@ -153,6 +159,7 @@ export function parseSignalEnvelope(
     sender: expectedSender,
     sequence: Number(envelope.sequence),
     kind: kind as SignalKind,
+    reason: kind === "end" ? String(fields.reason) : undefined,
   };
 }
 

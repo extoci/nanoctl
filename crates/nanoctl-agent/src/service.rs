@@ -358,6 +358,20 @@ async fn reconcile_sessions(
                         error = %redact(&error),
                         "session negotiation failed"
                     );
+                    if let Err(publish_error) = crate::rtc::report_negotiation_failure(
+                        client,
+                        token.as_ref(),
+                        &session.session_id,
+                        "agent could not initialize the remote desktop session",
+                    )
+                    .await
+                    {
+                        warn!(
+                            session_id = session.session_id,
+                            error = %redact(&publish_error),
+                            "could not publish terminal negotiation status"
+                        );
+                    }
                     continue;
                 }
             }

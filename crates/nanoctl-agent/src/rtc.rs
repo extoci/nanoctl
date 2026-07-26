@@ -649,6 +649,21 @@ fn serialize(session_id: &str, sequence: u64, payload: OutgoingPayload) -> Resul
     })?)
 }
 
+pub async fn report_negotiation_failure(
+    control_plane: &ControlPlane,
+    token: &Zeroizing<String>,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    // Sequence zero is otherwise reserved for the initial answer. If peer construction fails there
+    // is no answer, so it is also the only host sequence that can have been published.
+    let reason = reason.chars().take(256).collect::<String>();
+    let envelope = serialize(session_id, 0, OutgoingPayload::End { reason })?;
+    control_plane
+        .send_signal(token, session_id, 0, &envelope)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +698,25 @@ mod tests {
         let value = serialize("session", 3, OutgoingPayload::IceComplete).unwrap();
         assert!(value.contains(r#""sender":"host""#));
         assert!(value.contains(r#""sequence":3"#));
+    }
+
+    #[test]
+    fn serializes_bounded_terminal_negotiation_reason() {
+        let value = serialize(
+            "session",
+            0,
+            OutgoingPayload::End {
+                reason: "agent could not initialize the remote desktop session".to_owned(),
+            },
+        )
+        .unwrap();
+        let envelope: Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(envelope["sequence"], 0);
+        assert_eq!(envelope["payload"]["type"], "end");
+        assert_eq!(
+            envelope["payload"]["reason"],
+            "agent could not initialize the remote desktop session"
+        );
     }
 
     #[test]

@@ -42,6 +42,8 @@ type ViewerOperations = {
   } | null>;
 };
 
+const NEGOTIATION_TIMEOUT_MS = 30_000;
+
 export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
@@ -169,6 +171,7 @@ export function RemoteViewerCore({
       if (stream && videoRef.current) videoRef.current.srcObject = stream;
     };
     let restartTimer: number | null = null;
+    let negotiationTimer: number | null = null;
     let offerInFlight = false;
     const sendOffer = async (iceRestart: boolean) => {
       if (offerInFlight || peer.signalingState === "closed") return;
@@ -187,6 +190,18 @@ export function RemoteViewerCore({
             payload: { type: "offer", sdp: offer.sdp ?? "" },
           }),
         });
+        if (!iceRestart && negotiationTimer === null) {
+          negotiationTimer = window.setTimeout(() => {
+            negotiationTimer = null;
+            if (peer.connectionState === "connected" || peer.signalingState === "closed") return;
+            setStatus("failed: host did not answer");
+            peer.close();
+            void endSession({
+              sessionId,
+              reason: "host did not answer within 30 seconds",
+            }).catch(() => {});
+          }, NEGOTIATION_TIMEOUT_MS);
+        }
       } finally {
         offerInFlight = false;
       }
@@ -208,6 +223,8 @@ export function RemoteViewerCore({
       const state = peer.connectionState;
       if (state === "connected") {
         restartAttemptsRef.current = 0;
+        if (negotiationTimer !== null) window.clearTimeout(negotiationTimer);
+        negotiationTimer = null;
         if (restartTimer !== null) window.clearTimeout(restartTimer);
         restartTimer = null;
       } else if (state === "disconnected" && restartTimer === null) {
@@ -475,6 +492,7 @@ export function RemoteViewerCore({
       window.clearInterval(keepalive);
       window.clearInterval(statsTimer);
       if (restartTimer !== null) window.clearTimeout(restartTimer);
+      if (negotiationTimer !== null) window.clearTimeout(negotiationTimer);
       pointerChannel.close();
       controlChannel.close();
       peer.close();

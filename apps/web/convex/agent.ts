@@ -170,18 +170,19 @@ export const sendSignal = internalMutation({
         });
       } else if (parsed.kind === "end") {
         const now = Date.now();
+        const reason = parsed.reason?.slice(0, 256) ?? "agent media pipeline failed";
         await ctx.db.patch(sessionId, {
           state: "failed",
           endedAt: now,
           updatedAt: now,
-          endReason: "agent media pipeline failed",
+          endReason: reason,
         });
         await ctx.db.insert("auditEvents", {
           ownerId: session.ownerId,
           deviceId: session.deviceId,
           sessionId,
           action: "session.failed",
-          detail: "agent media pipeline failed",
+          detail: reason,
           createdAt: now,
         });
       }
