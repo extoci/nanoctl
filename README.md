@@ -44,6 +44,8 @@ cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- run
 
 Run all repository checks with `bun run check`.
 
+Host registration and removal instructions are in [docs/SETUP.md](docs/SETUP.md).
+
 ## Security posture
 
 nanoctl is designed for device-owner-authorized access. It does not hide its installation, bypass

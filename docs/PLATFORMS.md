@@ -2,38 +2,38 @@
 
 ## Windows
 
-Target Windows 11. Capture uses Windows.Graphics.Capture with Desktop Duplication fallback for
-supported session types. Prefer D3D11 textures through Media Foundation hardware encoders to avoid
-GPU-to-CPU copies. Input uses SendInput in the interactive user session. The service supervisor and
-per-user capture process communicate over an ACL-protected named pipe; Session 0 cannot directly
-capture the user desktop.
+Target Windows 11. The portable v1 backend uses xcap for interactive-session capture, OpenH264 for
+the browser-compatible baseline stream, and enigo's Windows input backend. The release performance
+path is Windows.Graphics.Capture/D3D11 into Media Foundation without a GPU-to-CPU copy; that path
+must not be advertised until its physical release gate passes.
 
-The MSI installs the supervisor, registers automatic delayed start and recovery, and adds no public
-firewall listener. The per-user bootstrap explains capture permission/readiness. UAC secure desktop
-and Windows sign-in screens remain inaccessible.
+The current package registration is a headless per-user Scheduled Task because Session 0 cannot
+capture the user desktop or use the enrolling user's Credential Manager entry. A future
+supervisor/helper split may add a LocalSystem supervisor, but the capture/input process must remain
+in the authorized user session. UAC secure desktop and Windows sign-in screens remain inaccessible.
 
 ## macOS
 
-Target macOS 14+. ScreenCaptureKit provides displays/windows and system audio where available.
-VideoToolbox provides low-latency H.264/HEVC-family hardware primitives, but v1 sends browser-safe
-H.264. CGEvent injection requires Accessibility permission. ScreenCaptureKit requires Screen
-Recording permission. The signed/notarized package installs a LaunchDaemon plus a LaunchAgent
-because TCC permission is tied to an interactive code identity/session.
+Target macOS 14+. The portable backend uses xcap, OpenH264, and enigo. The release performance path
+is ScreenCaptureKit into VideoToolbox, but it must not be advertised until the signed physical gate
+passes. Input requires Accessibility and capture requires Screen Recording permission. The current
+package installs a LaunchAgent because TCC permission is tied to an interactive code
+identity/session.
 
 The setup tool opens the correct System Settings pages and verifies grants. It cannot click consent
 for the user. Fast user switching and lock behavior are tested explicitly.
 
 ## Linux
 
-Wayland capture uses xdg-desktop-portal + PipeWire; input uses RemoteDesktop portal where the
-compositor supports it. Portal restore tokens are stored as non-secret configuration and may still
-require renewed consent. Hardware encoding prefers VA-API, then platform-specific alternatives, then
-bounded software x264.
+The portable backend uses xcap's compositor/X11 facilities, bounded OpenH264 software encoding, and
+enigo input where the session permits it. The release performance path uses
+xdg-desktop-portal/PipeWire with VA-API, and RemoteDesktop portal input where supported. Portal
+restore tokens are non-secret configuration and may still require renewed consent.
 
-X11 capture uses XDamage/XShm and input uses XTest. X11 cannot provide strong per-application input
-isolation, so the diagnostics and UI label it as a weaker environment. A systemd system service
-supervises a user-session process over a protected Unix socket. Supported reference desktops are
-GNOME and KDE on current distributions; other compositors may be view-only.
+X11 cannot provide strong per-application input isolation, so diagnostics must label it as a weaker
+environment. The current package is a hardened systemd user service so capture, input, and the
+credential store share the enrolled graphical identity. Supported reference desktops are GNOME and
+KDE on current distributions; other compositors may be view-only.
 
 ## Packaging contract
 

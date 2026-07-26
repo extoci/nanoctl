@@ -52,6 +52,10 @@ enum Command {
     },
     /// Print the effective redacted configuration.
     Config,
+    /// Print the configuration path used by this invocation.
+    Paths,
+    /// Delete this computer's local device credential and enrollment configuration.
+    Unenroll,
 }
 
 #[tokio::main]
@@ -110,6 +114,20 @@ async fn main() -> Result<()> {
         Command::Config => {
             let config = AgentConfig::load_or_default(&config_path)?;
             println!("{}", toml::to_string_pretty(&config)?);
+        }
+        Command::Paths => {
+            println!("config={}", config_path.display());
+        }
+        Command::Unenroll => {
+            let config = AgentConfig::load_or_default(&config_path)?;
+            if let Some(device_id) = config.device_id.as_deref() {
+                credential::delete(device_id)?;
+            }
+            if config_path.exists() {
+                std::fs::remove_file(&config_path)
+                    .with_context(|| format!("cannot remove {}", config_path.display()))?;
+            }
+            println!("Local enrollment removed. Revoke the device in the web dashboard if needed.");
         }
     }
     Ok(())

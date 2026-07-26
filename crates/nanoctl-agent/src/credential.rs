@@ -18,3 +18,11 @@ pub fn load(device_id: &str) -> Result<Zeroizing<String>> {
         .context("device credential missing; re-enroll this device")?;
     Ok(Zeroizing::new(value))
 }
+
+pub fn delete(device_id: &str) -> Result<()> {
+    let entry = Entry::new(SERVICE, device_id).context("credential store unavailable")?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error).context("could not delete device credential"),
+    }
+}
