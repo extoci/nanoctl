@@ -17,7 +17,9 @@ Current automated coverage includes bounded protocol and signaling parsing, role
 duplicate enrollment and signaling, owner isolation, revocation, terminal mutation idempotency,
 rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer and
 bitstream transforms, input bounds and fail-safe release behavior, packaging transactions,
-production configuration, CSP nonces, and media-evidence validation.
+production configuration, CSP nonces, media-evidence validation, and an in-process connection
+between the production host peer and a real WebRTC controller peer through SDP, ICE, DTLS/SCTP,
+and control-channel opening.
 
 ## Required release-test expansion
 
@@ -42,8 +44,10 @@ remain release gates because synthetic media is insufficient for decoder perform
 
 Native unit tests cover configuration, update transactions, media conversion/queue behavior,
 hardware-fallback policy, input parsing/bounds, signaling identity, and peer-failure grace. A
-two-peer integration harness with synthetic 4K motion, impairment, ICE restart, TURN-only,
-permission loss, sleep/wake, network switch, and abrupt controller death is still required.
+real two-peer localhost test covers production host signaling, SDP/ICE negotiation, connection, and
+control-channel opening. Expansion of that harness to synthetic 4K motion, impairment, ICE restart,
+TURN-only, permission loss, sleep/wake, network switch, and abrupt controller death is still
+required.
 
 Physical-machine release matrix:
 

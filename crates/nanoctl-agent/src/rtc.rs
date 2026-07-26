@@ -37,8 +37,7 @@ const PROTOCOL_VERSION: u8 = 1;
 
 pub struct HostPeer {
     peer: Arc<RTCPeerConnection>,
-    control_plane: ControlPlane,
-    token: Arc<Zeroizing<String>>,
+    publisher: SignalPublisher,
     session_id: String,
     sequence: Arc<AtomicU64>,
     #[cfg(feature = "media")]
@@ -49,6 +48,62 @@ pub struct HostPeer {
     display_selection: tokio::sync::watch::Sender<String>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
+}
+
+#[derive(Clone)]
+struct SignalPublisher {
+    inner: SignalPublisherInner,
+}
+
+#[derive(Clone)]
+enum SignalPublisherInner {
+    ControlPlane {
+        client: ControlPlane,
+        token: Arc<Zeroizing<String>>,
+    },
+    #[cfg(test)]
+    Test(tokio::sync::mpsc::UnboundedSender<TestSignal>),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestSignal {
+    session_id: String,
+    sequence: u64,
+    envelope: String,
+}
+
+impl SignalPublisher {
+    fn control_plane(client: ControlPlane, token: Arc<Zeroizing<String>>) -> Self {
+        Self {
+            inner: SignalPublisherInner::ControlPlane { client, token },
+        }
+    }
+
+    #[cfg(test)]
+    fn test(sender: tokio::sync::mpsc::UnboundedSender<TestSignal>) -> Self {
+        Self {
+            inner: SignalPublisherInner::Test(sender),
+        }
+    }
+
+    async fn send(&self, session_id: &str, sequence: u64, envelope: &str) -> Result<()> {
+        match &self.inner {
+            SignalPublisherInner::ControlPlane { client, token } => {
+                client
+                    .send_signal(token, session_id, sequence, envelope)
+                    .await
+            }
+            #[cfg(test)]
+            SignalPublisherInner::Test(sender) => sender
+                .send(TestSignal {
+                    session_id: session_id.to_owned(),
+                    sequence,
+                    envelope: envelope.to_owned(),
+                })
+                .map_err(|_| anyhow::anyhow!("test signal receiver closed")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +172,25 @@ impl HostPeer {
     pub async fn answer(
         control_plane: ControlPlane,
         token: Arc<Zeroizing<String>>,
+        session_id: String,
+        serialized_offer: &str,
+        ice_servers: Vec<RTCIceServer>,
+        ice_transport_policy: RTCIceTransportPolicy,
+        allow_remote_input: bool,
+    ) -> Result<Self> {
+        Self::answer_with_publisher(
+            SignalPublisher::control_plane(control_plane, token),
+            session_id,
+            serialized_offer,
+            ice_servers,
+            ice_transport_policy,
+            allow_remote_input,
+        )
+        .await
+    }
+
+    async fn answer_with_publisher(
+        publisher: SignalPublisher,
         session_id: String,
         serialized_offer: &str,
         ice_servers: Vec<RTCIceServer>,
@@ -283,13 +357,11 @@ impl HostPeer {
 
         let sequence = Arc::new(AtomicU64::new(1));
         peer.on_ice_candidate({
-            let client = control_plane.clone();
-            let token = token.clone();
+            let publisher = publisher.clone();
             let session_id = session_id.clone();
             let sequence = sequence.clone();
             Box::new(move |candidate: Option<RTCIceCandidate>| {
-                let client = client.clone();
-                let token = token.clone();
+                let publisher = publisher.clone();
                 let session_id = session_id.clone();
                 let sequence = sequence.clone();
                 Box::pin(async move {
@@ -306,9 +378,7 @@ impl HostPeer {
                     };
                     let index = sequence.fetch_add(1, Ordering::Relaxed);
                     if let Ok(envelope) = serialize(&session_id, index, payload) {
-                        let _ = client
-                            .send_signal(&token, &session_id, index, &envelope)
-                            .await;
+                        let _ = publisher.send(&session_id, index, &envelope).await;
                     }
                 })
             })
@@ -324,13 +394,10 @@ impl HostPeer {
             .context("WebRTC answer was not created")?;
         // Sequence zero is reserved for the answer. Candidate callbacks begin at one.
         let envelope = serialize(&session_id, 0, OutgoingPayload::Answer { sdp: local.sdp })?;
-        control_plane
-            .send_signal(&token, &session_id, 0, &envelope)
-            .await?;
+        publisher.send(&session_id, 0, &envelope).await?;
         Ok(Self {
             peer,
-            control_plane,
-            token,
+            publisher,
             session_id,
             sequence,
             #[cfg(feature = "media")]
@@ -412,8 +479,8 @@ impl HostPeer {
                     index,
                     OutgoingPayload::Answer { sdp: local.sdp },
                 )?;
-                self.control_plane
-                    .send_signal(&self.token, &self.session_id, index, &response)
+                self.publisher
+                    .send(&self.session_id, index, &response)
                     .await?;
                 Ok(true)
             }
@@ -431,8 +498,8 @@ impl HostPeer {
         let index = self.sequence.fetch_add(1, Ordering::Relaxed);
         let envelope = serialize(&self.session_id, index, OutgoingPayload::End { reason })?;
         let signal_result = self
-            .control_plane
-            .send_signal(&self.token, &self.session_id, index, &envelope)
+            .publisher
+            .send(&self.session_id, index, &envelope)
             .await;
         let close_result = self.peer.close().await;
         signal_result?;
@@ -539,6 +606,9 @@ fn serialize(session_id: &str, sequence: u64, payload: OutgoingPayload) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use tokio::time::{Duration, Instant, timeout};
+    use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     #[test]
     fn rejects_cross_session_offer() {
@@ -579,5 +649,125 @@ mod tests {
         .unwrap();
         assert!(value.contains(r#""type":"end""#));
         assert!(value.contains(r#""reason":"media pipeline failed""#));
+    }
+
+    #[tokio::test]
+    async fn production_host_peer_connects_to_a_real_controller_peer() {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs().unwrap();
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine).unwrap();
+        let controller = Arc::new(
+            APIBuilder::new()
+                .with_media_engine(media_engine)
+                .with_interceptor_registry(registry)
+                .build()
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap(),
+        );
+        controller
+            .add_transceiver_from_kind(RTPCodecType::Video, None)
+            .await
+            .unwrap();
+        let control = controller
+            .create_data_channel("nanoctl.control.v1", None)
+            .await
+            .unwrap();
+        let opened = Arc::new(tokio::sync::Notify::new());
+        control.on_open({
+            let opened = opened.clone();
+            Box::new(move || {
+                let opened = opened.clone();
+                Box::pin(async move {
+                    opened.notify_one();
+                })
+            })
+        });
+
+        let offer = controller.create_offer(None).await.unwrap();
+        controller.set_local_description(offer).await.unwrap();
+        let mut gathering_complete = controller.gathering_complete_promise().await;
+        let _ = gathering_complete.recv().await;
+        let offer = controller.local_description().await.unwrap();
+        let session_id = "integration-session";
+        let serialized_offer = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "sessionId": session_id,
+            "sequence": 0,
+            "sender": "controller",
+            "sentAt": 1,
+            "payload": {"type": "offer", "sdp": offer.sdp},
+        })
+        .to_string();
+
+        let (signals_tx, mut signals_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = HostPeer::answer_with_publisher(
+            SignalPublisher::test(signals_tx),
+            session_id.to_owned(),
+            &serialized_offer,
+            Vec::new(),
+            RTCIceTransportPolicy::All,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut answer_applied = false;
+        while Instant::now() < deadline
+            && (controller.connection_state() != RTCPeerConnectionState::Connected
+                || !answer_applied)
+        {
+            let Some(signal) = timeout(Duration::from_millis(250), signals_rx.recv())
+                .await
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            assert_eq!(signal.session_id, session_id);
+            let envelope: Value = serde_json::from_str(&signal.envelope).unwrap();
+            assert_eq!(envelope["sequence"].as_u64(), Some(signal.sequence));
+            match envelope["payload"]["type"].as_str() {
+                Some("answer") => {
+                    assert_eq!(signal.sequence, 0);
+                    let sdp = envelope["payload"]["sdp"].as_str().unwrap().to_owned();
+                    controller
+                        .set_remote_description(RTCSessionDescription::answer(sdp).unwrap())
+                        .await
+                        .unwrap();
+                    answer_applied = true;
+                }
+                Some("ice-candidate") => {
+                    controller
+                        .add_ice_candidate(RTCIceCandidateInit {
+                            candidate: envelope["payload"]["candidate"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned(),
+                            sdp_mid: envelope["payload"]["sdpMid"].as_str().map(str::to_owned),
+                            sdp_mline_index: envelope["payload"]["sdpMLineIndex"]
+                                .as_u64()
+                                .map(|value| value as u16),
+                            username_fragment: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                Some("ice-complete") => {}
+                other => panic!("unexpected host signal: {other:?}"),
+            }
+        }
+
+        assert!(answer_applied, "host did not publish its SDP answer");
+        assert_eq!(
+            controller.connection_state(),
+            RTCPeerConnectionState::Connected
+        );
+        timeout(Duration::from_secs(3), opened.notified())
+            .await
+            .expect("negotiated control channel did not open");
+        host.close().await.unwrap();
+        controller.close().await.unwrap();
     }
 }
