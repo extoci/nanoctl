@@ -1,0 +1,94 @@
+import { ConvexError, v } from "convex/values";
+import { action, internalMutation, mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { cleanDeviceName, requireIdentity } from "./lib";
+
+const PAIRING_TTL_MS = 10 * 60 * 1000;
+const ONLINE_WINDOW_MS = 45 * 1000;
+
+export const list = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await requireIdentity(ctx);
+    const devices = await ctx.db
+      .query("devices")
+      .withIndex("by_owner", (q) => q.eq("ownerId", identity.subject))
+      .collect();
+    const now = Date.now();
+    return devices.map(({ tokenHash: _tokenHash, capabilitiesJson: _capabilities, ...device }) => ({
+      ...device,
+      status:
+        device.status === "disabled"
+          ? ("disabled" as const)
+          : now - device.lastSeenAt <= ONLINE_WINDOW_MS
+            ? ("online" as const)
+            : ("offline" as const),
+    }));
+  },
+});
+
+export const createPairingCode = action({
+  args: {},
+  handler: async (ctx): Promise<{ code: string; expiresAt: number }> => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new ConvexError("Unauthenticated");
+    const random = crypto.getRandomValues(new Uint32Array(2));
+    const code = `${String((random[0] ?? 0) % 1_000_000).padStart(6, "0")}-${String(
+      (random[1] ?? 0) % 1_000_000,
+    ).padStart(6, "0")}`;
+    const codeHash = await sha256(code);
+    const expiresAt = Date.now() + PAIRING_TTL_MS;
+    await ctx.runMutation(internal.devices.storePairingCode, {
+      ownerId: identity.subject,
+      codeHash,
+      expiresAt,
+    });
+    return { code, expiresAt };
+  },
+});
+
+export const storePairingCode = internalMutation({
+  args: { ownerId: v.string(), codeHash: v.string(), expiresAt: v.number() },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("pairingCodes", { ...args, createdAt: Date.now() });
+  },
+});
+
+export const rename = mutation({
+  args: { deviceId: v.id("devices"), name: v.string() },
+  handler: async (ctx, args) => {
+    const identity = await requireIdentity(ctx);
+    const device = await ctx.db.get(args.deviceId);
+    if (!device || device.ownerId !== identity.subject) throw new ConvexError("Device not found");
+    await ctx.db.patch(args.deviceId, { name: cleanDeviceName(args.name) });
+    return null;
+  },
+});
+
+export const remove = mutation({
+  args: { deviceId: v.id("devices") },
+  handler: async (ctx, args) => {
+    const identity = await requireIdentity(ctx);
+    const device = await ctx.db.get(args.deviceId);
+    if (!device || device.ownerId !== identity.subject) throw new ConvexError("Device not found");
+    await ctx.db.patch(args.deviceId, {
+      status: "disabled",
+      disabledAt: Date.now(),
+      tokenHash: `revoked:${device.tokenHash}`,
+    });
+    await ctx.db.insert("auditEvents", {
+      ownerId: identity.subject,
+      deviceId: args.deviceId,
+      action: "device.revoked",
+      createdAt: Date.now(),
+    });
+    return null;
+  },
+});
+
+async function sha256(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}

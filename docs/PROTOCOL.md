@@ -1,0 +1,58 @@
+# Protocol v1
+
+All control-plane envelopes carry `version: 1`. Unknown versions are rejected, not guessed. JSON is
+UTF-8 and bounded before parsing. Persistent schema types live in Convex; wire types live in
+`@nanoctl/protocol` and the Rust mirror.
+
+## Signaling envelope
+
+```json
+{
+  "version": 1,
+  "sessionId": "convex-session-id",
+  "sequence": 0,
+  "sender": "controller",
+  "sentAt": 1710000000000,
+  "payload": { "type": "offer", "sdp": "v=0..." }
+}
+```
+
+Sequences are strictly increasing independently for `controller` and `host`. Duplicate tuples
+`(session, sender, sequence)` are idempotent. Gaps are allowed because ICE candidates may race HTTP
+retries. Messages outside the session deadline are rejected.
+
+Payloads are `offer`, `answer`, `ice-candidate`, `ice-complete`, `renegotiate`, and `end`. SDP is at
+most 1 MB, a candidate 8 KiB, and a reason 512 characters. SDP codec/media lines are validated again
+by the WebRTC implementation.
+
+## Data channels
+
+`nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, clipboard,
+display selection, peer status, ping/pong, and capability negotiation. `nanoctl.pointer.v1` is
+unordered with zero retransmissions and carries pointer movement/wheel samples. Both begin with a
+hello containing protocol version, session nonce, capabilities, and maximum accepted message size.
+
+Normalized coordinates are finite numbers clamped to `[0, 1]` and map to the selected display’s
+current logical bounds. Display changes invalidate old geometry. Input has a monotonically
+increasing event id; stale transitions are ignored. A 2-second input watchdog releases all held keys
+and buttons.
+
+Keyboard events use DOM `code` for physical location plus `key` for meaning. The agent maps `code`
+using the active OS layout and treats text input separately in future protocol versions. Modifier
+bits are Shift=1, Control=2, Alt=4, Meta=8. Clipboard text is UTF-8, opt-in, and at most 1 MiB.
+
+## Codec negotiation
+
+Browser offer order is a preference, not a command. Agent intersects it with hardware/software
+capability and local policy. H.264 packetization-mode 1 is the mandatory v1 baseline. VP9 and AV1
+are optional. The agent never shells out with remote-provided encoder names or arguments.
+
+The selected codec, profile, pixel format, resolution, target bitrate, max FPS, display, and audio
+state are reported on the reliable channel. Adaptation changes are reported so diagnostics can
+distinguish congestion from capture failure.
+
+## Compatibility
+
+Additive optional fields are allowed within v1. New variants or changed semantics require v2.
+Peers advertise minimum and maximum supported versions; there is no downgrade below the minimum.
+Security fixes may tighten validation without a version increment.

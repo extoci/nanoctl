@@ -1,0 +1,4 @@
+{
+  "ignorePatterns": ["apps/web/convex/_generated/**", "target/**", ".next/**", "bun.lock"],
+  "sortPackageJson": true
+}
