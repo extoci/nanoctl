@@ -1,6 +1,7 @@
 import { httpRouter } from "convex/server";
 import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { pseudonymousAddress } from "./httpSecurity";
 import { boundedCapabilities, parseEnrollmentInput } from "./httpValidation";
 import { mintTurnCredentials } from "./turn";
 
@@ -14,7 +15,7 @@ http.route({
     if (!parsed.ok) return parsed.response;
     const body = parseEnrollmentInput(parsed.value);
     if (!body) return json({ error: "invalid_request" }, 400);
-    const requester = await requestFingerprint(request);
+    const requester = await requestFingerprint(ctx);
     const [ipPermitted, codePermitted] = await Promise.all([
       ctx.runMutation(internal.rateLimits.consume, {
         key: `enroll:ip:${requester}`,
@@ -131,7 +132,7 @@ async function authenticateAgent(
     return { status: "unauthorized" as const };
   }
   const permitted = await ctx.runMutation(internal.rateLimits.consume, {
-    key: `agent:http:${await requestFingerprint(request)}`,
+    key: `agent:http:${await requestFingerprint(ctx)}`,
     // A host may legitimately poll four times per second in advanced mode.
     // Signaling has a separate, tighter per-session limit.
     limit: 10_000,
@@ -194,22 +195,11 @@ async function sha256(value: string): Promise<string> {
     .join("");
 }
 
-async function requestFingerprint(request: Request): Promise<string> {
-  const address =
-    request.headers.get("cf-connecting-ip") ??
-    request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim() ??
-    "unknown";
-  const secret = process.env.RATE_LIMIT_SECRET;
-  if (!secret) return sha256(address);
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(address));
-  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+async function requestFingerprint(
+  ctx: Parameters<Parameters<typeof httpAction>[0]>[0],
+): Promise<string> {
+  const metadata = await ctx.meta.getRequestMetadata();
+  return pseudonymousAddress(metadata.ip, process.env.RATE_LIMIT_SECRET);
 }
 
 function base64Url(bytes: Uint8Array): string {
