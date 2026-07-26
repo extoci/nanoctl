@@ -1,0 +1,132 @@
+name: release candidates
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            runner: ubuntu-24.04
+            binary: nanoctl
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            binary: nanoctl
+          - platform: macos
+            arch: x64
+            runner: macos-15-intel
+            binary: nanoctl
+          - platform: macos
+            arch: arm64
+            runner: macos-15
+            binary: nanoctl
+          - platform: windows
+            arch: x64
+            runner: windows-2025
+            binary: nanoctl.exe
+          - platform: windows
+            arch: arm64
+            runner: windows-11-arm
+            binary: nanoctl.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+      - run: bun install --frozen-lockfile
+      - name: Install Linux media dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
+            libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
+      - run: bun run scripts/cargo.ts build --release --locked --features media
+      - name: Stage Unix package
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          install -d stage
+          install -m 0755 crates/nanoctl-agent/target/release/${{ matrix.binary }} stage/
+          cp LICENSE README.md stage/
+          cp -R packaging/${{ matrix.platform }} stage/
+      - name: Stage Windows package
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path stage | Out-Null
+          Copy-Item "crates/nanoctl-agent/target/release/${{ matrix.binary }}" stage/
+          Copy-Item LICENSE, README.md stage/
+          Copy-Item packaging/windows stage/ -Recurse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ matrix.platform }}-${{ matrix.arch }}
+          path: stage
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    needs: native
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Create deterministic archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir packages
+          epoch="$(git log -1 --format=%ct)"
+          for directory in candidates/candidate-*; do
+            name="${directory##*/candidate-}"
+            tar \
+              --sort=name \
+              --mtime="@${epoch}" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --format=posix \
+              --pax-option=delete=atime,delete=ctime \
+              -C "$directory" \
+              -czf "packages/nanoctl-${name}.tar.gz" .
+          done
+          (cd packages && sha256sum ./*.tar.gz > SHA256SUMS)
+      - uses: anchore/sbom-action@v0
+        with:
+          path: candidates
+          format: cyclonedx-json
+          output-file: packages/nanoctl.cdx.json
+          upload-artifact: false
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: packages/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanoctl-release-candidates
+          path: packages
+          if-no-files-found: error
+          retention-days: 30

@@ -3,8 +3,13 @@
 ## Required gates
 
 Every change runs formatting, oxc lint, TypeScript 7 project checking, Bun protocol tests, Rust
-format/clippy/tests, Next production build, Convex function generation/type checking, dependency
-audit, and secret scan. Release builds are reproducible from a tag and produce an SBOM.
+format/clippy/tests, the production OpenNext/Sites build, Convex function generation/type checking,
+dependency audit, and secret scan.
+
+The `release candidates` workflow compiles the full media agent on native x64 and arm64 runners for
+Linux, macOS, and Windows. It creates timestamp-normalized archives, SHA-256 checksums, a CycloneDX
+SBOM, and GitHub build-provenance attestations. These artifacts are deliberately called
+**candidates**: they are unsigned and are not an installable release.
 
 ## Protocol and security tests
 
@@ -54,10 +59,18 @@ bandwidth. Averages cannot hide p95/p99 stalls.
 
 ## Manual release checklist
 
-1. Fresh install, enroll, reboot, reconnect, revoke, and uninstall on every target.
-2. Verify publisher signatures/notarization and update rollback.
-3. Verify no inbound listener and least-privilege file/credential ACLs.
-4. Inspect logs and crash artifacts for sensitive content.
-5. Run TURN-only from an unrelated external network.
-6. Confirm lock/TCC/UAC/portal boundaries behave as documented.
-7. Record exact hardware, OS, browser, agent, and test results in the release artifact.
+1. Build candidates from the exact reviewed tag and verify every provenance attestation, SBOM, and
+   checksum.
+2. Sign the native binary and installer with the platform publisher identity; notarize macOS
+   artifacts. Rebuild the archive and attest the signed bytes.
+3. Fresh install, enroll, reboot, reconnect, revoke, and uninstall on every target.
+4. Verify publisher signatures/notarization and update rollback.
+5. Verify no inbound listener and least-privilege file/credential ACLs.
+6. Inspect logs and crash artifacts for sensitive content.
+7. Run TURN-only from an unrelated external network.
+8. Confirm lock/TCC/UAC/portal boundaries behave as documented.
+9. Record exact hardware, OS, browser, agent, and test results in the signed release artifact.
+
+Never publish or label an unsigned candidate as a release. Code-signing credentials stay outside
+the repository and candidate workflow; the signing ceremony is a separate, access-controlled
+release gate.

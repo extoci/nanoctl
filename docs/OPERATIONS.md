@@ -55,6 +55,13 @@ and `TURN_AUTH_SECRET` belong to the Convex deployment rather than the web runti
 Convex URL is a browser-visible Next variable, changing it requires rebuilding and publishing a new
 web version.
 
+Native release candidates are produced by `.github/workflows/release-candidates.yml` for Linux,
+macOS, and Windows on x64 and arm64. The aggregate artifact includes normalized archives, SHA-256
+checksums, a CycloneDX SBOM, and provenance attestations. It is not a release: platform signing,
+macOS notarization, installer construction, update-manifest signing, and the physical acceptance
+matrix remain mandatory gates. Signing must attest the final signed bytes, not reuse the unsigned
+candidate attestation.
+
 ## Readiness
 
 A production launch is blocked until canonical domains, private security contact, signing
