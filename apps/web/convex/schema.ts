@@ -51,12 +51,20 @@ export default defineSchema({
   signals: defineTable({
     sessionId: v.id("sessions"),
     sender: v.union(v.literal("controller"), v.literal("host")),
+    kind: v.union(
+      v.literal("offer"),
+      v.literal("answer"),
+      v.literal("ice-candidate"),
+      v.literal("ice-complete"),
+      v.literal("end"),
+    ),
     sequence: v.number(),
     envelope: v.string(),
     expiresAt: v.number(),
     createdAt: v.number(),
   })
     .index("by_session_sender_sequence", ["sessionId", "sender", "sequence"])
+    .index("by_session_sender_kind_sequence", ["sessionId", "sender", "kind", "sequence"])
     .index("by_expiry", ["expiresAt"]),
 
   auditEvents: defineTable({

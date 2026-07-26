@@ -7,7 +7,6 @@ out/
 dist/
 coverage/
 *.tsbuildinfo
-apps/web/convex/_generated/
 
 # native builds
 target/

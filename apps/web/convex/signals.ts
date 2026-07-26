@@ -1,6 +1,6 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { requireIdentity } from "./lib";
+import { parseSignalEnvelope, requireIdentity } from "./lib";
 
 const MAX_ENVELOPE_BYTES = 1_100_000;
 
@@ -11,12 +11,22 @@ export const list = query({
     const session = await ctx.db.get(args.sessionId);
     if (!session || session.ownerId !== identity.subject)
       throw new ConvexError("Session not found");
-    return ctx.db
+    const latest = await ctx.db
       .query("signals")
       .withIndex("by_session_sender_sequence", (q) =>
         q.eq("sessionId", args.sessionId).eq("sender", "host").gt("sequence", args.afterSequence),
       )
-      .take(128);
+      .order("desc")
+      .take(127);
+    const answer = await ctx.db
+      .query("signals")
+      .withIndex("by_session_sender_kind_sequence", (q) =>
+        q.eq("sessionId", args.sessionId).eq("sender", "host").eq("kind", "answer"),
+      )
+      .first();
+    return [...new Map([answer, ...latest].filter(Boolean).map((row) => [row!._id, row!])).values()]
+      .filter((row) => row.sequence > args.afterSequence)
+      .sort((left, right) => left.sequence - right.sequence);
   },
 });
 
@@ -34,8 +44,8 @@ export const send = mutation({
       throw new ConvexError("Session unavailable");
     }
     if (args.envelope.length > MAX_ENVELOPE_BYTES) throw new ConvexError("Signal too large");
-    const parsed = parseEnvelope(args.envelope);
-    if (parsed.sessionId !== String(args.sessionId) || parsed.sender !== "controller") {
+    const parsed = parseSignalEnvelope(args.envelope, "controller");
+    if (parsed.sessionId !== String(args.sessionId)) {
       throw new ConvexError("Invalid signal envelope");
     }
     const duplicate = await ctx.db
@@ -52,6 +62,7 @@ export const send = mutation({
     await ctx.db.insert("signals", {
       sessionId: args.sessionId,
       sender: "controller",
+      kind: parsed.kind,
       sequence: parsed.sequence,
       envelope: args.envelope,
       createdAt: now,
@@ -63,28 +74,3 @@ export const send = mutation({
     return null;
   },
 });
-
-function parseEnvelope(value: string): { sessionId: string; sender: string; sequence: number } {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new ConvexError("Malformed signal envelope");
-  }
-  if (!parsed || typeof parsed !== "object") throw new ConvexError("Malformed signal envelope");
-  const envelope = parsed as Record<string, unknown>;
-  if (
-    envelope.version !== 1 ||
-    typeof envelope.sessionId !== "string" ||
-    typeof envelope.sender !== "string" ||
-    !Number.isSafeInteger(envelope.sequence) ||
-    Number(envelope.sequence) < 0
-  ) {
-    throw new ConvexError("Malformed signal envelope");
-  }
-  return {
-    sessionId: envelope.sessionId,
-    sender: envelope.sender,
-    sequence: Number(envelope.sequence),
-  };
-}

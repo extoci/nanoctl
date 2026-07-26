@@ -46,9 +46,10 @@ Tools embedding the old API must temporarily run beside TypeScript 6 or earlier.
 TypeScript 7 and recommends bundler resolution, preserved modules, strict checking, and explicit Bun
 types. Next currently invokes the legacy compiler API during its production build.
 
-Implication: `@typescript/native` 7.0 is the authoritative `typecheck` command. A legacy `typescript`
-package exists only for Next’s internal build hook and does not determine repository diagnostics.
-oxfmt and oxlint replace Prettier/ESLint.
+Implication: `@typescript/native` 7.0 is the authoritative application/shared-package `typecheck`
+command. A legacy `typescript` package exists only for Next’s internal build hook and Convex's
+generated-function checker; it does not determine application diagnostics. oxfmt and oxlint replace
+Prettier/ESLint.
 
 Sources:
 

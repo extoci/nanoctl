@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
+import { parseSignalEnvelope } from "./lib";
 
 export const enroll = internalMutation({
   args: {
@@ -80,16 +81,25 @@ export const pendingSessions = internalQuery({
     return Promise.all(
       sessions
         .filter((session) => session.expiresAt > Date.now())
-        .map(async (session) => ({
-          sessionId: session._id,
-          expiresAt: session.expiresAt,
-          signals: await ctx.db
+        .map(async (session) => {
+          const latest = await ctx.db
             .query("signals")
             .withIndex("by_session_sender_sequence", (q) =>
               q.eq("sessionId", session._id).eq("sender", "controller"),
             )
-            .take(128),
-        })),
+            .order("desc")
+            .take(127);
+          const offer = await ctx.db
+            .query("signals")
+            .withIndex("by_session_sender_kind_sequence", (q) =>
+              q.eq("sessionId", session._id).eq("sender", "controller").eq("kind", "offer"),
+            )
+            .first();
+          const signals = [
+            ...new Map([offer, ...latest].filter(Boolean).map((row) => [row!._id, row!])).values(),
+          ].sort((left, right) => left.sequence - right.sequence);
+          return { sessionId: session._id, expiresAt: session.expiresAt, signals };
+        }),
     );
   },
 });
@@ -112,6 +122,15 @@ export const sendSignal = internalMutation({
     ) {
       return false;
     }
+    let parsed: ReturnType<typeof parseSignalEnvelope>;
+    try {
+      parsed = parseSignalEnvelope(args.envelope, "host");
+    } catch {
+      return false;
+    }
+    if (parsed.sessionId !== String(args.sessionId) || parsed.sequence !== args.sequence) {
+      return false;
+    }
     const duplicate = await ctx.db
       .query("signals")
       .withIndex("by_session_sender_sequence", (q) =>
@@ -122,6 +141,7 @@ export const sendSignal = internalMutation({
       await ctx.db.insert("signals", {
         sessionId: args.sessionId,
         sender: "host",
+        kind: parsed.kind,
         sequence: args.sequence,
         envelope: args.envelope,
         createdAt: Date.now(),
