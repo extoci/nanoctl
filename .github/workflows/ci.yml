@@ -49,6 +49,9 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: sh -n packaging/linux/*.sh packaging/macos/*.sh
+      - name: Lint POSIX package scripts
+        if: runner.os == 'Linux'
+        run: shellcheck packaging/linux/*.sh packaging/macos/*.sh
       - name: Validate PowerShell package scripts
         if: runner.os == 'Windows'
         shell: pwsh

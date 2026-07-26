@@ -3,6 +3,10 @@ set -eu
 
 manifest_path=${1:?usage: update-user-service.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
 public_key=${2:?usage: update-user-service.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
+[ "$(id -u)" -ne 0 ] || {
+  printf '%s\n' "Update nanoctl as the enrolled graphical user, not root." >&2
+  exit 1
+}
 binary_path="$HOME/.local/bin/nanoctl"
 activated=0
 completed=0
@@ -12,7 +16,7 @@ cleanup() {
     return
   fi
   systemctl --user stop nanoctl.service 2>/dev/null || true
-  if [ "$activated" -eq 1 ]; then
+  if [ "$activated" -eq 1 ] || [ -f "$binary_path.previous" ]; then
     "$binary_path" rollback-update 2>/dev/null || true
   fi
   systemctl --user start nanoctl.service 2>/dev/null || true

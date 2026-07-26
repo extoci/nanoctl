@@ -3,6 +3,10 @@ set -eu
 
 manifest_path=${1:?usage: update-agent.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
 public_key=${2:?usage: update-agent.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
+[ "$(id -u)" -ne 0 ] || {
+  printf '%s\n' "Update nanoctl as the enrolled desktop user, not root." >&2
+  exit 1
+}
 install_root="$HOME/Library/Application Support/nanoctl"
 binary_path="$install_root/bin/nanoctl"
 agent_path="$HOME/Library/LaunchAgents/dev.nanoctl.agent.plist"
@@ -15,7 +19,7 @@ cleanup() {
     return
   fi
   launchctl bootout "$service_target" 2>/dev/null || true
-  if [ "$activated" -eq 1 ]; then
+  if [ "$activated" -eq 1 ] || [ -f "$binary_path.previous" ]; then
     "$binary_path" rollback-update 2>/dev/null || true
   fi
   launchctl bootstrap "gui/$(id -u)" "$agent_path" 2>/dev/null || true

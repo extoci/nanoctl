@@ -11,10 +11,12 @@ agent validates each access unit before RTP. RGBA-to-NV12 and the hardware-surfa
 copy through system memory. Direct D3D11 capture-surface import remains a physical performance gate
 and must not be advertised until it passes on signed release hardware.
 
-The current package registration is a headless per-user Scheduled Task because Session 0 cannot
-capture the user desktop or use the enrolling user's Credential Manager entry. A future
-supervisor/helper split may add a LocalSystem supervisor, but the capture/input process must remain
-in the authorized user session. UAC secure desktop and Windows sign-in screens remain inaccessible.
+The current package registration is a headless, non-elevated per-user Scheduled Task because
+Session 0 cannot capture the user desktop or use the enrolling user's Credential Manager entry. The
+binary is administrator-owned under Program Files while configuration access is restricted to the
+agent identity, SYSTEM, and local administrators. A future supervisor/helper split may add a
+LocalSystem supervisor, but the capture/input process must remain in the authorized user session.
+UAC secure desktop, elevated applications, and Windows sign-in screens remain inaccessible.
 
 ## macOS
 

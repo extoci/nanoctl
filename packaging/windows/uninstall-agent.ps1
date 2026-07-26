@@ -1,11 +1,8 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)]
-  [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
-  [string]$BinaryPath,
+  [string]$BinaryPath = (Join-Path $env:ProgramFiles "nanoctl\nanoctl.exe"),
 
-  [Parameter(Mandatory = $true)]
   [string]$ConfigPath
 )
 
@@ -17,8 +14,24 @@ if ($task) {
   Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 
-$resolvedBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
-if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
-  & $resolvedBinary --config $ConfigPath unenroll
+if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+  Write-Warning "The installed nanoctl binary is missing; the Scheduled Task was removed."
+  return
 }
-Write-Host "nanoctl background agent registration and local enrollment removed."
+$resolvedBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
+if (-not $ConfigPath) {
+  $pathOutput = & $resolvedBinary paths
+  $ConfigPath = [string]($pathOutput -replace '^config=', '')
+}
+if ($ConfigPath -and (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+  & $resolvedBinary --config $ConfigPath unenroll
+  if ($LASTEXITCODE -ne 0) {
+    throw "nanoctl could not remove its local enrollment."
+  }
+}
+$installRoot = Split-Path -Parent $resolvedBinary
+Remove-Item -LiteralPath $resolvedBinary -Force
+if ((Split-Path -Leaf $installRoot) -eq "nanoctl") {
+  Remove-Item -LiteralPath $installRoot -Force -ErrorAction SilentlyContinue
+}
+Write-Host "nanoctl background agent, installed binary, and local enrollment removed."

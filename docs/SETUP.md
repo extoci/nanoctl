@@ -28,10 +28,13 @@ $configPath = ((.\nanoctl.exe paths) -replace '^config=', '')
   -ConfigPath $configPath
 ```
 
-Despite the compatibility filename, the script registers a headless highest-privilege Scheduled
-Task for the current interactive user. A LocalSystem Windows service runs in Session 0 and cannot
-capture or inject into that user's desktop or read their Credential Manager item. The task starts
-at logon and restarts after failure. The signed installer supplies the exact generated config path.
+Despite the compatibility filename, the script copies the signed binary under Program Files and
+registers a headless, non-elevated Scheduled Task for the current interactive user. A LocalSystem
+Windows service runs in Session 0 and cannot capture or inject into that user's desktop or read
+their Credential Manager item. The task starts at logon and restarts after failure. Explicit ACLs
+prevent the agent identity from replacing its installed executable and restrict the configuration
+to the agent identity, SYSTEM, and local administrators. The signed installer supplies the exact
+generated config path.
 
 Remove it from the same user session with `uninstall-agent.ps1`. Removal deletes the local
 credential and configuration; revoke the device in the dashboard as well if it is still listed.
