@@ -8,6 +8,12 @@ use xcap::Monitor;
 
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy)]
+pub enum InputLane {
+    Reliable,
+    PointerMotion,
+}
+
 pub struct InputController {
     enigo: Enigo,
     width: u32,
@@ -74,12 +80,36 @@ impl InputController {
         })
     }
 
-    pub fn dispatch(&mut self, bytes: &[u8]) -> Result<()> {
+    pub fn dispatch(&mut self, bytes: &[u8], lane: InputLane) -> Result<()> {
         if bytes.len() > MAX_CONTROL_BYTES {
             anyhow::bail!("control message exceeds maximum size");
         }
         let message: ControlMessage =
             serde_json::from_slice(bytes).context("control message is invalid")?;
+        match (&message, lane) {
+            (
+                ControlMessage::Pointer {
+                    action: PointerAction::Move,
+                    ..
+                },
+                InputLane::PointerMotion,
+            )
+            | (
+                ControlMessage::Pointer {
+                    action: PointerAction::Move,
+                    ..
+                },
+                InputLane::Reliable,
+            ) => {
+                if matches!(lane, InputLane::Reliable) {
+                    anyhow::bail!("pointer motion must use the pointer channel");
+                }
+            }
+            (_, InputLane::PointerMotion) => {
+                anyhow::bail!("only pointer motion is accepted on the pointer channel");
+            }
+            (_, InputLane::Reliable) => {}
+        }
         self.last_activity = Instant::now();
         match message {
             ControlMessage::Pointer {

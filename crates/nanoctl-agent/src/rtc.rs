@@ -141,31 +141,40 @@ impl HostPeer {
                     }
                 });
             }
+            let (control_sender, control_receiver) = tokio::sync::mpsc::channel(128);
+            let (pointer_sender, pointer_receiver) = tokio::sync::mpsc::channel(1);
+            if let Some(input) = &input {
+                spawn_input_worker(
+                    control_receiver,
+                    input.clone(),
+                    crate::input::InputLane::Reliable,
+                );
+                spawn_input_worker(
+                    pointer_receiver,
+                    input.clone(),
+                    crate::input::InputLane::PointerMotion,
+                );
+            }
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
-                if !matches!(
-                    channel.label(),
-                    "nanoctl.control.v1" | "nanoctl.pointer.v1"
-                ) {
+                if input.is_none() {
                     return Box::pin(async {});
                 }
-                let message_input = input.clone();
+                let (sender, drop_when_full) = match channel.label() {
+                    "nanoctl.control.v1" => (control_sender.clone(), false),
+                    "nanoctl.pointer.v1" => (pointer_sender.clone(), true),
+                    _ => return Box::pin(async {}),
+                };
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    let input = message_input.clone();
+                    let sender = sender.clone();
                     Box::pin(async move {
-                        if !message.is_string || input.is_none() {
+                        if !message.is_string {
                             return;
                         }
-                        let result = tokio::task::spawn_blocking(move || {
-                            input
-                                .expect("input availability checked")
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?
-                                .dispatch(&message.data)
-                        })
-                        .await;
-                        if let Ok(Err(error)) = result {
-                            tracing::warn!(error = %error, "control message rejected");
+                        if let Err(error) = sender.try_send(message.data.to_vec())
+                            && !drop_when_full
+                        {
+                            tracing::warn!(error = %error, "reliable input queue is full");
                         }
                     })
                 }));
@@ -293,6 +302,34 @@ impl HostPeer {
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
     }
+}
+
+#[cfg(feature = "media")]
+fn spawn_input_worker(
+    mut receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    input: Arc<std::sync::Mutex<crate::input::InputController>>,
+    lane: crate::input::InputLane,
+) {
+    tokio::spawn(async move {
+        while let Some(bytes) = receiver.recv().await {
+            let input = input.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                input
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?
+                    .dispatch(&bytes, lane)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(error = %error, "control message rejected"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "input worker stopped unexpectedly");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn parse_offer(serialized: &str, expected_session: &str) -> Result<String> {
