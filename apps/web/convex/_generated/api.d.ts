@@ -14,6 +14,7 @@ import type * as devices from "../devices.js";
 import type * as http from "../http.js";
 import type * as lib from "../lib.js";
 import type * as maintenance from "../maintenance.js";
+import type * as rateLimits from "../rateLimits.js";
 import type * as sessions from "../sessions.js";
 import type * as signals from "../signals.js";
 
@@ -30,6 +31,7 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   lib: typeof lib;
   maintenance: typeof maintenance;
+  rateLimits: typeof rateLimits;
   sessions: typeof sessions;
   signals: typeof signals;
 }>;

@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { parseSignalEnvelope } from "./lib";
+import { consumeRateLimit } from "./rateLimits";
 
 export const enroll = internalMutation({
   args: {
@@ -116,6 +117,9 @@ export const sendSignal = internalMutation({
     envelope: v.string(),
   },
   handler: async (ctx, args) => {
+    if (!(await consumeRateLimit(ctx, `signal:host:${args.sessionId}`, 512, 60 * 1000))) {
+      return false;
+    }
     const session = await ctx.db.get(args.sessionId);
     if (
       !session ||

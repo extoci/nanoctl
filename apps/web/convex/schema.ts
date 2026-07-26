@@ -26,7 +26,8 @@ export default defineSchema({
     consumedAt: v.optional(v.number()),
   })
     .index("by_code_hash", ["codeHash"])
-    .index("by_owner", ["ownerId"]),
+    .index("by_owner", ["ownerId"])
+    .index("by_expiry", ["expiresAt"]),
 
   sessions: defineTable({
     ownerId: v.string(),
@@ -46,7 +47,8 @@ export default defineSchema({
     endReason: v.optional(v.string()),
   })
     .index("by_owner", ["ownerId"])
-    .index("by_device_state", ["deviceId", "state"]),
+    .index("by_device_state", ["deviceId", "state"])
+    .index("by_state_updated", ["state", "updatedAt"]),
 
   signals: defineTable({
     sessionId: v.id("sessions"),
@@ -74,5 +76,16 @@ export default defineSchema({
     action: v.string(),
     detail: v.optional(v.string()),
     createdAt: v.number(),
-  }).index("by_owner_time", ["ownerId", "createdAt"]),
+  })
+    .index("by_owner_time", ["ownerId", "createdAt"])
+    .index("by_created", ["createdAt"]),
+
+  rateLimits: defineTable({
+    key: v.string(),
+    windowStartedAt: v.number(),
+    count: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_key", ["key"])
+    .index("by_expiry", ["expiresAt"]),
 });

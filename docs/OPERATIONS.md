@@ -52,9 +52,10 @@ The hosted web artifact uses the official OpenNext Cloudflare adapter. Set the p
 `NEXT_PUBLIC_CONVEX_URL` and canonical HTTPS `NEXT_PUBLIC_APP_ORIGIN` in the build environment, run
 `bun run build:sites`, package `dist` with the Sites packaging helper, and publish only that exact
 committed build. The fail-closed preflight rejects loopback, non-HTTPS, credential-bearing, and
-non-origin values. `APP_ORIGIN`, `TURN_URLS`, and `TURN_AUTH_SECRET` belong to the Convex deployment
-rather than the web runtime. Because the Convex URL is a browser-visible Next variable, changing it
-requires rebuilding and publishing a new web version.
+non-origin values. `APP_ORIGIN`, `TURN_URLS`, `TURN_AUTH_SECRET`, and an independent
+`RATE_LIMIT_SECRET` belong to the Convex deployment rather than the web runtime. Because the Convex
+URL is a browser-visible Next variable, changing it requires rebuilding and publishing a new web
+version.
 
 Native release candidates are produced by `.github/workflows/release-candidates.yml` for Linux,
 macOS, and Windows on x64 and arm64. The aggregate artifact includes normalized archives, SHA-256

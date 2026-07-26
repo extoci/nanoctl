@@ -93,6 +93,7 @@ unusual relay volume. Never silently auto-enroll.
 | Agent token         | OS credential store; hash in Convex | revoke/re-enroll           |
 | Shoo signing key    | Shoo; public JWKS cached by Convex  | issuer-managed             |
 | TURN auth secret    | Convex/edge secret + coturn         | quarterly / incident       |
+| Rate-limit secret   | Convex environment                  | quarterly / incident       |
 | Convex deploy key   | CI secret store                     | least privilege / incident |
 | Package signing key | offline or managed signing service  | documented ceremony        |
 

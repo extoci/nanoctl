@@ -1,6 +1,7 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 import { parseSignalEnvelope, requireIdentity } from "./lib";
+import { consumeRateLimit } from "./rateLimits";
 
 const MAX_ENVELOPE_BYTES = 1_100_000;
 
@@ -42,6 +43,9 @@ export const send = mutation({
       session.state === "ended"
     ) {
       throw new ConvexError("Session unavailable");
+    }
+    if (!(await consumeRateLimit(ctx, `signal:controller:${args.sessionId}`, 512, 60 * 1000))) {
+      throw new ConvexError("Signal rate exceeded");
     }
     if (args.envelope.length > MAX_ENVELOPE_BYTES) throw new ConvexError("Signal too large");
     const parsed = parseSignalEnvelope(args.envelope, "controller");

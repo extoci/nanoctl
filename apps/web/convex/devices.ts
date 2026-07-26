@@ -32,6 +32,12 @@ export const createPairingCode = action({
   handler: async (ctx): Promise<{ code: string; expiresAt: number }> => {
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) throw new ConvexError("Unauthenticated");
+    const permitted = await ctx.runMutation(internal.rateLimits.consume, {
+      key: `pairing:${identity.subject}`,
+      limit: 10,
+      windowMs: 10 * 60 * 1000,
+    });
+    if (!permitted) throw new ConvexError("Too many pairing requests");
     const code = pairingCode();
     const codeHash = await sha256(code);
     const expiresAt = Date.now() + PAIRING_TTL_MS;

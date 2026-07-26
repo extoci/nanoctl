@@ -21,6 +21,22 @@ http.route({
     ) {
       return json({ error: "invalid_request" }, 400);
     }
+    const requester = await requestFingerprint(request);
+    const [ipPermitted, codePermitted] = await Promise.all([
+      ctx.runMutation(internal.rateLimits.consume, {
+        key: `enroll:ip:${requester}`,
+        limit: 20,
+        windowMs: 10 * 60 * 1000,
+      }),
+      ctx.runMutation(internal.rateLimits.consume, {
+        key: `enroll:code:${await sha256(body.code.trim().toUpperCase())}`,
+        limit: 5,
+        windowMs: 10 * 60 * 1000,
+      }),
+    ]);
+    if (!ipPermitted || !codePermitted) {
+      return json({ error: "rate_limited" }, 429);
+    }
     const token = base64Url(crypto.getRandomValues(new Uint8Array(32)));
     const result = await ctx.runMutation(internal.agent.enroll, {
       codeHash: await sha256(body.code.trim().toUpperCase()),
@@ -117,6 +133,12 @@ async function authenticateAgent(
 ) {
   const header = request.headers.get("authorization") ?? "";
   if (!header.startsWith("Bearer ") || header.length > 512) return null;
+  const permitted = await ctx.runMutation(internal.rateLimits.consume, {
+    key: `agent:http:${await requestFingerprint(request)}`,
+    limit: 600,
+    windowMs: 5 * 60 * 1000,
+  });
+  if (!permitted) return null;
   return ctx.runQuery(internal.agent.authenticate, {
     tokenHash: await sha256(header.slice(7)),
   });
@@ -172,6 +194,24 @@ async function sha256(value: string): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+async function requestFingerprint(request: Request): Promise<string> {
+  const address =
+    request.headers.get("cf-connecting-ip") ??
+    request.headers.get("x-forwarded-for")?.split(",", 1)[0]?.trim() ??
+    "unknown";
+  const secret = process.env.RATE_LIMIT_SECRET;
+  if (!secret) return sha256(address);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(address));
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function base64Url(bytes: Uint8Array): string {

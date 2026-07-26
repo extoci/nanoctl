@@ -2,6 +2,7 @@ import { ConvexError, v } from "convex/values";
 import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { parseDeviceDisplays, requireIdentity } from "./lib";
+import { consumeRateLimit } from "./rateLimits";
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
 
@@ -26,6 +27,9 @@ export const create = mutation({
   args: { deviceId: v.id("devices") },
   handler: async (ctx, args) => {
     const identity = await requireIdentity(ctx);
+    if (!(await consumeRateLimit(ctx, `session:${identity.subject}`, 30, 60 * 60 * 1000))) {
+      throw new ConvexError("Too many session requests");
+    }
     const device = await ctx.db.get(args.deviceId);
     if (
       !device ||
