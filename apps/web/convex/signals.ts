@@ -73,7 +73,22 @@ export const send = mutation({
       createdAt: now,
       expiresAt: session.expiresAt,
     });
-    if (session.state === "requested") {
+    if (parsed.kind === "end") {
+      await ctx.db.patch(args.sessionId, {
+        state: "ended",
+        endedAt: now,
+        updatedAt: now,
+        endReason: "ended by controller signal",
+      });
+      await ctx.db.insert("auditEvents", {
+        ownerId: session.ownerId,
+        deviceId: session.deviceId,
+        sessionId: args.sessionId,
+        action: "session.ended",
+        detail: "ended by controller signal",
+        createdAt: now,
+      });
+    } else if (session.state === "requested") {
       await ctx.db.patch(args.sessionId, { state: "negotiating", updatedAt: now });
     }
     return null;

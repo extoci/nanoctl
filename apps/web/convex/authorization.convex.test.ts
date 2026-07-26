@@ -181,6 +181,41 @@ describe("control-plane authorization", () => {
     );
   });
 
+  test("makes a controller end signal atomically terminal", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const ownerA = asOwner(t, "owner-a");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+    await ownerA.mutation(api.signals.send, {
+      sessionId,
+      envelope: JSON.stringify({
+        version: 1,
+        sessionId,
+        sequence: 0,
+        sender: "controller",
+        sentAt: Date.now(),
+        payload: { type: "end", reason: "leaving" },
+      }),
+    });
+    const evidence = await t.run(async (ctx) => {
+      const session = await ctx.db.get(sessionId);
+      const events = await ctx.db
+        .query("auditEvents")
+        .withIndex("by_owner_time", (q) => q.eq("ownerId", "owner-a"))
+        .collect();
+      return {
+        state: session?.state,
+        reason: session?.endReason,
+        endedEvents: events.filter((event) => event.action === "session.ended").length,
+      };
+    });
+    expect(evidence).toEqual({
+      state: "ended",
+      reason: "ended by controller signal",
+      endedEvents: 1,
+    });
+  });
+
   test("revocation terminates sessions and invalidates the agent token", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");
