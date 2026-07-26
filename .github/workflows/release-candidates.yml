@@ -141,7 +141,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir packages
+          mkdir release-packages
           epoch="$(git log -1 --format=%ct)"
           for directory in candidates/candidate-*; do
             name="${directory##*/candidate-}"
@@ -154,21 +154,21 @@ jobs:
               --format=posix \
               --pax-option=delete=atime,delete=ctime \
               -C "$directory" \
-              -czf "packages/nanoctl-${name}.tar.gz" .
+              -czf "release-packages/nanoctl-${name}.tar.gz" .
           done
-          (cd packages && sha256sum ./*.tar.gz > SHA256SUMS)
+          (cd release-packages && sha256sum ./*.tar.gz > SHA256SUMS)
       - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: candidates
           format: cyclonedx-json
-          output-file: packages/nanoctl.cdx.json
+          output-file: release-packages/nanoctl.cdx.json
           upload-artifact: false
       - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
-          subject-path: packages/*
+          subject-path: release-packages/*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nanoctl-release-candidates
-          path: packages
+          path: release-packages
           if-no-files-found: error
           retention-days: 30
