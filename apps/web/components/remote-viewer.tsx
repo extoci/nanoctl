@@ -5,6 +5,16 @@ import { useAction, useMutation, useQuery } from "convex/react";
 import { useEffect, useRef, useState } from "react";
 import { functions } from "../lib/convex";
 
+type ViewerMetrics = {
+  resolution: string;
+  fps: number;
+  bitrateKbps: number;
+  rttMs: number;
+  packetsLost: number;
+  framesDropped: number;
+  route: "direct" | "relay" | "unknown";
+};
+
 export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -22,6 +32,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const [status, setStatus] = useState("Negotiating");
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
   const [ending, setEnding] = useState(false);
+  const [metrics, setMetrics] = useState<ViewerMetrics | null>(null);
 
   useEffect(() => {
     if (!session) return;
@@ -239,6 +250,69 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     video?.addEventListener("keydown", key);
     video?.addEventListener("keyup", key);
     const keepalive = window.setInterval(() => sendControl({ type: "ping" }), 1_000);
+    let previousBytes: { value: number; timestamp: number } | null = null;
+    let statsInFlight = false;
+    let statsStopped = false;
+    const statsTimer = window.setInterval(() => {
+      if (statsInFlight || peer.connectionState === "closed") return;
+      statsInFlight = true;
+      void peer
+        .getStats()
+        .then((report) => {
+          if (statsStopped) return;
+          let inbound: RTCStats | undefined;
+          let candidatePair: RTCStats | undefined;
+          report.forEach((stats) => {
+            if (
+              stats.type === "inbound-rtp" &&
+              (stringStat(stats, "kind") === "video" || stringStat(stats, "mediaType") === "video")
+            ) {
+              inbound = stats;
+            }
+            if (
+              stats.type === "candidate-pair" &&
+              stringStat(stats, "state") === "succeeded" &&
+              booleanStat(stats, "nominated")
+            ) {
+              candidatePair = stats;
+            }
+          });
+          if (!inbound) return;
+          const bytes = numberStat(inbound, "bytesReceived") ?? 0;
+          const now = inbound.timestamp;
+          const elapsed = previousBytes ? now - previousBytes.timestamp : 0;
+          const bitrateKbps =
+            previousBytes && elapsed > 0
+              ? Math.max(0, Math.round(((bytes - previousBytes.value) * 8) / elapsed))
+              : 0;
+          previousBytes = { value: bytes, timestamp: now };
+          const remoteCandidateId = candidatePair
+            ? stringStat(candidatePair, "remoteCandidateId")
+            : undefined;
+          const remoteCandidate = remoteCandidateId ? report.get(remoteCandidateId) : undefined;
+          const route =
+            stringStat(remoteCandidate, "candidateType") === "relay"
+              ? "relay"
+              : remoteCandidate
+                ? "direct"
+                : "unknown";
+          const width = numberStat(inbound, "frameWidth") ?? 0;
+          const height = numberStat(inbound, "frameHeight") ?? 0;
+          setMetrics({
+            resolution: width > 0 && height > 0 ? `${width}×${height}` : "—",
+            fps: Math.round(numberStat(inbound, "framesPerSecond") ?? 0),
+            bitrateKbps,
+            rttMs: Math.round((numberStat(candidatePair, "currentRoundTripTime") ?? 0) * 1_000),
+            packetsLost: Math.max(0, Math.round(numberStat(inbound, "packetsLost") ?? 0)),
+            framesDropped: Math.max(0, Math.round(numberStat(inbound, "framesDropped") ?? 0)),
+            route,
+          });
+        })
+        .catch(() => {})
+        .finally(() => {
+          statsInFlight = false;
+        });
+    }, 1_000);
 
     void sendOffer(false);
 
@@ -250,7 +324,9 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       video?.removeEventListener("contextmenu", contextMenu);
       video?.removeEventListener("keydown", key);
       video?.removeEventListener("keyup", key);
+      statsStopped = true;
       window.clearInterval(keepalive);
+      window.clearInterval(statsTimer);
       if (restartTimer !== null) window.clearTimeout(restartTimer);
       pointerChannel.close();
       controlChannel.close();
@@ -291,7 +367,16 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     <main className="viewer">
       <div className="viewer-bar">
         <a href="/dashboard">← Devices</a>
-        <span>{status}</span>
+        <div className="viewer-health">
+          <span>{status}</span>
+          {metrics ? (
+            <small>
+              {metrics.resolution} · {metrics.fps} fps · {formatBitrate(metrics.bitrateKbps)} ·{" "}
+              {metrics.rttMs} ms · {metrics.route} · {metrics.packetsLost} lost ·{" "}
+              {metrics.framesDropped} dropped
+            </small>
+          ) : null}
+        </div>
         <div className="viewer-actions">
           <button type="button" onClick={() => void videoRef.current?.requestFullscreen()}>
             Fullscreen
@@ -309,4 +394,26 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       <video ref={videoRef} autoPlay playsInline tabIndex={0} />
     </main>
   );
+}
+
+function statValue(stats: RTCStats | undefined, key: string): unknown {
+  return stats ? (stats as unknown as Record<string, unknown>)[key] : undefined;
+}
+
+function numberStat(stats: RTCStats | undefined, key: string): number | undefined {
+  const value = statValue(stats, key);
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringStat(stats: RTCStats | undefined, key: string): string | undefined {
+  const value = statValue(stats, key);
+  return typeof value === "string" ? value : undefined;
+}
+
+function booleanStat(stats: RTCStats | undefined, key: string): boolean {
+  return statValue(stats, key) === true;
+}
+
+function formatBitrate(kbps: number): string {
+  return kbps >= 1_000 ? `${(kbps / 1_000).toFixed(1)} Mbps` : `${kbps} kbps`;
 }

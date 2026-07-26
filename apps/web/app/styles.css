@@ -289,6 +289,18 @@ dd {
   text-transform: capitalize;
 }
 
+.viewer-health {
+  display: grid;
+  justify-items: center;
+  gap: 0.1rem;
+}
+
+.viewer-health small {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .viewer-actions button {
   min-height: 2.2rem;
   padding: 0.4rem 0.75rem;
