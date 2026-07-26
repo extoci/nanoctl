@@ -1,4 +1,11 @@
 {
-  "ignorePatterns": ["apps/web/convex/_generated/**", "target/**", ".next/**", "bun.lock"],
+  "ignorePatterns": [
+    "apps/web/convex/_generated/**",
+    "target/**",
+    ".next/**",
+    "playwright-report/**",
+    "test-results/**",
+    "bun.lock"
+  ],
   "sortPackageJson": true
 }

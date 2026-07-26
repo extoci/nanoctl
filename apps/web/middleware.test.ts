@@ -10,6 +10,7 @@ describe("web content security policy", () => {
     );
     expect(policy).toContain("script-src 'self' 'nonce-test-nonce' 'strict-dynamic'");
     expect(policy).toContain("frame-ancestors 'none'");
+    expect(policy).toContain("upgrade-insecure-requests");
     expect(policy).not.toContain("'unsafe-inline'");
     expect(policy).not.toContain("'unsafe-eval'");
   });
@@ -17,5 +18,11 @@ describe("web content security policy", () => {
   test("does not reflect unsupported control-plane schemes", () => {
     const policy = buildContentSecurityPolicy("test-nonce", "javascript:alert(1)", false);
     expect(policy).not.toContain("javascript:");
+  });
+
+  test("does not upgrade local development control-plane traffic", () => {
+    const policy = buildContentSecurityPolicy("test-nonce", "http://127.0.0.1:3210", true);
+    expect(policy).toContain("http://127.0.0.1:3210 ws://127.0.0.1:3210");
+    expect(policy).not.toContain("upgrade-insecure-requests");
   });
 });

@@ -1,6 +1,13 @@
 import { rm } from "node:fs/promises";
 
-const generatedPaths = ["apps/web/.next", "packages/protocol/dist", "target", "coverage"];
+const generatedPaths = [
+  "apps/web/.next",
+  "packages/protocol/dist",
+  "target",
+  "coverage",
+  "playwright-report",
+  "test-results",
+];
 
 await Promise.all(
   generatedPaths.map(async (path) => {

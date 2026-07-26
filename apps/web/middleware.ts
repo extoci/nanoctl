@@ -32,8 +32,8 @@ export function buildContentSecurityPolicy(
     "form-action 'self' https://shoo.dev",
     "frame-ancestors 'none'",
     "worker-src 'none'",
-    "upgrade-insecure-requests",
   ];
+  if (!development) directives.push("upgrade-insecure-requests");
   return `${directives.join("; ")};`;
 }
 
