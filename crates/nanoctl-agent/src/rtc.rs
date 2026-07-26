@@ -455,7 +455,7 @@ impl HostPeer {
                 if reason.is_empty() || reason.len() > 512 {
                     anyhow::bail!("end reason is invalid");
                 }
-                tracing::info!(reason = %reason, "controller ended session");
+                tracing::info!(reason_bytes = reason.len(), "controller ended session");
                 self.peer.close().await?;
                 Ok(false)
             }

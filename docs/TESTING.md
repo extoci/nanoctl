@@ -17,9 +17,9 @@ Current automated coverage includes bounded protocol and signaling parsing, role
 duplicate enrollment and signaling, owner isolation, revocation, terminal mutation idempotency,
 rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer and
 bitstream transforms, input bounds and fail-safe release behavior, packaging transactions,
-production configuration, CSP nonces, media-evidence validation, and an in-process connection
-between the production host peer and a real WebRTC controller peer through SDP, ICE, DTLS/SCTP,
-and control-channel opening.
+production configuration, CSP nonces, media/network/performance-evidence validation, agent log
+redaction, and an in-process connection between the production host peer and a real WebRTC
+controller peer through SDP, ICE, DTLS/SCTP, and control-channel opening.
 
 ## Required release-test expansion
 

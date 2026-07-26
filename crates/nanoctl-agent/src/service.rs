@@ -436,18 +436,42 @@ fn spawn_media(
 }
 
 fn redact(error: &anyhow::Error) -> String {
-    let value = error.to_string();
-    if value.len() > 256 {
-        format!("{}…", &value[..256])
+    let value = error.to_string().to_ascii_lowercase();
+    if value.contains("timed out") || value.contains("timeout") {
+        "operation timed out".to_owned()
+    } else if value.contains("connect") || value.contains("dns") {
+        "connection unavailable".to_owned()
+    } else if value.contains("status") || value.contains("rejected") {
+        "remote service rejected the operation".to_owned()
+    } else if value.contains("invalid") || value.contains("malformed") {
+        "invalid data".to_owned()
+    } else if value.contains("permission") || value.contains("denied") {
+        "permission denied".to_owned()
+    } else if value.contains("unavailable") || value.contains("not available") {
+        "resource unavailable".to_owned()
     } else {
-        value
+        "operation failed".to_owned()
     }
 }
 
 #[cfg(all(test, feature = "rtc"))]
 mod tests {
-    use super::failure_grace_elapsed;
+    use super::{failure_grace_elapsed, redact};
     use std::time::Duration;
+
+    #[test]
+    fn logged_errors_never_include_transport_or_authentication_material() {
+        for sensitive in [
+            "Bearer secret-device-token",
+            "v=0\r\na=fingerprint:sha-256 11:22",
+            "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+            "turns://user:password@turn.example.com",
+        ] {
+            let rendered = redact(&anyhow::anyhow!("request rejected: {sensitive}"));
+            assert_eq!(rendered, "remote service rejected the operation");
+            assert!(!rendered.contains(sensitive));
+        }
+    }
     use tokio::time::Instant;
 
     #[test]

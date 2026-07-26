@@ -41,6 +41,10 @@ Session authorization is `(owner subject, device id, session id, expiry, role)`.
 capabilities. Signal sequence numbers are scoped by sender. Replays are ignored. SDP, candidates,
 clipboard, names, and reasons have explicit size limits.
 
+Persistent agent logs use allowlisted error categories rather than raw error strings. They never
+write bearer tokens, SDP, ICE candidates, TURN credentials, or controller-provided end reasons;
+terminal events retain only a bounded byte count and pseudonymous session/device identifiers.
+
 ## Transport
 
 Browser-to-control-plane traffic requires TLS. WebRTC uses ICE + DTLS, SRTP for media, and SCTP over
