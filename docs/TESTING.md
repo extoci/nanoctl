@@ -38,12 +38,12 @@ The checked-in Chromium suite covers the unauthenticated gate, Shoo origin/redir
 malformed callback containment, response CSP/nonces, authenticated dashboard loading/empty/device
 states, readiness affordances, activity history, pairing, rename, removal, sign-out, and operation
 failure containment. The authenticated fixtures reuse the production dashboard view through an
-explicit test-server gate; production preflight rejects that gate. The same suite drives the
-production viewer controller through a deterministic WebRTC browser peer and verifies display
-commands, button and keyboard emergency release, page/unmount cleanup, terminal state, and bounded
-reconnect exhaustion. Full browser-to-native media interoperability, Firefox and WebKit, plus real
-Chrome and Edge performance remain release gates because synthetic peers and media are insufficient
-for decoder performance.
+explicit test-server gate; production preflight rejects that gate. Chromium, Firefox, and WebKit
+all run the same suite. It drives the production viewer controller through a deterministic WebRTC
+browser peer and verifies display commands, button and keyboard emergency release, page/unmount
+cleanup, terminal state, and bounded reconnect exhaustion. Full browser-to-native media
+interoperability plus real Chrome, Edge, Firefox, and Safari performance remain release gates
+because synthetic peers and media are insufficient for decoder performance.
 
 ## Native tests
 

@@ -92,6 +92,17 @@ test("viewer switches displays and releases control with button and emergency sh
   await expect(page.getByText("Negotiating")).toBeVisible();
   const display = page.getByLabel("Display");
   await expect(display).toHaveValue("display-primary");
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as typeof window & {
+            __nanoctlChannels?: { label: string }[];
+          }
+        ).__nanoctlChannels?.some((channel) => channel.label === "nanoctl.control.v1"),
+      ),
+    )
+    .toBe(true);
   await display.selectOption("display-secondary");
   await expect
     .poll(() =>
