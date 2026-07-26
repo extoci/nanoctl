@@ -50,9 +50,9 @@ for decoder performance.
 Native unit tests cover configuration, update transactions, media conversion/queue behavior,
 hardware-fallback policy, input parsing/bounds, signaling identity, and peer-failure grace. A
 real two-peer localhost test covers production host signaling, SDP/ICE negotiation, connection, and
-control-channel opening. Expansion of that harness to synthetic 4K motion, impairment, ICE restart,
-TURN-only, permission loss, sleep/wake, network switch, and abrupt controller death is still
-required.
+control-channel opening, then performs and reconnects through an ICE restart. Expansion of that
+harness to synthetic 4K motion, impairment, TURN-only, permission loss, sleep/wake, network switch,
+and abrupt controller death is still required.
 
 Physical-machine release matrix:
 

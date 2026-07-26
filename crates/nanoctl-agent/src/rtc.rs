@@ -608,6 +608,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use tokio::time::{Duration, Instant, timeout};
+    use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     #[test]
@@ -767,6 +768,94 @@ mod tests {
         timeout(Duration::from_secs(3), opened.notified())
             .await
             .expect("negotiated control channel did not open");
+
+        while signals_rx.try_recv().is_ok() {}
+        let initial_remote_sdp = controller.remote_description().await.unwrap().sdp;
+        let restart_offer = controller
+            .create_offer(Some(RTCOfferOptions {
+                ice_restart: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        controller
+            .set_local_description(restart_offer)
+            .await
+            .unwrap();
+        let mut restart_gathering_complete = controller.gathering_complete_promise().await;
+        let _ = restart_gathering_complete.recv().await;
+        let restart_offer = controller.local_description().await.unwrap();
+        let restart_envelope = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "sessionId": session_id,
+            "sequence": 1,
+            "sender": "controller",
+            "sentAt": 2,
+            "payload": {"type": "offer", "sdp": restart_offer.sdp},
+        })
+        .to_string();
+        assert!(
+            host.add_signal(&restart_envelope, session_id, 1)
+                .await
+                .unwrap()
+        );
+
+        let restart_deadline = Instant::now() + Duration::from_secs(10);
+        let mut restart_answer_applied = false;
+        let mut pending_candidates = Vec::new();
+        while Instant::now() < restart_deadline && !restart_answer_applied {
+            let Some(signal) = timeout(Duration::from_millis(250), signals_rx.recv())
+                .await
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            let envelope: Value = serde_json::from_str(&signal.envelope).unwrap();
+            match envelope["payload"]["type"].as_str() {
+                Some("answer") if signal.sequence > 0 => {
+                    let sdp = envelope["payload"]["sdp"].as_str().unwrap().to_owned();
+                    assert_ne!(sdp, initial_remote_sdp);
+                    controller
+                        .set_remote_description(RTCSessionDescription::answer(sdp).unwrap())
+                        .await
+                        .unwrap();
+                    restart_answer_applied = true;
+                }
+                Some("ice-candidate") => pending_candidates.push(envelope),
+                Some("ice-complete") => {}
+                Some("answer") => {}
+                other => panic!("unexpected host restart signal: {other:?}"),
+            }
+        }
+        assert!(
+            restart_answer_applied,
+            "host did not publish an ICE restart answer"
+        );
+        for envelope in pending_candidates {
+            controller
+                .add_ice_candidate(RTCIceCandidateInit {
+                    candidate: envelope["payload"]["candidate"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    sdp_mid: envelope["payload"]["sdpMid"].as_str().map(str::to_owned),
+                    sdp_mline_index: envelope["payload"]["sdpMLineIndex"]
+                        .as_u64()
+                        .map(|value| value as u16),
+                    username_fragment: None,
+                })
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(10), async {
+            while controller.connection_state() != RTCPeerConnectionState::Connected {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("controller did not reconnect after ICE restart");
+
         host.close().await.unwrap();
         controller.close().await.unwrap();
     }
