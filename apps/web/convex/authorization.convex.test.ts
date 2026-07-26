@@ -50,6 +50,38 @@ function asOwner(t: ReturnType<typeof convexTest>, subject: string) {
 }
 
 describe("control-plane authorization", () => {
+  test("requires Shoo identity on every public control-plane operation", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const ownerA = asOwner(t, "owner-a");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+    const offer = JSON.stringify({
+      version: 1,
+      sessionId,
+      sequence: 0,
+      sender: "controller",
+      sentAt: Date.now(),
+      payload: { type: "offer", sdp: "v=0" },
+    });
+
+    const operations = [
+      t.query(api.devices.list),
+      t.action(api.devices.createPairingCode),
+      t.mutation(api.devices.rename, { deviceId, name: "No identity" }),
+      t.mutation(api.devices.remove, { deviceId }),
+      t.query(api.audit.listRecent),
+      t.query(api.sessions.getState, { sessionId }),
+      t.mutation(api.sessions.create, { deviceId }),
+      t.mutation(api.sessions.end, { sessionId, reason: "No identity" }),
+      t.action(api.sessions.turnCredentials, { sessionId }),
+      t.query(api.signals.list, { sessionId, afterSequence: -1 }),
+      t.mutation(api.signals.send, { sessionId, envelope: offer }),
+    ];
+    const results = await Promise.allSettled(operations);
+    expect(results).toHaveLength(11);
+    expect(results.every((result) => result.status === "rejected")).toBe(true);
+  });
+
   test("consumes one pairing code at most once under concurrent enrollment", async () => {
     const t = convexTest(schema, modules);
     await t.run(async (ctx) => {
@@ -161,6 +193,31 @@ describe("control-plane authorization", () => {
       return { state: session?.state, signalCount: signals.length };
     });
     expect(evidence).toEqual({ state: "negotiating", signalCount: 1 });
+  });
+
+  test("denies cross-owner session reads, ending, host signals, and TURN authorization", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const ownerA = asOwner(t, "owner-a");
+    const ownerB = asOwner(t, "owner-b");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+
+    await expect(ownerB.query(api.sessions.getState, { sessionId })).rejects.toThrow();
+    await expect(
+      ownerB.query(api.signals.list, { sessionId, afterSequence: -1 }),
+    ).rejects.toThrow();
+    await expect(
+      ownerB.mutation(api.sessions.end, { sessionId, reason: "cross-owner" }),
+    ).rejects.toThrow();
+    expect(
+      await t.query(internal.sessions.authorizeTurn, {
+        sessionId,
+        ownerId: "owner-b",
+      }),
+    ).toBe(false);
+
+    const session = await t.run(async (ctx) => ctx.db.get(sessionId));
+    expect(session?.state).toBe("requested");
   });
 
   test("does not offer sessions to a reachable but unready device", async () => {
