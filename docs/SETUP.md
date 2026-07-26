@@ -28,6 +28,10 @@ $configPath = ((.\nanoctl.exe paths) -replace '^config=', '')
   -ConfigPath $configPath
 ```
 
+UAC must elevate that same Windows account. If an administrator credential prompt is answered with
+a different account, installation fails before making changes: the scheduled task, desktop session,
+configuration, and Credential Manager enrollment must all belong to one identity.
+
 Despite the compatibility filename, the script copies the signed binary under Program Files and
 registers a headless, non-elevated Scheduled Task for the current interactive user. A LocalSystem
 Windows service runs in Session 0 and cannot capture or inject into that user's desktop or read

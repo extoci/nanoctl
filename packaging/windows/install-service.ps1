@@ -14,10 +14,21 @@ $ErrorActionPreference = "Stop"
 $taskName = "nanoctl Agent"
 $sourceBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
-$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUser = $currentIdentity.Name
+$configOwner = (Get-Acl -LiteralPath $resolvedConfig).Owner
+$configOwnerSid = ([Security.Principal.NTAccount]$configOwner).Translate(
+  [Security.Principal.SecurityIdentifier]
+)
 $installRoot = Join-Path $env:ProgramFiles "nanoctl"
 $installedBinary = Join-Path $installRoot "nanoctl.exe"
 
+if ($configOwnerSid.Value -ne $currentIdentity.User.Value) {
+  throw (
+    "The elevated identity '$currentUser' does not own the enrolled configuration. " +
+    "Sign in as '$configOwner' and elevate that same account; do not supply another administrator."
+  )
+}
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
   throw "The nanoctl agent is already installed. Uninstall or update it explicitly."
 }
