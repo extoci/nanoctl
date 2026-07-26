@@ -5,8 +5,10 @@ use std::time::SystemTime;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use interceptor::registry::Registry;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
+use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 #[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
@@ -106,7 +108,11 @@ impl HostPeer {
         let offer = parse_offer(serialized_offer, &session_id)?;
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
-        let api = APIBuilder::new().with_media_engine(media_engine).build();
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
         #[cfg(not(feature = "media"))]
         let _ = allow_remote_input;
         let peer = Arc::new(

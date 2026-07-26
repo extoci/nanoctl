@@ -2183,6 +2183,7 @@ dependencies = [
  "enigo",
  "futures-util",
  "hostname",
+ "interceptor",
  "keyring",
  "openh264",
  "reqwest",
