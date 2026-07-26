@@ -114,7 +114,7 @@ impl MacOsEncoder {
                 height: image.height(),
             });
         }
-        let (parameter_sets, nal_length_size) = h264_format(encoded.cm_sample_buffer_ptr())?;
+        let (parameter_sets, nal_length_size) = h264_format(encoded.cm_sample_buffer_ptr().cast())?;
         let parameter_refs = parameter_sets.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let bytes = avcc_to_annex_b(&encoded.data, nal_length_size, &parameter_refs)?;
         Ok(EncodedFrame {

@@ -37,7 +37,7 @@ use crate::control_plane::ControlPlane;
 
 const PROTOCOL_VERSION: u8 = 1;
 #[cfg(any(feature = "media", test))]
-const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 #[cfg(feature = "media")]
 const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 64;
 
@@ -652,6 +652,7 @@ fn serialize(session_id: &str, sequence: u64, payload: OutgoingPayload) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::Value;
     use tokio::time::{Duration, Instant, timeout};
     use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
@@ -722,6 +723,47 @@ mod tests {
             admit_input_message(&sender, vec![0; 1]),
             InputAdmission::Closed
         );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_signaling_text_never_bypasses_offer_identity(
+            version in any::<u8>(),
+            sequence in any::<u64>(),
+            sender in ".{0,32}",
+            sent_at in any::<u64>(),
+            session_id in ".{0,64}",
+            expected_session in ".{0,64}",
+            sdp in ".{0,2048}",
+        ) {
+            let envelope = serde_json::json!({
+                "version": version,
+                "sessionId": session_id,
+                "sequence": sequence,
+                "sender": sender,
+                "sentAt": sent_at,
+                "payload": {"type": "offer", "sdp": sdp},
+            })
+            .to_string();
+            let accepted = parse_offer(&envelope, &expected_session).is_ok();
+            let should_accept = version == PROTOCOL_VERSION
+                && session_id == expected_session
+                && sequence == 0
+                && sender == "controller"
+                && sent_at != 0
+                && !sdp.is_empty();
+            prop_assert_eq!(accepted, should_accept);
+        }
+
+        #[test]
+        fn arbitrary_text_does_not_panic_the_signaling_parser(
+            serialized in proptest::collection::vec(any::<u8>(), 0..4096),
+            expected_session in ".{0,64}",
+        ) {
+            if let Ok(text) = std::str::from_utf8(&serialized) {
+                let _ = is_offer_for_session(text, &expected_session);
+            }
+        }
     }
 
     #[tokio::test]

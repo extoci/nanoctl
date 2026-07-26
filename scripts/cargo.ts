@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
 const args = process.argv.slice(2);
 if (args.length === 0) throw new Error("usage: bun scripts/cargo.ts <cargo arguments>");
 const separator = args.indexOf("--");
@@ -11,7 +14,13 @@ const cargoArgs =
         ...args.slice(separator),
       ];
 
-const subprocess = Bun.spawn(["cargo", ...cargoArgs], {
+const cargoHome = process.env.CARGO_HOME;
+const cargoFromHome = cargoHome
+  ? join(cargoHome, "bin", process.platform === "win32" ? "cargo.exe" : "cargo")
+  : undefined;
+const cargo = cargoFromHome && existsSync(cargoFromHome) ? cargoFromHome : "cargo";
+
+const subprocess = Bun.spawn([cargo, ...cargoArgs], {
   cwd: new URL("..", import.meta.url).pathname,
   env: {
     ...process.env,

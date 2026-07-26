@@ -318,6 +318,7 @@ fn map_key(code: &str, value: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn coordinates_are_bounded() {
@@ -348,5 +349,35 @@ mod tests {
             display,
             ControlMessage::Display { display_id } if display_id == "42"
         ));
+    }
+
+    proptest! {
+        #[test]
+        fn coordinate_and_scroll_math_is_total_and_bounded(
+            coordinate in any::<f64>(),
+            extent in any::<u32>(),
+            origin in any::<i32>(),
+            scroll in any::<f64>(),
+        ) {
+            let normalized = normalized_pixel(coordinate, extent);
+            let upper = extent.saturating_sub(1).min(i32::MAX as u32) as i32;
+            prop_assert!(normalized >= 0);
+            prop_assert!(normalized <= upper);
+            let displayed = display_pixel(coordinate, extent, origin);
+            prop_assert!(displayed >= origin);
+            prop_assert!(displayed <= origin.saturating_add(upper));
+            prop_assert!((-20..=20).contains(&bounded_scroll(scroll)));
+        }
+
+        #[test]
+        fn arbitrary_control_bytes_never_escape_the_bounded_parser(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=MAX_CONTROL_MESSAGE_BYTES + 1),
+        ) {
+            if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
+                prop_assert!(bytes.len() > MAX_CONTROL_MESSAGE_BYTES);
+            } else {
+                let _ = serde_json::from_slice::<ControlMessage>(&bytes);
+            }
+        }
     }
 }
