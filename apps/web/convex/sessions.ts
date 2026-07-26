@@ -77,6 +77,7 @@ export const end = mutation({
     const session = await ctx.db.get(args.sessionId);
     if (!session || session.ownerId !== identity.subject)
       throw new ConvexError("Session not found");
+    if (session.state === "ended" || session.state === "failed") return null;
     const now = Date.now();
     await ctx.db.patch(args.sessionId, {
       state: "ended",

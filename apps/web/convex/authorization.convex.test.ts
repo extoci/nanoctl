@@ -169,4 +169,29 @@ describe("control-plane authorization", () => {
     });
     await expect(ownerA.mutation(api.signals.send, { sessionId, envelope })).rejects.toThrow();
   });
+
+  test("makes terminal device and session mutations idempotent", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const ownerA = asOwner(t, "owner-a");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+
+    await ownerA.mutation(api.sessions.end, { sessionId, reason: "done" });
+    await ownerA.mutation(api.sessions.end, { sessionId, reason: "duplicate" });
+    await ownerA.mutation(api.devices.remove, { deviceId });
+    await ownerA.mutation(api.devices.remove, { deviceId });
+
+    const evidence = await t.run(async (ctx) => {
+      const device = await ctx.db.get(deviceId);
+      const events = await ctx.db.query("auditEvents").collect();
+      return {
+        tokenHash: device?.tokenHash,
+        endedEvents: events.filter((event) => event.action === "session.ended").length,
+        revokedEvents: events.filter((event) => event.action === "device.revoked").length,
+      };
+    });
+    expect(evidence.tokenHash).toBe("revoked:token-owner-a");
+    expect(evidence.endedEvents).toBe(1);
+    expect(evidence.revokedEvents).toBe(1);
+  });
 });

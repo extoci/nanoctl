@@ -1,38 +1,49 @@
 # Verification strategy
 
-## Required gates
+## Automated repository gates
 
-Every change runs formatting, oxc lint, TypeScript 7 project checking, Bun protocol tests, Rust
-format/clippy/tests, the production OpenNext/Sites build, Convex function generation/type checking,
-dependency audit, and secret scan.
+CI runs formatting, oxc lint, TypeScript 7 project checking, Bun unit tests, transactional Convex
+authorization tests, Rust format/clippy/tests, the production OpenNext/Sites build, dependency
+audits, and secret scanning. Native media builds run on Linux, macOS, and Windows. Local
+`bun run check` is the fast pre-commit subset; it does not replace the browser, production-build,
+media-feature, or security jobs.
 
 The `release candidates` workflow compiles the full media agent on native x64 and arm64 runners for
 Linux, macOS, and Windows. It creates timestamp-normalized archives, SHA-256 checksums, a CycloneDX
 SBOM, and GitHub build-provenance attestations. These artifacts are deliberately called
 **candidates**: they are unsigned and are not an installable release.
 
-## Protocol and security tests
+Current automated coverage includes bounded protocol and signaling parsing, role/session identity,
+duplicate enrollment and signaling, owner isolation, revocation, terminal mutation idempotency,
+rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer and
+bitstream transforms, input bounds and fail-safe release behavior, packaging transactions,
+production configuration, CSP nonces, and media-evidence validation.
 
-- property/fuzz tests for every JSON/control parser, size bound, coordinate, state transition, and
-  configuration field;
+## Required release-test expansion
+
+The following remain mandatory before a supported release; they are requirements, not claims about
+the current automated suite:
+
+- property/fuzz tests for security-sensitive JSON/control parsers and state transitions;
 - replay, duplicate, gap, expiry, wrong-role, wrong-owner, revoked-token, and cross-device tests;
-- enrollment concurrency test proving one code creates at most one device;
 - authorization tests around every public Convex function and HTTP action;
 - malformed SDP/candidate tests and data-channel flood/backpressure tests;
 - log snapshots proving secrets, clipboard, SDP, and ICE candidates are redacted.
 
 ## Browser tests
 
-Playwright covers login callback state, unauthenticated routing, device empty/list/offline states,
-pairing, session lifecycle, keyboard escape behavior, display switching, reconnect UI, and cleanup.
-Chromium, Firefox, and WebKit are tested where their WebRTC codec support permits. Real Chrome and
-Edge remain release targets because synthetic media is insufficient for decoder performance.
+The checked-in Chromium suite covers the unauthenticated gate, Shoo origin/redirect binding,
+malformed callback containment, and response CSP/nonces. Authenticated dashboard states, pairing,
+session cleanup, emergency keyboard release, display switching, and reconnect UI still require
+browser automation. Firefox and WebKit interoperability plus real Chrome and Edge performance
+remain release gates because synthetic media is insufficient for decoder performance.
 
 ## Native tests
 
-Unit tests use mock capture, encoder, input, credential store, clock, and control plane. Integration
-tests run two peers with synthetic 4K motion, artificial loss/jitter/bandwidth, ICE restart, TURN
-only, encoder crash, permission loss, sleep/wake, network switch, and abrupt controller death.
+Native unit tests cover configuration, update transactions, media conversion/queue behavior,
+hardware-fallback policy, input parsing/bounds, signaling identity, and peer-failure grace. A
+two-peer integration harness with synthetic 4K motion, impairment, ICE restart, TURN-only,
+permission loss, sleep/wake, network switch, and abrupt controller death is still required.
 
 Physical-machine release matrix:
 

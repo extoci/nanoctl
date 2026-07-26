@@ -62,7 +62,9 @@ export const rename = mutation({
   handler: async (ctx, args) => {
     const identity = await requireIdentity(ctx);
     const device = await ctx.db.get(args.deviceId);
-    if (!device || device.ownerId !== identity.subject) throw new ConvexError("Device not found");
+    if (!device || device.ownerId !== identity.subject || device.status === "disabled") {
+      throw new ConvexError("Device not found");
+    }
     await ctx.db.patch(args.deviceId, { name: cleanDeviceName(args.name) });
     return null;
   },
@@ -74,6 +76,7 @@ export const remove = mutation({
     const identity = await requireIdentity(ctx);
     const device = await ctx.db.get(args.deviceId);
     if (!device || device.ownerId !== identity.subject) throw new ConvexError("Device not found");
+    if (device.status === "disabled") return null;
     const now = Date.now();
     await ctx.db.patch(args.deviceId, {
       status: "disabled",
