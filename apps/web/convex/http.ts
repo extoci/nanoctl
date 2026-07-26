@@ -1,6 +1,7 @@
 import { httpRouter } from "convex/server";
 import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { boundedCapabilities, parseEnrollmentInput } from "./httpValidation";
 import { mintTurnCredentials } from "./turn";
 
 const http = httpRouter();
@@ -11,17 +12,8 @@ http.route({
   handler: httpAction(async (ctx, request) => {
     const parsed = await readJson(request, 70_000);
     if (!parsed.ok) return parsed.response;
-    const body = parsed.value;
-    if (
-      typeof body.code !== "string" ||
-      typeof body.name !== "string" ||
-      !isPlatform(body.platform) ||
-      !isArchitecture(body.architecture) ||
-      typeof body.agentVersion !== "string" ||
-      !isRecord(body.capabilities)
-    ) {
-      return json({ error: "invalid_request" }, 400);
-    }
+    const body = parseEnrollmentInput(parsed.value);
+    if (!body) return json({ error: "invalid_request" }, 400);
     const requester = await requestFingerprint(request);
     const [ipPermitted, codePermitted] = await Promise.all([
       ctx.runMutation(internal.rateLimits.consume, {
@@ -30,7 +22,7 @@ http.route({
         windowMs: 10 * 60 * 1000,
       }),
       ctx.runMutation(internal.rateLimits.consume, {
-        key: `enroll:code:${await sha256(body.code.trim().toUpperCase())}`,
+        key: `enroll:code:${await sha256(body.code)}`,
         limit: 5,
         windowMs: 10 * 60 * 1000,
       }),
@@ -40,13 +32,13 @@ http.route({
     }
     const token = base64Url(crypto.getRandomValues(new Uint8Array(32)));
     const result = await ctx.runMutation(internal.agent.enroll, {
-      codeHash: await sha256(body.code.trim().toUpperCase()),
+      codeHash: await sha256(body.code),
       tokenHash: await sha256(token),
       name: body.name,
       platform: body.platform,
       architecture: body.architecture,
       agentVersion: body.agentVersion,
-      capabilitiesJson: JSON.stringify(body.capabilities),
+      capabilitiesJson: body.capabilitiesJson,
     });
     if (!result) return json({ error: "invalid_or_expired_code" }, 401);
     return json({ deviceId: result.deviceId, token });
@@ -62,10 +54,12 @@ http.route({
     const parsed = await readJson(request, 70_000);
     if (!parsed.ok) return parsed.response;
     const body = parsed.value;
+    const capabilitiesJson = boundedCapabilities(body.capabilities);
+    if (capabilitiesJson === null) return json({ error: "invalid_request" }, 400);
     const ok = await ctx.runMutation(internal.agent.heartbeat, {
       deviceId: auth.deviceId,
       agentVersion: typeof body.agentVersion === "string" ? body.agentVersion : "unknown",
-      capabilitiesJson: JSON.stringify(body.capabilities ?? {}),
+      capabilitiesJson,
     });
     return ok ? json({ ok: true }) : json({ error: "disabled" }, 403);
   }),
@@ -102,7 +96,7 @@ http.route({
     }
     const ok = await ctx.runMutation(internal.agent.sendSignal, {
       deviceId: auth.deviceId,
-      sessionId: body.sessionId as never,
+      sessionId: body.sessionId,
       sequence: Number(body.sequence),
       envelope: body.envelope,
     });
@@ -120,7 +114,7 @@ http.route({
     if (!sessionId) return json({ error: "invalid_request" }, 400);
     const authorized = await ctx.runQuery(internal.agent.authorizeSession, {
       deviceId: auth.deviceId,
-      sessionId: sessionId as never,
+      sessionId,
     });
     if (!authorized) return json({ error: "session_unavailable" }, 404);
     const credentials = await mintTurnCredentials(sessionId);
@@ -187,14 +181,6 @@ function json(body: unknown, status = 200): Response {
       "content-type": "application/json; charset=utf-8",
     },
   });
-}
-
-function isPlatform(value: unknown): value is "windows" | "macos" | "linux" {
-  return value === "windows" || value === "macos" || value === "linux";
-}
-
-function isArchitecture(value: unknown): value is "x64" | "arm64" {
-  return value === "x64" || value === "arm64";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

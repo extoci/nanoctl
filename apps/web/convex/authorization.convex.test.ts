@@ -194,4 +194,42 @@ describe("control-plane authorization", () => {
     expect(evidence.endedEvents).toBe(1);
     expect(evidence.revokedEvents).toBe(1);
   });
+
+  test("treats malformed and terminal host session IDs as unavailable", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    expect(
+      await t.query(internal.agent.authorizeSession, {
+        deviceId,
+        sessionId: "not-a-convex-id",
+      }),
+    ).toBe(false);
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId: "not-a-convex-id",
+        sequence: 0,
+        envelope: "{}",
+      }),
+    ).toBe(false);
+
+    const ownerA = asOwner(t, "owner-a");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+    await ownerA.mutation(api.sessions.end, { sessionId, reason: "done" });
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 0,
+        envelope: JSON.stringify({
+          version: 1,
+          sessionId,
+          sequence: 0,
+          sender: "host",
+          sentAt: Date.now(),
+          payload: { type: "answer", sdp: "v=0" },
+        }),
+      }),
+    ).toBe(false);
+  });
 });

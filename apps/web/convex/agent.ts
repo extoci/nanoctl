@@ -112,20 +112,23 @@ export const pendingSessions = internalQuery({
 export const sendSignal = internalMutation({
   args: {
     deviceId: v.id("devices"),
-    sessionId: v.id("sessions"),
+    sessionId: v.string(),
     sequence: v.number(),
     envelope: v.string(),
   },
   handler: async (ctx, args) => {
-    if (!(await consumeRateLimit(ctx, `signal:host:${args.sessionId}`, 512, 60 * 1000))) {
+    const sessionId = ctx.db.normalizeId("sessions", args.sessionId);
+    if (!sessionId) return false;
+    if (!(await consumeRateLimit(ctx, `signal:host:${sessionId}`, 512, 60 * 1000))) {
       return false;
     }
-    const session = await ctx.db.get(args.sessionId);
+    const session = await ctx.db.get(sessionId);
     if (
       !session ||
       session.deviceId !== args.deviceId ||
       session.expiresAt <= Date.now() ||
       session.state === "ended" ||
+      session.state === "failed" ||
       args.envelope.length > 1_100_000
     ) {
       return false;
@@ -136,18 +139,18 @@ export const sendSignal = internalMutation({
     } catch {
       return false;
     }
-    if (parsed.sessionId !== String(args.sessionId) || parsed.sequence !== args.sequence) {
+    if (parsed.sessionId !== String(sessionId) || parsed.sequence !== args.sequence) {
       return false;
     }
     const duplicate = await ctx.db
       .query("signals")
       .withIndex("by_session_sender_sequence", (q) =>
-        q.eq("sessionId", args.sessionId).eq("sender", "host").eq("sequence", args.sequence),
+        q.eq("sessionId", sessionId).eq("sender", "host").eq("sequence", args.sequence),
       )
       .unique();
     if (!duplicate) {
       await ctx.db.insert("signals", {
-        sessionId: args.sessionId,
+        sessionId,
         sender: "host",
         kind: parsed.kind,
         sequence: args.sequence,
@@ -157,17 +160,17 @@ export const sendSignal = internalMutation({
       });
       if (parsed.kind === "answer" && session.state === "negotiating") {
         const now = Date.now();
-        await ctx.db.patch(args.sessionId, { state: "connected", updatedAt: now });
+        await ctx.db.patch(sessionId, { state: "connected", updatedAt: now });
         await ctx.db.insert("auditEvents", {
           ownerId: session.ownerId,
           deviceId: session.deviceId,
-          sessionId: args.sessionId,
+          sessionId,
           action: "session.connected",
           createdAt: now,
         });
       } else if (parsed.kind === "end") {
         const now = Date.now();
-        await ctx.db.patch(args.sessionId, {
+        await ctx.db.patch(sessionId, {
           state: "failed",
           endedAt: now,
           updatedAt: now,
@@ -176,7 +179,7 @@ export const sendSignal = internalMutation({
         await ctx.db.insert("auditEvents", {
           ownerId: session.ownerId,
           deviceId: session.deviceId,
-          sessionId: args.sessionId,
+          sessionId,
           action: "session.failed",
           detail: "agent media pipeline failed",
           createdAt: now,
@@ -188,9 +191,11 @@ export const sendSignal = internalMutation({
 });
 
 export const authorizeSession = internalQuery({
-  args: { deviceId: v.id("devices"), sessionId: v.id("sessions") },
+  args: { deviceId: v.id("devices"), sessionId: v.string() },
   handler: async (ctx, args) => {
-    const session = await ctx.db.get(args.sessionId);
+    const sessionId = ctx.db.normalizeId("sessions", args.sessionId);
+    if (!sessionId) return false;
+    const session = await ctx.db.get(sessionId);
     return Boolean(
       session &&
       session.deviceId === args.deviceId &&
