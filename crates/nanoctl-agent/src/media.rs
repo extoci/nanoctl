@@ -291,6 +291,62 @@ fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Opti
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn avcc_to_annex_b(
+    access_unit: &[u8],
+    nal_length_size: usize,
+    parameter_sets: &[&[u8]],
+) -> Result<Vec<u8>> {
+    if !(1..=4).contains(&nal_length_size) {
+        bail!("AVCC NAL length field must contain between 1 and 4 bytes");
+    }
+    let parameter_bytes = parameter_sets
+        .iter()
+        .try_fold(0_usize, |total, parameter_set| {
+            if parameter_set.is_empty() || parameter_set.len() > 64 * 1024 {
+                return None;
+            }
+            total.checked_add(4)?.checked_add(parameter_set.len())
+        });
+    let parameter_bytes = parameter_bytes.context("H.264 parameter sets are invalid")?;
+    let capacity = parameter_bytes
+        .checked_add(access_unit.len())
+        .context("H.264 access unit is too large")?;
+    let mut annex_b = Vec::with_capacity(capacity);
+    for parameter_set in parameter_sets {
+        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+        annex_b.extend_from_slice(parameter_set);
+    }
+    let mut offset = 0_usize;
+    while offset < access_unit.len() {
+        let length_end = offset
+            .checked_add(nal_length_size)
+            .context("AVCC offset overflow")?;
+        let encoded_length = access_unit
+            .get(offset..length_end)
+            .context("AVCC access unit ends inside a NAL length field")?;
+        let nal_length = encoded_length
+            .iter()
+            .fold(0_usize, |value, byte| (value << 8) | usize::from(*byte));
+        if nal_length == 0 {
+            bail!("AVCC access unit contains an empty NAL unit");
+        }
+        let nal_end = length_end
+            .checked_add(nal_length)
+            .context("AVCC NAL length overflow")?;
+        let nal = access_unit
+            .get(length_end..nal_end)
+            .context("AVCC NAL length exceeds the access unit")?;
+        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+        annex_b.extend_from_slice(nal);
+        offset = nal_end;
+    }
+    if offset == 0 {
+        bail!("AVCC access unit is empty");
+    }
+    Ok(annex_b)
+}
+
 impl Drop for CaptureEncoder {
     fn drop(&mut self) {
         let _ = self.recorder.stop();
@@ -394,7 +450,7 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{EncoderBackend, LatestFrame, bitrate_target, fit_dimensions};
+    use super::{EncoderBackend, LatestFrame, avcc_to_annex_b, bitrate_target, fit_dimensions};
     use crate::config::{EncoderPreference, LatencyMode};
     use std::time::Duration;
 
@@ -435,5 +491,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn converts_avcc_access_units_and_parameter_sets_to_annex_b() {
+        let avcc = [0, 0, 0, 3, 0x65, 1, 2, 0, 0, 0, 2, 0x41, 3];
+        let annex_b = avcc_to_annex_b(&avcc, 4, &[&[0x67, 4], &[0x68, 5]]).unwrap();
+        assert_eq!(
+            annex_b,
+            [
+                0, 0, 0, 1, 0x67, 4, 0, 0, 0, 1, 0x68, 5, 0, 0, 0, 1, 0x65, 1, 2, 0, 0, 0, 1, 0x41,
+                3,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_or_empty_avcc_nals() {
+        assert!(avcc_to_annex_b(&[0, 0, 0], 4, &[]).is_err());
+        assert!(avcc_to_annex_b(&[0, 0, 0, 0], 4, &[]).is_err());
+        assert!(avcc_to_annex_b(&[0, 0, 0, 4, 0x65], 4, &[]).is_err());
+        assert!(avcc_to_annex_b(&[1, 0x65], 0, &[]).is_err());
     }
 }
