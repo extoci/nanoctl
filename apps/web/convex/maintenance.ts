@@ -1,4 +1,5 @@
 import { internalMutation } from "./_generated/server";
+import { internal } from "./_generated/api";
 
 const BATCH_SIZE = 256;
 const PAIRING_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -49,5 +50,12 @@ export const purgeExpired = internalMutation({
         await ctx.db.delete(document._id);
       }),
     );
+    if (
+      [signals, pairingCodes, endedSessions, failedSessions, auditEvents, rateLimits].some(
+        (batch) => batch.length === BATCH_SIZE,
+      )
+    ) {
+      await ctx.scheduler.runAfter(0, internal.maintenance.purgeExpired);
+    }
   },
 });
