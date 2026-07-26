@@ -58,7 +58,7 @@ http.route({
   method: "POST",
   handler: httpAction(async (ctx, request) => {
     const auth = await authenticateAgent(ctx, request);
-    if (!auth) return json({ error: "unauthorized" }, 401);
+    if (auth.status !== "ok") return authenticationFailure(auth.status);
     const parsed = await readJson(request, 70_000);
     if (!parsed.ok) return parsed.response;
     const body = parsed.value;
@@ -76,7 +76,7 @@ http.route({
   method: "GET",
   handler: httpAction(async (ctx, request) => {
     const auth = await authenticateAgent(ctx, request);
-    if (!auth) return json({ error: "unauthorized" }, 401);
+    if (auth.status !== "ok") return authenticationFailure(auth.status);
     const sessions = await ctx.runQuery(internal.agent.pendingSessions, {
       deviceId: auth.deviceId,
     });
@@ -89,7 +89,7 @@ http.route({
   method: "POST",
   handler: httpAction(async (ctx, request) => {
     const auth = await authenticateAgent(ctx, request);
-    if (!auth) return json({ error: "unauthorized" }, 401);
+    if (auth.status !== "ok") return authenticationFailure(auth.status);
     const parsed = await readJson(request, 1_200_000);
     if (!parsed.ok) return parsed.response;
     const body = parsed.value;
@@ -115,7 +115,7 @@ http.route({
   method: "GET",
   handler: httpAction(async (ctx, request) => {
     const auth = await authenticateAgent(ctx, request);
-    if (!auth) return json({ error: "unauthorized" }, 401);
+    if (auth.status !== "ok") return authenticationFailure(auth.status);
     const sessionId = new URL(request.url).searchParams.get("sessionId");
     if (!sessionId) return json({ error: "invalid_request" }, 400);
     const authorized = await ctx.runQuery(internal.agent.authorizeSession, {
@@ -133,16 +133,27 @@ async function authenticateAgent(
   request: Request,
 ) {
   const header = request.headers.get("authorization") ?? "";
-  if (!header.startsWith("Bearer ") || header.length > 512) return null;
+  if (!header.startsWith("Bearer ") || header.length > 512) {
+    return { status: "unauthorized" as const };
+  }
   const permitted = await ctx.runMutation(internal.rateLimits.consume, {
     key: `agent:http:${await requestFingerprint(request)}`,
-    limit: 600,
+    // A host may legitimately poll four times per second in advanced mode.
+    // Signaling has a separate, tighter per-session limit.
+    limit: 10_000,
     windowMs: 5 * 60 * 1000,
   });
-  if (!permitted) return null;
-  return ctx.runQuery(internal.agent.authenticate, {
+  if (!permitted) return { status: "rate_limited" as const };
+  const identity = await ctx.runQuery(internal.agent.authenticate, {
     tokenHash: await sha256(header.slice(7)),
   });
+  return identity ? { status: "ok" as const, ...identity } : { status: "unauthorized" as const };
+}
+
+function authenticationFailure(status: "unauthorized" | "rate_limited"): Response {
+  return status === "rate_limited"
+    ? json({ error: "rate_limited" }, 429)
+    : json({ error: "unauthorized" }, 401);
 }
 
 type JsonRead = { ok: true; value: Record<string, unknown> } | { ok: false; response: Response };

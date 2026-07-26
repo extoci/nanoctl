@@ -25,6 +25,15 @@ Payloads are `offer`, `answer`, `ice-candidate`, `ice-complete`, `renegotiate`, 
 most 1 MB, a candidate 8 KiB, and a reason 512 characters. SDP codec/media lines are validated again
 by the WebRTC implementation.
 
+## Agent HTTP status semantics
+
+Authenticated agent endpoints return `401` or `403` only when the credential is invalid, disabled,
+or revoked. The host treats those responses as a terminal enrollment failure and stops serving.
+`429` means temporary throttling, while `5xx` and transport failures are transient; the service
+retains its enrollment and retries on its normal bounded polling schedule. The shared HTTP abuse
+ceiling permits the documented 250 ms advanced polling interval, and signaling also has a tighter
+per-session limit.
+
 ## Data channels
 
 `nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, pointer
