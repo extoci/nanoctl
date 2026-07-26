@@ -71,6 +71,16 @@ repeat under the network/controller soak for the eight-hour gate. Preserve the J
 external process RSS/GPU/thermal traces; this command does not substitute for input-to-photon,
 browser decode, memory-growth, or network measurements.
 
+Validate the six 30-minute hardware records as one release set:
+
+```shell
+bun run evidence:media -- evidence/*/media-smoke.json
+```
+
+The verifier rejects missing or duplicate OS/architecture targets, mixed agent versions, software
+fallback, short runs, failed records, and absent bitstream counters. A passing set is necessary but
+does not replace the Linux X11 software-fallback record or the remaining manual and network gates.
+
 ## Manual release checklist
 
 1. Build candidates from the exact reviewed tag and verify every provenance attestation, SBOM, and

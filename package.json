@@ -23,6 +23,7 @@
     "typecheck:convex": "bun --cwd apps/web tsc -p convex/tsconfig.json",
     "test": "bun test",
     "test:agent": "bun run scripts/cargo.ts test --features rtc",
+    "evidence:media": "bun run scripts/verify-media-evidence.ts",
     "convex:dev": "bun --filter @nanoctl/web convex dev",
     "clean": "bun run scripts/clean.ts"
   },
