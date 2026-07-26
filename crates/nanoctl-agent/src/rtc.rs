@@ -313,6 +313,10 @@ fn parse_offer(serialized: &str, expected_session: &str) -> Result<String> {
     }
 }
 
+pub fn is_offer_for_session(serialized: &str, expected_session: &str) -> bool {
+    parse_offer(serialized, expected_session).is_ok()
+}
+
 fn serialize(session_id: &str, sequence: u64, payload: OutgoingPayload) -> Result<String> {
     Ok(serde_json::to_string(&OutgoingEnvelope {
         version: PROTOCOL_VERSION,
@@ -334,6 +338,12 @@ mod tests {
     fn rejects_cross_session_offer() {
         let value = r#"{"version":1,"sessionId":"other","sequence":0,"sender":"controller","sentAt":1,"payload":{"type":"offer","sdp":"v=0"}}"#;
         assert!(parse_offer(value, "expected").is_err());
+    }
+
+    #[test]
+    fn does_not_mistake_candidate_text_for_an_offer() {
+        let value = r#"{"version":1,"sessionId":"session","sequence":0,"sender":"controller","sentAt":1,"payload":{"type":"ice-candidate","candidate":"candidate with \\\"type\\\":\\\"offer\\\" text","sdpMid":"0","sdpMLineIndex":0}}"#;
+        assert!(!is_offer_for_session(value, "session"));
     }
 
     #[test]

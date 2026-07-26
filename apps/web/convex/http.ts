@@ -23,7 +23,7 @@ http.route({
     }
     const token = base64Url(crypto.getRandomValues(new Uint8Array(32)));
     const result = await ctx.runMutation(internal.agent.enroll, {
-      codeHash: await sha256(body.code),
+      codeHash: await sha256(body.code.trim().toUpperCase()),
       tokenHash: await sha256(token),
       name: body.name,
       platform: body.platform,

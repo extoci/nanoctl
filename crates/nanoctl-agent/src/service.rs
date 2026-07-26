@@ -153,7 +153,8 @@ async fn reconcile_sessions(
     for session in pending.iter().filter(|session| session.expires_at > now) {
         if !active.contains_key(&session.session_id) {
             let offer = session.signals.iter().find(|signal| {
-                signal.sender == "controller" && signal.envelope.contains(r#""type":"offer""#)
+                signal.sender == "controller"
+                    && crate::rtc::is_offer_for_session(&signal.envelope, &session.session_id)
             });
             let Some(offer) = offer else { continue };
             let mut ice_servers = if _config.network.stun_urls.is_empty() {

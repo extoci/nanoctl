@@ -32,10 +32,7 @@ export const createPairingCode = action({
   handler: async (ctx): Promise<{ code: string; expiresAt: number }> => {
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) throw new ConvexError("Unauthenticated");
-    const random = crypto.getRandomValues(new Uint32Array(2));
-    const code = `${String((random[0] ?? 0) % 1_000_000).padStart(6, "0")}-${String(
-      (random[1] ?? 0) % 1_000_000,
-    ).padStart(6, "0")}`;
+    const code = pairingCode();
     const codeHash = await sha256(code);
     const expiresAt = Date.now() + PAIRING_TTL_MS;
     await ctx.runMutation(internal.devices.storePairingCode, {
@@ -91,4 +88,15 @@ async function sha256(value: string): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function pairingCode(): string {
+  // Twenty Crockford-style base32 characters carry 100 bits of entropy. Ambiguous I/L/O/U
+  // characters are omitted so a code can still be entered manually when copy/paste is unavailable.
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  const random = crypto.getRandomValues(new Uint8Array(20));
+  const characters = [...random].map((byte) => alphabet[byte & 31]);
+  return Array.from({ length: 4 }, (_, index) =>
+    characters.slice(index * 5, index * 5 + 5).join(""),
+  ).join("-");
 }

@@ -38,7 +38,7 @@ In another terminal:
 
 ```sh
 cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- doctor
-cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- enroll 123456-123456
+cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- enroll ABCDE-FGHJK-MNPQR-STVWX
 cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- run
 ```
 
