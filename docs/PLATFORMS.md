@@ -16,8 +16,11 @@ in the authorized user session. UAC secure desktop and Windows sign-in screens r
 ## macOS
 
 Target macOS 14+. The portable backend keeps xcap's native recorder alive, retains only the newest
-RGBA frame, and uses OpenH264 plus enigo. The release performance path is ScreenCaptureKit into
-VideoToolbox, but it must not be advertised until the signed physical gate passes. Input requires
+RGBA frame, and uses enigo. The media backend prefers a real-time, no-frame-reordering VideoToolbox
+H.264 session, converts its AVCC output to WebRTC Annex-B with explicit SPS/PPS, and falls back to
+OpenH264 unless `quality.encoder = "hardware"` makes hardware mandatory. Capture still copies the
+xcap RGBA frame into a BGRA IOSurface; direct ScreenCaptureKit IOSurface handoff remains a release
+performance gate and must not be advertised until its signed physical test passes. Input requires
 Accessibility and capture requires Screen Recording permission. The current package installs a
 LaunchAgent because TCC permission is tied to an interactive code identity/session.
 

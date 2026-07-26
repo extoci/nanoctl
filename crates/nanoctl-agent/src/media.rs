@@ -63,6 +63,8 @@ pub struct CaptureEncoder {
 }
 
 enum EncoderBackend {
+    #[cfg(target_os = "macos")]
+    VideoToolbox(crate::macos_encoder::MacOsEncoder),
     Software(SoftwareEncoder),
 }
 
@@ -157,6 +159,18 @@ impl EncoderBackend {
         max_fps: u16,
         latency_mode: LatencyMode,
     ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if !matches!(preference, EncoderPreference::Software) {
+            match crate::macos_encoder::MacOsEncoder::new(bitrate_kbps, max_fps, latency_mode) {
+                Ok(encoder) => return Ok(Self::VideoToolbox(encoder)),
+                Err(error) if matches!(preference, EncoderPreference::Hardware) => {
+                    return Err(error).context("required VideoToolbox encoder is unavailable");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "VideoToolbox unavailable; using OpenH264");
+                }
+            }
+        }
         if matches!(preference, EncoderPreference::Hardware) {
             bail!("hardware encoding was required but no verified native backend is available");
         }
@@ -169,19 +183,35 @@ impl EncoderBackend {
 
     fn force_keyframe(&mut self) {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(encoder) => encoder.force_keyframe(),
             Self::Software(encoder) => encoder.encoder.force_intra_frame(),
         }
     }
 
     fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(encoder) => {
+                encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
+            }
             Self::Software(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
         }
     }
 
     fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(encoder) => encoder.encode(image),
             Self::Software(encoder) => encoder.encode(image),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::VideoToolbox(_) => "VideoToolbox",
+            Self::Software(_) => "OpenH264",
         }
     }
 }
@@ -276,11 +306,12 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .context("H.264 encoder is unavailable")
 }
 
-pub fn probe_encoder() -> Result<()> {
-    create_encoder(1_000, 30, LatencyMode::Balanced).map(drop)
+pub fn probe_encoder(preference: EncoderPreference) -> Result<&'static str> {
+    let encoder = EncoderBackend::new(preference, 1_000, 30, LatencyMode::Balanced)?;
+    Ok(encoder.name())
 }
 
-fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Option<u32> {
+pub(crate) fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Option<u32> {
     let target = estimate.clamp(floor, ceiling);
     let target = u64::from(target);
     let current = u64::from(current);
@@ -292,7 +323,7 @@ fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Opti
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn avcc_to_annex_b(
+pub(crate) fn avcc_to_annex_b(
     access_unit: &[u8],
     nal_length_size: usize,
     parameter_sets: &[&[u8]],
@@ -417,6 +448,9 @@ pub fn spawn_video(
                     }
                 }
                 let frame = encoder.next_access_unit(quality.max_width, quality.max_height)?;
+                if frame.bytes.is_empty() {
+                    continue;
+                }
                 match sender.try_send(frame) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Closed(_)) => break,
@@ -480,6 +514,7 @@ mod tests {
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn required_hardware_never_silently_falls_back() {
         assert!(

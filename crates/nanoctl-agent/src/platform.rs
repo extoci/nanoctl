@@ -26,8 +26,7 @@ pub struct Capabilities {
     platform: &'static str,
     architecture: &'static str,
     codecs: Vec<&'static str>,
-    encoder_backend: Option<&'static str>,
-    hardware_encoding: bool,
+    encoder_backends: Vec<&'static str>,
     input: bool,
     clipboard: bool,
     system_audio: bool,
@@ -68,8 +67,13 @@ pub fn capabilities() -> Capabilities {
         } else {
             Vec::new()
         },
-        encoder_backend: cfg!(feature = "media").then_some("software-openh264"),
-        hardware_encoding: false,
+        encoder_backends: if cfg!(all(feature = "media", target_os = "macos")) {
+            vec!["videotoolbox", "software-openh264"]
+        } else if cfg!(feature = "media") {
+            vec!["software-openh264"]
+        } else {
+            Vec::new()
+        },
         input: cfg!(feature = "media"),
         clipboard: false,
         system_audio: false,
@@ -140,7 +144,7 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
     });
     checks.push(control_plane_check(config, credential.as_ref()).await);
     checks.push(capture_check());
-    checks.push(encoder_check());
+    checks.push(encoder_check(config.quality.encoder));
     checks.push(input_check());
     DoctorReport {
         ready: checks.iter().all(|check| check.ok),
@@ -237,15 +241,15 @@ fn input_check() -> DoctorCheck {
     }
 }
 
-fn encoder_check() -> DoctorCheck {
+fn encoder_check(_preference: crate::config::EncoderPreference) -> DoctorCheck {
     #[cfg(feature = "media")]
     {
-        let result = crate::media::probe_encoder();
+        let result = crate::media::probe_encoder(_preference);
         DoctorCheck {
             name: "encoder",
             ok: result.is_ok(),
             detail: match result {
-                Ok(()) => "OpenH264 real-time screen-content encoder available".into(),
+                Ok(backend) => format!("{backend} real-time H.264 encoder available"),
                 Err(error) => format!("{error:#}"),
             },
         }

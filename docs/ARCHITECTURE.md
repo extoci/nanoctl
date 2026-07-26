@@ -75,8 +75,11 @@ the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% in
 the encoder also produces a clean recovery point; the hysteresis avoids reinitialization churn.
 OpenH264 runs in bitrate-control mode. Advanced latency policy maps responsiveness/balanced/quality
 to low/medium/high encoder complexity and controls whether the encoder may skip frames.
-Zero-copy GPU surfaces, hardware encoding, capture timestamps, and adaptive resolution/frame rate
-remain native performance-path release gates, not properties claimed for the portable backend.
+On macOS, the same hysteresis recreates a hardware-confirmed VideoToolbox session, which also forces
+a recovery frame. Its AVCC samples are length-checked and converted to Annex-B with copied SPS/PPS
+before reaching the RTP packetizer. Direct capture-to-encoder GPU surfaces, Windows Media
+Foundation, Linux VA-API, capture timestamps, and adaptive resolution/frame rate remain native
+performance-path release gates, not properties claimed for the portable backend.
 
 `quality.encoder` is a fail-closed policy rather than a hint. `auto` prefers a verified native
 backend and may fall back to OpenH264, `software` forces the portable backend, and `hardware` fails

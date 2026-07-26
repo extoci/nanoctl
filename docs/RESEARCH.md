@@ -73,3 +73,22 @@ Sources:
 - <https://www.rfc-editor.org/rfc/rfc8445>
 - <https://www.rfc-editor.org/rfc/rfc8656>
 - <https://www.rfc-editor.org/rfc/rfc8827>
+
+## Native H.264 encoding
+
+Apple VideoToolbox accepts IOSurface-backed pixel buffers and exposes real-time, expected-frame-rate,
+bitrate, keyframe-interval, profile, and frame-reordering controls. Its compressed H.264 sample data
+uses AVCC length-prefixed NAL units; WebRTC transport requires an explicit Annex-B conversion and
+the format description’s parameter sets. The selected Rust bindings retain the CoreMedia sample
+buffer while those parameter-set pointers are copied.
+
+Implication: macOS can use VideoToolbox immediately after copying the portable xcap RGBA frame into
+a BGRA IOSurface. This moves H.264 compression to hardware but is not yet a zero-copy capture path.
+Direct ScreenCaptureKit IOSurface handoff remains a separate physical performance gate.
+
+Sources:
+
+- <https://developer.apple.com/documentation/videotoolbox/vtcompressionsession>
+- <https://developer.apple.com/documentation/coremedia/cmvideoformatdescriptiongeth264parametersetatindex(_:parametersetindex:parametersetpointerout:parametersetsizeout:parametersetcountout:nalunitheaderlengthout:)>
+- <https://docs.rs/videotoolbox/0.18.1/videotoolbox/>
+- <https://docs.rs/apple-cf/0.9.3/apple_cf/iosurface/>
