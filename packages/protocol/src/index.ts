@@ -121,12 +121,14 @@ export function assertSignalPayload(value: unknown): asserts value is SignalPayl
       if (!isBoundedString(value.candidate, 1, MAX_CANDIDATE_BYTES)) {
         throw new Error("invalid ICE candidate");
       }
-      if (value.sdpMid !== null && typeof value.sdpMid !== "string") {
+      if (value.sdpMid !== null && !isBoundedString(value.sdpMid, 0, 256)) {
         throw new Error("invalid sdpMid");
       }
       if (
         value.sdpMLineIndex !== null &&
-        (!Number.isInteger(value.sdpMLineIndex) || Number(value.sdpMLineIndex) < 0)
+        (!Number.isInteger(value.sdpMLineIndex) ||
+          Number(value.sdpMLineIndex) < 0 ||
+          Number(value.sdpMLineIndex) > 65_535)
       ) {
         throw new Error("invalid sdpMLineIndex");
       }

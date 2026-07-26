@@ -2,13 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { parseDeviceDisplays, parseSignalEnvelope } from "./lib";
 
 function envelope(sender: "controller" | "host", type: string) {
+  const payload =
+    type === "offer" || type === "answer"
+      ? { type, sdp: "v=0" }
+      : type === "end"
+        ? { type, reason: "done" }
+        : { type };
   return JSON.stringify({
     version: 1,
     sessionId: "session",
     sequence: 7,
     sender,
     sentAt: 1,
-    payload: { type },
+    payload,
   });
 }
 
@@ -29,6 +35,16 @@ describe("signal envelope indexing", () => {
     expect(() => parseSignalEnvelope(envelope("controller", "answer"), "controller")).toThrow();
     expect(() =>
       parseSignalEnvelope(envelope("controller", "renegotiate"), "controller"),
+    ).toThrow();
+    expect(() =>
+      parseSignalEnvelope(
+        JSON.stringify({
+          ...JSON.parse(envelope("controller", "offer")),
+          sentAt: 0,
+          payload: { type: "offer" },
+        }),
+        "controller",
+      ),
     ).toThrow();
   });
 });

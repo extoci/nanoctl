@@ -99,6 +99,7 @@ export function parseSignalEnvelope(
     throw new ConvexError("Malformed signal payload");
   }
   const kind = (payload as Record<string, unknown>).type;
+  const fields = payload as Record<string, unknown>;
   const permitted =
     expectedSender === "controller"
       ? ["offer", "ice-candidate", "ice-complete", "end"]
@@ -109,10 +110,25 @@ export function parseSignalEnvelope(
     envelope.sender !== expectedSender ||
     !Number.isSafeInteger(envelope.sequence) ||
     Number(envelope.sequence) < 0 ||
+    !Number.isSafeInteger(envelope.sentAt) ||
+    Number(envelope.sentAt) <= 0 ||
     typeof kind !== "string" ||
     !permitted.includes(kind)
   ) {
     throw new ConvexError("Malformed signal envelope");
+  }
+  if (
+    ((kind === "offer" || kind === "answer") && !isBoundedString(fields.sdp, 1, 1_000_000)) ||
+    (kind === "ice-candidate" &&
+      (!isBoundedString(fields.candidate, 1, 8_192) ||
+        (fields.sdpMid !== null && !isBoundedString(fields.sdpMid, 0, 256)) ||
+        (fields.sdpMLineIndex !== null &&
+          (!Number.isInteger(fields.sdpMLineIndex) ||
+            Number(fields.sdpMLineIndex) < 0 ||
+            Number(fields.sdpMLineIndex) > 65_535)))) ||
+    (kind === "end" && !isBoundedString(fields.reason, 1, 512))
+  ) {
+    throw new ConvexError("Malformed signal payload");
   }
   return {
     sessionId: envelope.sessionId,
@@ -120,4 +136,8 @@ export function parseSignalEnvelope(
     sequence: Number(envelope.sequence),
     kind: kind as SignalKind,
   };
+}
+
+function isBoundedString(value: unknown, min: number, max: number): value is string {
+  return typeof value === "string" && value.length >= min && value.length <= max;
 }
