@@ -2,24 +2,46 @@
 
 import { createShooAuth, useShooAuth } from "@shoojs/react";
 import { useCallback } from "react";
+import { shooTokenDisposition } from "./shoo-token";
 
 const options = { callbackPath: "/auth/callback" } as const;
+let reauthInFlight: Promise<void> | null = null;
+
+function beginReauthentication(): void {
+  if (reauthInFlight || typeof window === "undefined") return;
+  reauthInFlight = createShooAuth(options)
+    .startSignIn()
+    .then(() => undefined)
+    .catch(() => undefined)
+    .finally(() => {
+      reauthInFlight = null;
+    });
+}
 
 export function useShooConvexAuth() {
   const { identity, claims, loading, clearIdentity } = useShooAuth(options);
+  const expiresAt = typeof claims?.exp === "number" ? claims.exp * 1000 : null;
+  const expired = expiresAt !== null && expiresAt <= Date.now();
   const fetchAccessToken = useCallback(
-    async (_request: { forceRefreshToken: boolean }) => {
-      if (typeof claims?.exp === "number" && claims.exp * 1000 <= Date.now() + 30_000) {
+    async (request: { forceRefreshToken: boolean }) => {
+      if (!identity.token) return null;
+      const disposition = shooTokenDisposition(expiresAt, request.forceRefreshToken, Date.now());
+      if (disposition === "expired") {
         clearIdentity();
+        if (request.forceRefreshToken) beginReauthentication();
         return null;
       }
-      return identity.token ?? null;
+      if (disposition === "reauthenticate") {
+        beginReauthentication();
+        return null;
+      }
+      return identity.token;
     },
-    [claims?.exp, clearIdentity, identity.token],
+    [clearIdentity, expiresAt, identity.token],
   );
   return {
     isLoading: loading,
-    isAuthenticated: Boolean(identity.userId && identity.token),
+    isAuthenticated: Boolean(identity.userId && identity.token && !expired),
     fetchAccessToken,
   };
 }
