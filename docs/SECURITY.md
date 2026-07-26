@@ -104,6 +104,15 @@ unusual relay volume. Never silently auto-enroll.
 | Convex deploy key   | CI secret store                     | least privilege / incident |
 | Package signing key | offline or managed signing service  | documented ceremony        |
 
+## Audited dependency exceptions
+
+`RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` apply to `quick-xml 0.30`, which is pulled in solely as
+an `xcb` build dependency. It parses protocol XML shipped inside the reviewed `xcb` crate while
+compiling the Linux X11 bindings; it is not linked into the nanoctl agent and never processes
+network, owner, device, signaling, clipboard, or local runtime input. CI keeps the two advisory IDs
+as explicit exceptions until `xcb` adopts the patched parser, while continuing to fail on every
+other RustSec vulnerability.
+
 ## Reporting
 
 Do not open public issues containing tokens, SDP, ICE candidates, private IPs, crash dumps, or

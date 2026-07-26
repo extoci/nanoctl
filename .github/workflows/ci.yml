@@ -132,4 +132,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: crates/nanoctl-agent
+          # xcb uses quick-xml only in its build script against crate-owned protocol XML. Neither
+          # vulnerable parser path nor quick-xml is present in the shipped agent runtime.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
       - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2

@@ -14,6 +14,8 @@ service_target="gui/$(id -u)/dev.nanoctl.agent"
 activated=0
 completed=0
 
+# Invoked indirectly by the EXIT/signal traps below.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   if [ "$completed" -eq 1 ]; then
     return

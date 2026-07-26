@@ -104,9 +104,12 @@ pub async fn stage_artifact(
 
 pub fn activate_staged(artifact: &UpdateArtifact) -> Result<PathBuf> {
     #[cfg(windows)]
-    bail!(
-        "Windows activation requires the signed installer bootstrap; use Stage-Update then run the installer"
-    );
+    {
+        let _ = artifact;
+        bail!(
+            "Windows activation requires the signed installer bootstrap; use Stage-Update then run the installer"
+        );
+    }
     #[cfg(unix)]
     {
         let current = std::env::current_exe().context("cannot locate the running agent")?;

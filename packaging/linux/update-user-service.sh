@@ -11,6 +11,8 @@ binary_path="$HOME/.local/bin/nanoctl"
 activated=0
 completed=0
 
+# Invoked indirectly by the EXIT/signal traps below.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   if [ "$completed" -eq 1 ]; then
     return
