@@ -8,14 +8,16 @@ http.route({
   path: "/v1/agent/enroll",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const body = await readJson(request, 70_000);
+    const parsed = await readJson(request, 70_000);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.value;
     if (
       typeof body.code !== "string" ||
       typeof body.name !== "string" ||
       !isPlatform(body.platform) ||
       !isArchitecture(body.architecture) ||
       typeof body.agentVersion !== "string" ||
-      typeof body.capabilities !== "object"
+      !isRecord(body.capabilities)
     ) {
       return json({ error: "invalid_request" }, 400);
     }
@@ -40,7 +42,9 @@ http.route({
   handler: httpAction(async (ctx, request) => {
     const auth = await authenticateAgent(ctx, request);
     if (!auth) return json({ error: "unauthorized" }, 401);
-    const body = await readJson(request, 70_000);
+    const parsed = await readJson(request, 70_000);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.value;
     const ok = await ctx.runMutation(internal.agent.heartbeat, {
       deviceId: auth.deviceId,
       agentVersion: typeof body.agentVersion === "string" ? body.agentVersion : "unknown",
@@ -69,7 +73,9 @@ http.route({
   handler: httpAction(async (ctx, request) => {
     const auth = await authenticateAgent(ctx, request);
     if (!auth) return json({ error: "unauthorized" }, 401);
-    const body = await readJson(request, 1_200_000);
+    const parsed = await readJson(request, 1_200_000);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.value;
     if (
       typeof body.sessionId !== "string" ||
       !Number.isSafeInteger(body.sequence) ||
@@ -116,16 +122,27 @@ async function authenticateAgent(
   });
 }
 
-async function readJson(request: Request, maxBytes: number): Promise<Record<string, unknown>> {
+type JsonRead = { ok: true; value: Record<string, unknown> } | { ok: false; response: Response };
+
+async function readJson(request: Request, maxBytes: number): Promise<JsonRead> {
   const length = Number(request.headers.get("content-length") ?? "0");
-  if (length > maxBytes) throw new Error("request_too_large");
-  const text = await request.text();
-  if (text.length > maxBytes) throw new Error("request_too_large");
-  const value: unknown = JSON.parse(text);
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("invalid_json");
+  if (Number.isFinite(length) && length > maxBytes) {
+    return { ok: false, response: json({ error: "request_too_large" }, 413) };
   }
-  return value as Record<string, unknown>;
+  const text = await request.text();
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    return { ok: false, response: json({ error: "request_too_large" }, 413) };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return { ok: false, response: json({ error: "invalid_json" }, 400) };
+  }
+  if (!isRecord(value)) {
+    return { ok: false, response: json({ error: "invalid_json" }, 400) };
+  }
+  return { ok: true, value };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -144,6 +161,10 @@ function isPlatform(value: unknown): value is "windows" | "macos" | "linux" {
 
 function isArchitecture(value: unknown): value is "x64" | "arm64" {
   return value === "x64" || value === "arm64";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 async function sha256(value: string): Promise<string> {
