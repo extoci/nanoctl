@@ -16,14 +16,16 @@ SBOM, and GitHub build-provenance attestations. These artifacts are deliberately
 **candidates**: they are unsigned and are not an installable release.
 
 Current automated coverage includes bounded protocol and signaling parsing, role/session identity,
-duplicate enrollment and signaling, owner isolation, revocation, terminal mutation idempotency,
+duplicate/replayed enrollment and signaling, deliberate sequence gaps, expiry, owner and device
+isolation, wrong-role rejection, revoked-token rejection, terminal mutation idempotency,
 rate-limit windows, TURN configuration, update signature/digest/rollback behavior, media buffer and
 bitstream transforms, property-generated signaling/input bounds, fail-safe input release behavior,
 packaging transactions,
 production configuration, CSP nonces, media/network/performance-evidence validation, agent log
-redaction (including bearer, SDP, ICE, and TURN-shaped secrets), malformed SDP/candidate rejection,
-bounded control-queue admission, and an in-process connection between the production host peer and
-a real WebRTC controller peer through SDP, ICE, DTLS/SCTP, and control-channel opening.
+redaction snapshots (including bearer, clipboard, SDP, ICE, and TURN-shaped secrets), malformed
+SDP/candidate rejection, bounded control-queue admission, and an in-process connection between the
+production host peer and a real WebRTC controller peer through SDP, ICE, DTLS/SCTP, and
+control-channel opening.
 
 ## Required release-test expansion
 
@@ -31,10 +33,8 @@ The following remain mandatory before a supported release; they are requirements
 the current automated suite:
 
 - coverage-guided fuzzing and model-based state-transition tests;
-- replay, duplicate, gap, expiry, wrong-role, wrong-owner, revoked-token, and cross-device tests;
 - authorization tests around every public Convex function and HTTP action;
 - end-to-end data-channel flood/backpressure tests with a real input backend;
-- log snapshots proving secrets, clipboard, SDP, and ICE candidates are redacted.
 
 ## Browser tests
 

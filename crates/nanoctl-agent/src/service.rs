@@ -460,15 +460,31 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn logged_errors_never_include_transport_or_authentication_material() {
-        for sensitive in [
-            "Bearer secret-device-token",
-            "v=0\r\na=fingerprint:sha-256 11:22",
-            "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
-            "turns://user:password@turn.example.com",
+    fn logged_error_snapshots_never_include_private_session_material() {
+        for (sensitive, expected) in [
+            (
+                "Bearer secret-device-token",
+                "remote service rejected the operation",
+            ),
+            (
+                "v=0\r\na=fingerprint:sha-256 11:22",
+                "remote service rejected the operation",
+            ),
+            (
+                "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+                "remote service rejected the operation",
+            ),
+            (
+                "turns://user:password@turn.example.com",
+                "remote service rejected the operation",
+            ),
+            (
+                "clipboard: private recovery phrase",
+                "remote service rejected the operation",
+            ),
         ] {
             let rendered = redact(&anyhow::anyhow!("request rejected: {sensitive}"));
-            assert_eq!(rendered, "remote service rejected the operation");
+            assert_eq!(rendered, expected);
             assert!(!rendered.contains(sensitive));
         }
     }

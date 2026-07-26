@@ -195,6 +195,68 @@ describe("control-plane authorization", () => {
     expect(evidence).toEqual({ state: "negotiating", signalCount: 1 });
   });
 
+  test("handles replay, sequence gaps, wrong roles, expiry, and cross-device host signals", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const otherDeviceId = await seedDevice(t, "owner-b");
+    const ownerA = asOwner(t, "owner-a");
+    const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
+    const envelope = (sequence: number, payload: Record<string, unknown>, sender = "controller") =>
+      JSON.stringify({
+        version: 1,
+        sessionId,
+        sequence,
+        sender,
+        sentAt: Date.now(),
+        payload,
+      });
+
+    const offer = envelope(0, { type: "offer", sdp: "v=0" });
+    await ownerA.mutation(api.signals.send, { sessionId, envelope: offer });
+    await ownerA.mutation(api.signals.send, { sessionId, envelope: offer });
+    await ownerA.mutation(api.signals.send, {
+      sessionId,
+      envelope: envelope(7, {
+        type: "ice-candidate",
+        candidate: "candidate:gap",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      }),
+    });
+    await expect(
+      ownerA.mutation(api.signals.send, {
+        sessionId,
+        envelope: envelope(8, { type: "answer", sdp: "v=0" }),
+      }),
+    ).rejects.toThrow();
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId: otherDeviceId,
+        sessionId,
+        sequence: 0,
+        envelope: envelope(0, { type: "answer", sdp: "v=0" }, "host"),
+      }),
+    ).toBe(false);
+
+    const pending = await t.query(internal.agent.pendingSessions, { deviceId });
+    expect(pending[0]?.signals.map((signal) => signal.sequence)).toEqual([0, 7]);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(sessionId, { expiresAt: Date.now() - 1 });
+    });
+    await expect(
+      ownerA.mutation(api.signals.send, {
+        sessionId,
+        envelope: envelope(8, { type: "ice-complete" }),
+      }),
+    ).rejects.toThrow("Session unavailable");
+    expect(
+      await t.query(internal.agent.authorizeSession, {
+        deviceId,
+        sessionId,
+      }),
+    ).toBe(false);
+  });
+
   test("denies cross-owner session reads, ending, host signals, and TURN authorization", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");
@@ -288,6 +350,11 @@ describe("control-plane authorization", () => {
     expect(evidence.device?.tokenHash).toMatch(/^revoked:/);
     expect(evidence.session?.state).toBe("ended");
     expect(evidence.session?.endReason).toBe("device revoked");
+    expect(
+      await t.query(internal.agent.authenticate, {
+        tokenHash: "token-owner-a",
+      }),
+    ).toBeNull();
   });
 
   test("rejects controller signaling after a terminal failure", async () => {
