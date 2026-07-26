@@ -368,6 +368,7 @@ fn spawn_media(
             max_width: config.quality.max_width,
             max_height: config.quality.max_height,
             latency_mode: config.quality.latency_mode,
+            encoder_preference: config.quality.encoder,
         },
     )
 }

@@ -78,6 +78,11 @@ to low/medium/high encoder complexity and controls whether the encoder may skip 
 Zero-copy GPU surfaces, hardware encoding, capture timestamps, and adaptive resolution/frame rate
 remain native performance-path release gates, not properties claimed for the portable backend.
 
+`quality.encoder` is a fail-closed policy rather than a hint. `auto` prefers a verified native
+backend and may fall back to OpenH264, `software` forces the portable backend, and `hardware` fails
+session startup if the platform backend is unavailable. This prevents an administrator who requires
+GPU isolation/performance from silently receiving software encoding.
+
 Input uses an unordered, zero-retransmit channel for pointer motion and a reliable ordered channel
 for key/button transitions and lifecycle messages. Pointer motion is coalesced; key-up and button-up
 are never dropped and are synthesized on disconnect. System audio and clipboard synchronization are

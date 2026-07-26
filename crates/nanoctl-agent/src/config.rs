@@ -20,6 +20,7 @@ pub struct AgentConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct QualityConfig {
     pub codec: CodecPreference,
+    pub encoder: EncoderPreference,
     pub max_fps: u16,
     pub max_bitrate_kbps: u32,
     pub max_width: u32,
@@ -56,6 +57,15 @@ pub enum CodecPreference {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+pub enum EncoderPreference {
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LatencyMode {
     Responsiveness,
     #[default]
@@ -87,6 +97,7 @@ impl Default for QualityConfig {
     fn default() -> Self {
         Self {
             codec: CodecPreference::Auto,
+            encoder: EncoderPreference::Auto,
             max_fps: 60,
             max_bitrate_kbps: 24_000,
             max_width: 3840,
@@ -271,6 +282,15 @@ mod tests {
         config.quality.codec = CodecPreference::Av1;
         assert!(config.validate().is_err());
         config.quality.codec = CodecPreference::H264;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_explicit_encoder_policy() {
+        let mut config = AgentConfig::default();
+        config.quality.encoder = EncoderPreference::Software;
+        assert!(config.validate().is_ok());
+        config.quality.encoder = EncoderPreference::Hardware;
         assert!(config.validate().is_ok());
     }
 }

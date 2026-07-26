@@ -68,7 +68,8 @@ release input. A new browser tab does not inherit control unless it has the auth
 ## Advanced mode
 
 Advanced mode is explicit, local, and deny-by-default schema-validated configuration. Protocol v1
-permits H.264/auto codec choice, maximum bitrate/FPS/resolution, a latency-mode policy value,
+permits H.264/auto codec choice, auto/hardware/software encoder policy, maximum
+bitrate/FPS/resolution, a latency-mode policy value,
 direct-or-relay ICE policy, up to eight STUN endpoints, heartbeat/poll cadence, and remote-input
 disablement. Unknown keys, unsafe remote HTTP, unsupported codecs, reserved audio/clipboard flags,
 and out-of-range values fail startup. TURN endpoints and credentials remain server-issued so local

@@ -19,7 +19,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use crate::config::LatencyMode;
+use crate::config::{EncoderPreference, LatencyMode};
 
 #[derive(Default)]
 struct LatestFrame {
@@ -59,6 +59,14 @@ pub struct CaptureEncoder {
     // OS capture pipeline for every frame.
     recorder: xcap::VideoRecorder,
     latest_frame: Arc<LatestFrame>,
+    encoder: EncoderBackend,
+}
+
+enum EncoderBackend {
+    Software(SoftwareEncoder),
+}
+
+struct SoftwareEncoder {
     encoder: Encoder,
     bitrate_kbps: u32,
     max_fps: u16,
@@ -68,7 +76,12 @@ pub struct CaptureEncoder {
 }
 
 impl CaptureEncoder {
-    pub fn primary(max_bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
+    pub fn primary(
+        max_bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        encoder_preference: EncoderPreference,
+    ) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
         let monitor = monitors
             .iter()
@@ -76,17 +89,13 @@ impl CaptureEncoder {
             .or_else(|| monitors.first())
             .cloned()
             .context("no display is available")?;
-        let encoder = create_encoder(max_bitrate_kbps, max_fps, latency_mode)?;
+        let encoder =
+            EncoderBackend::new(encoder_preference, max_bitrate_kbps, max_fps, latency_mode)?;
         let (recorder, latest_frame) = start_capture(&monitor)?;
         Ok(Self {
             recorder,
             latest_frame,
             encoder,
-            bitrate_kbps: max_bitrate_kbps,
-            max_fps,
-            latency_mode,
-            rgb: Vec::new(),
-            yuv: None,
         })
     }
 
@@ -103,7 +112,7 @@ impl CaptureEncoder {
         let _ = self.recorder.stop();
         self.recorder = recorder;
         self.latest_frame = latest_frame;
-        self.encoder.force_intra_frame();
+        self.encoder.force_keyframe();
         Ok(())
     }
 
@@ -112,15 +121,8 @@ impl CaptureEncoder {
         estimate_kbps: u32,
         ceiling_kbps: u32,
     ) -> Result<bool> {
-        let floor_kbps = 250.min(ceiling_kbps);
-        let Some(target_kbps) =
-            bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
-        else {
-            return Ok(false);
-        };
-        self.encoder = create_encoder(target_kbps, self.max_fps, self.latency_mode)?;
-        self.bitrate_kbps = target_kbps;
-        Ok(true)
+        self.encoder
+            .apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
     }
 
     pub fn next_access_unit(&mut self, max_width: u32, max_height: u32) -> Result<EncodedFrame> {
@@ -144,7 +146,72 @@ impl CaptureEncoder {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
         }
-        let dimensions = (width as usize, height as usize);
+        self.encoder.encode(&image)
+    }
+}
+
+impl EncoderBackend {
+    fn new(
+        preference: EncoderPreference,
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+    ) -> Result<Self> {
+        if matches!(preference, EncoderPreference::Hardware) {
+            bail!("hardware encoding was required but no verified native backend is available");
+        }
+        Ok(Self::Software(SoftwareEncoder::new(
+            bitrate_kbps,
+            max_fps,
+            latency_mode,
+        )?))
+    }
+
+    fn force_keyframe(&mut self) {
+        match self {
+            Self::Software(encoder) => encoder.encoder.force_intra_frame(),
+        }
+    }
+
+    fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
+        match self {
+            Self::Software(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
+        }
+    }
+
+    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+        match self {
+            Self::Software(encoder) => encoder.encode(image),
+        }
+    }
+}
+
+impl SoftwareEncoder {
+    fn new(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
+        Ok(Self {
+            encoder: create_encoder(bitrate_kbps, max_fps, latency_mode)?,
+            bitrate_kbps,
+            max_fps,
+            latency_mode,
+            rgb: Vec::new(),
+            yuv: None,
+        })
+    }
+
+    fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
+        let floor_kbps = 250.min(ceiling_kbps);
+        let Some(target_kbps) =
+            bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
+        else {
+            return Ok(false);
+        };
+        self.encoder = create_encoder(target_kbps, self.max_fps, self.latency_mode)?;
+        self.bitrate_kbps = target_kbps;
+        Ok(true)
+    }
+
+    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+        let dimensions = (image.width() as usize, image.height() as usize);
         self.rgb.clear();
         self.rgb.reserve(dimensions.0 * dimensions.1 * 3);
         for pixel in image.as_raw().chunks_exact(4) {
@@ -241,6 +308,7 @@ pub struct VideoQuality {
     pub max_width: u32,
     pub max_height: u32,
     pub latency_mode: LatencyMode,
+    pub encoder_preference: EncoderPreference,
 }
 
 pub fn spawn_video(
@@ -257,6 +325,7 @@ pub fn spawn_video(
                 quality.max_bitrate_kbps,
                 quality.max_fps,
                 quality.latency_mode,
+                quality.encoder_preference,
             )?;
             let mut keyframe_requests = keyframe_requests;
             let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
@@ -273,7 +342,7 @@ pub fn spawn_video(
                 next_frame = Instant::now() + frame_interval;
                 if keyframe_requests.has_changed().unwrap_or(false) {
                     keyframe_requests.borrow_and_update();
-                    encoder.encoder.force_intra_frame();
+                    encoder.encoder.force_keyframe();
                 }
                 if bitrate_estimate_kbps.has_changed().unwrap_or(false) {
                     let estimate = *bitrate_estimate_kbps.borrow_and_update();
@@ -325,7 +394,8 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 
 #[cfg(test)]
 mod tests {
-    use super::{LatestFrame, bitrate_target, fit_dimensions};
+    use super::{EncoderBackend, LatestFrame, bitrate_target, fit_dimensions};
+    use crate::config::{EncoderPreference, LatencyMode};
     use std::time::Duration;
 
     #[test]
@@ -352,5 +422,18 @@ mod tests {
         assert_eq!(bitrate_target(3_000, 5_000, 250, 8_000), Some(5_000));
         assert_eq!(bitrate_target(4_000, 100, 250, 8_000), Some(250));
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
+    }
+
+    #[test]
+    fn required_hardware_never_silently_falls_back() {
+        assert!(
+            EncoderBackend::new(
+                EncoderPreference::Hardware,
+                4_000,
+                60,
+                LatencyMode::Balanced,
+            )
+            .is_err()
+        );
     }
 }
