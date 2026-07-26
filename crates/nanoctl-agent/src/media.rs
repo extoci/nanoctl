@@ -6,7 +6,9 @@
 
 use anyhow::{Context, Result, bail};
 use openh264::OpenH264API;
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
+use openh264::encoder::{
+    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType,
+};
 use openh264::formats::{RgbSliceU8, YUVBuffer};
 use xcap::Monitor;
 
@@ -34,6 +36,7 @@ impl CaptureEncoder {
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(max_bitrate_kbps.saturating_mul(1_000)))
             .max_frame_rate(FrameRate::from_hz(max_fps as f32))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
             .usage_type(UsageType::ScreenContentRealTime);
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("H.264 encoder is unavailable")?;
