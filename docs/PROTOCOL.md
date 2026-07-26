@@ -34,6 +34,11 @@ retains its enrollment and retries on its normal bounded polling schedule. The s
 ceiling permits the documented 250 ms advanced polling interval, and signaling also has a tighter
 per-session limit.
 
+The browser ends a session with an authenticated control-plane mutation before deliberate
+navigation. If it disappears without doing so, the host gives ICE restart 15 seconds to recover;
+a peer that remains failed publishes a terminal `end` signal and closes locally. Convex then marks
+the session failed, so an abandoned browser cannot reserve a device for the full session TTL.
+
 ## Data channels
 
 `nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, pointer

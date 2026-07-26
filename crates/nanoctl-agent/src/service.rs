@@ -137,6 +137,7 @@ type Credential = zeroize::Zeroizing<String>;
 struct ActiveSession {
     peer: crate::rtc::HostPeer,
     processed: HashSet<u64>,
+    failed_since: Option<Instant>,
     #[cfg(feature = "media")]
     media_task: tokio::task::JoinHandle<anyhow::Result<()>>,
     #[cfg(feature = "media")]
@@ -171,6 +172,31 @@ async fn reconcile_sessions(
         }
     }
 
+    let failed = active
+        .iter_mut()
+        .filter_map(|(session_id, session)| {
+            failure_grace_elapsed(
+                session.peer.connection_failed(),
+                &mut session.failed_since,
+                Instant::now(),
+            )
+            .then(|| session_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for session_id in failed {
+        if let Some(session) = active.remove(&session_id) {
+            #[cfg(feature = "media")]
+            session.media_task.abort();
+            if let Err(error) = session.peer.fail("peer connection failed").await {
+                warn!(
+                    session_id,
+                    error = %redact(&error),
+                    "could not publish terminal peer status"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "media")]
     {
         let finished = active
@@ -185,6 +211,7 @@ async fn reconcile_sessions(
             let ActiveSession {
                 peer,
                 processed,
+                failed_since,
                 media_task,
                 media_restarts,
             } = session;
@@ -205,6 +232,7 @@ async fn reconcile_sessions(
                     ActiveSession {
                         peer,
                         processed,
+                        failed_since,
                         media_task,
                         media_restarts: 1,
                     },
@@ -309,6 +337,7 @@ async fn reconcile_sessions(
                         ActiveSession {
                             peer,
                             processed: HashSet::from([offer.sequence]),
+                            failed_since: None,
                             #[cfg(feature = "media")]
                             media_task,
                             #[cfg(feature = "media")]
@@ -333,23 +362,57 @@ async fn reconcile_sessions(
         let Some(active_session) = active.get_mut(&session.session_id) else {
             continue;
         };
+        let mut terminal = false;
         for signal in &session.signals {
-            if signal.sender != "controller" || !active_session.processed.insert(signal.sequence) {
+            if signal.sender != "controller" || active_session.processed.contains(&signal.sequence)
+            {
                 continue;
             }
-            if let Err(error) = active_session
+            match active_session
                 .peer
                 .add_signal(&signal.envelope, &session.session_id, signal.sequence)
                 .await
             {
-                warn!(
-                    session_id = session.session_id,
-                    error = %redact(&error),
-                    "controller signal rejected"
-                );
+                Ok(keep_open) => {
+                    active_session.processed.insert(signal.sequence);
+                    if !keep_open {
+                        terminal = true;
+                        break;
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = session.session_id,
+                        error = %redact(&error),
+                        "controller signal rejected"
+                    );
+                }
             }
         }
+        if terminal {
+            let removed = active.remove(&session.session_id);
+            #[cfg(feature = "media")]
+            if let Some(session) = removed {
+                session.media_task.abort();
+            }
+            #[cfg(not(feature = "media"))]
+            drop(removed);
+        }
     }
+}
+
+#[cfg(feature = "rtc")]
+fn failure_grace_elapsed(
+    failed: bool,
+    failed_since: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !failed {
+        *failed_since = None;
+        return false;
+    }
+    let started = failed_since.get_or_insert(now);
+    now.duration_since(*started) >= Duration::from_secs(15)
 }
 
 #[cfg(feature = "media")]
@@ -379,5 +442,35 @@ fn redact(error: &anyhow::Error) -> String {
         format!("{}…", &value[..256])
     } else {
         value
+    }
+}
+
+#[cfg(all(test, feature = "rtc"))]
+mod tests {
+    use super::failure_grace_elapsed;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn peer_failure_requires_a_continuous_grace_period() {
+        let start = Instant::now();
+        let mut failed_since = None;
+        assert!(!failure_grace_elapsed(true, &mut failed_since, start));
+        assert!(!failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            start + Duration::from_secs(14),
+        ));
+        assert!(failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            start + Duration::from_secs(15),
+        ));
+        assert!(!failure_grace_elapsed(
+            false,
+            &mut failed_since,
+            start + Duration::from_secs(16),
+        ));
+        assert_eq!(failed_since, None);
     }
 }

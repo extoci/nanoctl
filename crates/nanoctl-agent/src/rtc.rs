@@ -24,6 +24,7 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -107,7 +108,6 @@ enum OutgoingPayload {
         sdp_mline_index: Option<u16>,
     },
     IceComplete,
-    #[cfg(any(feature = "media", test))]
     End {
         reason: String,
     },
@@ -426,7 +426,6 @@ impl HostPeer {
         Ok(())
     }
 
-    #[cfg(feature = "media")]
     pub async fn fail(&self, reason: &str) -> Result<()> {
         let reason = reason.chars().take(256).collect::<String>();
         let index = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -439,6 +438,10 @@ impl HostPeer {
         signal_result?;
         close_result?;
         Ok(())
+    }
+
+    pub fn connection_failed(&self) -> bool {
+        self.peer.connection_state() == RTCPeerConnectionState::Failed
     }
 
     #[cfg(feature = "media")]

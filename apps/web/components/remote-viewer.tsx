@@ -439,7 +439,15 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   return (
     <main className="viewer">
       <div className="viewer-bar">
-        <a href="/dashboard">← Devices</a>
+        <a
+          href="/dashboard"
+          onClick={(event) => {
+            event.preventDefault();
+            void leaveSession();
+          }}
+        >
+          ← Devices
+        </a>
         <div className="viewer-health">
           <span>{status}</span>
           {metrics ? (
