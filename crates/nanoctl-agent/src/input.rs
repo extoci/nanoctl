@@ -249,6 +249,10 @@ impl InputController {
     }
 }
 
+pub fn probe() -> Result<()> {
+    InputController::new().map(drop)
+}
+
 impl Drop for InputController {
     fn drop(&mut self) {
         self.release_all();

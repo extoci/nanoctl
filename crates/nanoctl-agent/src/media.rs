@@ -209,6 +209,10 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .context("H.264 encoder is unavailable")
 }
 
+pub fn probe_encoder() -> Result<()> {
+    create_encoder(1_000, 30, LatencyMode::Balanced).map(drop)
+}
+
 fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Option<u32> {
     let target = estimate.clamp(floor, ceiling);
     let target = u64::from(target);

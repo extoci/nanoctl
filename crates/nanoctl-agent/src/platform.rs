@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::Serialize;
 
 use crate::config::AgentConfig;
@@ -25,6 +26,8 @@ pub struct Capabilities {
     platform: &'static str,
     architecture: &'static str,
     codecs: Vec<&'static str>,
+    encoder_backend: Option<&'static str>,
+    hardware_encoding: bool,
     input: bool,
     clipboard: bool,
     system_audio: bool,
@@ -65,6 +68,8 @@ pub fn capabilities() -> Capabilities {
         } else {
             Vec::new()
         },
+        encoder_backend: cfg!(feature = "media").then_some("software-openh264"),
+        hardware_encoding: false,
         input: cfg!(feature = "media"),
         clipboard: false,
         system_audio: false,
@@ -119,10 +124,11 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
             "invalid; run nanoctl config and inspect service logs".into()
         },
     });
-    let credential_ok = config
+    let credential = config
         .device_id
         .as_deref()
-        .is_some_and(|id| crate::credential::load(id).is_ok());
+        .and_then(|id| crate::credential::load(id).ok());
+    let credential_ok = credential.is_some();
     checks.push(DoctorCheck {
         name: "credential",
         ok: credential_ok,
@@ -132,11 +138,33 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
             "missing; enroll this device".into()
         },
     });
+    checks.push(control_plane_check(config, credential.as_ref()).await);
     checks.push(capture_check());
+    checks.push(encoder_check());
     checks.push(input_check());
     DoctorReport {
         ready: checks.iter().all(|check| check.ok),
         checks,
+    }
+}
+
+async fn control_plane_check(
+    config: &AgentConfig,
+    credential: Option<&zeroize::Zeroizing<String>>,
+) -> DoctorCheck {
+    let result = async {
+        let credential = credential.context("device credential is unavailable")?;
+        let client = crate::control_plane::ControlPlane::new(config.control_plane_url.clone())?;
+        client.heartbeat(credential).await
+    }
+    .await;
+    DoctorCheck {
+        name: "control plane",
+        ok: result.is_ok(),
+        detail: match result {
+            Ok(()) => "authenticated heartbeat accepted".into(),
+            Err(error) => format!("{error:#}"),
+        },
     }
 }
 
@@ -191,10 +219,14 @@ fn capture_check() -> DoctorCheck {
 fn input_check() -> DoctorCheck {
     #[cfg(feature = "media")]
     {
+        let result = crate::input::probe();
         DoctorCheck {
             name: "input",
-            ok: true,
-            detail: platform_input_guidance().into(),
+            ok: result.is_ok(),
+            detail: match result {
+                Ok(()) => platform_input_guidance().into(),
+                Err(error) => format!("{error:#}"),
+            },
         }
     }
     #[cfg(not(feature = "media"))]
@@ -202,6 +234,27 @@ fn input_check() -> DoctorCheck {
         name: "input",
         ok: false,
         detail: "media/input backend not compiled; build with --features media".into(),
+    }
+}
+
+fn encoder_check() -> DoctorCheck {
+    #[cfg(feature = "media")]
+    {
+        let result = crate::media::probe_encoder();
+        DoctorCheck {
+            name: "encoder",
+            ok: result.is_ok(),
+            detail: match result {
+                Ok(()) => "OpenH264 real-time screen-content encoder available".into(),
+                Err(error) => format!("{error:#}"),
+            },
+        }
+    }
+    #[cfg(not(feature = "media"))]
+    DoctorCheck {
+        name: "encoder",
+        ok: false,
+        detail: "H.264 encoder not compiled; build with --features media".into(),
     }
 }
 
