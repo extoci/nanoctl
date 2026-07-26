@@ -96,7 +96,7 @@ export const turnCredentials = action({
       .map((value) => value.trim())
       .filter(Boolean);
     if (!secret || urls.length === 0) return null;
-    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 5 * 60;
+    const expiresAtSeconds = Math.floor(Date.now() / 1000) + 20 * 60;
     const username = `${expiresAtSeconds}:${args.sessionId}`;
     const key = await crypto.subtle.importKey(
       "raw",

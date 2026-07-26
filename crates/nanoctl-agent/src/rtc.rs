@@ -28,6 +28,10 @@ const PROTOCOL_VERSION: u8 = 1;
 
 pub struct HostPeer {
     peer: Arc<RTCPeerConnection>,
+    control_plane: ControlPlane,
+    token: Arc<Zeroizing<String>>,
+    session_id: String,
+    sequence: Arc<AtomicU64>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
 }
@@ -256,7 +260,14 @@ impl HostPeer {
         control_plane
             .send_signal(&token, &session_id, 0, &envelope)
             .await?;
-        Ok(Self { peer, video })
+        Ok(Self {
+            peer,
+            control_plane,
+            token,
+            session_id,
+            sequence,
+            video,
+        })
     }
 
     pub async fn add_signal(&self, serialized: &str, expected_session: &str) -> Result<bool> {
@@ -289,7 +300,32 @@ impl HostPeer {
                 self.peer.close().await?;
                 Ok(false)
             }
-            SignalPayload::Offer { .. } | SignalPayload::Unsupported => Ok(true),
+            SignalPayload::Offer { sdp } => {
+                if sdp.is_empty() || sdp.len() > 1_000_000 {
+                    anyhow::bail!("restart offer SDP is invalid");
+                }
+                self.peer
+                    .set_remote_description(RTCSessionDescription::offer(sdp)?)
+                    .await?;
+                let answer = self.peer.create_answer(None).await?;
+                self.peer.set_local_description(answer).await?;
+                let local = self
+                    .peer
+                    .local_description()
+                    .await
+                    .context("WebRTC restart answer was not created")?;
+                let index = self.sequence.fetch_add(1, Ordering::Relaxed);
+                let response = serialize(
+                    &self.session_id,
+                    index,
+                    OutgoingPayload::Answer { sdp: local.sdp },
+                )?;
+                self.control_plane
+                    .send_signal(&self.token, &self.session_id, index, &response)
+                    .await?;
+                Ok(true)
+            }
+            SignalPayload::Unsupported => Ok(true),
         }
     }
 

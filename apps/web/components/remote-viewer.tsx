@@ -10,6 +10,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const sendSequenceRef = useRef(0);
   const processedSignalsRef = useRef(new Set<number>());
+  const restartAttemptsRef = useRef(0);
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
   const getTurnCredentials = useAction(functions.sessions.turnCredentials);
@@ -75,7 +76,57 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       const stream = streams[0];
       if (stream && videoRef.current) videoRef.current.srcObject = stream;
     };
-    peer.onconnectionstatechange = () => setStatus(peer.connectionState);
+    let restartTimer: number | null = null;
+    let offerInFlight = false;
+    const sendOffer = async (iceRestart: boolean) => {
+      if (offerInFlight || peer.signalingState === "closed") return;
+      offerInFlight = true;
+      try {
+        const offer = await peer.createOffer({ iceRestart });
+        await peer.setLocalDescription(offer);
+        await sendSignal({
+          sessionId,
+          envelope: JSON.stringify({
+            version: PROTOCOL_VERSION,
+            sessionId,
+            sequence: sendSequenceRef.current++,
+            sender: "controller",
+            sentAt: Date.now(),
+            payload: { type: "offer", sdp: offer.sdp ?? "" },
+          }),
+        });
+      } finally {
+        offerInFlight = false;
+      }
+    };
+    const restart = () => {
+      if (restartAttemptsRef.current >= 3 || peer.signalingState === "closed") {
+        setStatus("failed");
+        return;
+      }
+      restartAttemptsRef.current += 1;
+      setStatus(`reconnecting (${restartAttemptsRef.current}/3)`);
+      void sendOffer(true);
+    };
+    peer.onconnectionstatechange = () => {
+      const state = peer.connectionState;
+      if (state === "connected") {
+        restartAttemptsRef.current = 0;
+        if (restartTimer !== null) window.clearTimeout(restartTimer);
+        restartTimer = null;
+      } else if (state === "disconnected" && restartTimer === null) {
+        restartTimer = window.setTimeout(() => {
+          restartTimer = null;
+          restart();
+        }, 3_000);
+      } else if (state === "failed") {
+        if (restartTimer !== null) window.clearTimeout(restartTimer);
+        restartTimer = null;
+        restart();
+        return;
+      }
+      setStatus(state);
+    };
     peer.onicecandidate = ({ candidate }) => {
       const payload = candidate
         ? {
@@ -177,21 +228,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     video?.addEventListener("keyup", key);
     const keepalive = window.setInterval(() => sendControl({ type: "ping" }), 1_000);
 
-    void (async () => {
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      await sendSignal({
-        sessionId,
-        envelope: JSON.stringify({
-          version: PROTOCOL_VERSION,
-          sessionId,
-          sequence: sendSequenceRef.current++,
-          sender: "controller",
-          sentAt: Date.now(),
-          payload: { type: "offer", sdp: offer.sdp ?? "" },
-        }),
-      });
-    })();
+    void sendOffer(false);
 
     return () => {
       video?.removeEventListener("pointermove", pointer);
@@ -202,6 +239,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       video?.removeEventListener("keydown", key);
       video?.removeEventListener("keyup", key);
       window.clearInterval(keepalive);
+      if (restartTimer !== null) window.clearTimeout(restartTimer);
       pointerChannel.close();
       controlChannel.close();
       peer.close();
