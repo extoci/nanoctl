@@ -57,17 +57,22 @@ reports these as actionable readiness states rather than pretending the device i
 The web app creates a short-lived session bound to the authenticated owner and selected device.
 The agent polls/streams authorized session requests, then controller and host trickle ICE through
 the signaling plane. Once the data channel opens, input becomes active and the browser focuses the
-remote canvas. A persistent bar exposes status, latency, display, quality, fullscreen, and end.
+remote canvas. A persistent bar exposes connection state, decoded resolution/FPS, receive bitrate,
+RTT, direct/relay route, loss/drop counters, input enable/disable, fullscreen, and end.
 
 Disconnect is fail-closed: input state is released, capture stops, credentials stay resident, and
 the session cannot be reused. A brief network interruption triggers ICE restart within the same
-session deadline. A new browser tab does not inherit control unless it has the authenticated session.
+session deadline. Blur, visibility loss, control disable, and `Ctrl+Alt+Shift+Escape` explicitly
+release input. A new browser tab does not inherit control unless it has the authenticated session.
 
 ## Advanced mode
 
-Advanced mode is explicit, local, schema-validated configuration. It permits codec order, encoder,
-target/max bitrate, FPS, resolution ceiling, ICE transport policy, STUN/TURN endpoints, network
-interface allow/deny lists, latency tuning, logging level, and experimental feature gates.
+Advanced mode is explicit, local, and deny-by-default schema-validated configuration. Protocol v1
+permits H.264/auto codec choice, maximum bitrate/FPS/resolution, a latency-mode policy value,
+direct-or-relay ICE policy, up to eight STUN endpoints, heartbeat/poll cadence, and remote-input
+disablement. Unknown keys, unsafe remote HTTP, unsupported codecs, reserved audio/clipboard flags,
+and out-of-range values fail startup. TURN endpoints and credentials remain server-issued so local
+configuration cannot embed a shared relay secret.
 
 It does not permit arbitrary command execution, arbitrary FFmpeg arguments, disabling authentication,
 exporting secrets, weakening TLS verification, or making the control API listen on a public socket.

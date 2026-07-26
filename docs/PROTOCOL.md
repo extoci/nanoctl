@@ -27,19 +27,22 @@ by the WebRTC implementation.
 
 ## Data channels
 
-`nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, display selection,
-peer status, ping/pong, and capability negotiation. `nanoctl.pointer.v1` is
-unordered with zero retransmissions and carries pointer movement/wheel samples. Both begin with a
-hello containing protocol version, session nonce, capabilities, and maximum accepted message size.
+`nanoctl.control.v1` is reliable and ordered. It carries key/button transitions, pointer
+button/wheel events, release, and keepalive messages. `nanoctl.pointer.v1` is unordered with zero
+retransmissions and carries pointer movement samples. Channel labels and the authenticated WebRTC
+session identify protocol v1; unknown message variants are ignored and every message is capped at
+64 KiB.
 
 Normalized coordinates are finite numbers clamped to `[0, 1]` and map to the selected display’s
-current logical bounds. Display changes invalidate old geometry. Input has a monotonically
-increasing event id; stale transitions are ignored. A 2-second input watchdog releases all held keys
-and buttons.
+current logical bounds. A reliable `release` message releases all held keys and buttons immediately.
+The browser sends it on control disable, blur, visibility loss, and teardown. A 2-second input
+watchdog is the final backstop.
 
 Keyboard events use DOM `code` for physical location plus `key` for meaning. The agent maps `code`
 using the active OS layout and treats text input separately in future protocol versions. Modifier
-bits are Shift=1, Control=2, Alt=4, Meta=8. Clipboard variants are reserved and rejected in v1.
+bits are Shift=1, Control=2, Alt=4, Meta=8. `Ctrl+Alt+Shift+Escape` disables remote input, releases
+held state, and exits fullscreen locally without sending the chord to the host. Clipboard variants
+are reserved and rejected in v1.
 
 ## Codec negotiation
 

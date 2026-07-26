@@ -74,8 +74,10 @@ warns accordingly. Locked-session behavior follows OS policy and is surfaced to 
 
 The app sets no-sniff, frame denial, referrer, and permissions headers. Production adds a nonce-based
 CSP permitting only the application, Convex, and Shoo endpoints. Remote video is rendered directly
-to a media element, never injected HTML. Clipboard is opt-in and capped. Browser key handling is
-active only while the video owns focus and always preserves an emergency escape chord.
+to a media element, never injected HTML. Clipboard is unavailable in protocol v1. Browser key
+handling is active only while the video owns focus. `Ctrl+Alt+Shift+Escape` is intercepted locally
+before the video handler, releases remote key/button state, disables injection, and exits
+fullscreen.
 
 ## Abuse controls
 

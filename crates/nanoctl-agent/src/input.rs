@@ -42,6 +42,8 @@ enum ControlMessage {
         key: String,
         repeat: bool,
     },
+    Release,
+    Ping,
     #[serde(other)]
     Unsupported,
 }
@@ -126,6 +128,11 @@ impl InputController {
                 key,
                 repeat,
             } => self.keyboard(action, &code, &key, repeat),
+            ControlMessage::Release => {
+                self.release_all();
+                Ok(())
+            }
+            ControlMessage::Ping => Ok(()),
             ControlMessage::Unsupported => Ok(()),
         }
     }
@@ -283,5 +290,14 @@ mod tests {
         assert_eq!(bounded_scroll(10_000.0), 20);
         assert_eq!(bounded_scroll(-10_000.0), -20);
         assert_eq!(bounded_scroll(f64::INFINITY), 0);
+    }
+
+    #[test]
+    fn parses_release_and_keepalive_messages() {
+        let release: ControlMessage = serde_json::from_slice(br#"{"type":"release"}"#).unwrap();
+        assert!(matches!(release, ControlMessage::Release));
+        let ping: ControlMessage =
+            serde_json::from_slice(br#"{"type":"ping","nonce":7,"sentAt":123}"#).unwrap();
+        assert!(matches!(ping, ControlMessage::Ping));
     }
 }

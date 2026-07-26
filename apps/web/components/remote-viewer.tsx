@@ -1,6 +1,11 @@
 "use client";
 
-import { PROTOCOL_VERSION, assertSignalEnvelope, type SignalEnvelope } from "@nanoctl/protocol";
+import {
+  PROTOCOL_VERSION,
+  assertSignalEnvelope,
+  type ControlMessage,
+  type SignalEnvelope,
+} from "@nanoctl/protocol";
 import { useAction, useMutation, useQuery } from "convex/react";
 import { useEffect, useRef, useState } from "react";
 import { functions } from "../lib/convex";
@@ -21,6 +26,8 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const sendSequenceRef = useRef(0);
   const processedSignalsRef = useRef(new Set<number>());
   const restartAttemptsRef = useRef(0);
+  const inputEnabledRef = useRef(true);
+  const releaseInputRef = useRef<() => void>(() => {});
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
   const getTurnCredentials = useAction(functions.sessions.turnCredentials);
@@ -32,6 +39,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const [status, setStatus] = useState("Negotiating");
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
   const [ending, setEnding] = useState(false);
+  const [inputEnabled, setInputEnabled] = useState(true);
   const [metrics, setMetrics] = useState<ViewerMetrics | null>(null);
 
   useEffect(() => {
@@ -55,6 +63,13 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     } finally {
       window.location.assign("/dashboard");
     }
+  }
+
+  function setRemoteControl(enabled: boolean) {
+    inputEnabledRef.current = enabled;
+    setInputEnabled(enabled);
+    if (!enabled) releaseInputRef.current();
+    else videoRef.current?.focus();
   }
 
   useEffect(() => {
@@ -172,17 +187,26 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       });
     };
 
-    function sendControl(payload: object) {
-      const isMotion =
-        "type" in payload &&
-        payload.type === "pointer" &&
-        "action" in payload &&
-        payload.action === "move";
+    function sendControl(payload: ControlMessage) {
+      if (
+        !inputEnabledRef.current &&
+        (payload.type === "pointer" || payload.type === "key" || payload.type === "display")
+      ) {
+        return;
+      }
+      const isMotion = payload.type === "pointer" && payload.action === "move";
       const channel = isMotion ? pointerChannel : controlChannel;
       if (isMotion && channel.bufferedAmount > 64 * 1024) return;
       if (channel.readyState === "open") channel.send(JSON.stringify(payload));
     }
     const video = videoRef.current;
+    const releaseInput = () => {
+      if (controlChannel.readyState === "open") {
+        controlChannel.send(JSON.stringify({ type: "release" } satisfies ControlMessage));
+      }
+      video?.blur();
+    };
+    releaseInputRef.current = releaseInput;
     const normalizedPosition = (event: MouseEvent) => {
       if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
       const rect = video.getBoundingClientRect();
@@ -198,7 +222,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       };
     };
     const pointer = (event: PointerEvent) => {
-      if (!video) return;
+      if (!video || !inputEnabledRef.current) return;
       const position = normalizedPosition(event);
       if (!position) return;
       if (event.type === "pointerdown") {
@@ -215,6 +239,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       });
     };
     const wheel = (event: WheelEvent) => {
+      if (!inputEnabledRef.current) return;
       const position = normalizedPosition(event);
       if (!position) return;
       event.preventDefault();
@@ -226,8 +251,11 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
         deltaY: event.deltaY,
       });
     };
-    const contextMenu = (event: MouseEvent) => event.preventDefault();
+    const contextMenu = (event: MouseEvent) => {
+      if (inputEnabledRef.current) event.preventDefault();
+    };
     const key = (event: KeyboardEvent) => {
+      if (!inputEnabledRef.current) return;
       event.preventDefault();
       sendControl({
         type: "key",
@@ -242,6 +270,26 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
         repeat: event.repeat,
       });
     };
+    const emergencyEscape = (event: KeyboardEvent) => {
+      if (
+        event.type === "keydown" &&
+        event.code === "Escape" &&
+        event.ctrlKey &&
+        event.altKey &&
+        event.shiftKey
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        inputEnabledRef.current = false;
+        setInputEnabled(false);
+        releaseInput();
+        if (document.fullscreenElement) void document.exitFullscreen();
+      }
+    };
+    const releaseOnBlur = () => releaseInput();
+    const releaseWhenHidden = () => {
+      if (document.visibilityState === "hidden") releaseInput();
+    };
     video?.addEventListener("pointermove", pointer);
     video?.addEventListener("pointerdown", pointer);
     video?.addEventListener("pointerup", pointer);
@@ -249,7 +297,14 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
     video?.addEventListener("contextmenu", contextMenu);
     video?.addEventListener("keydown", key);
     video?.addEventListener("keyup", key);
-    const keepalive = window.setInterval(() => sendControl({ type: "ping" }), 1_000);
+    window.addEventListener("keydown", emergencyEscape, true);
+    window.addEventListener("blur", releaseOnBlur);
+    document.addEventListener("visibilitychange", releaseWhenHidden);
+    let pingNonce = 0;
+    const keepalive = window.setInterval(
+      () => sendControl({ type: "ping", nonce: pingNonce++, sentAt: Date.now() }),
+      1_000,
+    );
     let previousBytes: { value: number; timestamp: number } | null = null;
     let statsInFlight = false;
     let statsStopped = false;
@@ -324,6 +379,11 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       video?.removeEventListener("contextmenu", contextMenu);
       video?.removeEventListener("keydown", key);
       video?.removeEventListener("keyup", key);
+      window.removeEventListener("keydown", emergencyEscape, true);
+      window.removeEventListener("blur", releaseOnBlur);
+      document.removeEventListener("visibilitychange", releaseWhenHidden);
+      releaseInput();
+      releaseInputRef.current = () => {};
       statsStopped = true;
       window.clearInterval(keepalive);
       window.clearInterval(statsTimer);
@@ -378,6 +438,13 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
           ) : null}
         </div>
         <div className="viewer-actions">
+          <button
+            type="button"
+            title="Emergency release: Ctrl+Alt+Shift+Escape"
+            onClick={() => setRemoteControl(!inputEnabled)}
+          >
+            Control: {inputEnabled ? "on" : "off"}
+          </button>
           <button type="button" onClick={() => void videoRef.current?.requestFullscreen()}>
             Fullscreen
           </button>

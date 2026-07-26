@@ -53,6 +53,7 @@ export type ControlMessage =
       readonly repeat: boolean;
     }
   | { readonly type: "display"; readonly displayId: string }
+  | { readonly type: "release" }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }
   | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number };
 
