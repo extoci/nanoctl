@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { buildContentSecurityPolicy } from "./proxy";
+import { buildContentSecurityPolicy } from "./middleware";
 
 describe("web content security policy", () => {
   test("permits only the production authentication and control-plane connections", () => {

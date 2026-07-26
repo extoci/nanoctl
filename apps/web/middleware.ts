@@ -37,7 +37,10 @@ export function buildContentSecurityPolicy(
   return `${directives.join("; ")};`;
 }
 
-export function proxy(request: NextRequest) {
+// OpenNext Cloudflare 1.20 requires Edge Middleware. Next 16's newer `proxy`
+// convention is Node-only, so this filename must remain until the adapter
+// supports Node proxy execution.
+export function middleware(request: NextRequest) {
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
   const policy = buildContentSecurityPolicy(
     nonce,
