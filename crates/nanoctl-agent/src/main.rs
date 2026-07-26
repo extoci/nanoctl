@@ -70,6 +70,9 @@ enum Command {
         /// Base64-encoded 32-byte Ed25519 public key.
         #[arg(long)]
         public_key: String,
+        /// Print a machine-readable staging result.
+        #[arg(long)]
+        json: bool,
     },
     /// Atomically activate a verified staged update (Unix; stop the service first).
     ActivateUpdate {
@@ -172,6 +175,7 @@ async fn main() -> Result<()> {
         Command::StageUpdate {
             manifest,
             public_key,
+            json,
         } => {
             let bytes = std::fs::read(&manifest)
                 .with_context(|| format!("cannot read {}", manifest.display()))?;
@@ -189,7 +193,17 @@ async fn main() -> Result<()> {
             let path =
                 update::stage_artifact(&client, &artifact, &update::default_staging_directory()?)
                     .await?;
-            println!("Verified update staged at {}", path.display());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "path": path,
+                        "artifact": artifact,
+                    }))?
+                );
+            } else {
+                println!("Verified update staged at {}", path.display());
+            }
         }
         Command::ActivateUpdate {
             manifest,

@@ -76,6 +76,6 @@ nanoctl verify-update manifest.json --public-key "$NANOCTL_UPDATE_PUBLIC_KEY"
 ```
 
 Do not copy a public key from the update server itself: that would make a compromised distribution
-server its own trust anchor. Windows can verify and stage the same manifest, but activation remains
-installer-managed because a running Windows image cannot safely replace itself. An unsigned local
-build must not be mixed with the signed update channel.
+server its own trust anchor. On Windows, `update-agent.ps1` performs the same transaction outside
+the stopped Scheduled Task because a running Windows image cannot safely replace itself. An
+unsigned local build must not be mixed with the signed update channel.

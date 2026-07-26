@@ -66,8 +66,9 @@ The native updater verifies an exact-byte Ed25519 envelope before parsing it, re
 expired manifests, streams into a bounded private staging file, and checks the signed length and
 SHA-256 digest. Unix package scripts stop the service before an atomic activation and retain the
 previous executable until the restarted agent passes `doctor`. Failed health checks roll back.
-Windows uses the same verifier and staging format, but final replacement must be performed by the
-signed installer bootstrap; the agent deliberately refuses in-process Windows activation.
+Windows uses the same verifier and staging format; the signed installer’s PowerShell bootstrap
+stops the Scheduled Task before replacing the executable and applies the same health/rollback gate.
+The agent deliberately refuses in-process Windows activation.
 
 ## Readiness
 
