@@ -75,7 +75,10 @@ impl MacOsEncoder {
 
     pub fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
         let dimensions = image.dimensions();
-        if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.0 % 2 != 0 || dimensions.1 % 2 != 0
+        if dimensions.0 == 0
+            || dimensions.1 == 0
+            || !dimensions.0.is_multiple_of(2)
+            || !dimensions.1.is_multiple_of(2)
         {
             bail!("VideoToolbox input dimensions must be non-zero and even");
         }

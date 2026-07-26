@@ -318,6 +318,7 @@ fn map_key(code: &str, value: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtc::MAX_CONTROL_MESSAGE_BYTES;
     use proptest::prelude::*;
 
     #[test]
