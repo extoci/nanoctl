@@ -226,6 +226,11 @@ h2 {
   background: var(--danger);
 }
 
+.presence.unready {
+  background: #f5c451;
+  box-shadow: 0 0 0 0.25rem rgb(245 196 81 / 12%);
+}
+
 dl {
   display: grid;
   gap: 0.5rem;

@@ -115,7 +115,12 @@ export function DeviceDashboard() {
         {devices?.map((device) => (
           <article className="device-card" key={device._id}>
             <div className="device-heading">
-              <span className={`presence ${device.status}`} aria-hidden="true" />
+              <span
+                className={`presence ${
+                  device.status === "online" && !device.ready ? "unready" : device.status
+                }`}
+                aria-hidden="true"
+              />
               <div>
                 <h2>{device.name}</h2>
                 <p>
