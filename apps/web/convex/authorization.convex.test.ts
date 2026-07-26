@@ -94,6 +94,37 @@ describe("control-plane authorization", () => {
     expect((await ownerA.query(api.devices.list))[0]?.name).toBe("Owner desktop");
   });
 
+  test("isolates recent audit activity by Shoo subject", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("auditEvents", {
+        ownerId: "owner-a",
+        deviceId,
+        action: "session.connected",
+        createdAt: 2,
+      });
+      await ctx.db.insert("auditEvents", {
+        ownerId: "owner-b",
+        action: "device.enrolled",
+        createdAt: 1,
+      });
+    });
+    const ownerA = asOwner(t, "owner-a");
+    const ownerB = asOwner(t, "owner-b");
+    expect(await ownerA.query(api.audit.listRecent)).toEqual([
+      expect.objectContaining({
+        action: "session.connected",
+        deviceName: "Test desktop",
+      }),
+    ]);
+    expect(await ownerB.query(api.audit.listRecent)).toEqual([
+      expect.objectContaining({
+        action: "device.enrolled",
+      }),
+    ]);
+  });
+
   test("binds sessions and signaling to one owner and one active session", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");

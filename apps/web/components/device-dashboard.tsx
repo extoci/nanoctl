@@ -7,6 +7,7 @@ import { signOut } from "../lib/shoo";
 
 export function DeviceDashboard() {
   const devices = useQuery(functions.devices.list, {});
+  const auditEvents = useQuery(functions.audit.listRecent, {});
   const createPairingCode = useAction(functions.devices.createPairingCode);
   const createSession = useMutation(functions.sessions.create);
   const renameDevice = useMutation(functions.devices.rename);
@@ -165,6 +166,37 @@ export function DeviceDashboard() {
           </article>
         ))}
       </section>
+
+      <section className="activity">
+        <div>
+          <p className="eyebrow">Security activity</p>
+          <h2>Recent access</h2>
+        </div>
+        {auditEvents === undefined ? <p>Loading activity…</p> : null}
+        {auditEvents?.length === 0 ? <p>No access events yet.</p> : null}
+        {auditEvents?.length ? (
+          <ol className="activity-list">
+            {auditEvents.map((event) => (
+              <li key={event._id}>
+                <div>
+                  <strong>{formatAuditAction(event.action)}</strong>
+                  <span>{event.deviceName ?? "Unknown device"}</span>
+                </div>
+                <time dateTime={new Date(event.createdAt).toISOString()}>
+                  {new Date(event.createdAt).toLocaleString()}
+                </time>
+              </li>
+            ))}
+          </ol>
+        ) : null}
+      </section>
     </main>
   );
+}
+
+function formatAuditAction(action: string): string {
+  return action
+    .split(".")
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
 }

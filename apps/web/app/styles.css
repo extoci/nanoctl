@@ -266,6 +266,47 @@ dd {
   padding: 0.55rem 0.75rem;
 }
 
+.activity {
+  margin-top: 2rem;
+  border-top: 1px solid var(--line);
+  padding-top: 1.5rem;
+}
+
+.activity h2 {
+  margin-top: 0.2rem;
+}
+
+.activity-list {
+  display: grid;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--line);
+  padding: 0.8rem 0;
+}
+
+.activity-list li div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.activity-list span,
+.activity-list time {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.activity-list time {
+  white-space: nowrap;
+}
+
 .viewer {
   height: 100vh;
   display: grid;
@@ -345,5 +386,10 @@ dd {
 
   .topbar {
     gap: 1.5rem;
+  }
+
+  .activity-list li {
+    align-items: start;
+    flex-direction: column;
   }
 }

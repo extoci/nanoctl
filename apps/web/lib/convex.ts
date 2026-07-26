@@ -12,6 +12,19 @@ export type DeviceSummary = {
 };
 
 export const functions = {
+  audit: {
+    listRecent: makeFunctionReference<
+      "query",
+      Record<string, never>,
+      {
+        _id: string;
+        action: string;
+        detail?: string;
+        createdAt: number;
+        deviceName?: string;
+      }[]
+    >("audit:listRecent"),
+  },
   devices: {
     list: makeFunctionReference<"query", Record<string, never>, DeviceSummary[]>("devices:list"),
     createPairingCode: makeFunctionReference<

@@ -19,8 +19,7 @@ v1 includes:
 - One owner per device. One active controller per device.
 - Primary display, pointer, keyboard, and wheel. Display selection is available where the platform
   backend exposes stable display identifiers.
-- H.264 baseline compatibility, with VP9/AV1 offered only when both endpoints and the encoder support
-  them.
+- H.264 baseline compatibility. VP9 and AV1 remain reserved for a later protocol capability.
 - Adaptive bitrate, 30/60 FPS presets, 120 FPS advanced maximum, resolution scaling, and automatic
   recovery after ICE/network changes.
 - Device rename, revoke, online state, connection audit, and agent version visibility.
