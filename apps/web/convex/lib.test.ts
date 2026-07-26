@@ -21,6 +21,7 @@ describe("signal envelope indexing", () => {
       kind: "offer",
     });
     expect(parseSignalEnvelope(envelope("host", "answer"), "host").kind).toBe("answer");
+    expect(parseSignalEnvelope(envelope("host", "end"), "host").kind).toBe("end");
   });
 
   test("rejects role confusion and unknown payload kinds", () => {

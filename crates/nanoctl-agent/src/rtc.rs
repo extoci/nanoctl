@@ -105,6 +105,9 @@ enum OutgoingPayload {
         sdp_mline_index: Option<u16>,
     },
     IceComplete,
+    End {
+        reason: String,
+    },
 }
 
 impl HostPeer {
@@ -392,6 +395,25 @@ impl HostPeer {
     }
 
     #[cfg(feature = "media")]
+    pub async fn fail(&self, reason: &str) -> Result<()> {
+        let reason = reason.chars().take(256).collect::<String>();
+        let index = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let envelope = serialize(
+            &self.session_id,
+            index,
+            OutgoingPayload::End { reason },
+        )?;
+        let signal_result = self
+            .control_plane
+            .send_signal(&self.token, &self.session_id, index, &envelope)
+            .await;
+        let close_result = self.peer.close().await;
+        signal_result?;
+        close_result?;
+        Ok(())
+    }
+
+    #[cfg(feature = "media")]
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
     }
@@ -502,5 +524,19 @@ mod tests {
         let value = serialize("session", 3, OutgoingPayload::IceComplete).unwrap();
         assert!(value.contains(r#""sender":"host""#));
         assert!(value.contains(r#""sequence":3"#));
+    }
+
+    #[test]
+    fn serializes_terminal_media_status() {
+        let value = serialize(
+            "session",
+            4,
+            OutgoingPayload::End {
+                reason: "media pipeline failed".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(value.contains(r#""type":"end""#));
+        assert!(value.contains(r#""reason":"media pipeline failed""#));
     }
 }

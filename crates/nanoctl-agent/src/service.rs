@@ -137,6 +137,8 @@ struct ActiveSession {
     processed: HashSet<u64>,
     #[cfg(feature = "media")]
     media_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    #[cfg(feature = "media")]
+    media_restarts: u8,
 }
 
 #[cfg(feature = "rtc")]
@@ -164,6 +166,61 @@ async fn reconcile_sessions(
             #[cfg(feature = "media")]
             session.media_task.abort();
             let _ = session.peer.close().await;
+        }
+    }
+
+    #[cfg(feature = "media")]
+    {
+        let finished = active
+            .iter()
+            .filter(|(_, session)| session.media_task.is_finished())
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in finished {
+            let Some(session) = active.remove(&session_id) else {
+                continue;
+            };
+            let ActiveSession {
+                peer,
+                processed,
+                media_task,
+                media_restarts,
+            } = session;
+            let detail = match media_task.await {
+                Ok(Ok(())) => "media pipeline ended unexpectedly".to_owned(),
+                Ok(Err(error)) => redact(&error),
+                Err(error) => format!("media task stopped: {error}"),
+            };
+            if media_restarts == 0 {
+                warn!(
+                    session_id,
+                    error = detail,
+                    "media pipeline stopped; attempting one bounded restart"
+                );
+                let media_task = spawn_media(&peer, _config);
+                active.insert(
+                    session_id,
+                    ActiveSession {
+                        peer,
+                        processed,
+                        media_task,
+                        media_restarts: 1,
+                    },
+                );
+            } else {
+                warn!(
+                    session_id,
+                    error = detail,
+                    "media pipeline stopped after restart; failing session"
+                );
+                if let Err(error) = peer.fail("media pipeline failed after restart").await {
+                    warn!(
+                        session_id,
+                        error = %redact(&error),
+                        "could not publish terminal media status"
+                    );
+                }
+            }
         }
     }
 
@@ -231,7 +288,7 @@ async fn reconcile_sessions(
                 IceTransport::All => RTCIceTransportPolicy::All,
                 IceTransport::Relay => RTCIceTransportPolicy::Relay,
             };
-            match crate::rtc::HostPeer::answer(
+            let peer_result = crate::rtc::HostPeer::answer(
                 client.clone(),
                 token.clone(),
                 session.session_id.clone(),
@@ -240,23 +297,11 @@ async fn reconcile_sessions(
                 ice_transport_policy,
                 _config.features.remote_input,
             )
-            .await
-            {
+            .await;
+            match peer_result {
                 Ok(peer) => {
                     #[cfg(feature = "media")]
-                    let media_task = crate::media::spawn_video(
-                        peer.video_track(),
-                        peer.keyframe_requests(),
-                        peer.bitrate_estimate_kbps(),
-                        peer.display_selection(),
-                        crate::media::VideoQuality {
-                            max_bitrate_kbps: _config.quality.max_bitrate_kbps,
-                            max_fps: _config.quality.max_fps,
-                            max_width: _config.quality.max_width,
-                            max_height: _config.quality.max_height,
-                            latency_mode: _config.quality.latency_mode,
-                        },
-                    );
+                    let media_task = spawn_media(&peer, _config);
                     active.insert(
                         session.session_id.clone(),
                         ActiveSession {
@@ -264,6 +309,8 @@ async fn reconcile_sessions(
                             processed: HashSet::from([offer.sequence]),
                             #[cfg(feature = "media")]
                             media_task,
+                            #[cfg(feature = "media")]
+                            media_restarts: 0,
                         },
                     );
                     info!(
@@ -301,6 +348,26 @@ async fn reconcile_sessions(
             }
         }
     }
+}
+
+#[cfg(feature = "media")]
+fn spawn_media(
+    peer: &crate::rtc::HostPeer,
+    config: &AgentConfig,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    crate::media::spawn_video(
+        peer.video_track(),
+        peer.keyframe_requests(),
+        peer.bitrate_estimate_kbps(),
+        peer.display_selection(),
+        crate::media::VideoQuality {
+            max_bitrate_kbps: config.quality.max_bitrate_kbps,
+            max_fps: config.quality.max_fps,
+            max_width: config.quality.max_width,
+            max_height: config.quality.max_height,
+            latency_mode: config.quality.latency_mode,
+        },
+    )
 }
 
 fn redact(error: &anyhow::Error) -> String {

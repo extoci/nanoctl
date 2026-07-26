@@ -105,7 +105,8 @@ and lints. The privileged media path does not embed a JavaScript runtime.
 - Control-plane unavailable: existing WebRTC session continues; new sessions wait with backoff.
 - Heartbeat fails: device appears offline after 45 seconds; credentials are retained.
 - Capture revoked/locked: video pauses and a typed status travels over reliable control.
-- Encoder fails: one bounded restart, then session terminates with diagnostics.
+- Capture/encoder task fails: one bounded whole-pipeline restart; a second failure publishes a
+  terminal host signal, marks the Convex session failed with an audit event, and closes the peer.
 - Data channel closes: all injected input is released immediately.
 - Token revoked: the revoke transaction ends active session records immediately; the browser closes
   from the reactive state update, and the agent closes every peer on its next session poll (bounded
