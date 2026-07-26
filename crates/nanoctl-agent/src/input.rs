@@ -6,8 +6,6 @@ use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Se
 use serde::Deserialize;
 use xcap::Monitor;
 
-const MAX_CONTROL_BYTES: usize = 64 * 1024;
-
 #[derive(Clone, Copy)]
 pub enum InputLane {
     Reliable,
@@ -91,7 +89,7 @@ impl InputController {
     }
 
     pub fn dispatch(&mut self, bytes: &[u8], lane: InputLane) -> Result<Option<String>> {
-        if bytes.len() > MAX_CONTROL_BYTES {
+        if bytes.len() > crate::rtc::MAX_CONTROL_MESSAGE_BYTES {
             anyhow::bail!("control message exceeds maximum size");
         }
         let message: ControlMessage =

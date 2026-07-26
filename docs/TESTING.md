@@ -19,8 +19,8 @@ rate-limit windows, TURN configuration, update signature/digest/rollback behavio
 bitstream transforms, input bounds and fail-safe release behavior, packaging transactions,
 production configuration, CSP nonces, media/network/performance-evidence validation, agent log
 redaction (including bearer, SDP, ICE, and TURN-shaped secrets), malformed SDP/candidate rejection,
-and an in-process connection between the production host peer and a real WebRTC controller peer
-through SDP, ICE, DTLS/SCTP, and control-channel opening.
+bounded control-queue admission, and an in-process connection between the production host peer and
+a real WebRTC controller peer through SDP, ICE, DTLS/SCTP, and control-channel opening.
 
 ## Required release-test expansion
 
@@ -30,7 +30,7 @@ the current automated suite:
 - property/fuzz tests for security-sensitive JSON/control parsers and state transitions;
 - replay, duplicate, gap, expiry, wrong-role, wrong-owner, revoked-token, and cross-device tests;
 - authorization tests around every public Convex function and HTTP action;
-- data-channel flood/backpressure tests;
+- end-to-end data-channel flood/backpressure tests with a real input backend;
 - log snapshots proving secrets, clipboard, SDP, and ICE candidates are redacted.
 
 ## Browser tests

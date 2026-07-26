@@ -1,4 +1,6 @@
 use std::sync::Arc;
+#[cfg(feature = "media")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "media")]
 use std::time::Duration;
@@ -34,6 +36,34 @@ use zeroize::Zeroizing;
 use crate::control_plane::ControlPlane;
 
 const PROTOCOL_VERSION: u8 = 1;
+#[cfg(any(feature = "media", test))]
+const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(feature = "media")]
+const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 64;
+
+#[cfg(any(feature = "media", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum InputAdmission {
+    Accepted,
+    Full,
+    Oversized,
+    Closed,
+}
+
+#[cfg(any(feature = "media", test))]
+fn admit_input_message(
+    sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+) -> InputAdmission {
+    if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
+        return InputAdmission::Oversized;
+    }
+    match sender.try_send(bytes) {
+        Ok(()) => InputAdmission::Accepted,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InputAdmission::Full,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InputAdmission::Closed,
+    }
+}
 
 pub struct HostPeer {
     peer: Arc<RTCPeerConnection>,
@@ -245,8 +275,10 @@ impl HostPeer {
                     }
                 });
             }
-            let (control_sender, control_receiver) = tokio::sync::mpsc::channel(128);
+            let (control_sender, control_receiver) =
+                tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
             let (pointer_sender, pointer_receiver) = tokio::sync::mpsc::channel(1);
+            let fail_safe_release_pending = Arc::new(AtomicBool::new(false));
             if let Some(input) = &input {
                 spawn_input_worker(
                     control_receiver,
@@ -272,25 +304,39 @@ impl HostPeer {
                     _ => return Box::pin(async {}),
                 };
                 let message_input = input.clone();
+                let release_pending = fail_safe_release_pending.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
                     let sender = sender.clone();
                     let input = message_input.clone();
+                    let release_pending = release_pending.clone();
                     Box::pin(async move {
                         if !message.is_string {
                             return;
                         }
-                        if let Err(error) = sender.try_send(message.data.to_vec())
-                            && !drop_when_full
+                        let admission = admit_input_message(&sender, message.data.to_vec());
+                        let must_release = !drop_when_full
+                            && matches!(
+                                admission,
+                                InputAdmission::Full | InputAdmission::Oversized
+                            );
+                        if must_release
+                            && release_pending
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
                         {
-                            tracing::warn!(error = %error, "reliable input queue is full");
-                            let _ = tokio::task::spawn_blocking(move || {
+                            tracing::warn!(
+                                ?admission,
+                                "reliable input flood triggered fail-safe release"
+                            );
+                            let release_pending = release_pending.clone();
+                            tokio::task::spawn_blocking(move || {
                                 if let Some(input) = input
                                     && let Ok(mut input) = input.lock()
                                 {
                                     input.release_all();
                                 }
-                            })
-                            .await;
+                                release_pending.store(false, Ordering::Release);
+                            });
                         }
                     })
                 }));
@@ -650,6 +696,32 @@ mod tests {
         .unwrap();
         assert!(value.contains(r#""type":"end""#));
         assert!(value.contains(r#""reason":"media pipeline failed""#));
+    }
+
+    #[test]
+    fn bounds_control_queue_memory_and_work() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        assert_eq!(
+            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES]),
+            InputAdmission::Accepted
+        );
+        assert_eq!(
+            admit_input_message(&sender, vec![0; 1]),
+            InputAdmission::Full
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().len(),
+            MAX_CONTROL_MESSAGE_BYTES
+        );
+        assert_eq!(
+            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES + 1]),
+            InputAdmission::Oversized
+        );
+        drop(receiver);
+        assert_eq!(
+            admit_input_message(&sender, vec![0; 1]),
+            InputAdmission::Closed
+        );
     }
 
     #[tokio::test]
