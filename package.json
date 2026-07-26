@@ -26,6 +26,7 @@
     "test:browser": "playwright test -c tests/browser/playwright.config.ts",
     "test:agent": "bun run scripts/cargo.ts test --features rtc",
     "evidence:media": "bun run scripts/verify-media-evidence.ts",
+    "evidence:network": "bun run scripts/verify-network-evidence.ts",
     "convex:dev": "bun --filter @nanoctl/web convex dev",
     "clean": "bun run scripts/clean.ts"
   },

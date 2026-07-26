@@ -70,6 +70,21 @@ TCP-only TURN, TLS TURN on 443, 1–10% packet loss, 30–200 ms RTT, bandwidth 
 switch, five-second outage, and TURN loss. Capture connection setup time, selected candidate type,
 RTT, loss, encode/decode time, dropped frames, QP, bitrate, and recovery time.
 
+Record at least five minutes for every named scenario using schema version 1 and validate the
+complete, single-version set before release:
+
+```shell
+bun run evidence:network -- evidence/network/*.json
+```
+
+Each record must include `agent_version`, `web_version`, `scenario`, `duration_seconds`,
+`setup_milliseconds`, `recovery_milliseconds`, `samples`, `selected_route` (`direct`, `relay`, or
+`mixed`), `average_bitrate_kbps`, `p95_rtt_milliseconds`,
+`p95_input_to_photon_milliseconds`, `packets_lost`, `frames_dropped`, and `passed`. The verifier
+requires all 16 matrix scenarios exactly once, consistent versions, finite metrics, and an explicit
+pass. It validates evidence completeness, not the honesty of the measurement; preserve raw traces
+and impairment configuration with the signed release record.
+
 ## Performance acceptance
 
 On reference hardware, sustain 1080p60 for 30 minutes without monotonic memory growth, queue growth,
