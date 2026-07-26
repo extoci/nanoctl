@@ -43,6 +43,29 @@ jobs:
       - run: bun run scripts/cargo.ts fmt -- --check
       - run: bun run scripts/cargo.ts clippy --all-targets --features rtc -- -D warnings
       - run: bun run scripts/cargo.ts test --features rtc
+      - name: Validate POSIX package scripts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: sh -n packaging/linux/*.sh packaging/macos/*.sh
+      - name: Validate PowerShell package scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = @()
+          Get-ChildItem packaging/windows -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            $parseErrors += $errors
+          }
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List | Out-String | Write-Error
+            exit 1
+          }
 
   agent-media-linux:
     runs-on: ubuntu-latest
