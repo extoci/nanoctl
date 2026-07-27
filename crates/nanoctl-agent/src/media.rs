@@ -69,7 +69,10 @@ enum EncoderBackend {
     #[cfg(target_os = "macos")]
     VideoToolbox(Box<crate::macos_encoder::MacOsEncoder>),
     #[cfg(target_os = "windows")]
-    MediaFoundation(Box<crate::windows_encoder::WindowsEncoder>),
+    MediaFoundation {
+        encoder: Box<crate::windows_encoder::WindowsEncoder>,
+        allow_software_fallback: bool,
+    },
     Software(Box<SoftwareEncoder>),
 }
 
@@ -191,7 +194,12 @@ impl EncoderBackend {
         #[cfg(target_os = "windows")]
         if !matches!(preference, EncoderPreference::Software) {
             match crate::windows_encoder::WindowsEncoder::new(bitrate_kbps, max_fps, latency_mode) {
-                Ok(encoder) => return Ok(Self::MediaFoundation(Box::new(encoder))),
+                Ok(encoder) => {
+                    return Ok(Self::MediaFoundation {
+                        encoder: Box::new(encoder),
+                        allow_software_fallback: matches!(preference, EncoderPreference::Auto),
+                    });
+                }
                 Err(error) if matches!(preference, EncoderPreference::Hardware) => {
                     return Err(error)
                         .context("required Media Foundation hardware encoder is unavailable");
@@ -218,7 +226,7 @@ impl EncoderBackend {
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => encoder.force_keyframe(),
             #[cfg(target_os = "windows")]
-            Self::MediaFoundation(encoder) => encoder.force_keyframe(),
+            Self::MediaFoundation { encoder, .. } => encoder.force_keyframe(),
             Self::Software(encoder) => encoder.encoder.force_intra_frame(),
         }
     }
@@ -232,7 +240,7 @@ impl EncoderBackend {
                 encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
             }
             #[cfg(target_os = "windows")]
-            Self::MediaFoundation(encoder) => {
+            Self::MediaFoundation { encoder, .. } => {
                 encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
             }
             Self::Software(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
@@ -246,7 +254,29 @@ impl EncoderBackend {
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(encoder) => encoder.encode(image),
             #[cfg(target_os = "windows")]
-            Self::MediaFoundation(encoder) => encoder.encode(image),
+            Self::MediaFoundation {
+                encoder,
+                allow_software_fallback,
+            } => match encoder.encode(image) {
+                Ok(frame) => Ok(frame),
+                Err(error) if *allow_software_fallback => {
+                    let bitrate_kbps = encoder.bitrate_kbps();
+                    let max_fps = encoder.max_fps();
+                    let latency_mode = encoder.latency_mode();
+                    tracing::warn!(
+                        error = %error,
+                        "Media Foundation failed on a captured frame; switching session to OpenH264"
+                    );
+                    let mut software = SoftwareEncoder::new(bitrate_kbps, max_fps, latency_mode)
+                        .context("Media Foundation failed and OpenH264 fallback is unavailable")?;
+                    let frame = software
+                        .encode(image)
+                        .context("OpenH264 fallback could not encode the captured frame")?;
+                    *self = Self::Software(Box::new(software));
+                    Ok(frame)
+                }
+                Err(error) => Err(error),
+            },
             Self::Software(encoder) => encoder.encode(image),
         }
     }
@@ -258,7 +288,7 @@ impl EncoderBackend {
             #[cfg(target_os = "macos")]
             Self::VideoToolbox(_) => "VideoToolbox",
             #[cfg(target_os = "windows")]
-            Self::MediaFoundation(_) => "Media Foundation hardware MFT",
+            Self::MediaFoundation { .. } => "Media Foundation hardware MFT",
             Self::Software(_) => "OpenH264",
         }
     }
@@ -499,7 +529,6 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         quality.encoder,
     )?;
     let started_unix_seconds = crate::update::unix_time_now()?;
-    let backend = encoder.encoder.name();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
@@ -544,6 +573,9 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         && idr_frames > 0
         && sps_units > 0
         && pps_units > 0;
+    // Auto mode may switch from a native encoder to OpenH264 after the first real frame. Report
+    // the backend that completed the smoke test, not merely the one that initialized.
+    let backend = encoder.encoder.name();
     Ok(MediaSmokeReport {
         schema_version: 1,
         passed,
@@ -695,8 +727,8 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 #[cfg(test)]
 mod tests {
     use super::{
-        EncoderBackend, LatestFrame, annex_b_nal_types, avcc_to_annex_b, bitrate_target,
-        fit_dimensions,
+        EncoderBackend, LatestFrame, SoftwareEncoder, annex_b_nal_types, avcc_to_annex_b,
+        bitrate_target, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use std::time::Duration;
@@ -737,6 +769,36 @@ mod tests {
         ) {
             assert_ne!(backend.name(), "OpenH264");
         }
+    }
+
+    #[test]
+    fn software_fallback_encodes_a_real_1080p_capture_frame() {
+        let image =
+            xcap::image::RgbaImage::from_pixel(1920, 1080, xcap::image::Rgba([32, 96, 160, 255]));
+        let mut encoder =
+            SoftwareEncoder::new(4_000, 30, LatencyMode::Balanced).expect("OpenH264 fallback");
+        let frame = encoder.encode(&image).expect("encode 1080p capture frame");
+        assert_eq!((frame.width, frame.height), (1920, 1080));
+        assert!(!frame.bytes.is_empty());
+        let types = annex_b_nal_types(&frame.bytes).expect("Annex-B output");
+        assert!(types.contains(&7));
+        assert!(types.contains(&8));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_auto_encoder_survives_the_first_real_1080p_frame() {
+        let image =
+            xcap::image::RgbaImage::from_pixel(1920, 1080, xcap::image::Rgba([32, 96, 160, 255]));
+        let mut encoder =
+            EncoderBackend::new(EncoderPreference::Auto, 4_000, 30, LatencyMode::Balanced)
+                .expect("Windows auto encoder");
+        let frame = encoder
+            .encode(&image)
+            .expect("Windows auto encoder must encode or fall back");
+        assert_eq!((frame.width, frame.height), (1920, 1080));
+        assert!(!frame.bytes.is_empty());
+        assert!(annex_b_nal_types(&frame.bytes).is_ok());
     }
 
     #[test]

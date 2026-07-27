@@ -62,19 +62,21 @@ pub struct WindowsEncoder {
     active: Option<ActiveEncoder>,
     bitrate_kbps: u32,
     max_fps: u16,
+    latency_mode: LatencyMode,
     rebuild: bool,
     timestamp: i64,
     nv12: Vec<u8>,
 }
 
 impl WindowsEncoder {
-    pub fn new(bitrate_kbps: u32, max_fps: u16, _latency_mode: LatencyMode) -> Result<Self> {
+    pub fn new(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
         let runtime = MediaFoundationRuntime::start()?;
         let mut encoder = Self {
             _runtime: runtime,
             active: None,
             bitrate_kbps,
             max_fps,
+            latency_mode,
             rebuild: false,
             timestamp: 0,
             nv12: Vec::new(),
@@ -83,6 +85,18 @@ impl WindowsEncoder {
         // enumeration result as proof that its media types and buffers work.
         encoder.active = Some(encoder.create_active(64, 64)?);
         Ok(encoder)
+    }
+
+    pub fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
+    }
+
+    pub fn max_fps(&self) -> u16 {
+        self.max_fps
+    }
+
+    pub fn latency_mode(&self) -> LatencyMode {
+        self.latency_mode
     }
 
     pub fn force_keyframe(&mut self) {
