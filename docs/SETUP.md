@@ -24,12 +24,19 @@ If automatic platform selection is undesirable, use
 `https://extoci.lol/nanoctl/install.sh` or
 `https://extoci.lol/nanoctl/install.ps1` explicitly.
 
-Linux uses a systemd user service, macOS uses a per-user LaunchAgent, and Windows uses a
-non-elevated Scheduled Task. The agent must run in the enrolled interactive user's session so it
-can access that user's credential store, screen, and input APIs. It does not open an inbound port.
-The registration starts at login and restarts after failures. While idle, the agent does not
-capture the screen or initialize a media session; it only performs lightweight control-plane
-checks while waiting for an authorized session.
+Linux uses a systemd user service, macOS uses a per-user LaunchAgent, and Windows uses a hidden,
+non-elevated Scheduled Task launched through the windowless Windows Script Host (`wscript.exe`).
+The agent must run in the enrolled interactive user's session so it can access that user's
+credential store, screen, and input APIs. It does not open an inbound port. The registration starts
+at login and restarts after failures. While idle, the agent does not capture the screen or initialize
+a media session; it only performs lightweight control-plane checks while waiting for an authorized
+session. Windows runtime
+output is written to `%LOCALAPPDATA%\nanoctl\agent.log`; no console window is opened by the task.
+
+Running the installer again is an in-place, health-gated upgrade. It preserves the existing
+configuration and enrollment, migrates an older explicit `--config` task path when needed, and
+retains the previous executable until the new task survives startup. If an upgrade fails, rerun the
+same installer; the transaction restores the previous binary and task automatically.
 
 macOS may ask for Screen Recording and Accessibility. Wayland may ask through its desktop portal.
 Complete those prompts as the user who ran the installer.

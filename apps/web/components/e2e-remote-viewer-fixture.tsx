@@ -30,6 +30,7 @@ function appendFixtureEvent(value: unknown): void {
 
 export function E2eRemoteViewerFixture({ terminal }: { terminal: boolean }) {
   const [mounted, setMounted] = useState(true);
+  const [sessionId, setSessionId] = useState("viewer-fixture-a");
   const session = useMemo<ViewerSession>(
     () => ({
       state: terminal ? "ended" : "connected",
@@ -59,9 +60,20 @@ export function E2eRemoteViewerFixture({ terminal }: { terminal: boolean }) {
       <button className="fixture-unmount" type="button" onClick={() => setMounted(false)}>
         Unmount viewer
       </button>
+      <button
+        className="fixture-reopen"
+        type="button"
+        onClick={() =>
+          setSessionId((current) =>
+            current.endsWith("-a") ? "viewer-fixture-b" : "viewer-fixture-a",
+          )
+        }
+      >
+        Reopen viewer
+      </button>
       {mounted ? (
         <RemoteViewerCore
-          sessionId="viewer-fixture"
+          sessionId={sessionId}
           session={session}
           incoming={[]}
           operations={operations}

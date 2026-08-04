@@ -13,9 +13,11 @@ export async function processHostSignals(
   rows: readonly HostSignalRow[],
   processed: Set<number>,
   onEnd: (reason: string) => void,
+  isCurrent: () => boolean = () => true,
 ): Promise<void> {
   const ordered = [...rows].sort((left, right) => left.sequence - right.sequence);
   for (const row of ordered) {
+    if (!isCurrent()) return;
     if (!Number.isSafeInteger(row.sequence) || row.sequence < 0 || processed.has(row.sequence)) {
       continue;
     }
@@ -40,18 +42,23 @@ export async function processHostSignals(
           type: "answer",
           sdp: signal.payload.sdp,
         });
+        if (!isCurrent()) return;
         break;
       case "ice-candidate":
         await peer.addIceCandidate({
           candidate: signal.payload.candidate,
           sdpMid: signal.payload.sdpMid,
           sdpMLineIndex: signal.payload.sdpMLineIndex,
+          usernameFragment: signal.payload.usernameFragment,
         });
+        if (!isCurrent()) return;
         break;
       case "ice-complete":
         await peer.addIceCandidate(null);
+        if (!isCurrent()) return;
         break;
       case "end":
+        if (!isCurrent()) return;
         onEnd(signal.payload.reason);
         peer.close();
         break;

@@ -12,14 +12,17 @@ agent validates each access unit before RTP. RGBA-to-NV12 and the hardware-surfa
 copy through system memory. Direct D3D11 capture-surface import remains a physical performance gate
 and must not be advertised until it passes on signed release hardware.
 
-The current package registration is a headless, non-elevated per-user Scheduled Task because
-Session 0 cannot capture the user desktop or use the enrolling user's Credential Manager entry. The
-binary is administrator-owned under Program Files while configuration access is restricted to the
-agent identity, SYSTEM, and local administrators. Before changing state, the installer compares the
-configuration owner SID to the elevated identity and rejects elevation through another
-administrator. A future supervisor/helper split may add a LocalSystem supervisor, but the
-capture/input process must remain in the authorized user session. UAC secure desktop, elevated
-applications, and Windows sign-in screens remain inaccessible.
+The normal installer registers a hidden, non-elevated per-user Scheduled Task through a windowless
+Windows Script Host (`wscript.exe`) runner because Session 0 cannot capture the user desktop or use
+the enrolling user's Credential Manager entry. The public installation lives under
+`%LOCALAPPDATA%\nanoctl`, keeps runtime output in an owner-protected log, and passes the exact
+configuration path to the runner. The
+administrator-only `packaging/windows/install-service.ps1` helper remains available for managed
+Program Files deployments; it applies explicit ACLs and uses the same hidden task action. Before a
+managed install changes state, it compares the configuration owner SID to the elevated identity and
+rejects elevation through another administrator. A future supervisor/helper split may add a
+LocalSystem supervisor, but the capture/input process must remain in the authorized user session.
+UAC secure desktop, elevated applications, and Windows sign-in screens remain inaccessible.
 
 ## macOS
 

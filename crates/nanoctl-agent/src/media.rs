@@ -13,9 +13,11 @@ use openh264::encoder::{
 use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
 use xcap::Monitor;
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU16, Ordering},
+};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::error::TrySendError;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -52,6 +54,35 @@ impl LatestFrame {
         }
         slot.take()
             .context("display capture stopped without a frame")
+    }
+
+    fn take_until_stopped(
+        &self,
+        timeout: Duration,
+        stopped: &AtomicBool,
+    ) -> Result<Option<xcap::Frame>> {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow!("display capture queue was poisoned"))?;
+        loop {
+            if let Some(frame) = slot.take() {
+                return Ok(Some(frame));
+            }
+            if stopped.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("display capture timed out");
+            }
+            let (next_slot, _) = self
+                .ready
+                .wait_timeout(slot, remaining.min(Duration::from_millis(100)))
+                .map_err(|_| anyhow!("display capture queue was poisoned"))?;
+            slot = next_slot;
+        }
     }
 }
 
@@ -157,6 +188,46 @@ impl CaptureEncoder {
             bail!("captured display dimensions must be non-zero and even");
         }
         self.encoder.encode(&image)
+    }
+
+    fn next_access_unit_until_stopped(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+        stopped: &AtomicBool,
+    ) -> Result<Option<EncodedFrame>> {
+        let Some(frame) = self
+            .latest_frame
+            .take_until_stopped(Duration::from_secs(5), stopped)?
+        else {
+            return Ok(None);
+        };
+        if stopped.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let source = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.raw)
+            .context("display capture returned an invalid RGBA frame")?;
+        let (source_width, source_height) = source.dimensions();
+        let (target_width, target_height) =
+            fit_dimensions(source_width, source_height, max_width, max_height);
+        let image = if target_width == source_width && target_height == source_height {
+            source
+        } else {
+            xcap::image::imageops::resize(
+                &source,
+                target_width,
+                target_height,
+                xcap::image::imageops::FilterType::Triangle,
+            )
+        };
+        let (width, height) = image.dimensions();
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            bail!("captured display dimensions must be non-zero and even");
+        }
+        if stopped.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(self.encoder.encode(&image)?))
     }
 }
 
@@ -470,6 +541,116 @@ pub struct EncodedFrame {
     pub height: u32,
 }
 
+/// A bounded handoff that always retains the newest encoded frame. A full FIFO is the wrong
+/// shape for remote desktop video: keeping an obsolete frame adds latency and can discard the
+/// IDR requested for recovery.
+struct EncodedFrameSlot {
+    frame: Mutex<Option<EncodedFrame>>,
+    ready: tokio::sync::Notify,
+    closed: AtomicBool,
+    dropped: AtomicU16,
+}
+
+impl EncodedFrameSlot {
+    fn new() -> Self {
+        Self {
+            frame: Mutex::new(None),
+            ready: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+            dropped: AtomicU16::new(0),
+        }
+    }
+
+    fn replace(&self, frame: EncodedFrame) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(mut slot) = self.frame.lock() else {
+            return false;
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        // Never overwrite a recovery keyframe with a delta frame. The consumer may be briefly
+        // backpressured while Chromium requests an IDR; dropping that IDR would leave the peer
+        // waiting for the next periodic keyframe and turn a transient loss into visible outage.
+        let incoming_is_keyframe = is_idr(&frame.bytes);
+        if slot
+            .as_ref()
+            .is_some_and(|current| is_idr(&current.bytes) && !incoming_is_keyframe)
+        {
+            self.record_drop();
+            return true;
+        }
+        if slot.is_some() {
+            self.record_drop();
+        }
+        *slot = Some(frame);
+        self.ready.notify_one();
+        true
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ready.notify_waiters();
+    }
+
+    fn record_drop(&self) {
+        let _ = self
+            .dropped
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_add(1))
+            });
+    }
+
+    async fn take(&self) -> Option<(EncodedFrame, u16)> {
+        loop {
+            // Register the notification before checking the condition. Notify is not a counting
+            // semaphore, so creating the future afterwards has a close/notify lost-wakeup race.
+            let notified = self.ready.notified();
+            match self.frame.lock() {
+                Ok(mut slot) => {
+                    if let Some(frame) = slot.take() {
+                        let dropped = self.dropped.swap(0, Ordering::AcqRel);
+                        return Some((frame, dropped));
+                    }
+                }
+                Err(_) => {
+                    self.closed.store(true, Ordering::Release);
+                    return None;
+                }
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            notified.await;
+        }
+    }
+}
+
+fn is_idr(bytes: &[u8]) -> bool {
+    let mut offset = 0_usize;
+    while offset + 3 < bytes.len() {
+        let start_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            offset += 1;
+            continue;
+        };
+        let Some(&header) = bytes.get(offset + start_length) else {
+            return false;
+        };
+        match header & 0x1f {
+            5 => return true,
+            1..=4 => return false,
+            _ => offset += start_length + 1,
+        }
+    }
+    false
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct MediaSmokeReport {
     pub schema_version: u8,
@@ -640,79 +821,183 @@ pub struct VideoQuality {
     pub encoder_preference: EncoderPreference,
 }
 
+/// Owns both halves of the capture pipeline so shutdown can wait for the blocking worker to
+/// release native capture and encoder resources before a replacement session starts.
+pub(crate) struct VideoPipeline {
+    task: tokio::task::JoinHandle<Result<()>>,
+    stop: tokio::sync::watch::Sender<bool>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl VideoPipeline {
+    pub(crate) async fn stop(self) {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.stop.send(true);
+        // Do not abort this task. It owns a spawn_blocking capture/Media Foundation worker, and
+        // Tokio cannot cancel a blocking thread after it has entered native code. Awaiting the
+        // task is what makes close→reopen release the old native capture and encoder resources
+        // before the next session starts.
+        if let Err(error) = self.task.await {
+            tracing::warn!(error = %error, "video pipeline task stopped unexpectedly");
+        }
+    }
+
+    pub(crate) async fn finish(self) -> Result<()> {
+        self.task
+            .await
+            .context("video pipeline task stopped unexpectedly")?
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    #[cfg(test)]
+    fn test_worker(finished: Arc<AtomicBool>) -> Self {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let worker_stopped = stopped.clone();
+        let task = tokio::spawn(async move {
+            let worker = tokio::task::spawn_blocking(move || {
+                while !worker_stopped.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                finished.store(true, Ordering::Release);
+            });
+            let _ = stop_rx.changed().await;
+            worker
+                .await
+                .context("test capture worker stopped unexpectedly")?;
+            Ok(())
+        });
+        Self {
+            task,
+            stop,
+            stopped,
+        }
+    }
+}
+
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     bitrate_estimate_kbps: tokio::sync::watch::Receiver<u32>,
     display_selection: tokio::sync::watch::Receiver<String>,
     quality: VideoQuality,
-) -> tokio::task::JoinHandle<Result<()>> {
-    tokio::spawn(async move {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<EncodedFrame>(1);
+) -> VideoPipeline {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
+    let worker_stopped = stopped.clone();
+    let task = tokio::spawn(async move {
+        let encoded_slot = Arc::new(EncodedFrameSlot::new());
+        let producer_slot = encoded_slot.clone();
+        let producer_stopped = worker_stopped.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut encoder = CaptureEncoder::primary(
-                quality.max_bitrate_kbps,
-                quality.max_fps,
-                quality.latency_mode,
-                quality.encoder_preference,
-            )?;
-            let mut keyframe_requests = keyframe_requests;
-            let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
-            let mut display_selection = display_selection;
-            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
-            let mut next_frame = Instant::now();
-            loop {
-                let now = Instant::now();
-                if now < next_frame {
-                    std::thread::sleep(next_frame - now);
-                }
-                // Advance from the actual clock when capture/encode overruns. This prevents a burst
-                // of catch-up frames after a slow encode or a suspended machine.
-                next_frame = Instant::now() + frame_interval;
-                if keyframe_requests.has_changed().unwrap_or(false) {
-                    keyframe_requests.borrow_and_update();
-                    encoder.encoder.force_keyframe();
-                }
-                if bitrate_estimate_kbps.has_changed().unwrap_or(false) {
-                    let estimate = *bitrate_estimate_kbps.borrow_and_update();
-                    encoder.apply_bitrate_estimate(estimate, quality.max_bitrate_kbps)?;
-                }
-                if display_selection.has_changed().unwrap_or(false) {
-                    let display_id = display_selection.borrow_and_update().clone();
-                    if !display_id.is_empty()
-                        && let Err(error) = encoder.select_display(&display_id)
-                    {
-                        tracing::warn!(
-                            display_id,
-                            error = %error,
-                            "display switch rejected; retaining current capture"
-                        );
+            let result = (|| -> Result<()> {
+                let mut encoder = CaptureEncoder::primary(
+                    quality.max_bitrate_kbps,
+                    quality.max_fps,
+                    quality.latency_mode,
+                    quality.encoder_preference,
+                )?;
+                let mut keyframe_requests = keyframe_requests;
+                let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
+                let mut display_selection = display_selection;
+                let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
+                let mut next_frame = Instant::now();
+                loop {
+                    if producer_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let now = Instant::now();
+                    if now < next_frame {
+                        std::thread::sleep(next_frame - now);
+                    }
+                    if producer_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Advance from the actual clock when capture/encode overruns. This prevents a
+                    // burst of catch-up frames after a slow encode or a suspended machine.
+                    next_frame = Instant::now() + frame_interval;
+                    if keyframe_requests.has_changed().unwrap_or(false) {
+                        keyframe_requests.borrow_and_update();
+                        encoder.encoder.force_keyframe();
+                    }
+                    if bitrate_estimate_kbps.has_changed().unwrap_or(false) {
+                        let estimate = *bitrate_estimate_kbps.borrow_and_update();
+                        encoder.apply_bitrate_estimate(estimate, quality.max_bitrate_kbps)?;
+                    }
+                    if display_selection.has_changed().unwrap_or(false) {
+                        let display_id = display_selection.borrow_and_update().clone();
+                        if !display_id.is_empty()
+                            && let Err(error) = encoder.select_display(&display_id)
+                        {
+                            tracing::warn!(
+                                display_id,
+                                error = %error,
+                                "display switch rejected; retaining current capture"
+                            );
+                        }
+                    }
+                    let Some(frame) = encoder.next_access_unit_until_stopped(
+                        quality.max_width,
+                        quality.max_height,
+                        &producer_stopped,
+                    )?
+                    else {
+                        break;
+                    };
+                    if frame.bytes.is_empty() {
+                        continue;
+                    }
+                    if !producer_slot.replace(frame) {
+                        break;
                     }
                 }
-                let frame = encoder.next_access_unit(quality.max_width, quality.max_height)?;
-                if frame.bytes.is_empty() {
-                    continue;
+                Ok(())
+            })();
+            producer_slot.close();
+            result
+        });
+        let mut stop_rx = stop_rx;
+        let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
+        let mut write_result = Ok(());
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
                 }
-                match sender.try_send(frame) {
-                    Ok(()) | Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Closed(_)) => break,
+                frame = encoded_slot.take() => {
+                    let Some((frame, dropped)) = frame else { break };
+                    // Tell the RTP packetizer about frames discarded by the newest-frame slot so
+                    // timestamps keep pace with the capture clock instead of falling behind.
+                    if let Err(error) = track.write_sample(&Sample {
+                        data: frame.bytes.into(),
+                        duration,
+                        prev_dropped_packets: dropped,
+                        ..Default::default()
+                    }).await {
+                        write_result = Err(error);
+                        break;
+                    }
                 }
             }
-            Ok(())
-        });
-        let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
-        while let Some(frame) = receiver.recv().await {
-            track
-                .write_sample(&Sample {
-                    data: frame.bytes.into(),
-                    duration,
-                    ..Default::default()
-                })
-                .await?;
         }
-        producer.await??;
+        worker_stopped.store(true, Ordering::Release);
+        let producer_result = producer
+            .await
+            .context("video capture worker stopped unexpectedly")?;
+        write_result?;
+        producer_result?;
         Ok(())
-    })
+    });
+    VideoPipeline {
+        task,
+        stop,
+        stopped,
+    }
 }
 
 fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
@@ -727,11 +1012,77 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 #[cfg(test)]
 mod tests {
     use super::{
-        EncoderBackend, LatestFrame, SoftwareEncoder, annex_b_nal_types, avcc_to_annex_b,
-        bitrate_target, fit_dimensions,
+        EncodedFrame, EncodedFrameSlot, EncoderBackend, LatestFrame, SoftwareEncoder,
+        annex_b_nal_types, avcc_to_annex_b, bitrate_target, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn stopping_a_video_pipeline_waits_for_the_blocking_capture_worker() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipeline = super::VideoPipeline::test_worker(finished.clone());
+
+        pipeline.stop().await;
+
+        assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn encoded_frame_slot_replaces_stale_frames() {
+        let slot = EncodedFrameSlot::new();
+        assert!(slot.replace(EncodedFrame {
+            bytes: vec![1],
+            width: 2,
+            height: 2,
+        }));
+        assert!(slot.replace(EncodedFrame {
+            bytes: vec![2],
+            width: 2,
+            height: 2,
+        }));
+
+        let (frame, dropped) = slot.take().await.expect("newest frame");
+        assert_eq!(frame.bytes, vec![2]);
+        assert_eq!(dropped, 1);
+        slot.close();
+        assert!(slot.take().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn encoded_frame_slot_never_replaces_a_recovery_keyframe_with_delta() {
+        let slot = EncodedFrameSlot::new();
+        assert!(slot.replace(EncodedFrame {
+            bytes: vec![0, 0, 0, 1, 0x65],
+            width: 2,
+            height: 2,
+        }));
+        assert!(slot.replace(EncodedFrame {
+            bytes: vec![0, 0, 0, 1, 0x41],
+            width: 2,
+            height: 2,
+        }));
+
+        assert_eq!(
+            slot.take().await.expect("recovery frame").0.bytes,
+            vec![0, 0, 0, 1, 0x65]
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_frame_slot_close_wakes_a_waiting_consumer() {
+        let slot = std::sync::Arc::new(EncodedFrameSlot::new());
+        let consumer = {
+            let slot = slot.clone();
+            tokio::spawn(async move { slot.take().await })
+        };
+        slot.close();
+        let result = tokio::time::timeout(Duration::from_secs(1), consumer)
+            .await
+            .expect("consumer must wake after close")
+            .expect("consumer task must finish");
+        assert!(result.is_none());
+    }
 
     #[test]
     fn preserves_aspect_ratio_and_even_dimensions() {

@@ -68,6 +68,15 @@ pub struct WindowsEncoder {
     nv12: Vec<u8>,
 }
 
+impl Drop for WindowsEncoder {
+    fn drop(&mut self) {
+        // Release the transform and its event generator before MediaFoundationRuntime calls
+        // MFShutdown. The capture worker is reused across sessions, so relying on field-drop
+        // ordering here makes a close→reopen race unnecessarily easy to trigger.
+        self.active.take();
+    }
+}
+
 impl WindowsEncoder {
     pub fn new(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
         let runtime = MediaFoundationRuntime::start()?;

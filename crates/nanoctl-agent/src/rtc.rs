@@ -29,6 +29,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use zeroize::Zeroizing;
@@ -36,6 +37,10 @@ use zeroize::Zeroizing;
 use crate::control_plane::ControlPlane;
 
 const PROTOCOL_VERSION: u8 = 1;
+// Level 5.2 is the highest H.264 level supported by the configured 4K60 release envelope. The
+// WebRTC matcher treats the level byte asymmetrically, so this remains compatible with Chromium's
+// lower-level offer while no longer advertising a 720p30 ceiling for a 4K-capable sender.
+const H264_PROFILE_LEVEL_ID: &str = "42e034";
 #[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 #[cfg(feature = "media")]
@@ -159,6 +164,8 @@ enum SignalPayload {
         sdp_mid: Option<String>,
         #[serde(rename = "sdpMLineIndex")]
         sdp_mline_index: Option<u16>,
+        #[serde(rename = "usernameFragment", default)]
+        username_fragment: Option<String>,
     },
     IceComplete,
     End {
@@ -191,6 +198,8 @@ enum OutgoingPayload {
         sdp_mid: Option<String>,
         #[serde(rename = "sdpMLineIndex")]
         sdp_mline_index: Option<u16>,
+        #[serde(rename = "usernameFragment")]
+        username_fragment: Option<String>,
     },
     IceComplete,
     End {
@@ -358,10 +367,27 @@ impl HostPeer {
                 mime_type: MIME_TYPE_H264.to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_owned(),
-                rtcp_feedback: Vec::new(),
+                sdp_fmtp_line: format!(
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE_LEVEL_ID}"
+                ),
+                rtcp_feedback: vec![
+                    RTCPFeedback {
+                        typ: "nack".to_owned(),
+                        parameter: "".to_owned(),
+                    },
+                    RTCPFeedback {
+                        typ: "nack".to_owned(),
+                        parameter: "pli".to_owned(),
+                    },
+                    RTCPFeedback {
+                        typ: "ccm".to_owned(),
+                        parameter: "fir".to_owned(),
+                    },
+                    RTCPFeedback {
+                        typ: "goog-remb".to_owned(),
+                        parameter: "".to_owned(),
+                    },
+                ],
             },
             "desktop".to_owned(),
             "nanoctl".to_owned(),
@@ -417,6 +443,7 @@ impl HostPeer {
                                 candidate: candidate.candidate,
                                 sdp_mid: candidate.sdp_mid,
                                 sdp_mline_index: candidate.sdp_mline_index,
+                                username_fragment: candidate.username_fragment,
                             },
                             Err(_) => return,
                         },
@@ -479,10 +506,14 @@ impl HostPeer {
                 candidate,
                 sdp_mid,
                 sdp_mline_index,
+                username_fragment,
             } => {
                 if candidate.is_empty()
                     || candidate.len() > 8_192
                     || sdp_mid.as_ref().is_some_and(|value| value.len() > 256)
+                    || username_fragment
+                        .as_ref()
+                        .is_some_and(|value| value.is_empty() || value.len() > 256)
                 {
                     anyhow::bail!("ICE candidate is invalid");
                 }
@@ -491,7 +522,7 @@ impl HostPeer {
                         candidate,
                         sdp_mid,
                         sdp_mline_index,
-                        username_fragment: None,
+                        username_fragment,
                     })
                     .await?;
                 Ok(true)

@@ -36,6 +36,10 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// Write this marker after the service has initialized and remove it on exit.
+    #[arg(long, global = true)]
+    ready_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -144,7 +148,7 @@ async fn main() -> Result<()> {
         Command::Run => {
             let config = AgentConfig::load(&config_path)?;
             config.validate_enrolled()?;
-            service::run(config).await?;
+            service::run(config, cli.ready_file).await?;
         }
         Command::Doctor { json } => {
             let config = AgentConfig::load_or_default(&config_path)?;

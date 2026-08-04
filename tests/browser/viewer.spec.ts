@@ -160,6 +160,53 @@ test("viewer cleanup releases input, closes channels, and closes the peer", asyn
   expect(evidence).toEqual({ released: true, channelsClosed: true, peerClosed: true });
 });
 
+test("viewer reopens a retained component with a fresh offer sequence", async ({ page }) => {
+  await page.goto("/e2e/viewer");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
+            }
+          ).__nanoctlViewerEvents?.filter((event) => event.operation === "signal").length,
+      ),
+    )
+    .toBe(1);
+
+  await page.getByRole("button", { name: "Reopen viewer" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
+            }
+          ).__nanoctlViewerEvents?.filter((event) => event.operation === "signal").length,
+      ),
+    )
+    .toBe(2);
+
+  const offers = await page.evaluate(() => {
+    const events =
+      (
+        window as typeof window & {
+          __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
+        }
+      ).__nanoctlViewerEvents ?? [];
+    return events
+      .filter((event) => event.operation === "signal" && event.envelope)
+      .map((event) => JSON.parse(event.envelope as string))
+      .map((signal) => ({ sessionId: signal.sessionId, sequence: signal.sequence }));
+  });
+  expect(offers).toEqual([
+    { sessionId: "viewer-fixture-a", sequence: 0 },
+    { sessionId: "viewer-fixture-b", sequence: 0 },
+  ]);
+});
+
 test("viewer exhausts bounded reconnect attempts and ends the session", async ({ page }) => {
   await page.goto("/e2e/viewer");
   await expect

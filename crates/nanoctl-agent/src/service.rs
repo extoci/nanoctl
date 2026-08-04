@@ -1,6 +1,6 @@
-use std::time::Duration;
 #[cfg(feature = "rtc")]
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -18,13 +18,14 @@ use crate::{
     credential,
 };
 
-pub async fn run(config: AgentConfig) -> Result<()> {
+pub async fn run(config: AgentConfig, ready_file: Option<PathBuf>) -> Result<()> {
     let device_id = config
         .device_id
         .as_deref()
         .context("agent is not enrolled")?;
     let token = credential::load(device_id)?;
     let client = ControlPlane::new(config.control_plane_url.clone())?;
+    let _ready_file = ready_file.map(ReadyFile::create).transpose()?;
     let mut heartbeat =
         tokio::time::interval(Duration::from_secs(config.network.heartbeat_seconds));
     let mut sessions =
@@ -47,6 +48,8 @@ pub async fn run(config: AgentConfig) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("shutdown requested");
+                #[cfg(feature = "rtc")]
+                close_all_sessions(&mut active_sessions).await;
                 return Ok(());
             }
             _ = heartbeat.tick() => {
@@ -111,11 +114,34 @@ pub async fn run(config: AgentConfig) -> Result<()> {
     }
 }
 
+struct ReadyFile {
+    path: PathBuf,
+}
+
+impl ReadyFile {
+    fn create(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("cannot create readiness directory {}", parent.display())
+            })?;
+        }
+        std::fs::write(&path, format!("pid={}\n", std::process::id()))
+            .with_context(|| format!("cannot write readiness marker {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ReadyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(feature = "rtc")]
 async fn close_all_sessions(active: &mut HashMap<String, ActiveSession>) {
     for (_, session) in active.drain() {
         #[cfg(feature = "media")]
-        session.media_task.abort();
+        session.media_task.stop().await;
         let _ = session.peer.close().await;
     }
 }
@@ -142,7 +168,7 @@ struct ActiveSession {
     processed: HashSet<u64>,
     failed_since: Option<Instant>,
     #[cfg(feature = "media")]
-    media_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    media_task: crate::media::VideoPipeline,
     #[cfg(feature = "media")]
     media_restarts: u8,
 }
@@ -170,7 +196,7 @@ async fn reconcile_sessions(
     for session_id in stale {
         if let Some(session) = active.remove(&session_id) {
             #[cfg(feature = "media")]
-            session.media_task.abort();
+            session.media_task.stop().await;
             let _ = session.peer.close().await;
         }
     }
@@ -189,7 +215,7 @@ async fn reconcile_sessions(
     for session_id in failed {
         if let Some(session) = active.remove(&session_id) {
             #[cfg(feature = "media")]
-            session.media_task.abort();
+            session.media_task.stop().await;
             if let Err(error) = session.peer.fail("peer connection failed").await {
                 warn!(
                     session_id,
@@ -218,10 +244,9 @@ async fn reconcile_sessions(
                 media_task,
                 media_restarts,
             } = session;
-            let detail = match media_task.await {
-                Ok(Ok(())) => "media pipeline ended unexpectedly".to_owned(),
-                Ok(Err(error)) => redact(&error),
-                Err(error) => format!("media task stopped: {error}"),
+            let detail = match media_task.finish().await {
+                Ok(()) => "media pipeline ended unexpectedly".to_owned(),
+                Err(error) => redact(&error),
             };
             if media_restarts == 0 {
                 warn!(
@@ -410,7 +435,8 @@ async fn reconcile_sessions(
             let removed = active.remove(&session.session_id);
             #[cfg(feature = "media")]
             if let Some(session) = removed {
-                session.media_task.abort();
+                session.media_task.stop().await;
+                let _ = session.peer.close().await;
             }
             #[cfg(not(feature = "media"))]
             drop(removed);
@@ -429,10 +455,7 @@ fn failure_grace_elapsed(failed: bool, failed_since: &mut Option<Instant>, now: 
 }
 
 #[cfg(feature = "media")]
-fn spawn_media(
-    peer: &crate::rtc::HostPeer,
-    config: &AgentConfig,
-) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+fn spawn_media(peer: &crate::rtc::HostPeer, config: &AgentConfig) -> crate::media::VideoPipeline {
     crate::media::spawn_video(
         peer.video_track(),
         peer.keyframe_requests(),

@@ -109,9 +109,52 @@ describe("one-command Linux installer", () => {
 });
 
 describe("one-command Windows installer", () => {
-  test("uses a Task Scheduler-compatible restart interval", async () => {
+  test("uses a headless, restartable task with a stability check", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("-RestartInterval (New-TimeSpan -Minutes 1)");
     expect(installer).not.toContain("-RestartInterval (New-TimeSpan -Seconds");
+    expect(installer).toContain("System32\\wscript.exe");
+    expect(installer).toContain("run-agent.vbs");
+    expect(installer).toContain("agent.ready");
+    expect(installer).toContain("[IO.FileShare]::None");
+    expect(installer).toContain("-Hidden");
+    expect(installer).toContain("startup stability window");
+    expect(installer).toContain("nanoctl.{0}.previous.exe");
+    expect(installer).toContain("Migrated the existing configuration");
+    expect(installer).not.toContain('New-ScheduledTaskAction -Execute $binaryPath -Argument "run"');
+  });
+
+  test("keeps the low-level Windows installer headless too", async () => {
+    const installer = await Bun.file(
+      join(repository, "packaging/windows/install-service.ps1"),
+    ).text();
+    expect(installer).toContain("System32\\wscript.exe");
+    expect(installer).toContain("run-agent.vbs");
+    expect(installer).not.toContain("$powershell");
+    expect(installer).toContain("-Hidden");
+    expect(installer).toContain("agent.log");
+  });
+
+  test("makes signed updates retryable and health-gated", async () => {
+    const updater = await Bun.file(join(repository, "packaging/windows/update-agent.ps1")).text();
+    expect(updater).toContain("[IO.FileShare]::None");
+    expect(updater).toContain("$lockAcquired");
+    expect(updater).toContain("-not $completed -and $lockAcquired");
+    expect(updater).toContain("startup stability window");
+    expect(updater).toContain("Set-HeadlessTaskAction");
+    expect(updater).toContain("$transactionId");
+    expect(updater).not.toContain("A prior update transaction must be resolved");
+  });
+
+  test("uninstalls the public per-user layout without requiring elevation", async () => {
+    const uninstaller = await Bun.file(
+      join(repository, "packaging/windows/uninstall-agent.ps1"),
+    ).text();
+    expect(uninstaller).not.toContain("#Requires -RunAsAdministrator");
+    expect(uninstaller).toContain("$env:LOCALAPPDATA");
+    expect(uninstaller).toContain("-Recurse -Force");
+    expect(uninstaller).toContain("BinaryPath must be the standard nanoctl.exe");
+    expect(uninstaller).toContain("removing the broken task");
+    expect(uninstaller).toContain("Program Files installation requires an administrator");
   });
 });

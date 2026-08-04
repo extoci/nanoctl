@@ -68,12 +68,16 @@ states cannot transition back. One active session per device is enforced transac
 The portable backend keeps one long-lived native capture session open. xcap currently selects WGC
 on Windows and PipeWire on supported Wayland desktops, with platform fallbacks elsewhere. A
 dedicated forwarding thread replaces a single pending frame atomically: if capture outpaces
-encoding, obsolete frames are discarded rather than accumulated. RGBA frames are scaled and
-converted to I420 for bounded OpenH264 software encoding, then emitted directly to the WebRTC RTP
-packetizer. Decoder PLI/FIR feedback forces an IDR, with a two-second periodic IDR as a recovery
-backstop. Display metadata is refreshed in the signed-in owner’s device capability view. A display
-switch updates input origin/geometry and starts the replacement recorder before stopping the
-existing recorder; the next encoded frame is an IDR.
+encoding, obsolete frames are discarded rather than accumulated. The encoded handoff is also a
+single newest-frame slot, so a busy packetizer never retains stale content or discards the newest
+recovery frame; discarded-frame counts advance RTP time instead of hiding latency in a queue. RGBA
+frames are scaled and converted to I420 for bounded OpenH264 software
+encoding, then emitted directly to the WebRTC RTP packetizer. Decoder PLI/FIR feedback forces an
+IDR, with a two-second periodic IDR as a recovery backstop. Display metadata is refreshed in the
+signed-in owner’s device capability view. A display switch updates input origin/geometry and starts
+the replacement recorder before stopping the existing recorder; the next encoded frame is an IDR.
+Session teardown signals and joins the blocking capture/encoder worker before a replacement session
+is admitted.
 
 The portable path consumes receiver-estimated maximum bitrate (REMB), clamps it between 250 kbps and
 the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% increase. Recreating

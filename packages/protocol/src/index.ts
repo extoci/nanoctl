@@ -29,6 +29,8 @@ export type SignalPayload =
       readonly candidate: string;
       readonly sdpMid: string | null;
       readonly sdpMLineIndex: number | null;
+      /** ICE generation discriminator; null keeps compatibility with older agents. */
+      readonly usernameFragment?: string | null;
     }
   | { readonly type: "ice-complete" }
   | { readonly type: "end"; readonly reason: string };
@@ -131,6 +133,13 @@ export function assertSignalPayload(value: unknown): asserts value is SignalPayl
           Number(value.sdpMLineIndex) > 65_535)
       ) {
         throw new Error("invalid sdpMLineIndex");
+      }
+      if (
+        value.usernameFragment !== undefined &&
+        value.usernameFragment !== null &&
+        !isBoundedString(value.usernameFragment, 1, 256)
+      ) {
+        throw new Error("invalid usernameFragment");
       }
       return;
     case "ice-complete":

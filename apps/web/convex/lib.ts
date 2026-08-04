@@ -149,7 +149,10 @@ export function parseSignalEnvelope(
         (fields.sdpMLineIndex !== null &&
           (!Number.isInteger(fields.sdpMLineIndex) ||
             Number(fields.sdpMLineIndex) < 0 ||
-            Number(fields.sdpMLineIndex) > 65_535)))) ||
+            Number(fields.sdpMLineIndex) > 65_535)) ||
+        (fields.usernameFragment !== undefined &&
+          fields.usernameFragment !== null &&
+          !isBoundedString(fields.usernameFragment, 1, 256)))) ||
     (kind === "end" && !isBoundedString(fields.reason, 1, 512))
   ) {
     throw new ConvexError("Malformed signal payload");

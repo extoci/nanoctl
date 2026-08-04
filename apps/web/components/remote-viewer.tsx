@@ -56,6 +56,7 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
 
   return (
     <RemoteViewerCore
+      key={sessionId}
       sessionId={sessionId}
       session={session}
       incoming={incoming}
@@ -77,6 +78,8 @@ export function RemoteViewerCore({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
+  const peerSessionRef = useRef<string | null>(null);
+  const sessionGenerationRef = useRef(0);
   const sendSequenceRef = useRef(0);
   const processedSignalsRef = useRef(new Set<number>());
   const signalTaskRef = useRef<Promise<void>>(Promise.resolve());
@@ -90,6 +93,27 @@ export function RemoteViewerCore({
   const [inputEnabled, setInputEnabled] = useState(true);
   const [selectedDisplay, setSelectedDisplay] = useState("");
   const [metrics, setMetrics] = useState<ViewerMetrics | null>(null);
+  const iceServersSessionRef = useRef<string | null>(null);
+
+  // A viewer can be retained while the route changes between sessions. Reset every piece of
+  // signaling state before the new TURN/peer effects run; sequence zero is reserved for the
+  // initial offer that the Windows agent uses to discover a session.
+  useEffect(() => {
+    sessionGenerationRef.current += 1;
+    sendSequenceRef.current = 0;
+    processedSignalsRef.current = new Set<number>();
+    signalTaskRef.current = Promise.resolve();
+    restartAttemptsRef.current = 0;
+    peerSessionRef.current = null;
+    iceServersSessionRef.current = null;
+    setIceServers(null);
+    setSelectedDisplay("");
+    setMetrics(null);
+    setStatus("Negotiating");
+    setEnding(false);
+    inputEnabledRef.current = true;
+    setInputEnabled(true);
+  }, [sessionId]);
 
   useEffect(() => {
     if (!session) return;
@@ -100,6 +124,7 @@ export function RemoteViewerCore({
     ) {
       setStatus(session.endReason ? `ended: ${session.endReason}` : session.state);
       peerRef.current?.close();
+      if (videoRef.current) videoRef.current.srcObject = null;
     }
   }, [session]);
 
@@ -133,6 +158,7 @@ export function RemoteViewerCore({
     void getTurnCredentials({ sessionId })
       .then((turn) => {
         if (cancelled) return;
+        iceServersSessionRef.current = sessionId;
         setIceServers([
           { urls: "stun:stun.cloudflare.com:3478" },
           ...(turn
@@ -141,7 +167,10 @@ export function RemoteViewerCore({
         ]);
       })
       .catch(() => {
-        if (!cancelled) setIceServers([{ urls: "stun:stun.cloudflare.com:3478" }]);
+        if (!cancelled) {
+          iceServersSessionRef.current = sessionId;
+          setIceServers([{ urls: "stun:stun.cloudflare.com:3478" }]);
+        }
       });
     return () => {
       cancelled = true;
@@ -149,13 +178,21 @@ export function RemoteViewerCore({
   }, [getTurnCredentials, sessionId]);
 
   useEffect(() => {
-    if (!iceServers) return;
+    if (!iceServers || iceServersSessionRef.current !== sessionId) return;
+    const generation = sessionGenerationRef.current;
+    let disposed = false;
+    const isCurrent = () =>
+      !disposed &&
+      sessionGenerationRef.current === generation &&
+      peerSessionRef.current === sessionId;
     const peer = new RTCPeerConnection({
       iceServers,
       bundlePolicy: "max-bundle",
     });
     peerRef.current = peer;
+    peerSessionRef.current = sessionId;
     const endOnPageHide = () => {
+      if (!isCurrent()) return;
       void endSession({ sessionId, reason: "controller disconnected" });
     };
     window.addEventListener("pagehide", endOnPageHide, { once: true });
@@ -166,19 +203,32 @@ export function RemoteViewerCore({
     const controlChannel = peer.createDataChannel("nanoctl.control.v1");
     peer.addTransceiver("video", { direction: "recvonly" });
 
-    peer.ontrack = ({ streams }) => {
-      const stream = streams[0];
-      if (stream && videoRef.current) videoRef.current.srcObject = stream;
+    peer.ontrack = ({ receiver, streams, track }) => {
+      if (!isCurrent()) return;
+      if ("playoutDelayHint" in receiver) {
+        (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
+      }
+      const stream = streams[0] ?? new MediaStream([track]);
+      if (stream && videoRef.current) {
+        videoRef.current.srcObject = stream;
+        void videoRef.current.play().catch(() => {});
+      }
     };
     let restartTimer: number | null = null;
     let negotiationTimer: number | null = null;
     let offerInFlight = false;
     const sendOffer = async (iceRestart: boolean) => {
-      if (offerInFlight || peer.signalingState === "closed") return;
+      if (!isCurrent() || offerInFlight || peer.signalingState === "closed") return;
       offerInFlight = true;
       try {
         const offer = await peer.createOffer({ iceRestart });
+        if (!isCurrent()) return;
         await peer.setLocalDescription(offer);
+        if (!isCurrent()) return;
+        const localDescription = peer.localDescription;
+        if (!localDescription || localDescription.type !== "offer") {
+          throw new Error("local offer was not installed");
+        }
         await sendSignal({
           sessionId,
           envelope: JSON.stringify({
@@ -187,13 +237,18 @@ export function RemoteViewerCore({
             sequence: sendSequenceRef.current++,
             sender: "controller",
             sentAt: Date.now(),
-            payload: { type: "offer", sdp: offer.sdp ?? "" },
+            payload: { type: "offer", sdp: localDescription.sdp ?? "" },
           }),
         });
         if (!iceRestart && negotiationTimer === null) {
           negotiationTimer = window.setTimeout(() => {
             negotiationTimer = null;
-            if (peer.connectionState === "connected" || peer.signalingState === "closed") return;
+            if (
+              !isCurrent() ||
+              peer.connectionState === "connected" ||
+              peer.signalingState === "closed"
+            )
+              return;
             setStatus("failed: host did not answer");
             peer.close();
             void endSession({
@@ -207,6 +262,7 @@ export function RemoteViewerCore({
       }
     };
     const restart = () => {
+      if (!isCurrent()) return;
       if (restartAttemptsRef.current >= 3 || peer.signalingState === "closed") {
         setStatus("failed");
         peer.close();
@@ -216,10 +272,11 @@ export function RemoteViewerCore({
       restartAttemptsRef.current += 1;
       setStatus(`reconnecting (${restartAttemptsRef.current}/3)`);
       void sendOffer(true).catch(() => {
-        setStatus("signaling failed");
+        if (isCurrent()) setStatus("signaling failed");
       });
     };
     peer.onconnectionstatechange = () => {
+      if (!isCurrent()) return;
       const state = peer.connectionState;
       if (state === "connected") {
         restartAttemptsRef.current = 0;
@@ -243,12 +300,14 @@ export function RemoteViewerCore({
       setStatus(state);
     };
     peer.onicecandidate = ({ candidate }) => {
+      if (!isCurrent()) return;
       const payload = candidate
         ? {
             type: "ice-candidate" as const,
             candidate: candidate.candidate,
             sdpMid: candidate.sdpMid,
             sdpMLineIndex: candidate.sdpMLineIndex,
+            usernameFragment: candidate.usernameFragment ?? null,
           }
         : { type: "ice-complete" as const };
       void sendSignal({
@@ -262,11 +321,12 @@ export function RemoteViewerCore({
           payload,
         }),
       }).catch(() => {
-        setStatus("signaling failed");
+        if (isCurrent()) setStatus("signaling failed");
       });
     };
 
     function sendControl(payload: ControlMessage) {
+      if (!isCurrent()) return;
       if (
         !inputEnabledRef.current &&
         (payload.type === "pointer" || payload.type === "key" || payload.type === "display")
@@ -413,7 +473,7 @@ export function RemoteViewerCore({
       void peer
         .getStats()
         .then((report) => {
-          if (statsStopped) return;
+          if (statsStopped || !isCurrent()) return;
           let inbound: RTCStats | undefined;
           let candidatePair: RTCStats | undefined;
           report.forEach((stats) => {
@@ -469,10 +529,11 @@ export function RemoteViewerCore({
     }, 1_000);
 
     void sendOffer(false).catch(() => {
-      setStatus("signaling failed");
+      if (isCurrent()) setStatus("signaling failed");
     });
 
     return () => {
+      disposed = true;
       video?.removeEventListener("pointermove", pointer);
       video?.removeEventListener("pointerdown", pointer);
       video?.removeEventListener("pointerup", pointer);
@@ -496,24 +557,46 @@ export function RemoteViewerCore({
       pointerChannel.close();
       controlChannel.close();
       peer.close();
-      peerRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+      if (peerRef.current === peer) peerRef.current = null;
+      if (peerSessionRef.current === sessionId) peerSessionRef.current = null;
       window.removeEventListener("pagehide", endOnPageHide);
     };
   }, [endSession, iceServers, sendSignal, sessionId]);
 
   useEffect(() => {
     const peer = peerRef.current;
-    if (!peer || !incoming) return;
+    const generation = sessionGenerationRef.current;
+    if (!peer || peerSessionRef.current !== sessionId || !incoming) return;
     signalTaskRef.current = signalTaskRef.current
-      .then(() =>
-        processHostSignals(peer, sessionId, incoming, processedSignalsRef.current, (reason) => {
-          setStatus(`ended: ${reason}`);
-        }),
-      )
+      .then(() => {
+        if (
+          sessionGenerationRef.current !== generation ||
+          peerSessionRef.current !== sessionId ||
+          peerRef.current !== peer ||
+          peer.signalingState === "closed"
+        ) {
+          return;
+        }
+        return processHostSignals(
+          peer,
+          sessionId,
+          incoming,
+          processedSignalsRef.current,
+          (reason) => {
+            if (sessionGenerationRef.current === generation) setStatus(`ended: ${reason}`);
+          },
+          () =>
+            sessionGenerationRef.current === generation &&
+            peerSessionRef.current === sessionId &&
+            peerRef.current === peer &&
+            peer.signalingState !== "closed",
+        );
+      })
       .catch(() => {
-        setStatus("signaling failed");
+        if (sessionGenerationRef.current === generation) setStatus("signaling failed");
       });
-  }, [incoming, sessionId]);
+  }, [iceServers, incoming, sessionId]);
 
   return (
     <main className="viewer">

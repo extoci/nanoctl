@@ -90,4 +90,44 @@ describe("remote signal application", () => {
     ).rejects.toThrow("description rejected");
     expect(processed.size).toBe(0);
   });
+
+  test("stops applying a signal when its peer generation is replaced", async () => {
+    let releaseDescription!: () => void;
+    const descriptionReady = new Promise<void>((resolve) => {
+      releaseDescription = resolve;
+    });
+    let current = true;
+    const peer = {
+      setRemoteDescription: async () => descriptionReady,
+      addIceCandidate: async () => {
+        throw new Error("old peer must not receive later signals");
+      },
+      close: () => {},
+    };
+    const processed = new Set<number>();
+    const processing = processHostSignals(
+      peer,
+      "session",
+      [
+        { sequence: 1, envelope: envelope(1, { type: "answer", sdp: "v=0" }) },
+        {
+          sequence: 2,
+          envelope: envelope(2, {
+            type: "ice-candidate",
+            candidate: "candidate:1 1 UDP 1 192.0.2.1 5000 typ host",
+            sdpMid: "0",
+            sdpMLineIndex: 0,
+          }),
+        },
+      ],
+      processed,
+      () => {},
+      () => current,
+    );
+    await Promise.resolve();
+    current = false;
+    releaseDescription();
+    await processing;
+    expect(processed.size).toBe(0);
+  });
 });
