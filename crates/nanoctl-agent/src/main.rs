@@ -18,6 +18,7 @@ mod update;
 mod windows_encoder;
 
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -143,11 +144,8 @@ fn init_logging(log_file: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<()> {
     control_plane::install_crypto_provider()?;
-    init_logging(cli.log_file.as_deref())?;
     let config_path = cli.config.unwrap_or(AgentConfig::default_path()?);
 
     match cli.command {
@@ -306,4 +304,27 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn report_error(error: &anyhow::Error, log_file: Option<&Path>) {
+    if let Some(path) = log_file
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "nanoctl command failed: {error:#}");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let log_file = cli.log_file.clone();
+    if let Err(error) = init_logging(log_file.as_deref()) {
+        report_error(&error, log_file.as_deref());
+        return Err(error);
+    }
+    let result = run(cli).await;
+    if let Err(error) = &result {
+        report_error(error, log_file.as_deref());
+    }
+    result
 }

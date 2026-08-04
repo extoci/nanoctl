@@ -145,10 +145,13 @@ describe("one-command Windows installer", () => {
   test("migrates a legacy task's implicit config path and allows slow startup", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("function Get-BinaryConfigPath");
+    expect(installer).toContain("function Test-ConfigEnrolled");
     expect(installer).toContain("Get-BinaryConfigPath -Path $legacyBinaryPath");
+    expect(installer).toContain("-log-file $probeLogPath --version");
     expect(installer).toContain("AddSeconds(30)");
     expect(installer).toContain("$logPath");
     expect(installer).toContain("LastTaskResult");
+    expect(installer).toContain("failed its health check");
   });
 
   test("keeps the low-level Windows installer headless too", async () => {
@@ -167,6 +170,11 @@ describe("one-command Windows installer", () => {
     expect(updater).toContain("[IO.FileShare]::None");
     expect(updater).toContain("$lockAcquired");
     expect(updater).toContain("-not $completed -and $lockAcquired");
+    expect(updater).toContain("$configOwnerSid.Value -ne $currentIdentity.User.Value");
+    expect(updater).toContain("Export-ScheduledTask");
+    expect(updater).toContain("function Restore-PreviousTask");
+    expect(updater).toContain("$previousTaskXml");
+    expect(updater).toContain("Wait-AgentProcessExit");
     expect(updater).toContain("startup stability window");
     expect(updater).toContain("Set-HeadlessTaskAction");
     expect(updater).toContain("$transactionId");

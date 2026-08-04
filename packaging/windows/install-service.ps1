@@ -81,7 +81,9 @@ function Get-AgentFailureDetails {
 }
 
 function Wait-AgentTask {
-  Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $readyPath -PathType Leaf) {
+    Remove-Item -LiteralPath $readyPath -Force -ErrorAction Stop
+  }
   Start-ScheduledTask -TaskName $taskName
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   $ready = $false
@@ -138,6 +140,10 @@ try {
     throw "Could not apply the nanoctl configuration ACL."
   }
 
+  & $installedBinary --log-file $logPath --version | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "The nanoctl executable is incompatible with the headless service runner."
+  }
   & $installedBinary --config $resolvedConfig doctor
   if ($LASTEXITCODE -ne 0) {
     throw "nanoctl failed its pre-install health check."

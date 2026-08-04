@@ -22,12 +22,24 @@ $ErrorActionPreference = "Stop"
 $taskName = "nanoctl Agent"
 $resolvedBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$configOwner = (Get-Acl -LiteralPath $resolvedConfig).Owner
+$configOwnerSid = ([Security.Principal.NTAccount]$configOwner).Translate(
+  [Security.Principal.SecurityIdentifier]
+)
+if ($configOwnerSid.Value -ne $currentIdentity.User.Value) {
+  throw (
+    "The elevated identity '$($currentIdentity.Name)' does not own the enrolled configuration. " +
+    "Elevate the same account that enrolled nanoctl; do not supply another administrator."
+  )
+}
 $resolvedManifest = (Resolve-Path -LiteralPath $ManifestPath).Path
 $installRoot = Split-Path -Parent $resolvedBinary
 $transactionId = [Guid]::NewGuid().ToString("N")
 $candidate = "$resolvedBinary.$transactionId.candidate"
 $previous = "$resolvedBinary.$transactionId.previous"
 $failed = "$resolvedBinary.$transactionId.failed"
+$previousTaskXml = "$resolvedBinary.$transactionId.previous-task.xml"
 $runnerPath = Join-Path $installRoot "run-agent.vbs"
 $logPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.log"
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
@@ -36,6 +48,7 @@ $lockStream = $null
 $lockAcquired = $false
 $activated = $false
 $completed = $false
+$taskBackedUp = $false
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $readyPath) -Force | Out-Null
 New-Item -ItemType File -Path $logPath -Force | Out-Null
@@ -89,6 +102,17 @@ function Set-HeadlessTaskAction {
   Set-ScheduledTask -TaskName $taskName -Action $action -Settings $settings | Out-Null
 }
 
+function Restore-PreviousTask {
+  if (-not $taskBackedUp -or -not (Test-Path -LiteralPath $previousTaskXml -PathType Leaf)) {
+    throw "The previous nanoctl task definition is unavailable; refusing to start an unverified task."
+  }
+  if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+  }
+  $xml = Get-Content -LiteralPath $previousTaskXml -Raw
+  Register-ScheduledTask -TaskName $taskName -Xml $xml -Force | Out-Null
+}
+
 function Stop-AgentTask {
   Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   for ($attempt = 0; $attempt -lt 50; $attempt++) {
@@ -123,6 +147,9 @@ function Wait-AgentProcessExit {
 }
 
 function Wait-AgentReady {
+  if (Test-Path -LiteralPath $readyPath -PathType Leaf) {
+    Remove-Item -LiteralPath $readyPath -Force -ErrorAction Stop
+  }
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   while ([DateTime]::UtcNow -lt $deadline) {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -143,6 +170,10 @@ try {
     [IO.FileShare]::None
   )
   $lockAcquired = $true
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+  Export-ScheduledTask -TaskName $taskName |
+    Set-Content -LiteralPath $previousTaskXml -Encoding UTF8
+  $taskBackedUp = $true
   Stop-AgentTask
   Wait-AgentProcessExit
 
@@ -167,6 +198,10 @@ try {
       $candidateHash -ine [string]$stage.artifact.sha256) {
     throw "Copied update bytes do not match the signed manifest."
   }
+  & $candidate --log-file $logPath --version | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "The staged nanoctl executable is incompatible with the headless service runner."
+  }
 
   Move-Item -LiteralPath $resolvedBinary -Destination $previous
   try {
@@ -177,7 +212,6 @@ try {
     throw
   }
   $activated = $true
-  Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
   Set-HeadlessTaskAction
   Start-ScheduledTask -TaskName $taskName
   Wait-AgentReady
@@ -193,15 +227,17 @@ try {
     throw "Updated nanoctl did not remain ready during its startup stability window. $(Get-AgentFailureDetails)"
   }
 
-  Remove-Item -LiteralPath $previous -Force
-  Remove-Item -LiteralPath $stagedPath -ErrorAction SilentlyContinue
   $completed = $true
+  Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $stagedPath -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $previousTaskXml -Force -ErrorAction SilentlyContinue
   Write-Host "nanoctl update activated and committed."
 }
 finally {
   if (-not $completed -and $lockAcquired) {
     try {
       Stop-AgentTask
+      Wait-AgentProcessExit
       if ($activated -and (Test-Path -LiteralPath $previous -PathType Leaf)) {
         Move-Item -LiteralPath $resolvedBinary -Destination $failed
         try {
@@ -212,10 +248,12 @@ finally {
           throw
         }
       }
+      Restore-PreviousTask
       Remove-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
+      Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
     }
-  finally {
-      Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    catch {
+      Write-Warning "nanoctl rollback could not fully restore the previous task and binary: $($_.Exception.Message)"
     }
   }
   if ($lockStream) {

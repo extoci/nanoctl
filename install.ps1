@@ -138,7 +138,9 @@ function Get-AgentFailureDetails {
 function Wait-AgentTask {
   param([Parameter(Mandatory = $true)][string]$ReadyPath)
 
-  Remove-Item -LiteralPath $ReadyPath -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $ReadyPath -PathType Leaf) {
+    Remove-Item -LiteralPath $ReadyPath -Force -ErrorAction Stop
+  }
   Start-ScheduledTask -TaskName $taskName
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   $ready = $false
@@ -232,6 +234,16 @@ function Get-BinaryConfigPath {
   return $null
 }
 
+function Test-ConfigEnrolled {
+  param([string]$Path)
+
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return $false
+  }
+  $contents = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+  return [bool]($contents -match '(?m)^\s*device_id\s*=\s*["''][^"'']+["'']\s*$')
+}
+
 function Restore-LegacyTask {
   if (-not (Test-Path -LiteralPath $legacyTaskXmlPath -PathType Leaf)) {
     return $false
@@ -279,6 +291,12 @@ try {
   if ($LASTEXITCODE -ne 0) {
     throw "The downloaded nanoctl executable did not start."
   }
+  $probeLogPath = Join-Path $temporary "log-probe.txt"
+  & $download --log-file $probeLogPath --version | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "The downloaded nanoctl executable is incompatible with this installer."
+  }
+  Remove-Item -LiteralPath $probeLogPath -Force -ErrorAction SilentlyContinue
 
   $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   if ($existingTask) {
@@ -313,12 +331,13 @@ try {
   }
   $configPath = $Matches[1]
   if ($legacyConfigPath -and (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf) -and
-      -not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+      (-not (Test-ConfigEnrolled -Path $configPath) -and
+        (Test-ConfigEnrolled -Path $legacyConfigPath))) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $configPath) -Force | Out-Null
     Copy-Item -LiteralPath $legacyConfigPath -Destination $configPath
     Write-Host "Migrated the existing configuration from $legacyConfigPath."
   }
-  if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+  if (-not (Test-ConfigEnrolled -Path $configPath)) {
     $setupCode = $env:NANOCTL_ENROLL_CODE
     if (-not $setupCode) {
       $setupCode = Read-Host "Setup code"
@@ -334,27 +353,37 @@ try {
 
   Register-AgentTask -ConfigPath $configPath
   Wait-AgentTask -ReadyPath $readyPath
+  & $binaryPath --config $configPath doctor
+  if ($LASTEXITCODE -ne 0) {
+    throw "nanoctl installed but failed its health check. See $logPath for service diagnostics."
+  }
+
+  try {
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $pathEntries = @($userPath -split ";" | Where-Object { $_ })
+    if ($pathEntries -notcontains $installRoot) {
+      $newPath = (@($pathEntries) + $installRoot) -join ";"
+      [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    }
+    # Persistent environment changes are inherited only by new Windows processes. Always update the
+    # PowerShell process running the installer too, including when this is a reinstall and the
+    # persistent user PATH entry already exists.
+    $processPathEntries = @($env:Path -split ";" | Where-Object { $_ })
+    if ($processPathEntries -notcontains $installRoot) {
+      $env:Path = "$installRoot;$env:Path"
+    }
+  } catch {
+    Write-Warning "nanoctl is running, but the installer could not update PATH: $($_.Exception.Message)"
+  }
+
   if (Test-Path -LiteralPath $previousPath -PathType Leaf) {
     Remove-Item -LiteralPath $previousPath -Force -ErrorAction SilentlyContinue
   }
   $completed = $true
 
-  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  $pathEntries = @($userPath -split ";" | Where-Object { $_ })
-  if ($pathEntries -notcontains $installRoot) {
-    $newPath = (@($pathEntries) + $installRoot) -join ";"
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-  }
-  # Persistent environment changes are inherited only by new Windows processes. Always update the
-  # PowerShell process running the installer too, including when this is a reinstall and the
-  # persistent user PATH entry already exists.
-  $processPathEntries = @($env:Path -split ";" | Where-Object { $_ })
-  if ($processPathEntries -notcontains $installRoot) {
-    $env:Path = "$installRoot;$env:Path"
-  }
-
   Write-Host ""
   Write-Host "nanoctl is installed, enrolled, and running."
+  Write-Host "Installed version: $(& $binaryPath --version)"
   Write-Host "nanoctl is available in this PowerShell session and in newly opened terminals."
   Write-Host "Run this installer again at any time to update."
 }
