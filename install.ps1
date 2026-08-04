@@ -417,7 +417,6 @@ function Start-RestoredTask {
 try {
   New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
   New-Item -ItemType File -Path $logPath -Force | Out-Null
-  Set-OwnerProtectedAcl
   $lockStream = [IO.File]::Open(
     $lockPath,
     [IO.FileMode]::OpenOrCreate,
@@ -464,6 +463,12 @@ try {
   if (-not $legacyConfigPath) {
     $legacyConfigPath = Get-BinaryConfigPath -Path $legacyBinaryPath
   }
+  if ($legacyConfigPath -and (Test-ConfigEnrolled -Path $legacyConfigPath)) {
+    Assert-ConfigOwner -Path $legacyConfigPath
+  }
+  # Do not change an existing installation's ACL until its task/configuration ownership has
+  # passed the migration checks above. A rejected cross-user upgrade must be side-effect free.
+  Set-OwnerProtectedAcl
   if ($existingTask) {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
