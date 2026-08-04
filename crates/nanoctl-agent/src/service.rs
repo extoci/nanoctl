@@ -18,14 +18,20 @@ use crate::{
     credential,
 };
 
-pub async fn run(config: AgentConfig, ready_file: Option<PathBuf>) -> Result<()> {
+pub async fn run(
+    config: AgentConfig,
+    ready_file: Option<PathBuf>,
+    ready_token: Option<String>,
+) -> Result<()> {
     let device_id = config
         .device_id
         .as_deref()
         .context("agent is not enrolled")?;
     let token = credential::load(device_id)?;
     let client = ControlPlane::new(config.control_plane_url.clone())?;
-    let _ready_file = ready_file.map(ReadyFile::create).transpose()?;
+    let _ready_file = ready_file
+        .map(|path| ReadyFile::create(path, ready_token.as_deref()))
+        .transpose()?;
     let mut heartbeat =
         tokio::time::interval(Duration::from_secs(config.network.heartbeat_seconds));
     let mut sessions =
@@ -119,14 +125,26 @@ struct ReadyFile {
 }
 
 impl ReadyFile {
-    fn create(path: PathBuf) -> Result<Self> {
+    fn create(path: PathBuf, token: Option<&str>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("cannot create readiness directory {}", parent.display())
             })?;
         }
-        std::fs::write(&path, format!("pid={}\n", std::process::id()))
-            .with_context(|| format!("cannot write readiness marker {}", path.display()))?;
+        if token.is_some_and(|value| value.contains('\r') || value.contains('\n')) {
+            anyhow::bail!("readiness token cannot contain a newline");
+        }
+        let token_line = token.map_or_else(String::new, |value| format!("token={value}\n"));
+        std::fs::write(
+            &path,
+            format!(
+                "pid={}\nversion={}\n{}",
+                std::process::id(),
+                env!("CARGO_PKG_VERSION"),
+                token_line
+            ),
+        )
+        .with_context(|| format!("cannot write readiness marker {}", path.display()))?;
         Ok(Self { path })
     }
 }
@@ -134,6 +152,32 @@ impl ReadyFile {
 impl Drop for ReadyFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::ReadyFile;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn readiness_marker_is_transaction_bound_and_removed() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nanoctl-ready-{}-{unique}.marker",
+            std::process::id()
+        ));
+        let marker = ReadyFile::create(path.clone(), Some("transaction-123"))
+            .expect("readiness marker should be writable");
+        let contents = std::fs::read_to_string(&path).expect("readiness marker should be readable");
+        assert!(contents.contains("pid="));
+        assert!(contents.contains("version="));
+        assert!(contents.contains("token=transaction-123"));
+        drop(marker);
+        assert!(!path.exists());
     }
 }
 

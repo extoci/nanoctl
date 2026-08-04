@@ -60,24 +60,32 @@ function Ensure-HeadlessRunner {
 Option Explicit
 On Error Resume Next
 
-Dim shell, fso, binaryPath, configPath, logPath, readyPath, command, exitCode
+Dim shell, fso, binaryPath, configPath, logPath, readyPath, readyToken, command, exitCode, stream
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 binaryPath = WScript.Arguments(0)
 configPath = WScript.Arguments(1)
 logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
+readyToken = WScript.Arguments(4)
+Set stream = fso.OpenTextFile(logPath, 8, True)
+stream.WriteLine "headless runner started for " & binaryPath
+stream.Close
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
 command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
-  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & " run"
+  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & _
+  " --ready-token " & Chr(34) & readyToken & Chr(34) & " run"
 Err.Clear
 exitCode = shell.Run(command, 0, True)
 If Err.Number <> 0 Then
-  Dim stream
   Set stream = fso.OpenTextFile(logPath, 8, True)
   stream.WriteLine "headless runner error " & Err.Description
   stream.Close
   exitCode = 1
+Else
+  Set stream = fso.OpenTextFile(logPath, 8, True)
+  stream.WriteLine "headless runner child exited with code " & exitCode
+  stream.Close
 End If
 WScript.Quit exitCode
 '@
@@ -87,9 +95,12 @@ WScript.Quit exitCode
 function Set-HeadlessTaskAction {
   Ensure-HeadlessRunner -Path $runnerPath
   $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-  $arguments = '//B //NoLogo "{0}" "{1}" "{2}" "{3}" "{4}"' -f `
-    $runnerPath, $resolvedBinary, $resolvedConfig, $logPath, $readyPath
-  $action = New-ScheduledTaskAction -Execute $wscript -Argument $arguments
+  $arguments = '//B //NoLogo "{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f `
+    $runnerPath, $resolvedBinary, $resolvedConfig, $logPath, $readyPath, $transactionId
+  $action = New-ScheduledTaskAction `
+    -Execute $wscript `
+    -Argument $arguments `
+    -WorkingDirectory $installRoot
   $settings = New-ScheduledTaskSettingsSet `
     -Hidden `
     -AllowStartIfOnBatteries `
@@ -146,20 +157,66 @@ function Wait-AgentProcessExit {
   throw "Timed out while waiting for the previous nanoctl process to exit."
 }
 
+function Get-ReadyAgentProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$BinaryPath,
+    [Parameter(Mandatory = $true)][string]$ReadyToken
+  )
+
+  if (-not (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
+    return $null
+  }
+  $marker = Get-Content -LiteralPath $readyPath -Raw -ErrorAction SilentlyContinue
+  if ($marker -notmatch '(?m)^\s*pid=(\d+)\s*$') {
+    return $null
+  }
+  $agentProcessIdText = $Matches[1]
+  if ($marker -notmatch "(?m)^\s*token=$([regex]::Escape($ReadyToken))\s*$") {
+    return $null
+  }
+  [int]$agentProcessId = 0
+  if (-not [int]::TryParse($agentProcessIdText, [ref]$agentProcessId)) {
+    return $null
+  }
+  $process = Get-Process -Id $agentProcessId -ErrorAction SilentlyContinue
+  if (-not $process) {
+    return $null
+  }
+  try {
+    $processPath = [IO.Path]::GetFullPath([string]$process.Path)
+    $expectedPath = [IO.Path]::GetFullPath($BinaryPath)
+    if (-not [String]::Equals($processPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+      return $null
+    }
+  } catch {
+    # A live PID marker is still stronger than the Task Scheduler state if Process.Path is
+    # unavailable to the current token.
+  }
+  return $process
+}
+
 function Wait-AgentReady {
+  param([Parameter(Mandatory = $true)][string]$BinaryPath)
+
   if (Test-Path -LiteralPath $readyPath -PathType Leaf) {
     Remove-Item -LiteralPath $readyPath -Force -ErrorAction Stop
   }
-  $deadline = [DateTime]::UtcNow.AddSeconds(30)
+  $deadline = [DateTime]::UtcNow.AddSeconds(90)
+  $readyProcess = $null
   while ([DateTime]::UtcNow -lt $deadline) {
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task -and $task.State -eq "Running" -and
-        (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
-      return
+    $readyProcess = Get-ReadyAgentProcess -BinaryPath $BinaryPath -ReadyToken $transactionId
+    if ($readyProcess) {
+      break
     }
     Start-Sleep -Milliseconds 100
   }
-  throw "Updated nanoctl did not become ready. $(Get-AgentFailureDetails)"
+  if (-not $readyProcess) {
+    throw "Updated nanoctl did not become ready. $(Get-AgentFailureDetails)"
+  }
+  Start-Sleep -Seconds 5
+  if (-not (Get-ReadyAgentProcess -BinaryPath $BinaryPath -ReadyToken $transactionId)) {
+    throw "Updated nanoctl exited during its startup stability window. $(Get-AgentFailureDetails)"
+  }
 }
 
 try {
@@ -214,16 +271,14 @@ try {
   $activated = $true
   Set-HeadlessTaskAction
   Start-ScheduledTask -TaskName $taskName
-  Wait-AgentReady
+  Wait-AgentReady -BinaryPath $resolvedBinary
 
   & $resolvedBinary --config $resolvedConfig doctor
   if ($LASTEXITCODE -ne 0) {
     throw "Updated nanoctl failed its health check."
   }
 
-  Start-Sleep -Seconds 5
-  if ((Get-ScheduledTask -TaskName $taskName).State -ne "Running" -or
-      -not (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
+  if (-not (Get-ReadyAgentProcess -BinaryPath $resolvedBinary -ReadyToken $transactionId)) {
     throw "Updated nanoctl did not remain ready during its startup stability window. $(Get-AgentFailureDetails)"
   }
 

@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, global = true)]
     ready_file: Option<PathBuf>,
 
+    /// Bind the readiness marker to one installer transaction.
+    #[arg(long, global = true)]
+    ready_token: Option<String>,
+
     /// Append service diagnostics to this file instead of the process console.
     #[arg(long, global = true)]
     log_file: Option<PathBuf>,
@@ -173,7 +177,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Run => {
             let config = AgentConfig::load(&config_path)?;
             config.validate_enrolled()?;
-            service::run(config, cli.ready_file).await?;
+            service::run(config, cli.ready_file, cli.ready_token).await?;
         }
         Command::Doctor { json } => {
             let config = AgentConfig::load_or_default(&config_path)?;

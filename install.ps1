@@ -4,7 +4,7 @@ param()
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $Repository = if ($env:NANOCTL_REPOSITORY) { $env:NANOCTL_REPOSITORY } else { "extoci/nanoctl" }
-$Version = if ($env:NANOCTL_VERSION) { $env:NANOCTL_VERSION } else { "latest" }
+$RequestedVersion = if ($env:NANOCTL_VERSION) { $env:NANOCTL_VERSION.Trim() } else { "latest" }
 $ControlPlane = if ($env:NANOCTL_CONTROL_PLANE) {
   $env:NANOCTL_CONTROL_PLANE
 } else {
@@ -25,18 +25,31 @@ $target = switch ($architecture.ToUpperInvariant()) {
   "ARM64" { "windows-arm64" }
   default { throw "Unsupported Windows architecture: $architecture" }
 }
-$baseUrl = if ($Version -eq "latest") {
-  "https://github.com/$Repository/releases/latest/download"
+$resolvedVersion = if ($RequestedVersion -eq "latest") {
+  $release = Invoke-RestMethod `
+    -UseBasicParsing `
+    -Headers @{ Accept = "application/vnd.github+json"; "User-Agent" = "nanoctl-installer" } `
+    -Uri "https://api.github.com/repos/$Repository/releases/latest"
+  [string]$release.tag_name
+} elseif ($RequestedVersion.StartsWith("v")) {
+  $RequestedVersion
 } else {
-  "https://github.com/$Repository/releases/download/$Version"
+  "v$RequestedVersion"
 }
+if ($resolvedVersion -notmatch "^v\d+\.\d+\.\d+$") {
+  throw "The release version '$resolvedVersion' is not a stable nanoctl version."
+}
+$displayVersion = $resolvedVersion.Substring(1)
+$baseUrl = "https://github.com/$Repository/releases/download/$resolvedVersion"
 $asset = "nanoctl-$target.exe"
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("nanoctl-" + [Guid]::NewGuid().ToString("N"))
 $installRoot = Join-Path $env:LOCALAPPDATA "nanoctl"
 $binaryPath = Join-Path $installRoot "nanoctl.exe"
 $candidatePath = Join-Path $installRoot "nanoctl.installing.exe"
 $taskName = "nanoctl Agent"
-$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUser = $currentIdentity.Name
+$currentUserSid = $currentIdentity.User.Value
 $transactionId = [Guid]::NewGuid().ToString("N")
 $previousPath = Join-Path $installRoot ("nanoctl.{0}.previous.exe" -f $transactionId)
 $failedPath = Join-Path $installRoot ("nanoctl.{0}.failed.exe" -f $transactionId)
@@ -59,24 +72,32 @@ function Ensure-HeadlessRunner {
 Option Explicit
 On Error Resume Next
 
-Dim shell, fso, binaryPath, configPath, logPath, readyPath, command, exitCode
+Dim shell, fso, binaryPath, configPath, logPath, readyPath, readyToken, command, exitCode, stream
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 binaryPath = WScript.Arguments(0)
 configPath = WScript.Arguments(1)
 logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
+readyToken = WScript.Arguments(4)
+Set stream = fso.OpenTextFile(logPath, 8, True)
+stream.WriteLine "headless runner started for " & binaryPath
+stream.Close
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
 command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
-  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & " run"
+  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & _
+  " --ready-token " & Chr(34) & readyToken & Chr(34) & " run"
 Err.Clear
 exitCode = shell.Run(command, 0, True)
 If Err.Number <> 0 Then
-  Dim stream
   Set stream = fso.OpenTextFile(logPath, 8, True)
   stream.WriteLine "headless runner error " & Err.Description
   stream.Close
   exitCode = 1
+Else
+  Set stream = fso.OpenTextFile(logPath, 8, True)
+  stream.WriteLine "headless runner child exited with code " & exitCode
+  stream.Close
 End If
 WScript.Quit exitCode
 '@
@@ -88,9 +109,9 @@ function New-HeadlessTaskAction {
 
   Ensure-HeadlessRunner -Path $runnerPath
   $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-  $arguments = '//B //NoLogo "{0}" "{1}" "{2}" "{3}" "{4}"' -f `
-    $runnerPath, $binaryPath, $ConfigPath, $logPath, $readyPath
-  New-ScheduledTaskAction -Execute $wscript -Argument $arguments
+  $arguments = '//B //NoLogo "{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f `
+    $runnerPath, $binaryPath, $ConfigPath, $logPath, $readyPath, $transactionId
+  New-ScheduledTaskAction -Execute $wscript -Argument $arguments -WorkingDirectory $installRoot
 }
 
 function Register-AgentTask {
@@ -126,42 +147,93 @@ function Register-AgentTask {
 }
 
 function Get-AgentFailureDetails {
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+  $action = if ($task) {
+    (@($task.Actions) | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join "`n"
+  } else {
+    "(task definition unavailable)"
+  }
   $logTail = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
     (Get-Content -LiteralPath $logPath -Tail 40 -ErrorAction SilentlyContinue | Out-String).Trim()
   } else {
     "(agent log was not created at $logPath)"
   }
-  "task result: $($taskInfo.LastTaskResult)`nlog: $logPath`n$logTail"
+  "task state: $($task.State)`nprincipal: $($task.Principal.UserId)`naction: $action`nlast run: $($taskInfo.LastRunTime)`nlast result: $($taskInfo.LastTaskResult)`nlog: $logPath`n$logTail"
+}
+
+function Get-ReadyAgentProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$ReadyPath,
+    [Parameter(Mandatory = $true)][string]$BinaryPath,
+    [Parameter(Mandatory = $true)][string]$ReadyToken
+  )
+
+  if (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+    return $null
+  }
+  $marker = Get-Content -LiteralPath $ReadyPath -Raw -ErrorAction SilentlyContinue
+  if ($marker -notmatch '(?m)^\s*pid=(\d+)\s*$') {
+    return $null
+  }
+  $agentProcessIdText = $Matches[1]
+  if ($marker -notmatch "(?m)^\s*token=$([regex]::Escape($ReadyToken))\s*$") {
+    return $null
+  }
+  [int]$agentProcessId = 0
+  if (-not [int]::TryParse($agentProcessIdText, [ref]$agentProcessId)) {
+    return $null
+  }
+  $process = Get-Process -Id $agentProcessId -ErrorAction SilentlyContinue
+  if (-not $process) {
+    return $null
+  }
+  try {
+    $processPath = [IO.Path]::GetFullPath([string]$process.Path)
+    $expectedPath = [IO.Path]::GetFullPath($BinaryPath)
+    if (-not [String]::Equals($processPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+      return $null
+    }
+  } catch {
+    # The marker is written by the agent in the owner-protected install directory. If Windows does
+    # not expose Process.Path to this token, a live PID is still a stronger signal than task state.
+  }
+  return $process
 }
 
 function Wait-AgentTask {
-  param([Parameter(Mandatory = $true)][string]$ReadyPath)
+  param(
+    [Parameter(Mandatory = $true)][string]$ReadyPath,
+    [Parameter(Mandatory = $true)][string]$BinaryPath,
+    [Parameter(Mandatory = $true)][string]$ReadyToken
+  )
 
   if (Test-Path -LiteralPath $ReadyPath -PathType Leaf) {
     Remove-Item -LiteralPath $ReadyPath -Force -ErrorAction Stop
   }
   Start-ScheduledTask -TaskName $taskName
-  $deadline = [DateTime]::UtcNow.AddSeconds(30)
-  $ready = $false
+  $deadline = [DateTime]::UtcNow.AddSeconds(90)
+  $readyProcess = $null
   while ([DateTime]::UtcNow -lt $deadline) {
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task -and $task.State -eq "Running" -and
-        (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
-      $ready = $true
+    $readyProcess = Get-ReadyAgentProcess `
+      -ReadyPath $ReadyPath `
+      -BinaryPath $BinaryPath `
+      -ReadyToken $ReadyToken
+    if ($readyProcess) {
       break
     }
     Start-Sleep -Milliseconds 200
   }
-  if (-not $ready) {
+  if (-not $readyProcess) {
     throw "The nanoctl agent did not become ready. $((Get-AgentFailureDetails))"
   }
-  # A task can briefly report Running while the process is still starting. Keep the previous
-  # binary until this short stability window has passed.
-  Start-Sleep -Seconds 3
-  $stableTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-  if (-not $stableTask -or $stableTask.State -ne "Running" -or
-      -not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+  # Start-ScheduledTask is asynchronous. The agent's PID marker is authoritative; Task Scheduler
+  # can report Ready while a windowless runner owns the live child process.
+  Start-Sleep -Seconds 5
+  if (-not (Get-ReadyAgentProcess `
+      -ReadyPath $ReadyPath `
+      -BinaryPath $BinaryPath `
+      -ReadyToken $ReadyToken)) {
     throw "The nanoctl agent exited during its startup stability window. $((Get-AgentFailureDetails))"
   }
 }
@@ -244,6 +316,57 @@ function Test-ConfigEnrolled {
   return [bool]($contents -match '(?m)^\s*device_id\s*=\s*["''][^"'']+["'']\s*$')
 }
 
+function Assert-ConfigOwner {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return
+  }
+  $owner = (Get-Acl -LiteralPath $Path).Owner
+  try {
+    $ownerSid = Resolve-AccountSid -Account $owner
+  } catch {
+    throw "Could not resolve the enrolled configuration owner '$owner'. Run the installer as the account that enrolled nanoctl."
+  }
+  if ($ownerSid -ne $currentUserSid) {
+    throw (
+      "The enrolled configuration belongs to '$owner', but this installer is running as '$currentUser'. " +
+      "Sign in as the account that enrolled nanoctl; do not update another Windows user's installation."
+    )
+  }
+}
+
+function Assert-ExistingTaskOwner {
+  param($Task)
+
+  $taskUser = [string]$Task.Principal.UserId
+  if (-not $taskUser -or $taskUser -match '(?i)^SYSTEM$|^NT AUTHORITY\\') {
+    throw "The existing nanoctl task is not a per-user interactive task. Remove the managed installation with its administrator script before using this installer."
+  }
+  try {
+    $taskSid = Resolve-AccountSid -Account $taskUser
+  } catch {
+    throw "Could not resolve the existing nanoctl task owner '$taskUser'. Run the installer as the account that owns the task."
+  }
+  if ($taskSid -ne $currentUserSid) {
+    throw (
+      "The existing nanoctl task belongs to '$taskUser', but this installer is running as '$currentUser'. " +
+      "Sign in as the account that owns the task before upgrading."
+    )
+  }
+}
+
+function Resolve-AccountSid {
+  param([Parameter(Mandatory = $true)][string]$Account)
+
+  if ($Account -match '^S-\d-') {
+    return ([Security.Principal.SecurityIdentifier]$Account).Value
+  }
+  return ([Security.Principal.NTAccount]$Account).Translate(
+    [Security.Principal.SecurityIdentifier]
+  ).Value
+}
+
 function Restore-LegacyTask {
   if (-not (Test-Path -LiteralPath $legacyTaskXmlPath -PathType Leaf)) {
     return $false
@@ -275,7 +398,7 @@ try {
   New-Item -ItemType Directory -Path $temporary | Out-Null
   $download = Join-Path $temporary "nanoctl.exe"
   $checksum = Join-Path $temporary "nanoctl.exe.sha256"
-  Write-Host "Downloading nanoctl for $target..."
+  Write-Host "Downloading nanoctl $displayVersion for $target..."
   Invoke-WebRequest -UseBasicParsing "$baseUrl/$asset" -OutFile $download
   Invoke-WebRequest -UseBasicParsing "$baseUrl/$asset.sha256" -OutFile $checksum
 
@@ -287,9 +410,12 @@ try {
   if ($actual -ine $expected) {
     throw "The release checksum did not match."
   }
-  & $download --version | Out-Null
+  $downloadVersion = (& $download --version 2>&1 | Out-String).Trim()
   if ($LASTEXITCODE -ne 0) {
     throw "The downloaded nanoctl executable did not start."
+  }
+  if ($downloadVersion -notmatch "(?m)^nanoctl\s+$([regex]::Escape($displayVersion))\s*$") {
+    throw "The downloaded nanoctl version '$downloadVersion' does not match the requested release $displayVersion."
   }
   $probeLogPath = Join-Path $temporary "log-probe.txt"
   & $download --log-file $probeLogPath --version | Out-Null
@@ -300,6 +426,7 @@ try {
 
   $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   if ($existingTask) {
+    Assert-ExistingTaskOwner -Task $existingTask
     Export-ScheduledTask -TaskName $taskName | Set-Content -LiteralPath $legacyTaskXmlPath -Encoding UTF8
   }
   $legacyConfigPath = if ($existingTask) { Get-TaskConfigPath -Task $existingTask } else { $null }
@@ -329,14 +456,23 @@ try {
   if ($LASTEXITCODE -ne 0 -or $pathOutput -notmatch "^config=(.+)$") {
     throw "The installed binary returned an invalid configuration path."
   }
-  $configPath = $Matches[1]
-  if ($legacyConfigPath -and (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf) -and
-      (-not (Test-ConfigEnrolled -Path $configPath) -and
-        (Test-ConfigEnrolled -Path $legacyConfigPath))) {
-    New-Item -ItemType Directory -Path (Split-Path -Parent $configPath) -Force | Out-Null
-    Copy-Item -LiteralPath $legacyConfigPath -Destination $configPath
-    Write-Host "Migrated the existing configuration from $legacyConfigPath."
+  $defaultConfigPath = $Matches[1].Trim()
+  $configPath = $defaultConfigPath
+  if ($legacyConfigPath -and (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf)) {
+    if (Test-ConfigEnrolled -Path $legacyConfigPath) {
+      # Preserve an explicit v1.0.9 --config location. A new default config can exist from a
+      # partially failed attempt and must not silently replace the enrolled configuration.
+      $configPath = (Resolve-Path -LiteralPath $legacyConfigPath).Path
+      if ($configPath -ne $defaultConfigPath) {
+        Write-Host "Preserving the existing configuration at $configPath."
+      }
+    } elseif (-not (Test-ConfigEnrolled -Path $defaultConfigPath)) {
+      New-Item -ItemType Directory -Path (Split-Path -Parent $defaultConfigPath) -Force | Out-Null
+      Copy-Item -LiteralPath $legacyConfigPath -Destination $defaultConfigPath
+      Write-Host "Migrated the existing configuration from $legacyConfigPath."
+    }
   }
+  Assert-ConfigOwner -Path $configPath
   if (-not (Test-ConfigEnrolled -Path $configPath)) {
     $setupCode = $env:NANOCTL_ENROLL_CODE
     if (-not $setupCode) {
@@ -345,14 +481,17 @@ try {
     if (-not $setupCode) {
       throw "The setup code cannot be empty."
     }
-    & $binaryPath enroll $setupCode --control-plane $ControlPlane
+    & $binaryPath --config $configPath enroll $setupCode --control-plane $ControlPlane
     if ($LASTEXITCODE -ne 0) {
       throw "nanoctl enrollment failed."
     }
   }
 
   Register-AgentTask -ConfigPath $configPath
-  Wait-AgentTask -ReadyPath $readyPath
+  Wait-AgentTask `
+    -ReadyPath $readyPath `
+    -BinaryPath $binaryPath `
+    -ReadyToken $transactionId
   & $binaryPath --config $configPath doctor
   if ($LASTEXITCODE -ne 0) {
     throw "nanoctl installed but failed its health check. See $logPath for service diagnostics."
@@ -360,18 +499,18 @@ try {
 
   try {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $pathEntries = @($userPath -split ";" | Where-Object { $_ })
-    if ($pathEntries -notcontains $installRoot) {
-      $newPath = (@($pathEntries) + $installRoot) -join ";"
-      [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    }
+    $pathEntries = @($userPath -split ";" | Where-Object {
+        $_ -and -not [String]::Equals($_, $installRoot, [StringComparison]::OrdinalIgnoreCase)
+      })
+    $newPath = (@($installRoot) + $pathEntries) -join ";"
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     # Persistent environment changes are inherited only by new Windows processes. Always update the
-    # PowerShell process running the installer too, including when this is a reinstall and the
-    # persistent user PATH entry already exists.
-    $processPathEntries = @($env:Path -split ";" | Where-Object { $_ })
-    if ($processPathEntries -notcontains $installRoot) {
-      $env:Path = "$installRoot;$env:Path"
-    }
+    # PowerShell process running the installer too, and move the install root ahead of any stale
+    # 1.0.9 entry that may already be present in this process's PATH.
+    $processPathEntries = @($env:Path -split ";" | Where-Object {
+        $_ -and -not [String]::Equals($_, $installRoot, [StringComparison]::OrdinalIgnoreCase)
+      })
+    $env:Path = (@($installRoot) + $processPathEntries) -join ";"
   } catch {
     Write-Warning "nanoctl is running, but the installer could not update PATH: $($_.Exception.Message)"
   }
@@ -384,6 +523,10 @@ try {
   Write-Host ""
   Write-Host "nanoctl is installed, enrolled, and running."
   Write-Host "Installed version: $(& $binaryPath --version)"
+  $resolvedCommand = Get-Command nanoctl -All -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($resolvedCommand) {
+    Write-Host "Command path: $($resolvedCommand.Source)"
+  }
   Write-Host "nanoctl is available in this PowerShell session and in newly opened terminals."
   Write-Host "Run this installer again at any time to update."
 }

@@ -135,10 +135,14 @@ describe("one-command Windows installer", () => {
 
     for (const script of scripts) {
       expect(script).toContain('" --log-file "');
+      expect(script).toContain("--ready-token");
       expect(script).toContain("Err.Clear");
+      expect(script).toContain("headless runner started for");
+      expect(script).toContain("child exited with code");
       expect(script).toContain("shell.Run(command, 0, True)");
       expect(script).not.toContain("cmd.exe /d /s /c");
       expect(script).toContain("New-Item -ItemType File -Path $logPath -Force");
+      expect(script).toContain("WorkingDirectory");
     }
   });
 
@@ -148,10 +152,28 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("function Test-ConfigEnrolled");
     expect(installer).toContain("Get-BinaryConfigPath -Path $legacyBinaryPath");
     expect(installer).toContain("-log-file $probeLogPath --version");
-    expect(installer).toContain("AddSeconds(30)");
+    expect(installer).toContain("AddSeconds(90)");
+    expect(installer).toContain("function Get-ReadyAgentProcess");
+    expect(installer).toContain("-ReadyPath $ReadyPath");
+    expect(installer).toContain("-BinaryPath $BinaryPath");
+    expect(installer).toContain("-ReadyToken $ReadyToken");
+    expect(installer).toContain("$transactionId");
     expect(installer).toContain("$logPath");
     expect(installer).toContain("LastTaskResult");
     expect(installer).toContain("failed its health check");
+  });
+
+  test("pins latest downloads to the resolved release and makes the installed binary win PATH", async () => {
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    expect(installer).toContain("Invoke-RestMethod");
+    expect(installer).toContain("tag_name");
+    expect(installer).toContain("$resolvedVersion");
+    expect(installer).toContain("Downloading nanoctl $displayVersion for $target...");
+    expect(installer).toContain("$downloadVersion");
+    expect(installer).toContain("does not match the requested release");
+    expect(installer).toContain("StringComparison]::OrdinalIgnoreCase");
+    expect(installer).toContain('SetEnvironmentVariable("Path", $newPath, "User")');
+    expect(installer).toContain("Get-Command nanoctl -All");
   });
 
   test("keeps the low-level Windows installer headless too", async () => {
@@ -175,6 +197,8 @@ describe("one-command Windows installer", () => {
     expect(updater).toContain("function Restore-PreviousTask");
     expect(updater).toContain("$previousTaskXml");
     expect(updater).toContain("Wait-AgentProcessExit");
+    expect(updater).toContain("AddSeconds(90)");
+    expect(updater).toContain("Wait-AgentReady -BinaryPath $resolvedBinary");
     expect(updater).toContain("startup stability window");
     expect(updater).toContain("Set-HeadlessTaskAction");
     expect(updater).toContain("$transactionId");

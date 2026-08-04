@@ -20,6 +20,12 @@ the setup code on first install, and starts the background agent. Run the same c
 update to the latest release without enrolling again. It also adds `nanoctl` to the current user's
 PATH for new terminals.
 
+Windows prints the resolved release and target before downloading, for example
+`Downloading nanoctl 1.0.14 for windows-x64...`, verifies that the executable reports that exact
+version, and prints the installed command path when the upgrade completes. A failed health-gated
+upgrade restores the previous task and executable rather than claiming that the new version is
+installed.
+
 If automatic platform selection is undesirable, use
 `https://extoci.lol/nanoctl/install.sh` or
 `https://extoci.lol/nanoctl/install.ps1` explicitly.
