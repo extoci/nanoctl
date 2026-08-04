@@ -36,6 +36,7 @@ test.beforeEach(async ({ page }) => {
     class FixturePeer {
       connectionState: RTCPeerConnectionState = "new";
       signalingState: RTCSignalingState = "stable";
+      localDescription: RTCSessionDescriptionInit | null = null;
       onconnectionstatechange: (() => void) | null = null;
       onicecandidate: (() => void) | null = null;
       ontrack: (() => void) | null = null;
@@ -55,7 +56,9 @@ test.beforeEach(async ({ page }) => {
         return { type: "offer", sdp: "v=0\r\n" };
       }
 
-      async setLocalDescription() {}
+      async setLocalDescription(description?: RTCSessionDescriptionInit) {
+        this.localDescription = description ?? null;
+      }
 
       async setRemoteDescription() {}
 
@@ -257,6 +260,18 @@ test("viewer exhausts bounded reconnect attempts and ends the session", async ({
 test("viewer handles terminal state and pagehide cleanup", async ({ page }) => {
   await page.goto("/e2e/viewer?state=ended");
   await expect(page.getByText("ended: host stopped")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __nanoctlPeers?: unknown[];
+            }
+          ).__nanoctlPeers?.length,
+      ),
+    )
+    .toBe(0);
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide")));
   await expect
     .poll(() =>

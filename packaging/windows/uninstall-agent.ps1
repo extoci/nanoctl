@@ -23,8 +23,8 @@ try {
 # documented Program Files layout so a partial migration can still be cleaned up.
 if (-not $PSBoundParameters.ContainsKey("BinaryPath") -and
     -not (Test-Path -LiteralPath $requestedBinary -PathType Leaf) -and
-    (Test-Path -LiteralPath $managedBinary -PathType Leaf -or
-      Test-Path -LiteralPath $managedRoot -PathType Container)) {
+    ((Test-Path -LiteralPath $managedBinary -PathType Leaf) -or
+      (Test-Path -LiteralPath $managedRoot -PathType Container))) {
   $requestedBinary = $managedBinary
 }
 if (-not ([StringComparer]::OrdinalIgnoreCase.Equals($requestedBinary, $publicBinary) -or

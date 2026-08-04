@@ -44,6 +44,15 @@ type ViewerOperations = {
 
 const NEGOTIATION_TIMEOUT_MS = 30_000;
 
+function isTerminalSession(session: ViewerSession | undefined): boolean {
+  return Boolean(
+    !session ||
+    session.state === "ended" ||
+    session.state === "failed" ||
+    session.expiresAt <= Date.now(),
+  );
+}
+
 export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
@@ -129,6 +138,15 @@ export function RemoteViewerCore({
   }, [session]);
 
   useEffect(() => {
+    if (!session || !isTerminalSession(session)) return;
+    const endOnPageHide = () => {
+      void endSession({ sessionId, reason: "controller disconnected" }).catch(() => {});
+    };
+    window.addEventListener("pagehide", endOnPageHide, { once: true });
+    return () => window.removeEventListener("pagehide", endOnPageHide);
+  }, [endSession, session, sessionId]);
+
+  useEffect(() => {
     if (selectedDisplay || !session?.displays.length) return;
     setSelectedDisplay(
       session.displays.find((display) => display.primary)?.id ?? session.displays[0]?.id ?? "",
@@ -154,6 +172,7 @@ export function RemoteViewerCore({
   }
 
   useEffect(() => {
+    if (isTerminalSession(session)) return;
     let cancelled = false;
     void getTurnCredentials({ sessionId })
       .then((turn) => {
@@ -175,10 +194,11 @@ export function RemoteViewerCore({
     return () => {
       cancelled = true;
     };
-  }, [getTurnCredentials, sessionId]);
+  }, [getTurnCredentials, session, sessionId]);
 
   useEffect(() => {
-    if (!iceServers || iceServersSessionRef.current !== sessionId) return;
+    if (isTerminalSession(session) || !iceServers || iceServersSessionRef.current !== sessionId)
+      return;
     const generation = sessionGenerationRef.current;
     let disposed = false;
     const isCurrent = () =>
@@ -562,7 +582,7 @@ export function RemoteViewerCore({
       if (peerSessionRef.current === sessionId) peerSessionRef.current = null;
       window.removeEventListener("pagehide", endOnPageHide);
     };
-  }, [endSession, iceServers, sendSignal, sessionId]);
+  }, [endSession, iceServers, sendSignal, session, sessionId]);
 
   useEffect(() => {
     const peer = peerRef.current;
