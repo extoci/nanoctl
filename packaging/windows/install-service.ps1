@@ -56,7 +56,7 @@ logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
 readyToken = WScript.Arguments(4)
 Set stream = fso.OpenTextFile(logPath, 8, True)
-stream.WriteLine "headless runner started for " & binaryPath
+stream.WriteLine "headless runner started"
 stream.Close
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
 command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
@@ -92,7 +92,9 @@ function Get-AgentFailureDetails {
 function Get-ReadyAgentProcess {
   param(
     [Parameter(Mandatory = $true)][string]$ReadyPath,
-    [Parameter(Mandatory = $true)][string]$ReadyToken
+    [Parameter(Mandatory = $true)][string]$BinaryPath,
+    [Parameter(Mandatory = $true)][string]$ReadyToken,
+    [Parameter(Mandatory = $true)][string]$ReadyVersion
   )
 
   if (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
@@ -106,14 +108,34 @@ function Get-ReadyAgentProcess {
   if ($marker -notmatch "(?m)^\s*token=$([regex]::Escape($ReadyToken))\s*$") {
     return $null
   }
+  if ($marker -notmatch "(?m)^\s*version=$([regex]::Escape($ReadyVersion))\s*$") {
+    return $null
+  }
   [int]$agentProcessId = 0
   if (-not [int]::TryParse($agentProcessIdText, [ref]$agentProcessId)) {
     return $null
   }
-  Get-Process -Id $agentProcessId -ErrorAction SilentlyContinue
+  $process = Get-Process -Id $agentProcessId -ErrorAction SilentlyContinue
+  if (-not $process) {
+    return $null
+  }
+  try {
+    $processPath = [IO.Path]::GetFullPath([string]$process.Path)
+    $expectedPath = [IO.Path]::GetFullPath($BinaryPath)
+    if (-not [String]::Equals($processPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+      return $null
+    }
+  } catch {
+    # Readiness is fail-closed: a PID without an executable path cannot prove that the
+    # installed binary is the process that reached readiness.
+    return $null
+  }
+  return $process
 }
 
 function Wait-AgentTask {
+  param([Parameter(Mandatory = $true)][string]$ReadyVersion)
+
   if (Test-Path -LiteralPath $readyPath -PathType Leaf) {
     Remove-Item -LiteralPath $readyPath -Force -ErrorAction Stop
   }
@@ -121,7 +143,11 @@ function Wait-AgentTask {
   $deadline = [DateTime]::UtcNow.AddSeconds(90)
   $readyProcess = $null
   while ([DateTime]::UtcNow -lt $deadline) {
-    $readyProcess = Get-ReadyAgentProcess -ReadyPath $readyPath -ReadyToken $transactionId
+    $readyProcess = Get-ReadyAgentProcess `
+      -ReadyPath $readyPath `
+      -BinaryPath $installedBinary `
+      -ReadyToken $transactionId `
+      -ReadyVersion $ReadyVersion
     if ($readyProcess) {
       break
     }
@@ -131,7 +157,11 @@ function Wait-AgentTask {
     throw "nanoctl did not become ready. $(Get-AgentFailureDetails)"
   }
   Start-Sleep -Seconds 5
-  if (-not (Get-ReadyAgentProcess -ReadyPath $readyPath -ReadyToken $transactionId)) {
+  if (-not (Get-ReadyAgentProcess `
+      -ReadyPath $readyPath `
+      -BinaryPath $installedBinary `
+      -ReadyToken $transactionId `
+      -ReadyVersion $ReadyVersion)) {
     throw "nanoctl exited during its startup stability window. $(Get-AgentFailureDetails)"
   }
 }
@@ -169,10 +199,12 @@ try {
     throw "Could not apply the nanoctl configuration ACL."
   }
 
-  & $installedBinary --log-file $logPath --version | Out-Null
-  if ($LASTEXITCODE -ne 0) {
+  $installedVersionOutput = (& $installedBinary --log-file $logPath --version 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or
+      $installedVersionOutput -notmatch '(?m)^nanoctl\s+(\d+\.\d+\.\d+)\s*$') {
     throw "The nanoctl executable is incompatible with the headless service runner."
   }
+  $installedVersion = $Matches[1]
   & $installedBinary --config $resolvedConfig doctor
   if ($LASTEXITCODE -ne 0) {
     throw "nanoctl failed its pre-install health check."
@@ -207,7 +239,7 @@ try {
     -Principal $principal `
     -Settings $settings `
     -Description "Headless device-owner-authorized nanoctl remote desktop agent." | Out-Null
-  Wait-AgentTask
+  Wait-AgentTask -ReadyVersion $installedVersion
 }
 catch {
   Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue

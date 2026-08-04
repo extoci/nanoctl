@@ -81,7 +81,7 @@ logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
 readyToken = WScript.Arguments(4)
 Set stream = fso.OpenTextFile(logPath, 8, True)
-stream.WriteLine "headless runner started for " & binaryPath
+stream.WriteLine "headless runner started"
 stream.Close
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
 command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
@@ -166,7 +166,8 @@ function Get-ReadyAgentProcess {
   param(
     [Parameter(Mandatory = $true)][string]$ReadyPath,
     [Parameter(Mandatory = $true)][string]$BinaryPath,
-    [Parameter(Mandatory = $true)][string]$ReadyToken
+    [Parameter(Mandatory = $true)][string]$ReadyToken,
+    [Parameter(Mandatory = $true)][string]$ReadyVersion
   )
 
   if (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
@@ -178,6 +179,9 @@ function Get-ReadyAgentProcess {
   }
   $agentProcessIdText = $Matches[1]
   if ($marker -notmatch "(?m)^\s*token=$([regex]::Escape($ReadyToken))\s*$") {
+    return $null
+  }
+  if ($marker -notmatch "(?m)^\s*version=$([regex]::Escape($ReadyVersion))\s*$") {
     return $null
   }
   [int]$agentProcessId = 0
@@ -195,8 +199,9 @@ function Get-ReadyAgentProcess {
       return $null
     }
   } catch {
-    # The marker is written by the agent in the owner-protected install directory. If Windows does
-    # not expose Process.Path to this token, a live PID is still a stronger signal than task state.
+    # Readiness is fail-closed: without an executable path, the marker cannot prove that this
+    # transaction's binary is the live process.
+    return $null
   }
   return $process
 }
@@ -205,7 +210,8 @@ function Wait-AgentTask {
   param(
     [Parameter(Mandatory = $true)][string]$ReadyPath,
     [Parameter(Mandatory = $true)][string]$BinaryPath,
-    [Parameter(Mandatory = $true)][string]$ReadyToken
+    [Parameter(Mandatory = $true)][string]$ReadyToken,
+    [Parameter(Mandatory = $true)][string]$ReadyVersion
   )
 
   if (Test-Path -LiteralPath $ReadyPath -PathType Leaf) {
@@ -218,7 +224,8 @@ function Wait-AgentTask {
     $readyProcess = Get-ReadyAgentProcess `
       -ReadyPath $ReadyPath `
       -BinaryPath $BinaryPath `
-      -ReadyToken $ReadyToken
+      -ReadyToken $ReadyToken `
+      -ReadyVersion $ReadyVersion
     if ($readyProcess) {
       break
     }
@@ -233,7 +240,8 @@ function Wait-AgentTask {
   if (-not (Get-ReadyAgentProcess `
       -ReadyPath $ReadyPath `
       -BinaryPath $BinaryPath `
-      -ReadyToken $ReadyToken)) {
+      -ReadyToken $ReadyToken `
+      -ReadyVersion $ReadyVersion)) {
     throw "The nanoctl agent exited during its startup stability window. $((Get-AgentFailureDetails))"
   }
 }
@@ -241,7 +249,7 @@ function Wait-AgentTask {
 function Wait-AgentProcessExit {
   param([Parameter(Mandatory = $true)][string[]]$Paths)
 
-  for ($attempt = 0; $attempt -lt 50; $attempt++) {
+  for ($attempt = 0; $attempt -lt 300; $attempt++) {
     $running = @(Get-Process -Name nanoctl -ErrorAction SilentlyContinue | Where-Object {
         $processPath = $_.Path
         $processPath -and ($Paths -contains $processPath)
@@ -343,6 +351,10 @@ function Assert-ExistingTaskOwner {
   if (-not $taskUser -or $taskUser -match '(?i)^SYSTEM$|^NT AUTHORITY\\') {
     throw "The existing nanoctl task is not a per-user interactive task. Remove the managed installation with its administrator script before using this installer."
   }
+  $taskLogonType = [string]$Task.Principal.LogonType
+  if ($taskLogonType -and $taskLogonType -notmatch '(?i)^Interactive$') {
+    throw "The existing nanoctl task does not run in the interactive user session; refusing to migrate it."
+  }
   try {
     $taskSid = Resolve-AccountSid -Account $taskUser
   } catch {
@@ -367,6 +379,23 @@ function Resolve-AccountSid {
   ).Value
 }
 
+function Set-OwnerProtectedAcl {
+  & icacls.exe $installRoot `
+    /inheritance:r `
+    /grant:r "*${currentUserSid}:(OI)(CI)(M)" "*S-1-5-18:(OI)(CI)(F)" `
+    /quiet | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not protect the nanoctl installation directory."
+  }
+  & icacls.exe $logPath `
+    /inheritance:r `
+    /grant:r "*${currentUserSid}:(M)" "*S-1-5-18:(F)" `
+    /quiet | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not protect the nanoctl agent log."
+  }
+}
+
 function Restore-LegacyTask {
   if (-not (Test-Path -LiteralPath $legacyTaskXmlPath -PathType Leaf)) {
     return $false
@@ -388,6 +417,7 @@ function Start-RestoredTask {
 try {
   New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
   New-Item -ItemType File -Path $logPath -Force | Out-Null
+  Set-OwnerProtectedAcl
   $lockStream = [IO.File]::Open(
     $lockPath,
     [IO.FileMode]::OpenOrCreate,
@@ -491,7 +521,8 @@ try {
   Wait-AgentTask `
     -ReadyPath $readyPath `
     -BinaryPath $binaryPath `
-    -ReadyToken $transactionId
+    -ReadyToken $transactionId `
+    -ReadyVersion $displayVersion
   & $binaryPath --config $configPath doctor
   if ($LASTEXITCODE -ne 0) {
     throw "nanoctl installed but failed its health check. See $logPath for service diagnostics."
@@ -515,6 +546,36 @@ try {
     Write-Warning "nanoctl is running, but the installer could not update PATH: $($_.Exception.Message)"
   }
 
+  $resolvedCommand = Get-Command nanoctl -All -ErrorAction SilentlyContinue | Select-Object -First 1
+  $resolvedCommandPath = if ($resolvedCommand) {
+    if ($resolvedCommand.Source) { [string]$resolvedCommand.Source } else { [string]$resolvedCommand.Path }
+  } else {
+    $null
+  }
+  $resolvedCommandMatchesInstall = $false
+  if ($resolvedCommandPath) {
+    try {
+      $resolvedCommandMatchesInstall = [String]::Equals(
+        [IO.Path]::GetFullPath($resolvedCommandPath),
+        [IO.Path]::GetFullPath($binaryPath),
+        [StringComparison]::OrdinalIgnoreCase
+      )
+    } catch {
+      $resolvedCommandMatchesInstall = $false
+    }
+  }
+  if (-not $resolvedCommandMatchesInstall) {
+    throw (
+      "nanoctl installed at '$binaryPath', but command resolution still points to " +
+      "'$resolvedCommandPath'. Close this shell and remove any older nanoctl entry from PATH."
+    )
+  }
+  $resolvedCommandVersion = (& $resolvedCommandPath --version 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or
+      $resolvedCommandVersion -notmatch "(?m)^nanoctl\s+$([regex]::Escape($displayVersion))\s*$") {
+    throw "The installed nanoctl command did not report version $displayVersion."
+  }
+
   if (Test-Path -LiteralPath $previousPath -PathType Leaf) {
     Remove-Item -LiteralPath $previousPath -Force -ErrorAction SilentlyContinue
   }
@@ -523,10 +584,7 @@ try {
   Write-Host ""
   Write-Host "nanoctl is installed, enrolled, and running."
   Write-Host "Installed version: $(& $binaryPath --version)"
-  $resolvedCommand = Get-Command nanoctl -All -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($resolvedCommand) {
-    Write-Host "Command path: $($resolvedCommand.Source)"
-  }
+  Write-Host "Command path: $resolvedCommandPath"
   Write-Host "nanoctl is available in this PowerShell session and in newly opened terminals."
   Write-Host "Run this installer again at any time to update."
 }
@@ -535,6 +593,9 @@ catch {
     if ($script:taskReplaced -and (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
       Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
       Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    if ($activated) {
+      Wait-AgentProcessExit -Paths @($binaryPath)
     }
     if (Test-Path -LiteralPath $previousPath -PathType Leaf) {
       if (Test-Path -LiteralPath $binaryPath -PathType Leaf) {

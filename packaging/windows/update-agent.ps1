@@ -53,6 +53,41 @@ $taskBackedUp = $false
 New-Item -ItemType Directory -Path (Split-Path -Parent $readyPath) -Force | Out-Null
 New-Item -ItemType File -Path $logPath -Force | Out-Null
 
+function Resolve-AccountSid {
+  param([Parameter(Mandatory = $true)][string]$Account)
+
+  if ($Account -match '^S-\d-') {
+    return ([Security.Principal.SecurityIdentifier]$Account).Value
+  }
+  return ([Security.Principal.NTAccount]$Account).Translate(
+    [Security.Principal.SecurityIdentifier]
+  ).Value
+}
+
+function Assert-TaskOwner {
+  param([Parameter(Mandatory = $true)]$Task)
+
+  $taskUser = [string]$Task.Principal.UserId
+  if (-not $taskUser -or $taskUser -match '(?i)^SYSTEM$|^NT AUTHORITY\\') {
+    throw "The nanoctl task is not a per-user interactive task; refusing to update it."
+  }
+  $taskLogonType = [string]$Task.Principal.LogonType
+  if ($taskLogonType -and $taskLogonType -notmatch '(?i)^Interactive$') {
+    throw "The nanoctl task does not run in the interactive user session; refusing to update it."
+  }
+  try {
+    $taskSid = Resolve-AccountSid -Account $taskUser
+  } catch {
+    throw "Could not resolve the nanoctl task owner '$taskUser'; refusing to update it."
+  }
+  if ($taskSid -ne $currentIdentity.User.Value) {
+    throw (
+      "The nanoctl task belongs to '$taskUser', but the update is running as " +
+      "'$($currentIdentity.Name)'. Elevate the same account that enrolled nanoctl."
+    )
+  }
+}
+
 function Ensure-HeadlessRunner {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -69,7 +104,7 @@ logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
 readyToken = WScript.Arguments(4)
 Set stream = fso.OpenTextFile(logPath, 8, True)
-stream.WriteLine "headless runner started for " & binaryPath
+stream.WriteLine "headless runner started"
 stream.Close
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
 command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
@@ -147,7 +182,7 @@ function Get-AgentFailureDetails {
 }
 
 function Wait-AgentProcessExit {
-  for ($attempt = 0; $attempt -lt 50; $attempt++) {
+  for ($attempt = 0; $attempt -lt 300; $attempt++) {
     $running = @(Get-Process -Name nanoctl -ErrorAction SilentlyContinue | Where-Object {
         $_.Path -eq $resolvedBinary
       })
@@ -160,7 +195,8 @@ function Wait-AgentProcessExit {
 function Get-ReadyAgentProcess {
   param(
     [Parameter(Mandatory = $true)][string]$BinaryPath,
-    [Parameter(Mandatory = $true)][string]$ReadyToken
+    [Parameter(Mandatory = $true)][string]$ReadyToken,
+    [Parameter(Mandatory = $true)][string]$ReadyVersion
   )
 
   if (-not (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
@@ -172,6 +208,9 @@ function Get-ReadyAgentProcess {
   }
   $agentProcessIdText = $Matches[1]
   if ($marker -notmatch "(?m)^\s*token=$([regex]::Escape($ReadyToken))\s*$") {
+    return $null
+  }
+  if ($marker -notmatch "(?m)^\s*version=$([regex]::Escape($ReadyVersion))\s*$") {
     return $null
   }
   [int]$agentProcessId = 0
@@ -189,14 +228,18 @@ function Get-ReadyAgentProcess {
       return $null
     }
   } catch {
-    # A live PID marker is still stronger than the Task Scheduler state if Process.Path is
-    # unavailable to the current token.
+    # Readiness is fail-closed: a PID without an executable path cannot prove that the
+    # candidate binary is the process that reached readiness.
+    return $null
   }
   return $process
 }
 
 function Wait-AgentReady {
-  param([Parameter(Mandatory = $true)][string]$BinaryPath)
+  param(
+    [Parameter(Mandatory = $true)][string]$BinaryPath,
+    [Parameter(Mandatory = $true)][string]$ReadyVersion
+  )
 
   if (Test-Path -LiteralPath $readyPath -PathType Leaf) {
     Remove-Item -LiteralPath $readyPath -Force -ErrorAction Stop
@@ -204,7 +247,10 @@ function Wait-AgentReady {
   $deadline = [DateTime]::UtcNow.AddSeconds(90)
   $readyProcess = $null
   while ([DateTime]::UtcNow -lt $deadline) {
-    $readyProcess = Get-ReadyAgentProcess -BinaryPath $BinaryPath -ReadyToken $transactionId
+    $readyProcess = Get-ReadyAgentProcess `
+      -BinaryPath $BinaryPath `
+      -ReadyToken $transactionId `
+      -ReadyVersion $ReadyVersion
     if ($readyProcess) {
       break
     }
@@ -214,7 +260,10 @@ function Wait-AgentReady {
     throw "Updated nanoctl did not become ready. $(Get-AgentFailureDetails)"
   }
   Start-Sleep -Seconds 5
-  if (-not (Get-ReadyAgentProcess -BinaryPath $BinaryPath -ReadyToken $transactionId)) {
+  if (-not (Get-ReadyAgentProcess `
+      -BinaryPath $BinaryPath `
+      -ReadyToken $transactionId `
+      -ReadyVersion $ReadyVersion)) {
     throw "Updated nanoctl exited during its startup stability window. $(Get-AgentFailureDetails)"
   }
 }
@@ -228,6 +277,7 @@ try {
   )
   $lockAcquired = $true
   $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+  Assert-TaskOwner -Task $task
   Export-ScheduledTask -TaskName $taskName |
     Set-Content -LiteralPath $previousTaskXml -Encoding UTF8
   $taskBackedUp = $true
@@ -255,10 +305,12 @@ try {
       $candidateHash -ine [string]$stage.artifact.sha256) {
     throw "Copied update bytes do not match the signed manifest."
   }
-  & $candidate --log-file $logPath --version | Out-Null
-  if ($LASTEXITCODE -ne 0) {
+  $candidateVersionOutput = (& $candidate --log-file $logPath --version 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or
+      $candidateVersionOutput -notmatch '(?m)^nanoctl\s+(\d+\.\d+\.\d+)\s*$') {
     throw "The staged nanoctl executable is incompatible with the headless service runner."
   }
+  $candidateVersion = $Matches[1]
 
   Move-Item -LiteralPath $resolvedBinary -Destination $previous
   try {
@@ -271,14 +323,17 @@ try {
   $activated = $true
   Set-HeadlessTaskAction
   Start-ScheduledTask -TaskName $taskName
-  Wait-AgentReady -BinaryPath $resolvedBinary
+  Wait-AgentReady -BinaryPath $resolvedBinary -ReadyVersion $candidateVersion
 
   & $resolvedBinary --config $resolvedConfig doctor
   if ($LASTEXITCODE -ne 0) {
     throw "Updated nanoctl failed its health check."
   }
 
-  if (-not (Get-ReadyAgentProcess -BinaryPath $resolvedBinary -ReadyToken $transactionId)) {
+  if (-not (Get-ReadyAgentProcess `
+      -BinaryPath $resolvedBinary `
+      -ReadyToken $transactionId `
+      -ReadyVersion $candidateVersion)) {
     throw "Updated nanoctl did not remain ready during its startup stability window. $(Get-AgentFailureDetails)"
   }
 

@@ -137,7 +137,8 @@ describe("one-command Windows installer", () => {
       expect(script).toContain('" --log-file "');
       expect(script).toContain("--ready-token");
       expect(script).toContain("Err.Clear");
-      expect(script).toContain("headless runner started for");
+      expect(script).toContain("headless runner started");
+      expect(script).not.toContain("headless runner started for");
       expect(script).toContain("child exited with code");
       expect(script).toContain("shell.Run(command, 0, True)");
       expect(script).not.toContain("cmd.exe /d /s /c");
@@ -157,9 +158,13 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("-ReadyPath $ReadyPath");
     expect(installer).toContain("-BinaryPath $BinaryPath");
     expect(installer).toContain("-ReadyToken $ReadyToken");
+    expect(installer).toContain("-ReadyVersion $ReadyVersion");
     expect(installer).toContain("$transactionId");
     expect(installer).toContain("$logPath");
     expect(installer).toContain("LastTaskResult");
+    expect(installer).toContain("Task.Principal.LogonType");
+    expect(installer).toContain("Set-OwnerProtectedAcl");
+    expect(installer).toContain("icacls.exe");
     expect(installer).toContain("failed its health check");
   });
 
@@ -174,6 +179,8 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("StringComparison]::OrdinalIgnoreCase");
     expect(installer).toContain('SetEnvironmentVariable("Path", $newPath, "User")');
     expect(installer).toContain("Get-Command nanoctl -All");
+    expect(installer).toContain("resolvedCommandMatchesInstall");
+    expect(installer).toContain("resolvedCommandVersion");
   });
 
   test("keeps the low-level Windows installer headless too", async () => {
@@ -185,6 +192,9 @@ describe("one-command Windows installer", () => {
     expect(installer).not.toContain("$powershell");
     expect(installer).toContain("-Hidden");
     expect(installer).toContain("agent.log");
+    expect(installer).toContain("-ReadyVersion $ReadyVersion");
+    expect(installer).toContain("$installedVersion");
+    expect(installer).toContain("$process.Path");
   });
 
   test("makes signed updates retryable and health-gated", async () => {
@@ -193,12 +203,17 @@ describe("one-command Windows installer", () => {
     expect(updater).toContain("$lockAcquired");
     expect(updater).toContain("-not $completed -and $lockAcquired");
     expect(updater).toContain("$configOwnerSid.Value -ne $currentIdentity.User.Value");
+    expect(updater).toContain("function Assert-TaskOwner");
+    expect(updater).toContain("Task.Principal.LogonType");
     expect(updater).toContain("Export-ScheduledTask");
     expect(updater).toContain("function Restore-PreviousTask");
     expect(updater).toContain("$previousTaskXml");
     expect(updater).toContain("Wait-AgentProcessExit");
     expect(updater).toContain("AddSeconds(90)");
-    expect(updater).toContain("Wait-AgentReady -BinaryPath $resolvedBinary");
+    expect(updater).toContain(
+      "Wait-AgentReady -BinaryPath $resolvedBinary -ReadyVersion $candidateVersion",
+    );
+    expect(updater).toContain("$candidateVersion");
     expect(updater).toContain("startup stability window");
     expect(updater).toContain("Set-HeadlessTaskAction");
     expect(updater).toContain("$transactionId");
