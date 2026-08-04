@@ -11,6 +11,7 @@ $publicRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "nanoctl"))
 $managedRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles "nanoctl"))
 $publicBinary = [IO.Path]::GetFullPath((Join-Path $publicRoot "nanoctl.exe"))
 $managedBinary = [IO.Path]::GetFullPath((Join-Path $managedRoot "nanoctl.exe"))
+$logPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.log"
 
 try {
   $requestedBinary = [IO.Path]::GetFullPath($BinaryPath)
@@ -89,4 +90,5 @@ if (Test-Path -LiteralPath $installRoot -PathType Container) {
 }
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
 Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
 Write-Host "nanoctl background agent, installed binary, and local enrollment removed."

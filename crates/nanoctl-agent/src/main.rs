@@ -17,7 +17,8 @@ mod update;
 #[cfg(all(feature = "media", target_os = "windows"))]
 mod windows_encoder;
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -39,6 +40,10 @@ struct Cli {
     /// Write this marker after the service has initialized and remove it on exit.
     #[arg(long, global = true)]
     ready_file: Option<PathBuf>,
+
+    /// Append service diagnostics to this file instead of the process console.
+    #[arg(long, global = true)]
+    log_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -110,17 +115,39 @@ enum Command {
     CommitUpdate,
 }
 
+fn init_logging(log_file: Option<&Path>) -> Result<()> {
+    let filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("nanoctl=info"));
+    if let Some(path) = log_file {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create log directory {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("cannot open log file {}", path.display()))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_writer(file)
+            .compact()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .compact()
+            .init();
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    control_plane::install_crypto_provider()?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("nanoctl=info")),
-        )
-        .compact()
-        .init();
-
     let cli = Cli::parse();
+    control_plane::install_crypto_provider()?;
+    init_logging(cli.log_file.as_deref())?;
     let config_path = cli.config.unwrap_or(AgentConfig::default_path()?);
 
     match cli.command {

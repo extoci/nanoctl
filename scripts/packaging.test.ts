@@ -124,6 +124,33 @@ describe("one-command Windows installer", () => {
     expect(installer).not.toContain('New-ScheduledTaskAction -Execute $binaryPath -Argument "run"');
   });
 
+  test("uses a direct hidden runner with file-backed diagnostics", async () => {
+    const scripts = await Promise.all(
+      [
+        "install.ps1",
+        "packaging/windows/install-service.ps1",
+        "packaging/windows/update-agent.ps1",
+      ].map((path) => Bun.file(join(repository, path)).text()),
+    );
+
+    for (const script of scripts) {
+      expect(script).toContain('" --log-file "');
+      expect(script).toContain("Err.Clear");
+      expect(script).toContain("shell.Run(command, 0, True)");
+      expect(script).not.toContain("cmd.exe /d /s /c");
+      expect(script).toContain("New-Item -ItemType File -Path $logPath -Force");
+    }
+  });
+
+  test("migrates a legacy task's implicit config path and allows slow startup", async () => {
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    expect(installer).toContain("function Get-BinaryConfigPath");
+    expect(installer).toContain("Get-BinaryConfigPath -Path $legacyBinaryPath");
+    expect(installer).toContain("AddSeconds(30)");
+    expect(installer).toContain("$logPath");
+    expect(installer).toContain("LastTaskResult");
+  });
+
   test("keeps the low-level Windows installer headless too", async () => {
     const installer = await Bun.file(
       join(repository, "packaging/windows/install-service.ps1"),

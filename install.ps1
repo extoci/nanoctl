@@ -41,7 +41,7 @@ $transactionId = [Guid]::NewGuid().ToString("N")
 $previousPath = Join-Path $installRoot ("nanoctl.{0}.previous.exe" -f $transactionId)
 $failedPath = Join-Path $installRoot ("nanoctl.{0}.failed.exe" -f $transactionId)
 $runnerPath = Join-Path $installRoot "run-agent.vbs"
-$logPath = Join-Path $installRoot "agent.log"
+$logPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.log"
 $readyPath = Join-Path $installRoot "agent.ready"
 $lockPath = Join-Path $installRoot "install.lock"
 $legacyTaskXmlPath = Join-Path $temporary "legacy-task.xml"
@@ -59,7 +59,7 @@ function Ensure-HeadlessRunner {
 Option Explicit
 On Error Resume Next
 
-Dim shell, fso, binaryPath, configPath, logPath, readyPath, inner, command, exitCode
+Dim shell, fso, binaryPath, configPath, logPath, readyPath, command, exitCode
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 binaryPath = WScript.Arguments(0)
@@ -67,9 +67,9 @@ configPath = WScript.Arguments(1)
 logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
-inner = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
-  " --ready-file " & Chr(34) & readyPath & Chr(34) & " run >> " & Chr(34) & logPath & Chr(34) & " 2>&1"
-command = "cmd.exe /d /s /c " & Chr(34) & inner & Chr(34)
+command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
+  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & " run"
+Err.Clear
 exitCode = shell.Run(command, 0, True)
 If Err.Number <> 0 Then
   Dim stream
@@ -125,22 +125,41 @@ function Register-AgentTask {
   $script:taskReplaced = $true
 }
 
+function Get-AgentFailureDetails {
+  $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+  $logTail = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+    (Get-Content -LiteralPath $logPath -Tail 40 -ErrorAction SilentlyContinue | Out-String).Trim()
+  } else {
+    "(agent log was not created at $logPath)"
+  }
+  "task result: $($taskInfo.LastTaskResult)`nlog: $logPath`n$logTail"
+}
+
 function Wait-AgentTask {
   param([Parameter(Mandatory = $true)][string]$ReadyPath)
 
   Start-ScheduledTask -TaskName $taskName
-  Start-Sleep -Seconds 2
-  $startedTask = Get-ScheduledTask -TaskName $taskName
-  if ($startedTask.State -ne "Running" -or -not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
-    $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
-    throw "The nanoctl agent did not become ready (task result: $($taskInfo.LastTaskResult)). Run '$binaryPath doctor' for diagnostics."
+  $deadline = [DateTime]::UtcNow.AddSeconds(30)
+  $ready = $false
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task -and $task.State -eq "Running" -and
+        (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+      $ready = $true
+      break
+    }
+    Start-Sleep -Milliseconds 200
+  }
+  if (-not $ready) {
+    throw "The nanoctl agent did not become ready. $((Get-AgentFailureDetails))"
   }
   # A task can briefly report Running while the process is still starting. Keep the previous
   # binary until this short stability window has passed.
   Start-Sleep -Seconds 3
-  $stableTask = Get-ScheduledTask -TaskName $taskName
-  if ($stableTask.State -ne "Running" -or -not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
-    throw "The nanoctl agent exited during its startup stability window. Run '$binaryPath doctor' for diagnostics."
+  $stableTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if (-not $stableTask -or $stableTask.State -ne "Running" -or
+      -not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
+    throw "The nanoctl agent exited during its startup stability window. $((Get-AgentFailureDetails))"
   }
 }
 
@@ -195,6 +214,23 @@ function Get-TaskBinaryPath {
   return $null
 }
 
+function Get-BinaryConfigPath {
+  param([string]$Path)
+
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return $null
+  }
+  $pathOutput = & $Path paths 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    foreach ($line in @($pathOutput)) {
+      if ([string]$line -match "^config=(.+)$") {
+        return $Matches[1].Trim()
+      }
+    }
+  }
+  return $null
+}
+
 function Restore-LegacyTask {
   if (-not (Test-Path -LiteralPath $legacyTaskXmlPath -PathType Leaf)) {
     return $false
@@ -215,6 +251,7 @@ function Start-RestoredTask {
 
 try {
   New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+  New-Item -ItemType File -Path $logPath -Force | Out-Null
   $lockStream = [IO.File]::Open(
     $lockPath,
     [IO.FileMode]::OpenOrCreate,
@@ -248,6 +285,9 @@ try {
   }
   $legacyConfigPath = if ($existingTask) { Get-TaskConfigPath -Task $existingTask } else { $null }
   $legacyBinaryPath = if ($existingTask) { Get-TaskBinaryPath -Task $existingTask } else { $null }
+  if (-not $legacyConfigPath) {
+    $legacyConfigPath = Get-BinaryConfigPath -Path $legacyBinaryPath
+  }
   if ($existingTask) {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     for ($attempt = 0; $attempt -lt 50; $attempt++) {

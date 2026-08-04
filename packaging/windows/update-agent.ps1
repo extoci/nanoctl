@@ -29,7 +29,7 @@ $candidate = "$resolvedBinary.$transactionId.candidate"
 $previous = "$resolvedBinary.$transactionId.previous"
 $failed = "$resolvedBinary.$transactionId.failed"
 $runnerPath = Join-Path $installRoot "run-agent.vbs"
-$logPath = Join-Path $installRoot "agent.log"
+$logPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.log"
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
 $lockPath = "$resolvedBinary.update.lock"
 $lockStream = $null
@@ -38,6 +38,7 @@ $activated = $false
 $completed = $false
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $readyPath) -Force | Out-Null
+New-Item -ItemType File -Path $logPath -Force | Out-Null
 
 function Ensure-HeadlessRunner {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -46,7 +47,7 @@ function Ensure-HeadlessRunner {
 Option Explicit
 On Error Resume Next
 
-Dim shell, fso, binaryPath, configPath, logPath, readyPath, inner, command, exitCode
+Dim shell, fso, binaryPath, configPath, logPath, readyPath, command, exitCode
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 binaryPath = WScript.Arguments(0)
@@ -54,9 +55,9 @@ configPath = WScript.Arguments(1)
 logPath = WScript.Arguments(2)
 readyPath = WScript.Arguments(3)
 If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
-inner = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
-  " --ready-file " & Chr(34) & readyPath & Chr(34) & " run >> " & Chr(34) & logPath & Chr(34) & " 2>&1"
-command = "cmd.exe /d /s /c " & Chr(34) & inner & Chr(34)
+command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
+  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & " run"
+Err.Clear
 exitCode = shell.Run(command, 0, True)
 If Err.Number <> 0 Then
   Dim stream
@@ -100,6 +101,16 @@ function Stop-AgentTask {
   throw "Timed out while stopping the nanoctl Scheduled Task."
 }
 
+function Get-AgentFailureDetails {
+  $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+  $logTail = if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+    (Get-Content -LiteralPath $logPath -Tail 40 -ErrorAction SilentlyContinue | Out-String).Trim()
+  } else {
+    "(agent log was not created at $logPath)"
+  }
+  "task result: $($taskInfo.LastTaskResult)`nlog: $logPath`n$logTail"
+}
+
 function Wait-AgentProcessExit {
   for ($attempt = 0; $attempt -lt 50; $attempt++) {
     $running = @(Get-Process -Name nanoctl -ErrorAction SilentlyContinue | Where-Object {
@@ -112,7 +123,8 @@ function Wait-AgentProcessExit {
 }
 
 function Wait-AgentReady {
-  for ($attempt = 0; $attempt -lt 150; $attempt++) {
+  $deadline = [DateTime]::UtcNow.AddSeconds(30)
+  while ([DateTime]::UtcNow -lt $deadline) {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($task -and $task.State -eq "Running" -and
         (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
@@ -120,8 +132,7 @@ function Wait-AgentReady {
     }
     Start-Sleep -Milliseconds 100
   }
-  $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-  throw "Updated nanoctl did not become ready (task result: $($taskInfo.LastTaskResult))."
+  throw "Updated nanoctl did not become ready. $(Get-AgentFailureDetails)"
 }
 
 try {
@@ -179,7 +190,7 @@ try {
   Start-Sleep -Seconds 5
   if ((Get-ScheduledTask -TaskName $taskName).State -ne "Running" -or
       -not (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
-    throw "Updated nanoctl did not remain ready during its startup stability window."
+    throw "Updated nanoctl did not remain ready during its startup stability window. $(Get-AgentFailureDetails)"
   }
 
   Remove-Item -LiteralPath $previous -Force
