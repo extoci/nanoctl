@@ -139,4 +139,12 @@ jobs:
           # xcb uses quick-xml only in its build script against crate-owned protocol XML. Neither
           # vulnerable parser path nor quick-xml is present in the shipped agent runtime.
           ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
-      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+      # Run the official CLI directly instead of the hosted Action. The Action's license/API
+      # validation can fail on organization repositories because of third-party rate limits even
+      # when the scanner itself reports no findings.
+      - name: Scan git history for secrets
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            ghcr.io/gitleaks/gitleaks@sha256:b5918eb91b8d2473cec722f066abb4352e4ffdc4ec9f4283ec143aba9ec9ebc4 \
+            git --redact --no-banner /repo
