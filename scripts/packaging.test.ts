@@ -168,6 +168,21 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("failed its health check");
   });
 
+  test("accepts a legacy Administrators-owned config only for an administrator token", async () => {
+    const scripts = await Promise.all(
+      [
+        "install.ps1",
+        "packaging/windows/install-service.ps1",
+        "packaging/windows/update-agent.ps1",
+      ].map((path) => Bun.file(join(repository, path)).text()),
+    );
+
+    for (const script of scripts) {
+      expect(script).toContain("S-1-5-32-544");
+      expect(script).toContain("WindowsBuiltInRole]::Administrator");
+    }
+  });
+
   test("pins latest downloads to the resolved release and makes the installed binary win PATH", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("Invoke-RestMethod");

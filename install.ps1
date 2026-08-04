@@ -336,6 +336,19 @@ function Assert-ConfigOwner {
   } catch {
     throw "Could not resolve the enrolled configuration owner '$owner'. Run the installer as the account that enrolled nanoctl."
   }
+  if ($ownerSid -eq $currentUserSid) {
+    return
+  }
+  if ($ownerSid -eq "S-1-5-32-544" -and (Test-CurrentUserAdministrator)) {
+    return
+  }
+  if ($ownerSid -eq "S-1-5-32-544") {
+    throw (
+      "The enrolled configuration is owned by 'BUILTIN\Administrators', but '$currentUser' " +
+      "is not running with an administrator token. Run the installer once from an elevated " +
+      "PowerShell window to repair this legacy enrollment."
+    )
+  }
   if ($ownerSid -ne $currentUserSid) {
     throw (
       "The enrolled configuration belongs to '$owner', but this installer is running as '$currentUser'. " +
@@ -377,6 +390,43 @@ function Resolve-AccountSid {
   return ([Security.Principal.NTAccount]$Account).Translate(
     [Security.Principal.SecurityIdentifier]
   ).Value
+}
+
+function Test-CurrentUserAdministrator {
+  try {
+    $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      return $true
+    }
+    $administratorSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+    return @($currentIdentity.Groups | Where-Object {
+        $_.Value -eq $administratorSid.Value
+      }).Count -gt 0
+  } catch {
+    return $false
+  }
+}
+
+function Ensure-ConfigUserAccess {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return
+  }
+  $owner = (Get-Acl -LiteralPath $Path).Owner
+  $ownerSid = Resolve-AccountSid -Account $owner
+  if ($ownerSid -ne "S-1-5-32-544") {
+    return
+  }
+  & icacls.exe $Path `
+    /grant:r "*${currentUserSid}:(F)" `
+    /quiet | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw (
+      "The enrolled configuration is owned by 'BUILTIN\Administrators' and could not be " +
+      "made writable by '$currentUser'. Run the installer from an elevated PowerShell window."
+    )
+  }
 }
 
 function Set-OwnerProtectedAcl {
@@ -465,6 +515,7 @@ try {
   }
   if ($legacyConfigPath -and (Test-ConfigEnrolled -Path $legacyConfigPath)) {
     Assert-ConfigOwner -Path $legacyConfigPath
+    Ensure-ConfigUserAccess -Path $legacyConfigPath
   }
   # Do not change an existing installation's ACL until its task/configuration ownership has
   # passed the migration checks above. A rejected cross-user upgrade must be side-effect free.
@@ -508,6 +559,7 @@ try {
     }
   }
   Assert-ConfigOwner -Path $configPath
+  Ensure-ConfigUserAccess -Path $configPath
   if (-not (Test-ConfigEnrolled -Path $configPath)) {
     $setupCode = $env:NANOCTL_ENROLL_CODE
     if (-not $setupCode) {

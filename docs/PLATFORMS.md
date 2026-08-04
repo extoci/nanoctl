@@ -19,8 +19,9 @@ the enrolling user's Credential Manager entry. The public installation lives und
 configuration path to the runner. The
 administrator-only `packaging/windows/install-service.ps1` helper remains available for managed
 Program Files deployments; it applies explicit ACLs and uses the same hidden task action. Before a
-managed install changes state, it compares the configuration owner SID to the elevated identity and
-rejects elevation through another administrator. A future supervisor/helper split may add a
+managed install changes state, it compares the configuration owner SID to the elevated identity,
+accepting only a legacy `BUILTIN\Administrators` owner when that same identity is an administrator;
+it rejects elevation through another administrator. A future supervisor/helper split may add a
 LocalSystem supervisor, but the capture/input process must remain in the authorized user session.
 UAC secure desktop, elevated applications, and Windows sign-in screens remain inaccessible.
 

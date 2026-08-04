@@ -23,11 +23,30 @@ $taskName = "nanoctl Agent"
 $resolvedBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUser = $currentIdentity.Name
+$currentUserSid = $currentIdentity.User.Value
 $configOwner = (Get-Acl -LiteralPath $resolvedConfig).Owner
 $configOwnerSid = ([Security.Principal.NTAccount]$configOwner).Translate(
   [Security.Principal.SecurityIdentifier]
 )
-if ($configOwnerSid.Value -ne $currentIdentity.User.Value) {
+
+function Test-CurrentUserAdministrator {
+  try {
+    $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      return $true
+    }
+    $administratorSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+    return @($currentIdentity.Groups | Where-Object {
+        $_.Value -eq $administratorSid.Value
+      }).Count -gt 0
+  } catch {
+    return $false
+  }
+}
+
+if ($configOwnerSid.Value -ne $currentIdentity.User.Value -and
+    -not ($configOwnerSid.Value -eq "S-1-5-32-544" -and (Test-CurrentUserAdministrator))) {
   throw (
     "The elevated identity '$($currentIdentity.Name)' does not own the enrolled configuration. " +
     "Elevate the same account that enrolled nanoctl; do not supply another administrator."
@@ -62,6 +81,20 @@ function Resolve-AccountSid {
   return ([Security.Principal.NTAccount]$Account).Translate(
     [Security.Principal.SecurityIdentifier]
   ).Value
+}
+
+function Ensure-ConfigUserAccess {
+  $owner = (Get-Acl -LiteralPath $resolvedConfig).Owner
+  $ownerSid = Resolve-AccountSid -Account $owner
+  if ($ownerSid -ne "S-1-5-32-544") {
+    return
+  }
+  & icacls.exe $resolvedConfig `
+    /grant:r "*${currentUserSid}:(F)" `
+    /quiet | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "The Administrators-owned configuration could not be made writable by '$currentUser'."
+  }
 }
 
 function Assert-TaskOwner {
@@ -278,6 +311,7 @@ try {
   $lockAcquired = $true
   $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
   Assert-TaskOwner -Task $task
+  Ensure-ConfigUserAccess
   Export-ScheduledTask -TaskName $taskName |
     Set-Content -LiteralPath $previousTaskXml -Encoding UTF8
   $taskBackedUp = $true

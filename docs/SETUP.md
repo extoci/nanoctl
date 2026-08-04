@@ -21,7 +21,7 @@ update to the latest release without enrolling again. It also adds `nanoctl` to 
 PATH for new terminals.
 
 Windows prints the resolved release and target before downloading, for example
-`Downloading nanoctl 1.0.14 for windows-x64...`, verifies that the executable reports that exact
+`Downloading nanoctl 1.0.15 for windows-x64...`, verifies that the executable reports that exact
 version, and prints the installed command path when the upgrade completes. A failed health-gated
 upgrade restores the previous task and executable rather than claiming that the new version is
 installed.
@@ -43,6 +43,10 @@ Running the installer again is an in-place, health-gated upgrade. It preserves t
 configuration and enrollment, migrates an older explicit `--config` task path when needed, and
 retains the previous executable until the new task survives startup. If an upgrade fails, rerun the
 same installer; the transaction restores the previous binary and task automatically.
+
+Configurations created by an older elevated setup may be owned by `BUILTIN\Administrators`. The
+installer accepts that legacy owner only when run by an administrator and grants the enrolled user
+explicit access; it still rejects a task or configuration belonging to another Windows user.
 
 macOS may ask for Screen Recording and Accessibility. Wayland may ask through its desktop portal.
 Complete those prompts as the user who ran the installer.

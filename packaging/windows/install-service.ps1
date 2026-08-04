@@ -27,7 +27,23 @@ $logPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.log"
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
 $transactionId = [Guid]::NewGuid().ToString("N")
 
-if ($configOwnerSid.Value -ne $currentIdentity.User.Value) {
+function Test-CurrentUserAdministrator {
+  try {
+    $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      return $true
+    }
+    $administratorSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+    return @($currentIdentity.Groups | Where-Object {
+        $_.Value -eq $administratorSid.Value
+      }).Count -gt 0
+  } catch {
+    return $false
+  }
+}
+
+if ($configOwnerSid.Value -ne $currentIdentity.User.Value -and
+    -not ($configOwnerSid.Value -eq "S-1-5-32-544" -and (Test-CurrentUserAdministrator))) {
   throw (
     "The elevated identity '$currentUser' does not own the enrolled configuration. " +
     "Sign in as '$configOwner' and elevate that same account; do not supply another administrator."
