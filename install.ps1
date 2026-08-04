@@ -138,6 +138,7 @@ function Get-AgentFailureDetails {
 function Wait-AgentTask {
   param([Parameter(Mandatory = $true)][string]$ReadyPath)
 
+  Remove-Item -LiteralPath $ReadyPath -Force -ErrorAction SilentlyContinue
   Start-ScheduledTask -TaskName $taskName
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   $ready = $false
@@ -371,6 +372,7 @@ catch {
     } elseif ($activated) {
       Remove-Item -LiteralPath $binaryPath -Force -ErrorAction SilentlyContinue
     }
+    Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
     if ($existingTask) {
       if (Restore-LegacyTask) {
         Start-RestoredTask

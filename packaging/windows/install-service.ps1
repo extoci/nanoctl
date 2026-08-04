@@ -81,6 +81,7 @@ function Get-AgentFailureDetails {
 }
 
 function Wait-AgentTask {
+  Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
   Start-ScheduledTask -TaskName $taskName
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   $ready = $false
