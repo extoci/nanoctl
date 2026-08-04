@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctl-agent"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "anyhow",
  "apple-cf",
