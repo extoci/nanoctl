@@ -78,6 +78,9 @@ jobs:
           }
 
   agent-media-linux:
+    # Master pushes produce the exact release matrix below. Keep the faster media check for pull
+    # requests and non-release branches, but do not compile the same master commit twice.
+    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -102,6 +105,9 @@ jobs:
       - run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
+    # Master pushes produce the exact release matrix below. Keep the faster media check for pull
+    # requests and non-release branches, but do not compile the same master commit twice.
+    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
     strategy:
       fail-fast: false
       matrix:
@@ -120,6 +126,81 @@ jobs:
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+
+  release-candidate:
+    # This is the single artifact-producing build for a master commit. The tag workflow promotes
+    # these immutable artifacts instead of compiling the same commit on a second set of runners.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            architecture: x64
+            binary: nanoctl
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            architecture: arm64
+            binary: nanoctl
+          - runner: macos-15-intel
+            platform: macos
+            architecture: x64
+            binary: nanoctl
+          - runner: macos-15
+            platform: macos
+            architecture: arm64
+            binary: nanoctl
+          - runner: windows-2025
+            platform: windows
+            architecture: x64
+            binary: nanoctl.exe
+          - runner: windows-11-arm
+            platform: windows
+            architecture: arm64
+            binary: nanoctl.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.1
+          components: clippy
+      - name: Install Linux media dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
+            libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
+      - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Stage Unix release asset
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          asset="nanoctl-${{ matrix.platform }}-${{ matrix.architecture }}"
+          install -m 0755 "crates/nanoctl-agent/target/release/${{ matrix.binary }}" "$asset"
+          "./$asset" --version
+          sha256sum "$asset" >"$asset.sha256"
+      - name: Stage Windows release asset
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $asset = "nanoctl-${{ matrix.platform }}-${{ matrix.architecture }}.exe"
+          Copy-Item "crates/nanoctl-agent/target/release/${{ matrix.binary }}" $asset
+          & ".\$asset" --version
+          if ($LASTEXITCODE -ne 0) { throw "Release binary smoke test failed." }
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -NoNewline "$asset.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nanoctl-release-${{ matrix.platform }}-${{ matrix.architecture }}
+          path: nanoctl-${{ matrix.platform }}-${{ matrix.architecture }}*
+          if-no-files-found: error
 
   security:
     runs-on: ubuntu-latest
