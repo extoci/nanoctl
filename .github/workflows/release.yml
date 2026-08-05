@@ -14,10 +14,26 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify tag matches the agent version
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          set -euo pipefail
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/nanoctl-agent/Cargo.toml | head -1)"
           test "$GITHUB_REF_NAME" = "v$version"
+          if ! master_relation="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...master" \
+              --jq '.status')"; then
+            echo "Could not verify that $GITHUB_SHA belongs to master." >&2
+            exit 1
+          fi
+          case "$master_relation" in
+            ahead|identical) ;;
+            *)
+              echo "Release tags must point to a commit in the master history (compare status: $master_relation)." >&2
+              exit 1
+              ;;
+          esac
 
   candidate:
     needs: verify
@@ -34,28 +50,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          set -euo pipefail
           endpoint="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=20"
 
-          for attempt in $(seq 1 40); do
-            run_id="$(gh api "$endpoint" --jq \
-              '[.workflow_runs[] | select(.head_branch == "master" and .status == "completed" and .conclusion == "success")] | sort_by(.created_at) | reverse | .[0].id // empty')"
+          for attempt in $(seq 1 120); do
+            if ! run_id="$(gh api "$endpoint" --jq \
+                '[.workflow_runs[] | select(.head_branch == "master" and .status == "completed" and .conclusion == "success")] | sort_by(.created_at) | reverse | .[0].id // empty')"; then
+              echo "GitHub could not be queried for the CI run for $GITHUB_SHA." >&2
+              exit 1
+            fi
             if [ -n "$run_id" ]; then
               echo "Found successful CI run $run_id for $GITHUB_SHA."
               echo "run_id=$run_id" >>"$GITHUB_OUTPUT"
               exit 0
             fi
 
-            latest="$(gh api "$endpoint" --jq \
-              '[.workflow_runs[] | select(.head_branch == "master")] | sort_by(.created_at) | reverse | .[0] | if . == null then empty else [.id, .status, (.conclusion // ""), .html_url] | @tsv end')"
+            if ! latest="$(gh api "$endpoint" --jq \
+                '[.workflow_runs[] | select(.head_branch == "master")] | sort_by(.created_at) | reverse | .[0] | if . == null then empty else [.id, .status, (.conclusion // ""), .html_url] | @tsv end')"; then
+              echo "GitHub could not be queried for the latest CI status for $GITHUB_SHA." >&2
+              exit 1
+            fi
             if [ -n "$latest" ]; then
               IFS=$'\t' read -r latest_id latest_status latest_conclusion latest_url <<<"$latest"
               if [ "$latest_status" = "completed" ] && [ "$latest_conclusion" != "success" ]; then
                 echo "The CI run for this commit failed: $latest_url" >&2
                 exit 1
               fi
-              echo "CI run $latest_id is $latest_status${latest_conclusion:+ ($latest_conclusion)}; waiting."
+              echo "CI run $latest_id is $latest_status${latest_conclusion:+ ($latest_conclusion)}; waiting (attempt $attempt/120)."
             else
-              echo "No CI run is visible for $GITHUB_SHA yet; waiting."
+              echo "No CI run is visible for $GITHUB_SHA yet; waiting (attempt $attempt/120)."
             fi
             sleep 15
           done

@@ -78,9 +78,6 @@ jobs:
           }
 
   agent-media-linux:
-    # Master pushes produce the exact release matrix below. Keep the faster media check for pull
-    # requests and non-release branches, but do not compile the same master commit twice.
-    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -102,12 +99,13 @@ jobs:
             nasm pkg-config
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
-      - run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      # Master release candidates own the only release build. Keep a release build on PRs and
+      # non-release branches so media packaging remains covered before code reaches master.
+      - name: Build release media binary
+        if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+        run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
-    # Master pushes produce the exact release matrix below. Keep the faster media check for pull
-    # requests and non-release branches, but do not compile the same master commit twice.
-    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
     strategy:
       fail-fast: false
       matrix:
@@ -125,7 +123,9 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
-      - run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Build release media binary
+        if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+        run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   release-candidate:
     # This is the single artifact-producing build for a master commit. The tag workflow promotes
@@ -165,7 +165,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
-          components: clippy
       - name: Install Linux media dependencies
         if: matrix.platform == 'linux'
         shell: bash
@@ -175,8 +174,6 @@ jobs:
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
             libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config
-      - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
-      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'
@@ -205,6 +202,7 @@ jobs:
           name: nanoctl-release-${{ matrix.platform }}-${{ matrix.architecture }}
           path: nanoctl-${{ matrix.platform }}-${{ matrix.architecture }}*
           if-no-files-found: error
+          retention-days: 30
 
   security:
     runs-on: ubuntu-latest
