@@ -101,7 +101,9 @@ Else
 End If
 WScript.Quit exitCode
 '@
-  Set-Content -LiteralPath $Path -Value $runner -Encoding UTF8 -Force
+  # Windows Script Host expects this generated VBScript to be ANSI/ASCII. Windows PowerShell
+  # 5.1's UTF8 encoder writes a BOM that can make wscript.exe reject the script before logging.
+  Set-Content -LiteralPath $Path -Value $runner -Encoding ASCII -Force
 }
 
 function New-HeadlessTaskAction {

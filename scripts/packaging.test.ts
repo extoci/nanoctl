@@ -147,6 +147,20 @@ describe("one-command Windows installer", () => {
     }
   });
 
+  test("writes the Windows Script Host runner as ASCII", async () => {
+    for (const path of [
+      "install.ps1",
+      "packaging/windows/install-service.ps1",
+      "packaging/windows/update-agent.ps1",
+    ]) {
+      const script = await Bun.file(join(repository, path)).text();
+      const encoding = script.match(
+        /Set-Content -LiteralPath \$Path -Value \$runner -Encoding (\w+) -Force/,
+      )?.[1];
+      expect(encoding).toBe("ASCII");
+    }
+  });
+
   test("migrates a legacy task's implicit config path and allows slow startup", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("function Get-BinaryConfigPath");

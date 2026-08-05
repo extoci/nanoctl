@@ -156,7 +156,9 @@ Else
 End If
 WScript.Quit exitCode
 '@
-  Set-Content -LiteralPath $Path -Value $runner -Encoding UTF8 -Force
+  # Keep the WSH runner ASCII-only; Windows PowerShell 5.1 UTF8 output includes a BOM that can
+  # make wscript.exe reject the script before it can write diagnostics.
+  Set-Content -LiteralPath $Path -Value $runner -Encoding ASCII -Force
 }
 
 function Set-HeadlessTaskAction {
