@@ -195,22 +195,19 @@ try {
   # configuration remains writable only by that identity, SYSTEM, and local administrators.
   & icacls.exe $installRoot `
     /inheritance:r `
-    /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "${currentUser}:(OI)(CI)(RX)" `
-    /quiet | Out-Null
+    /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "${currentUser}:(OI)(CI)(RX)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Could not apply the nanoctl installation ACL."
   }
   & icacls.exe $logPath `
     /inheritance:r `
-    /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" "${currentUser}:(M)" `
-    /quiet | Out-Null
+    /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" "${currentUser}:(M)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Could not apply the nanoctl log ACL."
   }
   & icacls.exe $resolvedConfig `
     /inheritance:r `
-    /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" "${currentUser}:(F)" `
-    /quiet | Out-Null
+    /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" "${currentUser}:(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Could not apply the nanoctl configuration ACL."
   }

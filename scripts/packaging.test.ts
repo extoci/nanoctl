@@ -183,6 +183,20 @@ describe("one-command Windows installer", () => {
     }
   });
 
+  test("does not pass unsupported quiet switches to icacls", async () => {
+    const scripts = await Promise.all(
+      [
+        "install.ps1",
+        "packaging/windows/install-service.ps1",
+        "packaging/windows/update-agent.ps1",
+      ].map((path) => Bun.file(join(repository, path)).text()),
+    );
+
+    for (const script of scripts) {
+      expect(script).not.toContain("/quiet");
+    }
+  });
+
   test("pins latest downloads to the resolved release and makes the installed binary win PATH", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("Invoke-RestMethod");

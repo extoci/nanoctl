@@ -90,8 +90,7 @@ function Ensure-ConfigUserAccess {
     return
   }
   & icacls.exe $resolvedConfig `
-    /grant:r "*${currentUserSid}:(F)" `
-    /quiet | Out-Null
+    /grant:r "*${currentUserSid}:(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "The Administrators-owned configuration could not be made writable by '$currentUser'."
   }

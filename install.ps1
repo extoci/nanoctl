@@ -419,8 +419,7 @@ function Ensure-ConfigUserAccess {
     return
   }
   & icacls.exe $Path `
-    /grant:r "*${currentUserSid}:(F)" `
-    /quiet | Out-Null
+    /grant:r "*${currentUserSid}:(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw (
       "The enrolled configuration is owned by 'BUILTIN\Administrators' and could not be " +
@@ -432,15 +431,13 @@ function Ensure-ConfigUserAccess {
 function Set-OwnerProtectedAcl {
   & icacls.exe $installRoot `
     /inheritance:r `
-    /grant:r "*${currentUserSid}:(OI)(CI)(M)" "*S-1-5-18:(OI)(CI)(F)" `
-    /quiet | Out-Null
+    /grant:r "*${currentUserSid}:(OI)(CI)(M)" "*S-1-5-18:(OI)(CI)(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Could not protect the nanoctl installation directory."
   }
   & icacls.exe $logPath `
     /inheritance:r `
-    /grant:r "*${currentUserSid}:(M)" "*S-1-5-18:(F)" `
-    /quiet | Out-Null
+    /grant:r "*${currentUserSid}:(M)" "*S-1-5-18:(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Could not protect the nanoctl agent log."
   }

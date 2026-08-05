@@ -21,7 +21,7 @@ update to the latest release without enrolling again. It also adds `nanoctl` to 
 PATH for new terminals.
 
 Windows prints the resolved release and target before downloading, for example
-`Downloading nanoctl 1.0.15 for windows-x64...`, verifies that the executable reports that exact
+`Downloading nanoctl 1.0.16 for windows-x64...`, verifies that the executable reports that exact
 version, and prints the installed command path when the upgrade completes. A failed health-gated
 upgrade restores the previous task and executable rather than claiming that the new version is
 installed.
