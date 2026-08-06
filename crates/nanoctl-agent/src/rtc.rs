@@ -75,6 +75,7 @@ pub struct HostPeer {
     publisher: SignalPublisher,
     session_id: String,
     sequence: Arc<AtomicU64>,
+    publication_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(feature = "media")]
     keyframe_requests: tokio::sync::watch::Sender<u64>,
     #[cfg(feature = "media")]
@@ -428,15 +429,22 @@ impl HostPeer {
         });
 
         let sequence = Arc::new(AtomicU64::new(1));
+        // ICE callbacks are asynchronous and can run as soon as local description is installed.
+        // Serialize them with the answer publication so a browser never observes a host
+        // candidate before the SDP that gives that candidate a remote description.
+        let publication_lock = Arc::new(tokio::sync::Mutex::new(()));
         peer.on_ice_candidate({
             let publisher = publisher.clone();
             let session_id = session_id.clone();
             let sequence = sequence.clone();
+            let publication_lock = publication_lock.clone();
             Box::new(move |candidate: Option<RTCIceCandidate>| {
                 let publisher = publisher.clone();
                 let session_id = session_id.clone();
                 let sequence = sequence.clone();
+                let publication_lock = publication_lock.clone();
                 Box::pin(async move {
+                    let _publication_guard = publication_lock.lock().await;
                     let payload = match candidate {
                         Some(candidate) => match candidate.to_json() {
                             Ok(candidate) => OutgoingPayload::IceCandidate {
@@ -457,6 +465,7 @@ impl HostPeer {
             })
         });
 
+        let _publication_guard = publication_lock.lock().await;
         peer.set_remote_description(RTCSessionDescription::offer(offer)?)
             .await?;
         let answer = peer.create_answer(None).await?;
@@ -468,11 +477,13 @@ impl HostPeer {
         // Sequence zero is reserved for the answer. Candidate callbacks begin at one.
         let envelope = serialize(&session_id, 0, OutgoingPayload::Answer { sdp: local.sdp })?;
         publisher.send(&session_id, 0, &envelope).await?;
+        drop(_publication_guard);
         Ok(Self {
             peer,
             publisher,
             session_id,
             sequence,
+            publication_lock,
             #[cfg(feature = "media")]
             keyframe_requests,
             #[cfg(feature = "media")]
@@ -540,6 +551,7 @@ impl HostPeer {
                 if sdp.is_empty() || sdp.len() > 1_000_000 {
                     anyhow::bail!("restart offer SDP is invalid");
                 }
+                let _publication_guard = self.publication_lock.lock().await;
                 self.peer
                     .set_remote_description(RTCSessionDescription::offer(sdp)?)
                     .await?;
@@ -920,6 +932,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut answer_applied = false;
+        let mut first_signal = true;
         while Instant::now() < deadline
             && (controller.connection_state() != RTCPeerConnectionState::Connected
                 || !answer_applied)
@@ -934,6 +947,10 @@ mod tests {
             assert_eq!(signal.session_id, session_id);
             let envelope: Value = serde_json::from_str(&signal.envelope).unwrap();
             assert_eq!(envelope["sequence"].as_u64(), Some(signal.sequence));
+            if first_signal {
+                assert_eq!(envelope["payload"]["type"].as_str(), Some("answer"));
+                first_signal = false;
+            }
             match envelope["payload"]["type"].as_str() {
                 Some("answer") => {
                     assert_eq!(signal.sequence, 0);

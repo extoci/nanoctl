@@ -5,7 +5,14 @@ export type HostSignalRow = {
   envelope: string;
 };
 
-type SignalPeer = Pick<RTCPeerConnection, "addIceCandidate" | "close" | "setRemoteDescription">;
+type SignalPeer = Pick<
+  RTCPeerConnection,
+  | "addIceCandidate"
+  | "close"
+  | "remoteDescription"
+  | "setRemoteDescription"
+  | "signalingState"
+>;
 
 export async function processHostSignals(
   peer: SignalPeer,
@@ -45,6 +52,11 @@ export async function processHostSignals(
         if (!isCurrent()) return;
         break;
       case "ice-candidate":
+        // Safari rejects ICE candidates until the answer has been installed. The host can publish
+        // a candidate before its answer reaches Convex because both writes are asynchronous. Keep
+        // the row unprocessed so the next reactive query retries it after the answer arrives;
+        // Chromium's more permissive queuing must not hide this ordering bug.
+        if (!peer.remoteDescription || peer.signalingState === "have-local-offer") continue;
         await peer.addIceCandidate({
           candidate: signal.payload.candidate,
           sdpMid: signal.payload.sdpMid,
@@ -54,6 +66,7 @@ export async function processHostSignals(
         if (!isCurrent()) return;
         break;
       case "ice-complete":
+        if (!peer.remoteDescription || peer.signalingState === "have-local-offer") continue;
         await peer.addIceCandidate(null);
         if (!isCurrent()) return;
         break;
