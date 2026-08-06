@@ -78,7 +78,13 @@ impl Drop for WindowsEncoder {
 }
 
 impl WindowsEncoder {
-    pub fn new(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
+    pub fn new(
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        probe_width: u32,
+        probe_height: u32,
+    ) -> Result<Self> {
         let runtime = MediaFoundationRuntime::start()?;
         let mut encoder = Self {
             _runtime: runtime,
@@ -92,7 +98,10 @@ impl WindowsEncoder {
         };
         // `doctor` calls this constructor. Configure a real encoder rather than treating an
         // enumeration result as proof that its media types and buffers work.
-        encoder.active = Some(encoder.create_active(64, 64)?);
+        // A tiny synthetic probe is rejected by several otherwise usable hardware MFTs. Probe
+        // with the actual (already capped) capture dimensions so the service does not silently
+        // fall back to OpenH264 before the first real frame.
+        encoder.active = Some(encoder.create_active(probe_width, probe_height)?);
         Ok(encoder)
     }
 
@@ -180,12 +189,15 @@ impl WindowsEncoder {
                 .context("hardware MFT has no attribute store")?
         };
         unsafe {
-            attributes
-                .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
-                .context("cannot unlock asynchronous hardware MFT")?;
-            attributes
-                .SetUINT32(&MF_LOW_LATENCY, 1)
-                .context("hardware MFT does not support required low-latency mode")?;
+            if attributes.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
+                attributes
+                    .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+                    .context("cannot unlock asynchronous hardware MFT")?;
+            }
+            // MF_LOW_LATENCY is an optional encoder capability. Requiring every vendor MFT to
+            // accept the pipeline attribute made valid hardware encoders look unavailable; the
+            // encoder still uses no frame reordering and a bounded output wait below.
+            let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
         }
         let events: IMFMediaEventGenerator = transform
             .cast()
@@ -199,6 +211,9 @@ impl WindowsEncoder {
         )?;
         // SAFETY: output-before-input is required by the Microsoft H.264 encoder contract.
         unsafe {
+            output
+                .SetUINT32(&MF_MT_COMPRESSED, 1)
+                .context("cannot mark H.264 output as compressed")?;
             output
                 .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
                 .context("cannot request H.264 baseline profile")?;

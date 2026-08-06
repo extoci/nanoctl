@@ -130,8 +130,23 @@ impl CaptureEncoder {
             .or_else(|| monitors.first())
             .cloned()
             .context("no display is available")?;
-        let encoder =
-            EncoderBackend::new(encoder_preference, max_bitrate_kbps, max_fps, latency_mode)?;
+        let (initial_width, initial_height) = fit_dimensions(
+            monitor
+                .width()
+                .context("cannot read primary display width")?,
+            monitor
+                .height()
+                .context("cannot read primary display height")?,
+            max_width,
+            max_height,
+        );
+        let encoder = EncoderBackend::new(
+            encoder_preference,
+            max_bitrate_kbps,
+            max_fps,
+            latency_mode,
+            (initial_width, initial_height),
+        )?;
         let (recorder, latest_frame) = start_capture(&monitor)?;
         Ok(Self {
             recorder,
@@ -237,6 +252,7 @@ impl EncoderBackend {
         bitrate_kbps: u32,
         max_fps: u16,
         latency_mode: LatencyMode,
+        probe_dimensions: (u32, u32),
     ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         if !matches!(preference, EncoderPreference::Software) {
@@ -264,7 +280,13 @@ impl EncoderBackend {
         }
         #[cfg(target_os = "windows")]
         if !matches!(preference, EncoderPreference::Software) {
-            match crate::windows_encoder::WindowsEncoder::new(bitrate_kbps, max_fps, latency_mode) {
+            match crate::windows_encoder::WindowsEncoder::new(
+                bitrate_kbps,
+                max_fps,
+                latency_mode,
+                probe_dimensions.0,
+                probe_dimensions.1,
+            ) {
                 Ok(encoder) => {
                     return Ok(Self::MediaFoundation {
                         encoder: Box::new(encoder),
@@ -283,6 +305,8 @@ impl EncoderBackend {
         if matches!(preference, EncoderPreference::Hardware) {
             bail!("hardware encoding was required but no verified native backend is available");
         }
+        #[cfg(not(target_os = "windows"))]
+        let _ = probe_dimensions;
         Ok(Self::Software(Box::new(SoftwareEncoder::new(
             bitrate_kbps,
             max_fps,
@@ -458,7 +482,7 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
 }
 
 pub fn probe_encoder(preference: EncoderPreference) -> Result<&'static str> {
-    let encoder = EncoderBackend::new(preference, 1_000, 30, LatencyMode::Balanced)?;
+    let encoder = EncoderBackend::new(preference, 1_000, 30, LatencyMode::Balanced, (1_280, 720))?;
     Ok(encoder.name())
 }
 
@@ -1117,6 +1141,7 @@ mod tests {
             4_000,
             60,
             LatencyMode::Balanced,
+            (1_920, 1_080),
         ) {
             assert_ne!(backend.name(), "OpenH264");
         }
@@ -1141,9 +1166,14 @@ mod tests {
     fn windows_auto_encoder_survives_the_first_real_1080p_frame() {
         let image =
             xcap::image::RgbaImage::from_pixel(1920, 1080, xcap::image::Rgba([32, 96, 160, 255]));
-        let mut encoder =
-            EncoderBackend::new(EncoderPreference::Auto, 4_000, 30, LatencyMode::Balanced)
-                .expect("Windows auto encoder");
+        let mut encoder = EncoderBackend::new(
+            EncoderPreference::Auto,
+            4_000,
+            30,
+            LatencyMode::Balanced,
+            (1_920, 1_080),
+        )
+        .expect("Windows auto encoder");
         let frame = encoder
             .encode(&image)
             .expect("Windows auto encoder must encode or fall back");

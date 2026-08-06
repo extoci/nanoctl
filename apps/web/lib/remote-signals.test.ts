@@ -112,11 +112,7 @@ describe("remote signal application", () => {
     await processHostSignals(
       peer,
       "session",
-      [
-        { sequence: 1, envelope: envelope(1, { type: "answer", sdp: "v=0" }) },
-        candidate,
-        complete,
-      ],
+      [{ sequence: 1, envelope: envelope(1, { type: "answer", sdp: "v=0" }) }, candidate, complete],
       processed,
       () => {},
     );

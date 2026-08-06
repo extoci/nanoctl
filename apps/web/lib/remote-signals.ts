@@ -7,11 +7,7 @@ export type HostSignalRow = {
 
 type SignalPeer = Pick<
   RTCPeerConnection,
-  | "addIceCandidate"
-  | "close"
-  | "remoteDescription"
-  | "setRemoteDescription"
-  | "signalingState"
+  "addIceCandidate" | "close" | "remoteDescription" | "setRemoteDescription" | "signalingState"
 >;
 
 export async function processHostSignals(
