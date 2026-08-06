@@ -120,6 +120,8 @@ impl CaptureEncoder {
     pub fn primary(
         max_bitrate_kbps: u32,
         max_fps: u16,
+        max_width: u32,
+        max_height: u32,
         latency_mode: LatencyMode,
         encoder_preference: EncoderPreference,
     ) -> Result<Self> {
@@ -730,6 +732,8 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
     let mut encoder = CaptureEncoder::primary(
         quality.max_bitrate_kbps,
         quality.max_fps,
+        quality.max_width,
+        quality.max_height,
         quality.latency_mode,
         quality.encoder,
     )?;
@@ -921,6 +925,8 @@ pub fn spawn_video(
                 let mut encoder = CaptureEncoder::primary(
                     quality.max_bitrate_kbps,
                     quality.max_fps,
+                    quality.max_width,
+                    quality.max_height,
                     quality.latency_mode,
                     quality.encoder_preference,
                 )?;
