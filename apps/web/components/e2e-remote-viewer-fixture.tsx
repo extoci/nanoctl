@@ -74,15 +74,17 @@ export function E2eRemoteViewerFixture({ terminal }: { terminal: boolean }) {
       >
         Reopen viewer
       </button>
-      <button
-        className="fixture-state"
-        type="button"
-        onClick={() =>
-          setSessionState((current) => (current === "requested" ? "negotiating" : "connected"))
-        }
-      >
-        Advance session state
-      </button>
+      {!terminal ? (
+        <button
+          className="fixture-state"
+          type="button"
+          onClick={() =>
+            setSessionState((current) => (current === "requested" ? "negotiating" : "connected"))
+          }
+        >
+          Advance session state
+        </button>
+      ) : null}
       {mounted ? (
         <RemoteViewerCore
           sessionId={sessionId}

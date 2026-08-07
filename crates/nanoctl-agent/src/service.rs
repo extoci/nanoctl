@@ -1,13 +1,8 @@
 #[cfg(feature = "rtc")]
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
-use std::{
-    fs::{File, OpenOptions},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result, bail};
-use directories::ProjectDirs;
+use anyhow::{Context, Result};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
 #[cfg(feature = "rtc")]
@@ -21,6 +16,7 @@ use crate::{
     config::AgentConfig,
     control_plane::{ControlPlane, SessionPollError},
     credential,
+    service_control::ServiceControl,
 };
 
 pub async fn run(
@@ -28,7 +24,10 @@ pub async fn run(
     ready_file: Option<PathBuf>,
     ready_token: Option<String>,
 ) -> Result<()> {
-    let service_control = ServiceControl::acquire(ServiceControlPaths::default()?)?;
+    let Some(service_control) = ServiceControl::acquire()? else {
+        info!("service startup cancelled by an in-flight stop request");
+        return Ok(());
+    };
     let device_id = config
         .device_id
         .as_deref()
@@ -136,215 +135,8 @@ pub async fn run(
     }
 }
 
-#[derive(Clone, Debug)]
-struct ServiceControlPaths {
-    lock: PathBuf,
-    request: PathBuf,
-}
-
-impl ServiceControlPaths {
-    fn default() -> Result<Self> {
-        let project = ProjectDirs::from("dev", "nanoctl", "nanoctl")
-            .context("operating system has no local data directory")?;
-        Ok(Self::in_directory(
-            project.data_local_dir().join("service-control"),
-        ))
-    }
-
-    fn in_directory(directory: PathBuf) -> Self {
-        Self {
-            lock: directory.join("agent.lock"),
-            request: directory.join("stop.request"),
-        }
-    }
-
-    fn prepare(&self) -> Result<()> {
-        let directory = self.lock.parent().context("service lock has no parent")?;
-        std::fs::create_dir_all(directory).with_context(|| {
-            format!(
-                "cannot create service control directory {}",
-                directory.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| {
-                    format!(
-                        "cannot protect service control directory {}",
-                        directory.display()
-                    )
-                })?;
-        }
-        Ok(())
-    }
-
-    fn open_lock(&self) -> Result<File> {
-        self.prepare()?;
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&self.lock)
-            .with_context(|| format!("cannot open service lock {}", self.lock.display()))
-    }
-}
-
-struct ServiceControl {
-    _lock: File,
-    request: PathBuf,
-}
-
-impl ServiceControl {
-    fn acquire(paths: ServiceControlPaths) -> Result<Self> {
-        let lock = paths.open_lock()?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                bail!("the nanoctl background agent is already running")
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).context("cannot lock the nanoctl background agent");
-            }
-        }
-        remove_if_present(&paths.request)?;
-        Ok(Self {
-            _lock: lock,
-            request: paths.request,
-        })
-    }
-
-    fn take_stop_request(&self) -> Result<bool> {
-        match std::fs::remove_file(&self.request) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error)
-                .with_context(|| format!("cannot consume stop request {}", self.request.display())),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StopOutcome {
-    Stopped,
-    AlreadyStopped,
-}
-
-pub async fn request_stop() -> Result<StopOutcome> {
-    request_stop_with_paths(ServiceControlPaths::default()?, Duration::from_secs(30)).await
-}
-
-async fn request_stop_with_paths(
-    paths: ServiceControlPaths,
-    timeout: Duration,
-) -> Result<StopOutcome> {
-    let lock = paths.open_lock()?;
-    match lock.try_lock() {
-        Ok(()) => {
-            remove_if_present(&paths.request)?;
-            return Ok(StopOutcome::AlreadyStopped);
-        }
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(error)) => {
-            return Err(error).context("cannot inspect the nanoctl background agent");
-        }
-    }
-    std::fs::write(&paths.request, b"stop\n")
-        .with_context(|| format!("cannot request service stop at {}", paths.request.display()))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match lock.try_lock() {
-            Ok(()) => {
-                remove_if_present(&paths.request)?;
-                return Ok(StopOutcome::Stopped);
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).context("cannot wait for the nanoctl background agent to stop");
-            }
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for the nanoctl background agent to stop")
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
-    }
-}
-
 struct ReadyFile {
     path: PathBuf,
-}
-
-#[cfg(test)]
-mod control_tests {
-    use super::{ServiceControl, ServiceControlPaths, StopOutcome, request_stop_with_paths};
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn stop_command_requests_shutdown_and_waits_for_service_exit() {
-        let temporary = tempfile::tempdir().expect("temporary service directory");
-        let paths = ServiceControlPaths::in_directory(temporary.path().to_owned());
-        let control = ServiceControl::acquire(paths.clone()).expect("running service lock");
-        let stop = tokio::spawn(request_stop_with_paths(
-            paths.clone(),
-            Duration::from_secs(1),
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if control.take_stop_request().expect("read stop request") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("stop request should arrive");
-        drop(control);
-
-        assert_eq!(
-            stop.await
-                .expect("stop task should finish")
-                .expect("stop request should succeed"),
-            StopOutcome::Stopped
-        );
-    }
-
-    #[tokio::test]
-    async fn stop_command_is_idempotent_when_service_is_not_running() {
-        let temporary = tempfile::tempdir().expect("temporary service directory");
-        let paths = ServiceControlPaths::in_directory(temporary.path().to_owned());
-        paths.prepare().expect("service control directory");
-        std::fs::write(&paths.request, b"stale\n").expect("stale stop request");
-
-        assert_eq!(
-            request_stop_with_paths(paths.clone(), Duration::from_secs(1))
-                .await
-                .expect("idempotent stop"),
-            StopOutcome::AlreadyStopped
-        );
-        assert!(!paths.request.exists());
-    }
-
-    #[test]
-    fn a_second_service_process_cannot_acquire_the_agent_lock() {
-        let temporary = tempfile::tempdir().expect("temporary service directory");
-        let paths = ServiceControlPaths::in_directory(temporary.path().to_owned());
-        let _control = ServiceControl::acquire(paths.clone()).expect("first service lock");
-
-        let error = ServiceControl::acquire(paths)
-            .err()
-            .expect("duplicate service must fail");
-        assert!(error.to_string().contains("already running"));
-    }
 }
 
 impl ReadyFile {
@@ -511,7 +303,24 @@ async fn reconcile_sessions(
                 media_task,
                 media_restarts,
             } = session;
-            let detail = match media_task.finish().await {
+            let media_result = media_task.finish().await;
+            if let Err(error) = &media_result
+                && crate::media::is_video_delivery_unavailable(error)
+            {
+                warn!(
+                    session_id,
+                    "video transport did not recover; failing peer without restarting native media"
+                );
+                if let Err(error) = peer.fail("video transport did not recover").await {
+                    warn!(
+                        session_id,
+                        error = %redact(&error),
+                        "could not publish terminal video transport status"
+                    );
+                }
+                continue;
+            }
+            let detail = match media_result {
                 Ok(()) => "media pipeline ended unexpectedly".to_owned(),
                 Err(error) => redact(&error),
             };

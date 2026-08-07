@@ -21,7 +21,7 @@ update to the latest release without enrolling again. It also adds `nanoctl` to 
 PATH for new terminals.
 
 Windows prints the resolved release and target before downloading, for example
-`Downloading nanoctl 1.0.18 for windows-x64...`, verifies that the executable reports that exact
+`Downloading nanoctl 1.0.19 for windows-x64...`, verifies that the executable reports that exact
 version, and prints the installed command path when the upgrade completes. A failed health-gated
 upgrade restores the previous task and executable rather than claiming that the new version is
 installed.
@@ -45,8 +45,10 @@ retains the previous executable until the new task survives startup. If an upgra
 same installer; the transaction restores the previous binary and task automatically.
 
 Configurations created by an older elevated setup may be owned by `BUILTIN\Administrators`. The
-installer accepts that legacy owner only when run by an administrator and grants the enrolled user
-explicit access; it still rejects a task or configuration belonging to another Windows user.
+installer detects that legacy ACL before changing the installation. If the same Windows account is
+an administrator but is running with a filtered token, it automatically requests UAC approval once,
+reruns the exact resolved release, and grants the enrolled user explicit access. It still rejects a
+task or configuration belonging to another Windows user.
 
 macOS may ask for Screen Recording and Accessibility. Wayland may ask through its desktop portal.
 Complete those prompts as the user who ran the installer.
@@ -62,6 +64,17 @@ nanoctl media-smoke --require-hardware --seconds 30
 
 Then confirm the dashboard reports the device online and test a connection from another network.
 Use `--json` when collecting a machine-readable acceptance record.
+
+To stop the installed background agent without opening Task Scheduler, launchd, or systemd tools,
+run:
+
+```sh
+nanoctl stop
+```
+
+The command asks the running per-user agent to close active sessions, waits for native capture and
+encoder resources to be released, and succeeds if the agent is already stopped. The normal
+login-triggered registration remains installed, so it starts again at the next login or reinstall.
 
 ## Advanced and development setup
 

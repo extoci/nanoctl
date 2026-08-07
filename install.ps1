@@ -341,7 +341,7 @@ function Assert-ConfigOwner {
   if ($ownerSid -eq $currentUserSid) {
     return
   }
-  if ($ownerSid -eq "S-1-5-32-544" -and (Test-CurrentUserAdministrator)) {
+  if ($ownerSid -eq "S-1-5-32-544" -and (Test-CurrentProcessElevated)) {
     return
   }
   if ($ownerSid -eq "S-1-5-32-544") {
@@ -394,18 +394,116 @@ function Resolve-AccountSid {
   ).Value
 }
 
-function Test-CurrentUserAdministrator {
+function Test-CurrentProcessElevated {
   try {
     $principal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
-    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-      return $true
-    }
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch {
+    return $false
+  }
+}
+
+function Test-CurrentAccountAdministrator {
+  if (Test-CurrentProcessElevated) {
+    return $true
+  }
+  try {
     $administratorSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
     return @($currentIdentity.Groups | Where-Object {
         $_.Value -eq $administratorSid.Value
       }).Count -gt 0
   } catch {
     return $false
+  }
+}
+
+function Set-CurrentProcessNanoctlPath {
+  $processPathEntries = @($env:Path -split ";" | Where-Object {
+      $_ -and -not [String]::Equals($_, $installRoot, [StringComparison]::OrdinalIgnoreCase)
+    })
+  $env:Path = (@($installRoot) + $processPathEntries) -join ";"
+}
+
+function Invoke-ElevatedInstaller {
+  if ($env:NANOCTL_ELEVATION_ATTEMPTED -eq "1") {
+    throw "The installer was elevated, but Windows still did not grant an administrator token."
+  }
+
+  $scriptUri = "$baseUrl/install.ps1"
+  $escapedRepository = $Repository.Replace("'", "''")
+  $escapedVersion = $resolvedVersion.Replace("'", "''")
+  $escapedControlPlane = $ControlPlane.Replace("'", "''")
+  $escapedScriptUri = $scriptUri.Replace("'", "''")
+  $elevatedCommand = @"
+`$ErrorActionPreference = 'Stop'
+`$env:NANOCTL_REPOSITORY = '$escapedRepository'
+`$env:NANOCTL_VERSION = '$escapedVersion'
+`$env:NANOCTL_CONTROL_PLANE = '$escapedControlPlane'
+`$env:NANOCTL_ELEVATION_ATTEMPTED = '1'
+Invoke-Expression (Invoke-RestMethod -UseBasicParsing -Uri '$escapedScriptUri')
+"@
+  $encodedCommand = [Convert]::ToBase64String(
+    [Text.Encoding]::Unicode.GetBytes($elevatedCommand)
+  )
+  $powerShell = if ($PSVersionTable.PSEdition -eq "Desktop") {
+    Join-Path $PSHOME "powershell.exe"
+  } else {
+    (Get-Process -Id $PID).Path
+  }
+
+  Write-Host "Repairing the legacy administrator-owned enrollment (Windows will ask once)."
+  try {
+    $process = Start-Process `
+      -FilePath $powerShell `
+      -Verb RunAs `
+      -ArgumentList @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-EncodedCommand", $encodedCommand
+      ) `
+      -Wait `
+      -PassThru
+  } catch {
+    throw "Administrator approval was cancelled or Windows could not start the repair: $($_.Exception.Message)"
+  }
+  if ($process.ExitCode -ne 0) {
+    throw "The elevated nanoctl repair failed with exit code $($process.ExitCode)."
+  }
+}
+
+function Get-PreflightConfigPath {
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  $taskConfigPath = if ($task) { Get-TaskConfigPath -Task $task } else { $null }
+  $taskBinaryPath = if ($task) { Get-TaskBinaryPath -Task $task } else { $null }
+  if (-not $taskConfigPath) {
+    $taskConfigPath = Get-BinaryConfigPath -Path $taskBinaryPath
+  }
+  if (-not $taskConfigPath) {
+    $taskConfigPath = Get-BinaryConfigPath -Path $binaryPath
+  }
+  if ($taskConfigPath) {
+    return $taskConfigPath
+  }
+  return Join-Path $env:APPDATA "nanoctl\nanoctl\config\config.toml"
+}
+
+function Test-ConfigNeedsAdministratorRepair {
+  param([string]$Path)
+
+  if (-not $Path) {
+    return $false
+  }
+  try {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+      return $false
+    }
+    $owner = (Get-Acl -LiteralPath $Path).Owner
+    return (Resolve-AccountSid -Account $owner) -eq "S-1-5-32-544"
+  } catch {
+    # An administrator account's filtered token can be unable to read the legacy ACL. Elevation is
+    # still safe here: the elevated transaction repeats all cross-user ownership checks before it
+    # changes the task, configuration, or install directory.
+    return Test-CurrentAccountAdministrator
   }
 }
 
@@ -461,6 +559,21 @@ function Start-RestoredTask {
   if (-not $restored -or $restored.State -ne "Running") {
     throw "The previous nanoctl task could not be restarted."
   }
+}
+
+$preflightConfigPath = Get-PreflightConfigPath
+if (-not (Test-CurrentProcessElevated) -and
+    (Test-CurrentAccountAdministrator) -and
+    (Test-ConfigNeedsAdministratorRepair -Path $preflightConfigPath)) {
+  Invoke-ElevatedInstaller
+  $repairedVersion = (& $binaryPath --version 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or
+      $repairedVersion -notmatch "(?m)^nanoctl\s+$([regex]::Escape($displayVersion))\s*$") {
+    throw "The elevated nanoctl repair completed, but the installed binary did not report version $displayVersion."
+  }
+  Set-CurrentProcessNanoctlPath
+  Write-Host "The legacy enrollment was repaired and nanoctl was updated."
+  return
 }
 
 try {
@@ -594,10 +707,7 @@ try {
     # Persistent environment changes are inherited only by new Windows processes. Always update the
     # PowerShell process running the installer too, and move the install root ahead of any stale
     # 1.0.9 entry that may already be present in this process's PATH.
-    $processPathEntries = @($env:Path -split ";" | Where-Object {
-        $_ -and -not [String]::Equals($_, $installRoot, [StringComparison]::OrdinalIgnoreCase)
-      })
-    $env:Path = (@($installRoot) + $processPathEntries) -join ";"
+    Set-CurrentProcessNanoctlPath
   } catch {
     Write-Warning "nanoctl is running, but the installer could not update PATH: $($_.Exception.Message)"
   }

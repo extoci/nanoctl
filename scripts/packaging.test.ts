@@ -197,6 +197,22 @@ describe("one-command Windows installer", () => {
     }
   });
 
+  test("self-elevates the same administrator account for a legacy config repair", async () => {
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    expect(installer).toContain("function Test-CurrentProcessElevated");
+    expect(installer).toContain("function Test-CurrentAccountAdministrator");
+    expect(installer).toContain("function Invoke-ElevatedInstaller");
+    expect(installer).toContain("-Verb RunAs");
+    expect(installer).toContain("NANOCTL_ELEVATION_ATTEMPTED");
+    expect(installer).toContain('$scriptUri = "$baseUrl/install.ps1"');
+    expect(installer).toContain("Repairing the legacy administrator-owned enrollment");
+    expect(installer).toContain("function Set-CurrentProcessNanoctlPath");
+    expect(installer).toContain("The elevated nanoctl repair completed");
+    expect(installer).toMatch(
+      /Invoke-ElevatedInstaller\s+\$repairedVersion[\s\S]+Set-CurrentProcessNanoctlPath/,
+    );
+  });
+
   test("does not pass unsupported quiet switches to icacls", async () => {
     const scripts = await Promise.all(
       [

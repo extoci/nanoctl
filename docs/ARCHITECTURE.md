@@ -90,10 +90,12 @@ before reaching the RTP packetizer. On Linux, a VA-API backend uses low-delay pr
 keyframes, dynamic CBR tuning, and constrained-baseline Annex-B output from `cros-codecs`; RGBA is
 converted to NV12 and uploaded using the driver's declared plane layout. On Windows, hardware-only
 Media Foundation enumeration excludes the inbox software encoder, uses the asynchronous MFT event
-contract with bounded watchdogs, and rebuilds a low-latency baseline session for bitrate or
-keyframe changes. Direct capture-to-encoder GPU surfaces, capture timestamps, and adaptive
-resolution/frame rate remain native performance-path release gates, not properties claimed for the
-portable backend.
+contract with bounded watchdogs, requests recovery frames in place through `ICodecAPI`, and rebuilds
+a low-latency baseline session only for bitrate or dimension changes (or as a compatibility fallback
+when a vendor MFT cannot force a keyframe). The old transform is explicitly flushed and released
+before its replacement is created. Direct capture-to-encoder GPU surfaces, capture timestamps, and
+adaptive resolution/frame rate remain native performance-path release gates, not properties claimed
+for the portable backend.
 
 `quality.encoder` is a fail-closed policy rather than a hint. `auto` prefers a verified native
 backend and may fall back to OpenH264, `software` forces the portable backend, and `hardware` fails

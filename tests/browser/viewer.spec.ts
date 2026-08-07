@@ -163,7 +163,7 @@ test("viewer cleanup releases input, closes channels, and closes the peer", asyn
   expect(evidence).toEqual({ released: true, channelsClosed: true, peerClosed: true });
 });
 
-test("viewer reopens a retained component with a fresh offer sequence", async ({ page }) => {
+test("viewer survives 20 retained reopen cycles with fresh offer sequences", async ({ page }) => {
   await page.goto("/e2e/viewer");
   await expect
     .poll(() =>
@@ -178,36 +178,50 @@ test("viewer reopens a retained component with a fresh offer sequence", async ({
     )
     .toBe(1);
 
-  await page.getByRole("button", { name: "Reopen viewer" }).click();
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as typeof window & {
-              __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
-            }
-          ).__nanoctlViewerEvents?.filter((event) => event.operation === "signal").length,
-      ),
-    )
-    .toBe(2);
+  for (let cycle = 1; cycle <= 20; cycle += 1) {
+    await page.getByRole("button", { name: "Reopen viewer" }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window as typeof window & {
+                __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
+              }
+            ).__nanoctlViewerEvents?.filter((event) => event.operation === "signal").length,
+        ),
+      )
+      .toBe(cycle + 1);
+  }
 
-  const offers = await page.evaluate(() => {
+  const evidence = await page.evaluate(() => {
+    const fixture = window as typeof window & {
+      __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
+      __nanoctlPeers?: { closed: boolean }[];
+    };
     const events =
-      (
-        window as typeof window & {
-          __nanoctlViewerEvents?: { operation: string; envelope?: string }[];
-        }
-      ).__nanoctlViewerEvents ?? [];
-    return events
-      .filter((event) => event.operation === "signal" && event.envelope)
-      .map((event) => JSON.parse(event.envelope as string))
-      .map((signal) => ({ sessionId: signal.sessionId, sequence: signal.sequence }));
+      fixture.__nanoctlViewerEvents?.filter(
+        (event) => event.operation === "signal" && event.envelope,
+      ) ?? [];
+    return {
+      offers: events
+        .map((event) => JSON.parse(event.envelope as string))
+        .map((signal) => ({ sessionId: signal.sessionId, sequence: signal.sequence })),
+      peerCount: fixture.__nanoctlPeers?.length,
+      closedPeers: fixture.__nanoctlPeers?.slice(0, -1).filter((peer) => peer.closed).length,
+      currentPeerClosed: fixture.__nanoctlPeers?.at(-1)?.closed,
+    };
   });
-  expect(offers).toEqual([
-    { sessionId: "viewer-fixture-a", sequence: 0 },
-    { sessionId: "viewer-fixture-b", sequence: 0 },
-  ]);
+  expect(evidence.peerCount).toBe(21);
+  expect(evidence.closedPeers).toBe(20);
+  expect(evidence.currentPeerClosed).toBe(false);
+  expect(evidence.offers).toHaveLength(21);
+  expect(evidence.offers.every((offer) => offer.sequence === 0)).toBe(true);
+  expect(evidence.offers.map((offer) => offer.sessionId)).toEqual(
+    Array.from({ length: 21 }, (_, index) =>
+      index % 2 === 0 ? "viewer-fixture-a" : "viewer-fixture-b",
+    ),
+  );
 });
 
 test("active session and focus transitions preserve one live peer", async ({ page }) => {

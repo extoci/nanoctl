@@ -13,6 +13,7 @@ mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;
 mod service;
+mod service_control;
 mod update;
 #[cfg(all(feature = "media", target_os = "windows"))]
 mod windows_encoder;
@@ -181,9 +182,11 @@ async fn run(cli: Cli) -> Result<()> {
             config.validate_enrolled()?;
             service::run(config, cli.ready_file, cli.ready_token).await?;
         }
-        Command::Stop => match service::request_stop().await? {
-            service::StopOutcome::Stopped => println!("nanoctl background agent stopped."),
-            service::StopOutcome::AlreadyStopped => {
+        Command::Stop => match service_control::request_stop().await? {
+            service_control::StopOutcome::Stopped => {
+                println!("nanoctl background agent stopped.")
+            }
+            service_control::StopOutcome::AlreadyStopped => {
                 println!("nanoctl background agent is already stopped.")
             }
         },

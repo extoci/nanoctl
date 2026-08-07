@@ -49,6 +49,7 @@ impl Drop for MediaFoundationRuntime {
 }
 
 struct ActiveEncoder {
+    activation: IMFActivate,
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     width: u32,
@@ -56,6 +57,7 @@ struct ActiveEncoder {
     output_buffer_size: u32,
     provides_output_samples: bool,
     needs_input: bool,
+    shut_down: bool,
 }
 
 impl ActiveEncoder {
@@ -75,13 +77,14 @@ impl ActiveEncoder {
         }
         Ok(())
     }
-}
 
-impl Drop for ActiveEncoder {
-    fn drop(&mut self) {
-        // End the old stream before releasing its transform and event-generator references. Some
-        // GPU drivers retain the hardware session briefly when they are only COM-released, which
-        // makes an immediate close→reopen or reconfiguration fail with a resource-busy HRESULT.
+    fn shutdown(&mut self) -> Result<()> {
+        if self.shut_down {
+            return Ok(());
+        }
+        // Buffered output is intentionally discarded when a desktop session ends or the encoder
+        // is reconfigured. Notify and flush before deactivating the object so vendor MFTs release
+        // their hardware session synchronously.
         unsafe {
             let _ = self
                 .transform
@@ -90,6 +93,69 @@ impl Drop for ActiveEncoder {
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            self.activation
+                .ShutdownObject()
+                .context("cannot shut down hardware MFT activation")?;
+        }
+        self.shut_down = true;
+        Ok(())
+    }
+}
+
+impl Drop for ActiveEncoder {
+    fn drop(&mut self) {
+        // Best-effort fallback for early returns. Normal replacement calls `shutdown` explicitly
+        // and refuses to activate a second hardware session if the old one cannot be released.
+        let _ = self.shutdown();
+    }
+}
+
+struct ActivatedTransformGuard {
+    activation: Option<IMFActivate>,
+    transform: Option<IMFTransform>,
+}
+
+impl ActivatedTransformGuard {
+    fn new(activation: IMFActivate, transform: IMFTransform) -> Self {
+        Self {
+            activation: Some(activation),
+            transform: Some(transform),
+        }
+    }
+
+    fn transform(&self) -> &IMFTransform {
+        self.transform
+            .as_ref()
+            .expect("activated transform guard always owns a transform")
+    }
+
+    fn into_parts(mut self) -> (IMFActivate, IMFTransform) {
+        let activation = self
+            .activation
+            .take()
+            .expect("activated transform guard always owns an activation");
+        let transform = self
+            .transform
+            .take()
+            .expect("activated transform guard always owns a transform");
+        (activation, transform)
+    }
+}
+
+impl Drop for ActivatedTransformGuard {
+    fn drop(&mut self) {
+        // Armed immediately after ActivateObject: every later setup failure deactivates the MFT.
+        if let Some(transform) = &self.transform {
+            unsafe {
+                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            }
+        }
+        if let Some(activation) = &self.activation {
+            unsafe {
+                let _ = activation.ShutdownObject();
+            }
         }
     }
 }
@@ -111,7 +177,9 @@ impl Drop for WindowsEncoder {
         // Release the transform and its event generator before MediaFoundationRuntime calls
         // MFShutdown. The capture worker is reused across sessions, so relying on field-drop
         // ordering here makes a close→reopen race unnecessarily easy to trigger.
-        self.active.take();
+        if let Some(mut active) = self.active.take() {
+            let _ = active.shutdown();
+        }
     }
 }
 
@@ -230,7 +298,11 @@ impl WindowsEncoder {
     fn recreate_active(&mut self, width: u32, height: u32) -> Result<()> {
         // `Option::take` is deliberately a separate statement: evaluating `Some(create_active())`
         // first leaves two hardware MFT sessions alive at once and fails on single-session GPUs.
-        self.active.take();
+        if let Some(mut active) = self.active.take() {
+            active
+                .shutdown()
+                .context("cannot release previous hardware MFT before replacement")?;
+        }
         self.active = Some(self.create_active(width, height)?);
         Ok(())
     }
@@ -239,7 +311,8 @@ impl WindowsEncoder {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("Media Foundation H.264 dimensions must be non-zero and even");
         }
-        let transform = enumerate_hardware_encoder()?;
+        let activated = enumerate_hardware_encoder()?;
+        let transform = activated.transform();
         let attributes = unsafe {
             transform
                 .GetAttributes()
@@ -306,7 +379,9 @@ impl WindowsEncoder {
         let output_buffer_size = output_info.cbSize.max(pixel_bound).max(64 * 1024);
         let provides_output_samples =
             output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+        let (activation, transform) = activated.into_parts();
         let mut active = ActiveEncoder {
+            activation,
             transform,
             events,
             width,
@@ -314,6 +389,7 @@ impl WindowsEncoder {
             output_buffer_size,
             provides_output_samples,
             needs_input: false,
+            shut_down: false,
         };
         wait_until_input_needed(&mut active)?;
         Ok(active)
@@ -334,7 +410,7 @@ fn ui4_variant(value: u32) -> VARIANT {
     }
 }
 
-fn enumerate_hardware_encoder() -> Result<IMFTransform> {
+fn enumerate_hardware_encoder() -> Result<ActivatedTransformGuard> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -378,7 +454,7 @@ fn enumerate_hardware_encoder() -> Result<IMFTransform> {
     for activation in owned {
         let activated = unsafe { activation.ActivateObject::<IMFTransform>() };
         match activated {
-            Ok(transform) => return Ok(transform),
+            Ok(transform) => return Ok(ActivatedTransformGuard::new(activation, transform)),
             Err(error) => last_error = Some(error),
         }
     }

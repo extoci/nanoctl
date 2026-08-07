@@ -13,6 +13,7 @@ use openh264::encoder::{
 use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
 use xcap::Monitor;
 
+use std::future::Future;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU16, Ordering},
@@ -23,6 +24,46 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
+
+const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
+const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct VideoDeliveryUnavailable;
+
+impl std::fmt::Display for VideoDeliveryUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("video sample delivery remained unavailable")
+    }
+}
+
+impl std::error::Error for VideoDeliveryUnavailable {}
+
+pub(crate) fn is_video_delivery_unavailable(error: &anyhow::Error) -> bool {
+    error.is::<VideoDeliveryUnavailable>()
+}
+
+fn delivery_failure_grace_elapsed(
+    failed: bool,
+    failed_since: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !failed {
+        *failed_since = None;
+        return false;
+    }
+    let started = failed_since.get_or_insert(now);
+    now.duration_since(*started) >= VIDEO_DELIVERY_FAILURE_GRACE
+}
+
+async fn await_video_delivery<F>(delivery: F, timeout: Duration) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::time::timeout(timeout, delivery)
+        .await
+        .context("video sample delivery timed out")?
+}
 
 #[derive(Default)]
 struct LatestFrame {
@@ -918,6 +959,8 @@ pub fn spawn_video(
     let worker_stopped = stopped.clone();
     let task = tokio::spawn(async move {
         let encoded_slot = Arc::new(EncodedFrameSlot::new());
+        let (delivery_recovery, mut delivery_recovery_requests) =
+            tokio::sync::watch::channel(0_u64);
         let producer_slot = encoded_slot.clone();
         let producer_stopped = worker_stopped.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -951,6 +994,10 @@ pub fn spawn_video(
                     next_frame = Instant::now() + frame_interval;
                     if keyframe_requests.has_changed().unwrap_or(false) {
                         keyframe_requests.borrow_and_update();
+                        encoder.encoder.force_keyframe();
+                    }
+                    if delivery_recovery_requests.has_changed().unwrap_or(false) {
+                        delivery_recovery_requests.borrow_and_update();
                         encoder.encoder.force_keyframe();
                     }
                     if bitrate_estimate_kbps.has_changed().unwrap_or(false) {
@@ -991,7 +1038,9 @@ pub fn spawn_video(
         });
         let mut stop_rx = stop_rx;
         let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
-        let mut delivery_interrupted = false;
+        let mut delivery_interrupted_since: Option<Instant> = None;
+        let mut delivery_error_count = 0_u64;
+        let mut write_result = Ok(());
         loop {
             tokio::select! {
                 changed = stop_rx.changed() => {
@@ -1003,30 +1052,66 @@ pub fn spawn_video(
                     let Some((frame, dropped)) = frame else { break };
                     // Tell the RTP packetizer about frames discarded by the newest-frame slot so
                     // timestamps keep pace with the capture clock instead of falling behind.
-                    let result = track.write_sample(&Sample {
+                    let sample = Sample {
                         data: frame.bytes.into(),
                         duration,
                         prev_dropped_packets: dropped,
                         ..Default::default()
-                    }).await;
+                    };
+                    // A broken transport must not hold capture/encoder teardown hostage forever.
+                    // Cancelling the packetizer future is safe; the next successful delivery is
+                    // followed by a forced recovery keyframe.
+                    let result = await_video_delivery(
+                        async {
+                            track
+                                .write_sample(&sample)
+                                .await
+                                .map_err(anyhow::Error::from)
+                        },
+                        VIDEO_SAMPLE_WRITE_TIMEOUT,
+                    )
+                    .await;
                     match result {
-                        Ok(()) if delivery_interrupted => {
-                            delivery_interrupted = false;
-                            tracing::info!("video sample delivery recovered");
+                        Ok(()) if delivery_interrupted_since.is_some() => {
+                            let outage = delivery_interrupted_since
+                                .map_or(Duration::ZERO, |started| started.elapsed());
+                            delivery_failure_grace_elapsed(
+                                false,
+                                &mut delivery_interrupted_since,
+                                Instant::now(),
+                            );
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                            tracing::info!(
+                                outage_milliseconds = outage.as_millis(),
+                                delivery_errors = delivery_error_count,
+                                "video sample delivery recovered; keyframe requested"
+                            );
+                            delivery_error_count = 0;
                         }
                         Ok(()) => {}
-                        Err(error) if !delivery_interrupted => {
-                            delivery_interrupted = true;
-                            // RTP/SRTP writes can fail while ICE reconnects or a browser peer is
-                            // closing. Capture and encoding remain healthy, so restarting native
-                            // resources here only creates encoder contention and guarantees the
-                            // same closed peer rejects the replacement pipeline too.
-                            tracing::warn!(
-                                error = %error,
-                                "video sample delivery interrupted; retaining media pipeline"
-                            );
+                        Err(error) => {
+                            delivery_error_count = delivery_error_count.saturating_add(1);
+                            if delivery_interrupted_since.is_none() {
+                                // RTP/SRTP writes can fail while ICE reconnects or a browser peer is
+                                // closing. Capture and encoding remain healthy, so restarting native
+                                // resources here only creates encoder contention and guarantees the
+                                // same closed peer rejects the replacement pipeline too.
+                                tracing::warn!(
+                                    error = %error,
+                                    "video sample delivery interrupted; retaining media pipeline"
+                                );
+                            }
+                            if delivery_failure_grace_elapsed(
+                                true,
+                                &mut delivery_interrupted_since,
+                                Instant::now(),
+                            ) {
+                                write_result = Err(anyhow!(VideoDeliveryUnavailable));
+                                break;
+                            }
                         }
-                        Err(_) => {}
                     }
                 }
             }
@@ -1036,6 +1121,7 @@ pub fn spawn_video(
             .await
             .context("video capture worker stopped unexpectedly")?;
         producer_result?;
+        write_result?;
         Ok(())
     });
     VideoPipeline {
@@ -1058,10 +1144,11 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 mod tests {
     use super::{
         EncodedFrame, EncodedFrameSlot, EncoderBackend, LatestFrame, SoftwareEncoder,
-        annex_b_nal_types, avcc_to_annex_b, bitrate_target, fit_dimensions,
+        VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b, await_video_delivery,
+        bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn stopping_a_video_pipeline_waits_for_the_blocking_capture_worker() {
@@ -1071,6 +1158,63 @@ mod tests {
         pipeline.stop().await;
 
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn transient_delivery_failure_does_not_restart_native_media() {
+        let started = Instant::now();
+        let mut failed_since = None;
+
+        assert!(!delivery_failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            started,
+        ));
+        assert!(!delivery_failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            started + VIDEO_DELIVERY_FAILURE_GRACE - Duration::from_millis(1),
+        ));
+        assert!(!delivery_failure_grace_elapsed(
+            false,
+            &mut failed_since,
+            started + VIDEO_DELIVERY_FAILURE_GRACE,
+        ));
+        assert!(failed_since.is_none());
+        assert!(!delivery_failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            started + VIDEO_DELIVERY_FAILURE_GRACE,
+        ));
+    }
+
+    #[test]
+    fn permanent_delivery_failure_is_terminal_after_grace() {
+        let started = Instant::now();
+        let mut failed_since = None;
+
+        assert!(!delivery_failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            started,
+        ));
+        assert!(delivery_failure_grace_elapsed(
+            true,
+            &mut failed_since,
+            started + VIDEO_DELIVERY_FAILURE_GRACE,
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_delivery_is_bounded() {
+        let error = await_video_delivery(
+            std::future::pending::<anyhow::Result<()>>(),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a stalled sample write must time out");
+
+        assert!(error.to_string().contains("delivery timed out"));
     }
 
     #[tokio::test]
