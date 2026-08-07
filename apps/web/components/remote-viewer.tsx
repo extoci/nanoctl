@@ -103,6 +103,7 @@ export function RemoteViewerCore({
   const [selectedDisplay, setSelectedDisplay] = useState("");
   const [metrics, setMetrics] = useState<ViewerMetrics | null>(null);
   const iceServersSessionRef = useRef<string | null>(null);
+  const sessionActive = Boolean(session && !isTerminalSession(session));
 
   // A viewer can be retained while the route changes between sessions. Reset every piece of
   // signaling state before the new TURN/peer effects run; sequence zero is reserved for the
@@ -172,7 +173,7 @@ export function RemoteViewerCore({
   }
 
   useEffect(() => {
-    if (isTerminalSession(session)) return;
+    if (!sessionActive) return;
     let cancelled = false;
     void getTurnCredentials({ sessionId })
       .then((turn) => {
@@ -194,11 +195,10 @@ export function RemoteViewerCore({
     return () => {
       cancelled = true;
     };
-  }, [getTurnCredentials, session, sessionId]);
+  }, [getTurnCredentials, sessionActive, sessionId]);
 
   useEffect(() => {
-    if (isTerminalSession(session) || !iceServers || iceServersSessionRef.current !== sessionId)
-      return;
+    if (!sessionActive || !iceServers || iceServersSessionRef.current !== sessionId) return;
     const generation = sessionGenerationRef.current;
     let disposed = false;
     const isCurrent = () =>
@@ -582,7 +582,7 @@ export function RemoteViewerCore({
       if (peerSessionRef.current === sessionId) peerSessionRef.current = null;
       window.removeEventListener("pagehide", endOnPageHide);
     };
-  }, [endSession, iceServers, sendSignal, session, sessionId]);
+  }, [endSession, iceServers, sendSignal, sessionActive, sessionId]);
 
   useEffect(() => {
     const peer = peerRef.current;

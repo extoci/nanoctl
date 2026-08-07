@@ -16,6 +16,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
+use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 use windows::core::Interface;
 
 struct MediaFoundationRuntime;
@@ -57,13 +58,50 @@ struct ActiveEncoder {
     needs_input: bool,
 }
 
+impl ActiveEncoder {
+    fn request_keyframe(&self) -> Result<()> {
+        let codec: ICodecAPI = self
+            .transform
+            .cast()
+            .context("hardware MFT does not expose ICodecAPI")?;
+        let value = ui4_variant(1);
+        unsafe {
+            codec
+                .IsSupported(&CODECAPI_AVEncVideoForceKeyFrame)
+                .context("hardware MFT does not support forced keyframes")?;
+            codec
+                .SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value)
+                .context("hardware MFT rejected a forced keyframe")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ActiveEncoder {
+    fn drop(&mut self) {
+        // End the old stream before releasing its transform and event-generator references. Some
+        // GPU drivers retain the hardware session briefly when they are only COM-released, which
+        // makes an immediate close→reopen or reconfiguration fail with a resource-busy HRESULT.
+        unsafe {
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
+    }
+}
+
 pub struct WindowsEncoder {
     _runtime: MediaFoundationRuntime,
     active: Option<ActiveEncoder>,
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
-    rebuild: bool,
+    reconfigure: bool,
+    force_keyframe: bool,
     timestamp: i64,
     nv12: Vec<u8>,
 }
@@ -92,7 +130,8 @@ impl WindowsEncoder {
             bitrate_kbps,
             max_fps,
             latency_mode,
-            rebuild: false,
+            reconfigure: false,
+            force_keyframe: false,
             timestamp: 0,
             nv12: Vec::new(),
         };
@@ -101,7 +140,7 @@ impl WindowsEncoder {
         // A tiny synthetic probe is rejected by several otherwise usable hardware MFTs. Probe
         // with the actual (already capped) capture dimensions so the service does not silently
         // fall back to OpenH264 before the first real frame.
-        encoder.active = Some(encoder.create_active(probe_width, probe_height)?);
+        encoder.recreate_active(probe_width, probe_height)?;
         Ok(encoder)
     }
 
@@ -118,9 +157,7 @@ impl WindowsEncoder {
     }
 
     pub fn force_keyframe(&mut self) {
-        // Rebuilding a low-latency transform starts a new GOP and avoids relying on optional
-        // vendor-specific ICodecAPI force-keyframe support.
-        self.rebuild = true;
+        self.force_keyframe = true;
     }
 
     pub fn apply_bitrate_estimate(
@@ -135,7 +172,7 @@ impl WindowsEncoder {
             return Ok(false);
         };
         self.bitrate_kbps = target_kbps;
-        self.rebuild = true;
+        self.reconfigure = true;
         Ok(true)
     }
 
@@ -146,9 +183,21 @@ impl WindowsEncoder {
             .active
             .as_ref()
             .is_none_or(|active| active.width != width || active.height != height);
-        if self.rebuild || dimensions_changed {
-            self.active = Some(self.create_active(width, height)?);
-            self.rebuild = false;
+        if self.reconfigure || dimensions_changed {
+            self.recreate_active(width, height)?;
+            self.reconfigure = false;
+            self.force_keyframe = false;
+        } else if self.force_keyframe {
+            let forced_in_place = self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.request_keyframe().is_ok());
+            if !forced_in_place {
+                // Hardware keyframe control is optional. Recreate only as a compatibility fallback,
+                // and release the old MFT before activating its replacement.
+                self.recreate_active(width, height)?;
+            }
+            self.force_keyframe = false;
         }
         rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
         let duration = 10_000_000_i64 / i64::from(self.max_fps);
@@ -176,6 +225,14 @@ impl WindowsEncoder {
             width,
             height,
         })
+    }
+
+    fn recreate_active(&mut self, width: u32, height: u32) -> Result<()> {
+        // `Option::take` is deliberately a separate statement: evaluating `Some(create_active())`
+        // first leaves two hardware MFT sessions alive at once and fails on single-session GPUs.
+        self.active.take();
+        self.active = Some(self.create_active(width, height)?);
+        Ok(())
     }
 
     fn create_active(&self, width: u32, height: u32) -> Result<ActiveEncoder> {
@@ -260,6 +317,20 @@ impl WindowsEncoder {
         };
         wait_until_input_needed(&mut active)?;
         Ok(active)
+    }
+}
+
+fn ui4_variant(value: u32) -> VARIANT {
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { ulVal: value },
+            }),
+        },
     }
 }
 

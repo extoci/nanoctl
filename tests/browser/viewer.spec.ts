@@ -210,6 +210,51 @@ test("viewer reopens a retained component with a fresh offer sequence", async ({
   ]);
 });
 
+test("active session and focus transitions preserve one live peer", async ({ page }) => {
+  await page.goto("/e2e/viewer");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __nanoctlPeers?: { closed: boolean }[];
+            }
+          ).__nanoctlPeers?.length,
+      ),
+    )
+    .toBe(1);
+
+  await page.getByRole("button", { name: "Advance session state" }).click();
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+  });
+
+  const evidence = await page.evaluate(() => {
+    const fixture = window as typeof window & {
+      __nanoctlPeers?: { closed: boolean }[];
+      __nanoctlViewerEvents?: { operation: string }[];
+      __nanoctlChannels?: { label: string; payloads: string[] }[];
+    };
+    return {
+      peerCount: fixture.__nanoctlPeers?.length,
+      peerClosed: fixture.__nanoctlPeers?.[0]?.closed,
+      offerCount: fixture.__nanoctlViewerEvents?.filter((event) => event.operation === "signal")
+        .length,
+      releasedInput: fixture.__nanoctlChannels
+        ?.find((channel) => channel.label === "nanoctl.control.v1")
+        ?.payloads.includes('{"type":"release"}'),
+    };
+  });
+  expect(evidence).toEqual({
+    peerCount: 1,
+    peerClosed: false,
+    offerCount: 1,
+    releasedInput: true,
+  });
+});
+
 test("viewer exhausts bounded reconnect attempts and ends the session", async ({ page }) => {
   await page.goto("/e2e/viewer");
   await expect

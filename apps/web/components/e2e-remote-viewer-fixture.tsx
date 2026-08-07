@@ -31,14 +31,17 @@ function appendFixtureEvent(value: unknown): void {
 export function E2eRemoteViewerFixture({ terminal }: { terminal: boolean }) {
   const [mounted, setMounted] = useState(true);
   const [sessionId, setSessionId] = useState("viewer-fixture-a");
+  const [sessionState, setSessionState] = useState<ViewerSession["state"]>(
+    terminal ? "ended" : "requested",
+  );
   const session = useMemo<ViewerSession>(
     () => ({
-      state: terminal ? "ended" : "connected",
+      state: sessionState,
       expiresAt: Date.now() + 600_000,
       endReason: terminal ? "host stopped" : undefined,
       displays: DISPLAYS,
     }),
-    [terminal],
+    [sessionState, terminal],
   );
   const operations = useMemo(
     () => ({
@@ -70,6 +73,15 @@ export function E2eRemoteViewerFixture({ terminal }: { terminal: boolean }) {
         }
       >
         Reopen viewer
+      </button>
+      <button
+        className="fixture-state"
+        type="button"
+        onClick={() =>
+          setSessionState((current) => (current === "requested" ? "negotiating" : "connected"))
+        }
+      >
+        Advance session state
       </button>
       {mounted ? (
         <RemoteViewerCore

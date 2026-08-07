@@ -991,7 +991,7 @@ pub fn spawn_video(
         });
         let mut stop_rx = stop_rx;
         let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
-        let mut write_result = Ok(());
+        let mut delivery_interrupted = false;
         loop {
             tokio::select! {
                 changed = stop_rx.changed() => {
@@ -1003,14 +1003,30 @@ pub fn spawn_video(
                     let Some((frame, dropped)) = frame else { break };
                     // Tell the RTP packetizer about frames discarded by the newest-frame slot so
                     // timestamps keep pace with the capture clock instead of falling behind.
-                    if let Err(error) = track.write_sample(&Sample {
+                    let result = track.write_sample(&Sample {
                         data: frame.bytes.into(),
                         duration,
                         prev_dropped_packets: dropped,
                         ..Default::default()
-                    }).await {
-                        write_result = Err(error);
-                        break;
+                    }).await;
+                    match result {
+                        Ok(()) if delivery_interrupted => {
+                            delivery_interrupted = false;
+                            tracing::info!("video sample delivery recovered");
+                        }
+                        Ok(()) => {}
+                        Err(error) if !delivery_interrupted => {
+                            delivery_interrupted = true;
+                            // RTP/SRTP writes can fail while ICE reconnects or a browser peer is
+                            // closing. Capture and encoding remain healthy, so restarting native
+                            // resources here only creates encoder contention and guarantees the
+                            // same closed peer rejects the replacement pipeline too.
+                            tracing::warn!(
+                                error = %error,
+                                "video sample delivery interrupted; retaining media pipeline"
+                            );
+                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -1019,7 +1035,6 @@ pub fn spawn_video(
         let producer_result = producer
             .await
             .context("video capture worker stopped unexpectedly")?;
-        write_result?;
         producer_result?;
         Ok(())
     });

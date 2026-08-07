@@ -66,6 +66,8 @@ enum Command {
     },
     /// Run the foreground service process.
     Run,
+    /// Stop the installed background agent gracefully.
+    Stop,
     /// Check configuration, credentials, capture, input, and network readiness.
     Doctor {
         #[arg(long)]
@@ -179,6 +181,12 @@ async fn run(cli: Cli) -> Result<()> {
             config.validate_enrolled()?;
             service::run(config, cli.ready_file, cli.ready_token).await?;
         }
+        Command::Stop => match service::request_stop().await? {
+            service::StopOutcome::Stopped => println!("nanoctl background agent stopped."),
+            service::StopOutcome::AlreadyStopped => {
+                println!("nanoctl background agent is already stopped.")
+            }
+        },
         Command::Doctor { json } => {
             let config = AgentConfig::load_or_default(&config_path)?;
             let report = platform::doctor(&config).await;
