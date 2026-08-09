@@ -92,7 +92,7 @@ test("viewer switches displays and releases control with button and emergency sh
   page,
 }) => {
   await page.goto("/e2e/viewer");
-  await expect(page.getByText("Negotiating")).toBeVisible();
+  await expect(page.locator("header").getByText("Negotiating", { exact: true })).toBeVisible();
   const display = page.getByLabel("Display");
   await expect(display).toHaveValue("display-primary");
   await expect
@@ -298,7 +298,9 @@ test("viewer exhausts bounded reconnect attempts and ends the session", async ({
         }
       ).__nanoctlPeers?.[0]?.setState("failed");
     });
-    await expect(page.getByText(`reconnecting (${attempt}/3)`)).toBeVisible();
+    await expect(
+      page.locator("header").getByText(`reconnecting (${attempt}/3)`, { exact: true }),
+    ).toBeVisible();
   }
   await page.evaluate(() => {
     (
@@ -307,7 +309,7 @@ test("viewer exhausts bounded reconnect attempts and ends the session", async ({
       }
     ).__nanoctlPeers?.[0]?.setState("failed");
   });
-  await expect(page.getByText("failed", { exact: true })).toBeVisible();
+  await expect(page.locator("header").getByText("failed", { exact: true })).toBeVisible();
   await expect
     .poll(() =>
       page.evaluate(() =>
@@ -325,7 +327,9 @@ test("viewer exhausts bounded reconnect attempts and ends the session", async ({
 
 test("viewer handles terminal state without creating a peer", async ({ page }) => {
   await page.goto("/e2e/viewer?state=ended");
-  await expect(page.getByText("ended: host stopped")).toBeVisible();
+  await expect(
+    page.locator("header").getByText("ended: host stopped", { exact: true }),
+  ).toBeVisible();
   await expect
     .poll(() =>
       page.evaluate(
@@ -342,7 +346,7 @@ test("viewer handles terminal state without creating a peer", async ({ page }) =
 
 test("pagehide releases the peer without ending a refreshable session", async ({ page }) => {
   await page.goto("/e2e/viewer");
-  await expect(page.getByText("Negotiating")).toBeVisible();
+  await expect(page.locator("header").getByText("Negotiating", { exact: true })).toBeVisible();
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide")));
   await expect
     .poll(() =>
