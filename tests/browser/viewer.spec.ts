@@ -58,9 +58,12 @@ test.beforeEach(async ({ page }) => {
 
       async setLocalDescription(description?: RTCSessionDescriptionInit) {
         this.localDescription = description ?? null;
+        this.signalingState = "have-local-offer";
       }
 
-      async setRemoteDescription() {}
+      async setRemoteDescription() {
+        this.signalingState = "stable";
+      }
 
       async addIceCandidate() {}
 
@@ -347,6 +350,18 @@ test("viewer handles terminal state without creating a peer", async ({ page }) =
 test("pagehide releases the peer without ending a refreshable session", async ({ page }) => {
   await page.goto("/e2e/viewer");
   await expect(page.locator("header").getByText("Negotiating", { exact: true })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __nanoctlPeers?: unknown[];
+            }
+          ).__nanoctlPeers?.length,
+      ),
+    )
+    .toBe(1);
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide")));
   await expect
     .poll(() =>
