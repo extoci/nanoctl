@@ -45,9 +45,18 @@ export default defineSchema({
     updatedAt: v.number(),
     endedAt: v.optional(v.number()),
     endReason: v.optional(v.string()),
+    /** Server-authoritative controller peer claim; old rows remain replayable but not active. */
+    controllerEpoch: v.optional(v.string()),
+    controllerStartedAt: v.optional(v.number()),
+    /** Server-authoritative native peer claim for the current controller/generation. */
+    hostEpoch: v.optional(v.string()),
+    hostStartedAt: v.optional(v.number()),
+    hostGeneration: v.optional(v.number()),
   })
     .index("by_owner", ["ownerId"])
     .index("by_device_state", ["deviceId", "state"])
+    .index("by_expiry", ["expiresAt"])
+    .index("by_state_expiry", ["state", "expiresAt"])
     .index("by_state_updated", ["state", "updatedAt"]),
 
   signals: defineTable({
@@ -64,9 +73,32 @@ export default defineSchema({
     envelope: v.string(),
     expiresAt: v.number(),
     createdAt: v.number(),
+    peerEpoch: v.optional(v.string()),
+    controllerEpoch: v.optional(v.string()),
+    generation: v.optional(v.number()),
   })
     .index("by_session_sender_sequence", ["sessionId", "sender", "sequence"])
+    .index("by_session_sender_epoch_sequence", ["sessionId", "sender", "peerEpoch", "sequence"])
     .index("by_session_sender_kind_sequence", ["sessionId", "sender", "kind", "sequence"])
+    .index("by_session_sender_created", ["sessionId", "sender", "createdAt"])
+    .index("by_session_sender_kind_created", ["sessionId", "sender", "kind", "createdAt"])
+    .index("by_session_sender_epoch_generation_created", [
+      "sessionId",
+      "sender",
+      "controllerEpoch",
+      "peerEpoch",
+      "generation",
+      "createdAt",
+    ])
+    .index("by_session_sender_kind_epoch_generation_created", [
+      "sessionId",
+      "sender",
+      "kind",
+      "controllerEpoch",
+      "peerEpoch",
+      "generation",
+      "createdAt",
+    ])
     .index("by_expiry", ["expiresAt"]),
 
   auditEvents: defineTable({

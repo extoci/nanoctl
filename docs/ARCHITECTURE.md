@@ -38,14 +38,21 @@ owned by their Shoo `subject`. A session joins these identities for no more than
   and revocation status.
 - `pairingCodes`: owner, SHA-256 code digest, creation/expiry, and one-time consumption marker.
 - `sessions`: owner/device binding, strict state, expiry, and end reason.
-- `signals`: session, role, monotonically increasing per-role sequence, serialized versioned
-  envelope, and expiry.
+- `signals`: session, role, sender-epoch sequence, controller epoch, serialized versioned envelope,
+  insertion time, and expiry. A refreshed browser gets a new controller epoch; the agent echoes it
+  and Convex rejects delayed rows from another epoch. The browser replays a bounded recent window by
+  insertion time and keeps one latest host answer epoch, so an agent restart cannot hide a fresh host
+  epoch behind a lower random sequence or feed two answers into one peer.
 - `auditEvents`: append-only security-relevant ownership and session actions.
 
 Reachability and readiness are distinct. A fresh heartbeat makes a device online, while the
-authenticated capability document must also report protocol v1, H.264, at least one capturable
-display, and any locally enabled input permission before Convex permits a session. Permission
-revocation therefore disables new Connect actions without pretending the service itself is offline.
+authenticated capability document must also report protocol v2, H.264, at least one capturable
+display, and any locally enabled input permission before Convex permits a session. Older v1 devices
+remain visible so the UI can explain the required upgrade, but they are not admitted to a v2 session.
+Permission revocation therefore disables new Connect actions without pretending the service itself is
+offline.
+The capability document also carries `remoteInput`; a ready device may be intentionally view-only,
+in which case the controller never enables its input lane.
 
 Raw enrollment codes and agent bearer tokens are never stored. Signal rows and expired pairing rows
 must be deleted by scheduled maintenance. Audit retention is a deployment policy.
@@ -63,6 +70,13 @@ requested ── controller offer ──> negotiating ── ICE/DTLS ──> co
 Only the owner can create or end a session. Only the bound device can publish host signals. Terminal
 states cannot transition back. One active session per device is enforced transactionally.
 
+The browser and native agent both use an actor-style session owner. A session owns its peer, ICE
+generation, signaling cursor, input lanes, capture/encoder worker, metrics, and terminal barrier.
+No callback from an older lifecycle may write to a replacement peer. ICE restart is a connection
+generation inside the same session; it does not restart native capture or input resources. A browser
+refresh is a new controller epoch and replaces the native peer after the old capture task has been
+joined.
+
 ## Media pipeline
 
 The portable backend keeps one long-lived native capture session open. xcap currently selects WGC
@@ -70,14 +84,19 @@ on Windows and PipeWire on supported Wayland desktops, with platform fallbacks e
 dedicated forwarding thread replaces a single pending frame atomically: if capture outpaces
 encoding, obsolete frames are discarded rather than accumulated. The encoded handoff is also a
 single newest-frame slot, so a busy packetizer never retains stale content or discards the newest
-recovery frame; discarded-frame counts advance RTP time instead of hiding latency in a queue. RGBA
+recovery frame. Dropped local frames are not reported as RTP packet loss. RGBA
 frames are scaled and converted to I420 for bounded OpenH264 software
 encoding, then emitted directly to the WebRTC RTP packetizer. Decoder PLI/FIR feedback forces an
 IDR, with a two-second periodic IDR as a recovery backstop. Display metadata is refreshed in the
-signed-in owner’s device capability view. A display switch updates input origin/geometry and starts
-the replacement recorder before stopping the existing recorder; the next encoded frame is an IDR.
-Session teardown signals and joins the blocking capture/encoder worker before a replacement session
-is admitted.
+signed-in owner’s device capability view. A display switch first proves that the replacement
+recorder can start while the current stream remains valid; only then does it stop and join the old
+recorder before swapping the handoff and forcing an IDR. A failed switch therefore retains the
+current stream, while a successful switch never leaves two encoders or forwarders active. Static
+desktops retain and pace the latest captured frame instead of mistaking a lack of damage
+notifications for capture failure. Session teardown signals and joins the blocking capture/encoder
+worker before a replacement session is admitted. Shutdown awaits that join rather than aborting an
+async wrapper around native code, because aborting the wrapper cannot cancel a thread already inside
+OS capture or encoder APIs.
 
 The portable path consumes receiver-estimated maximum bitrate (REMB), clamps it between 250 kbps and
 the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% increase. Recreating
@@ -105,7 +124,7 @@ GPU isolation/performance from silently receiving software encoding.
 Input uses an unordered, zero-retransmit channel for pointer motion and a reliable ordered channel
 for key/button transitions and lifecycle messages. Pointer motion is coalesced; key-up and button-up
 are never dropped and are synthesized on disconnect. System audio and clipboard synchronization are
-reserved for a later protocol capability and are never advertised by a v1 agent.
+reserved for a later protocol capability and are never advertised by a v2 agent.
 
 ## Connectivity
 
@@ -129,8 +148,10 @@ and lints. The privileged media path does not embed a JavaScript runtime.
 - Control-plane unavailable: existing WebRTC session continues; new sessions wait with backoff.
 - Heartbeat fails: device appears offline after 45 seconds; credentials are retained.
 - Capture revoked/locked: video pauses and a typed status travels over reliable control.
-- Capture/encoder task fails: one bounded whole-pipeline restart; a second failure publishes a
-  terminal host signal, marks the Convex session failed with an audit event, and closes the peer.
+- RTP delivery interruption: native capture and encoding stay alive while ICE/DTLS recovers; the
+  first post-outage frame is forced to an IDR. Only a genuine capture/encoder failure gets one
+  bounded whole-pipeline restart; a second failure publishes a terminal host signal, marks the
+  Convex session failed with an audit event, and closes the peer.
 - Data channel closes: all injected input is released immediately.
 - Token revoked: the revoke transaction ends active session records immediately; the browser closes
   from the reactive state update, and the agent closes every peer on its next session poll (bounded

@@ -206,13 +206,13 @@ impl AgentConfig {
             }
         }
         if self.features.system_audio || self.features.clipboard {
-            bail!("system audio and clipboard are reserved and unavailable in protocol v1");
+            bail!("system audio and clipboard are reserved and unavailable in protocol v2");
         }
         if !matches!(
             self.quality.codec,
             CodecPreference::Auto | CodecPreference::H264
         ) {
-            bail!("this v1 build supports only quality.codec = auto or h264");
+            bail!("this v2 build supports only quality.codec = auto or h264");
         }
         Ok(())
     }

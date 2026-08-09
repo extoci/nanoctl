@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctl-agent"
-version = "1.0.19"
+version = "2.0.0-alpha.1"
 dependencies = [
  "anyhow",
  "apple-cf",
@@ -2398,6 +2398,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "videotoolbox",
  "webrtc",
  "windows 0.62.2",

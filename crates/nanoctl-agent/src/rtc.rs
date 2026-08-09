@@ -1,7 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(feature = "media")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "media")]
 use std::time::Duration;
 use std::time::SystemTime;
@@ -36,7 +35,9 @@ use zeroize::Zeroizing;
 
 use crate::control_plane::ControlPlane;
 
-const PROTOCOL_VERSION: u8 = 1;
+const PROTOCOL_VERSION: u8 = 2;
+const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
+const MAX_ICE_GENERATION: u64 = 1_000_000;
 // Level 5.2 is the highest H.264 level supported by the configured 4K60 release envelope. The
 // WebRTC matcher treats the level byte asymmetrically, so this remains compatible with Chromium's
 // lower-level offer while no longer advertising a 720p30 ceiling for a 4K-capable sender.
@@ -44,7 +45,9 @@ const H264_PROFILE_LEVEL_ID: &str = "42e034";
 #[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 #[cfg(feature = "media")]
-const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 64;
+// Reliable control is ordered, but it must remain a short queue. A remote desktop should fail
+// closed before stale keystrokes and clicks accumulate behind a slow native input call.
+const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 16;
 
 #[cfg(any(feature = "media", test))]
 #[derive(Debug, PartialEq, Eq)]
@@ -75,13 +78,27 @@ pub struct HostPeer {
     publisher: SignalPublisher,
     session_id: String,
     sequence: Arc<AtomicU64>,
+    controller_epoch: String,
+    host_epoch: String,
+    ice_generation: Arc<AtomicU64>,
     publication_lock: Arc<tokio::sync::Mutex<()>>,
+    ice_ufrag_generations: Arc<tokio::sync::RwLock<HashMap<String, u64>>>,
+    terminal: Arc<AtomicBool>,
+    rtcp_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(feature = "media")]
+    input_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "media")]
     keyframe_requests: tokio::sync::watch::Sender<u64>,
     #[cfg(feature = "media")]
     bitrate_estimate_kbps: tokio::sync::watch::Sender<u32>,
     #[cfg(feature = "media")]
     display_selection: tokio::sync::watch::Sender<String>,
+    #[cfg(feature = "media")]
+    display_selection_feedback: tokio::sync::watch::Sender<String>,
+    #[cfg(feature = "media")]
+    input_shutdown: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "media")]
+    input_revoked: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
 }
@@ -89,6 +106,8 @@ pub struct HostPeer {
 #[derive(Clone)]
 struct SignalPublisher {
     inner: SignalPublisherInner,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -99,6 +118,11 @@ enum SignalPublisherInner {
     },
     #[cfg(test)]
     Test(tokio::sync::mpsc::UnboundedSender<TestSignal>),
+    #[cfg(test)]
+    FlakyTest {
+        sender: tokio::sync::mpsc::UnboundedSender<TestSignal>,
+        failures: Arc<AtomicU64>,
+    },
 }
 
 #[cfg(test)]
@@ -113,6 +137,8 @@ impl SignalPublisher {
     fn control_plane(client: ControlPlane, token: Arc<Zeroizing<String>>) -> Self {
         Self {
             inner: SignalPublisherInner::ControlPlane { client, token },
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -120,10 +146,91 @@ impl SignalPublisher {
     fn test(sender: tokio::sync::mpsc::UnboundedSender<TestSignal>) -> Self {
         Self {
             inner: SignalPublisherInner::Test(sender),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    fn flaky_test(
+        sender: tokio::sync::mpsc::UnboundedSender<TestSignal>,
+        failures: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            inner: SignalPublisherInner::FlakyTest { sender, failures },
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     async fn send(&self, session_id: &str, sequence: u64, envelope: &str) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("signal publisher is closed");
+        }
+        let _gate = self.gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("signal publisher is closed");
+        }
+        self.send_locked(
+            session_id,
+            sequence,
+            envelope,
+            std::time::Duration::from_secs(5),
+            false,
+        )
+        .await
+    }
+
+    async fn send_terminal(&self, session_id: &str, sequence: u64, envelope: &str) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        self.closed.store(true, Ordering::Release);
+        self.send_locked(
+            session_id,
+            sequence,
+            envelope,
+            std::time::Duration::from_secs(2),
+            true,
+        )
+        .await
+    }
+
+    async fn send_locked(
+        &self,
+        session_id: &str,
+        sequence: u64,
+        envelope: &str,
+        attempt_timeout: std::time::Duration,
+        terminal: bool,
+    ) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            let result = match tokio::time::timeout(
+                attempt_timeout,
+                self.send_once(session_id, sequence, envelope),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("signal publication timed out")),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    if !terminal && self.closed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(25 * (1 << attempt)))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("signal publication failed")))
+    }
+
+    async fn send_once(&self, session_id: &str, sequence: u64, envelope: &str) -> Result<()> {
         match &self.inner {
             SignalPublisherInner::ControlPlane { client, token } => {
                 client
@@ -138,7 +245,29 @@ impl SignalPublisher {
                     envelope: envelope.to_owned(),
                 })
                 .map_err(|_| anyhow::anyhow!("test signal receiver closed")),
+            #[cfg(test)]
+            SignalPublisherInner::FlakyTest { sender, failures } => {
+                if failures
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    anyhow::bail!("injected transient signal failure");
+                }
+                sender
+                    .send(TestSignal {
+                        session_id: session_id.to_owned(),
+                        sequence,
+                        envelope: envelope.to_owned(),
+                    })
+                    .map_err(|_| anyhow::anyhow!("test signal receiver closed"))
+            }
         }
+    }
+
+    fn close_now(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 }
 
@@ -147,6 +276,12 @@ impl SignalPublisher {
 struct SignalEnvelope {
     version: u8,
     session_id: String,
+    #[serde(default)]
+    controller_epoch: Option<String>,
+    #[serde(default)]
+    host_epoch: Option<String>,
+    #[serde(default)]
+    generation: Option<u64>,
     sequence: u64,
     sender: String,
     sent_at: u64,
@@ -181,6 +316,9 @@ enum SignalPayload {
 struct OutgoingEnvelope<'a> {
     version: u8,
     session_id: &'a str,
+    controller_epoch: &'a str,
+    host_epoch: &'a str,
+    generation: u64,
     sequence: u64,
     sender: &'static str,
     sent_at: u64,
@@ -209,13 +347,15 @@ enum OutgoingPayload {
 }
 
 impl HostPeer {
-    pub async fn answer(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn answer_with_host_epoch(
         control_plane: ControlPlane,
         token: Arc<Zeroizing<String>>,
         session_id: String,
         serialized_offer: &str,
         ice_servers: Vec<RTCIceServer>,
         ice_transport_policy: RTCIceTransportPolicy,
+        host_epoch: String,
         allow_remote_input: bool,
     ) -> Result<Self> {
         Self::answer_with_publisher(
@@ -224,6 +364,7 @@ impl HostPeer {
             serialized_offer,
             ice_servers,
             ice_transport_policy,
+            host_epoch,
             allow_remote_input,
         )
         .await
@@ -235,9 +376,18 @@ impl HostPeer {
         serialized_offer: &str,
         ice_servers: Vec<RTCIceServer>,
         ice_transport_policy: RTCIceTransportPolicy,
+        host_epoch: String,
         allow_remote_input: bool,
     ) -> Result<Self> {
-        let offer = parse_offer(serialized_offer, &session_id)?;
+        let (offer, initial_generation, controller_epoch) =
+            parse_offer(serialized_offer, &session_id)?;
+        if controller_epoch.is_empty()
+            || controller_epoch.len() > 128
+            || host_epoch.is_empty()
+            || host_epoch.len() > 128
+        {
+            anyhow::bail!("peer epoch is invalid");
+        }
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
@@ -258,6 +408,15 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
+        let (display_selection_feedback, display_selection_feedback_receiver) =
+            tokio::sync::watch::channel(String::new());
+        #[cfg(feature = "media")]
+        let (input_shutdown, input_shutdown_receiver) = tokio::sync::watch::channel(false);
+        #[cfg(feature = "media")]
+        let input_revoked = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "media")]
+        let mut input_tasks = Vec::new();
+        #[cfg(feature = "media")]
         {
             let input = if allow_remote_input {
                 match crate::input::InputController::new() {
@@ -272,39 +431,52 @@ impl HostPeer {
             };
             if let Some(input) = &input {
                 let input = Arc::downgrade(input);
-                tokio::spawn(async move {
+                let mut shutdown = input_shutdown.subscribe();
+                input_tasks.push(tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_millis(500));
                     loop {
-                        interval.tick().await;
-                        let Some(input) = input.upgrade() else {
-                            break;
-                        };
-                        if let Ok(mut input) = input.lock() {
-                            input.release_if_idle(Duration::from_secs(2));
+                        tokio::select! {
+                            _ = shutdown.changed() => break,
+                            _ = interval.tick() => {
+                                let Some(input) = input.upgrade() else {
+                                    break;
+                                };
+                                if let Ok(mut input) = input.lock() {
+                                    input.release_if_idle(Duration::from_secs(2));
+                                }
+                            }
                         }
                     }
-                });
+                }));
             }
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
             let (pointer_sender, pointer_receiver) = tokio::sync::mpsc::channel(1);
             let fail_safe_release_pending = Arc::new(AtomicBool::new(false));
             if let Some(input) = &input {
-                spawn_input_worker(
+                input_tasks.push(spawn_input_worker(
                     control_receiver,
                     input.clone(),
                     crate::input::InputLane::Reliable,
                     Some(display_selection.clone()),
-                );
-                spawn_input_worker(
+                    Some(display_selection_feedback_receiver),
+                    input_shutdown_receiver.clone(),
+                    input_revoked.clone(),
+                ));
+                input_tasks.push(spawn_input_worker(
                     pointer_receiver,
                     input.clone(),
                     crate::input::InputLane::PointerMotion,
                     None,
-                );
+                    None,
+                    input_shutdown_receiver,
+                    input_revoked.clone(),
+                ));
             }
+            let input_revoked_for_channel = input_revoked.clone();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
+                let input_revoked = input_revoked_for_channel.clone();
                 if input.is_none() {
                     return Box::pin(async {});
                 }
@@ -319,8 +491,9 @@ impl HostPeer {
                     let sender = sender.clone();
                     let input = message_input.clone();
                     let release_pending = release_pending.clone();
+                    let input_revoked = input_revoked.clone();
                     Box::pin(async move {
-                        if !message.is_string {
+                        if !message.is_string || input_revoked.load(Ordering::Acquire) {
                             return;
                         }
                         let admission = admit_input_message(&sender, message.data.to_vec());
@@ -402,7 +575,7 @@ impl HostPeer {
         let (bitrate_estimate_kbps, _) = tokio::sync::watch::channel(0_u32);
         #[cfg(feature = "media")]
         let bitrate_feedback = bitrate_estimate_kbps.clone();
-        tokio::spawn(async move {
+        let rtcp_task = tokio::spawn(async move {
             while let Ok((_packets, _attributes)) = sender.read_rtcp().await {
                 #[cfg(feature = "media")]
                 {
@@ -428,37 +601,80 @@ impl HostPeer {
             }
         });
 
-        let sequence = Arc::new(AtomicU64::new(1));
+        // Host signal sequences must not collide with a previous in-memory peer after an agent
+        // restart. They stay below JavaScript's safe integer limit because Convex stores them as
+        // JSON numbers; the browser replays recent host rows by insertion time rather than using
+        // this fresh seed as a cross-process ordering cursor.
+        let initial_sequence = host_sequence_seed();
+        let sequence = Arc::new(AtomicU64::new(initial_sequence.saturating_add(1)));
+        let ice_generation = Arc::new(AtomicU64::new(initial_generation));
+        let ice_ufrag_generations = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let terminal = Arc::new(AtomicBool::new(false));
         // ICE callbacks are asynchronous and can run as soon as local description is installed.
         // Serialize them with the answer publication so a browser never observes a host
         // candidate before the SDP that gives that candidate a remote description.
         let publication_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let controller_epoch_for_ice = controller_epoch.clone();
+        let host_epoch_for_ice = host_epoch.clone();
         peer.on_ice_candidate({
             let publisher = publisher.clone();
             let session_id = session_id.clone();
             let sequence = sequence.clone();
+            let ice_generation = ice_generation.clone();
+            let ice_ufrag_generations = ice_ufrag_generations.clone();
             let publication_lock = publication_lock.clone();
             Box::new(move |candidate: Option<RTCIceCandidate>| {
                 let publisher = publisher.clone();
                 let session_id = session_id.clone();
                 let sequence = sequence.clone();
+                let ice_generation = ice_generation.clone();
+                let ice_ufrag_generations = ice_ufrag_generations.clone();
                 let publication_lock = publication_lock.clone();
+                let controller_epoch = controller_epoch_for_ice.clone();
+                let host_epoch = host_epoch_for_ice.clone();
                 Box::pin(async move {
                     let _publication_guard = publication_lock.lock().await;
-                    let payload = match candidate {
+                    let (payload, generation) = match candidate {
                         Some(candidate) => match candidate.to_json() {
-                            Ok(candidate) => OutgoingPayload::IceCandidate {
-                                candidate: candidate.candidate,
-                                sdp_mid: candidate.sdp_mid,
-                                sdp_mline_index: candidate.sdp_mline_index,
-                                username_fragment: candidate.username_fragment,
-                            },
+                            Ok(candidate) => {
+                                let current_generation = ice_generation.load(Ordering::Acquire);
+                                let generation =
+                                    if let Some(ufrag) = candidate.username_fragment.as_deref() {
+                                        ice_ufrag_generations
+                                            .read()
+                                            .await
+                                            .get(ufrag)
+                                            .copied()
+                                            .unwrap_or(current_generation)
+                                    } else {
+                                        current_generation
+                                    };
+                                (
+                                    OutgoingPayload::IceCandidate {
+                                        candidate: candidate.candidate,
+                                        sdp_mid: candidate.sdp_mid,
+                                        sdp_mline_index: candidate.sdp_mline_index,
+                                        username_fragment: candidate.username_fragment,
+                                    },
+                                    generation,
+                                )
+                            }
                             Err(_) => return,
                         },
-                        None => OutgoingPayload::IceComplete,
+                        None => (
+                            OutgoingPayload::IceComplete,
+                            ice_generation.load(Ordering::Acquire),
+                        ),
                     };
                     let index = sequence.fetch_add(1, Ordering::Relaxed);
-                    if let Ok(envelope) = serialize(&session_id, index, payload) {
+                    if let Ok(envelope) = serialize_with_generation(
+                        &session_id,
+                        &controller_epoch,
+                        &host_epoch,
+                        generation,
+                        index,
+                        payload,
+                    ) {
                         let _ = publisher.send(&session_id, index, &envelope).await;
                     }
                 })
@@ -474,22 +690,45 @@ impl HostPeer {
             .local_description()
             .await
             .context("WebRTC answer was not created")?;
-        // Sequence zero is reserved for the answer. Candidate callbacks begin at one.
-        let envelope = serialize(&session_id, 0, OutgoingPayload::Answer { sdp: local.sdp })?;
-        publisher.send(&session_id, 0, &envelope).await?;
+        remember_ice_ufrag(&ice_ufrag_generations, &local.sdp, initial_generation).await;
+        let envelope = serialize_with_generation(
+            &session_id,
+            &controller_epoch,
+            &host_epoch,
+            initial_generation,
+            initial_sequence,
+            OutgoingPayload::Answer { sdp: local.sdp },
+        )?;
+        publisher
+            .send(&session_id, initial_sequence, &envelope)
+            .await?;
         drop(_publication_guard);
         Ok(Self {
             peer,
             publisher,
             session_id,
             sequence,
+            controller_epoch,
+            host_epoch,
+            ice_generation,
             publication_lock,
+            ice_ufrag_generations,
+            terminal,
+            rtcp_task: tokio::sync::Mutex::new(Some(rtcp_task)),
+            #[cfg(feature = "media")]
+            input_tasks: tokio::sync::Mutex::new(input_tasks),
             #[cfg(feature = "media")]
             keyframe_requests,
             #[cfg(feature = "media")]
             bitrate_estimate_kbps,
             #[cfg(feature = "media")]
             display_selection,
+            #[cfg(feature = "media")]
+            display_selection_feedback,
+            #[cfg(feature = "media")]
+            input_shutdown,
+            #[cfg(feature = "media")]
+            input_revoked,
             video,
         })
     }
@@ -504,13 +743,21 @@ impl HostPeer {
             anyhow::bail!("signal exceeds maximum size");
         }
         let envelope: SignalEnvelope = serde_json::from_str(serialized)?;
-        if envelope.version != PROTOCOL_VERSION
+        if !supported_version(envelope.version)
             || envelope.session_id != expected_session
             || envelope.sequence != expected_sequence
             || envelope.sender != "controller"
             || envelope.sent_at == 0
+            || envelope.controller_epoch.as_deref().unwrap_or("") != self.controller_epoch
         {
             anyhow::bail!("signal identity does not match the session");
+        }
+        let envelope_generation = envelope.generation.unwrap_or(0);
+        if !envelope.host_epoch.as_deref().unwrap_or("").is_empty() {
+            anyhow::bail!("controller signal cannot carry a host epoch");
+        }
+        if envelope_generation > MAX_ICE_GENERATION {
+            anyhow::bail!("ICE generation is too large");
         }
         match envelope.payload {
             SignalPayload::IceCandidate {
@@ -519,6 +766,10 @@ impl HostPeer {
                 sdp_mline_index,
                 username_fragment,
             } => {
+                let generation = envelope_generation;
+                if generation != self.ice_generation.load(Ordering::Acquire) {
+                    anyhow::bail!("ICE candidate belongs to an inactive generation");
+                }
                 if candidate.is_empty()
                     || candidate.len() > 8_192
                     || sdp_mid.as_ref().is_some_and(|value| value.len() > 256)
@@ -538,18 +789,43 @@ impl HostPeer {
                     .await?;
                 Ok(true)
             }
-            SignalPayload::IceComplete => Ok(true),
+            SignalPayload::IceComplete => {
+                let generation = envelope_generation;
+                if generation != self.ice_generation.load(Ordering::Acquire) {
+                    anyhow::bail!("ICE completion belongs to an inactive generation");
+                }
+                self.peer
+                    .add_ice_candidate(RTCIceCandidateInit {
+                        candidate: String::new(),
+                        sdp_mid: None,
+                        sdp_mline_index: None,
+                        username_fragment: None,
+                    })
+                    .await?;
+                Ok(true)
+            }
             SignalPayload::End { reason } => {
                 if reason.is_empty() || reason.len() > 512 {
                     anyhow::bail!("end reason is invalid");
                 }
+                if envelope_generation != self.ice_generation.load(Ordering::Acquire) {
+                    anyhow::bail!("end signal belongs to an inactive generation");
+                }
                 tracing::info!(reason_bytes = reason.len(), "controller ended session");
-                self.peer.close().await?;
+                self.close().await?;
                 Ok(false)
             }
             SignalPayload::Offer { sdp } => {
                 if sdp.is_empty() || sdp.len() > 1_000_000 {
                     anyhow::bail!("restart offer SDP is invalid");
+                }
+                let generation = envelope_generation;
+                let current_generation = self.ice_generation.load(Ordering::Acquire);
+                // The initial generation-0 offer was already consumed by `answer`. Any later
+                // offer must explicitly advance the ICE generation; accepting another gen-0
+                // offer would let a delayed/duplicated bootstrap replace a live peer.
+                if generation <= current_generation {
+                    anyhow::bail!("restart offer belongs to an inactive generation");
                 }
                 let _publication_guard = self.publication_lock.lock().await;
                 self.peer
@@ -562,9 +838,14 @@ impl HostPeer {
                     .local_description()
                     .await
                     .context("WebRTC restart answer was not created")?;
+                remember_ice_ufrag(&self.ice_ufrag_generations, &local.sdp, generation).await;
+                self.ice_generation.store(generation, Ordering::Release);
                 let index = self.sequence.fetch_add(1, Ordering::Relaxed);
-                let response = serialize(
+                let response = serialize_with_generation(
                     &self.session_id,
+                    &self.controller_epoch,
+                    &self.host_epoch,
+                    generation,
                     index,
                     OutgoingPayload::Answer { sdp: local.sdp },
                 )?;
@@ -578,26 +859,74 @@ impl HostPeer {
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.peer.close().await?;
+        self.terminal.store(true, Ordering::Release);
+        #[cfg(feature = "media")]
+        self.revoke_input();
+        #[cfg(feature = "media")]
+        let _ = self.input_shutdown.send(true);
+        // Do not wait behind an in-flight control-plane publication while the WebRTC peer is
+        // still alive. A slow signal request must never make native teardown unbounded.
+        self.publisher.close_now();
+        let close_result = self.peer.close().await;
+        self.join_auxiliary_tasks().await;
+        close_result?;
         Ok(())
     }
 
     pub async fn fail(&self, reason: &str) -> Result<()> {
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        #[cfg(feature = "media")]
+        self.revoke_input();
+        #[cfg(feature = "media")]
+        let _ = self.input_shutdown.send(true);
         let reason = reason.chars().take(256).collect::<String>();
         let index = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let envelope = serialize(&self.session_id, index, OutgoingPayload::End { reason })?;
+        let envelope = serialize_with_generation(
+            &self.session_id,
+            &self.controller_epoch,
+            &self.host_epoch,
+            self.ice_generation.load(Ordering::Acquire),
+            index,
+            OutgoingPayload::End { reason },
+        )?;
         let signal_result = self
             .publisher
-            .send(&self.session_id, index, &envelope)
+            .send_terminal(&self.session_id, index, &envelope)
             .await;
         let close_result = self.peer.close().await;
+        self.join_auxiliary_tasks().await;
         signal_result?;
         close_result?;
         Ok(())
     }
 
+    async fn join_auxiliary_tasks(&self) {
+        if let Some(task) = self.rtcp_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        #[cfg(feature = "media")]
+        {
+            let tasks = std::mem::take(&mut *self.input_tasks.lock().await);
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+
     pub fn connection_failed(&self) -> bool {
         self.peer.connection_state() == RTCPeerConnectionState::Failed
+    }
+
+    /// Revoke data-channel input before asynchronous peer/media teardown begins. This closes the
+    /// handoff window where a stale browser could still enqueue a click or key after the control
+    /// plane has assigned the session to a replacement host.
+    #[cfg(feature = "media")]
+    pub fn revoke_input(&self) {
+        self.input_revoked.store(true, Ordering::Release);
+        let _ = self.input_shutdown.send(true);
     }
 
     #[cfg(feature = "media")]
@@ -619,6 +948,11 @@ impl HostPeer {
     pub fn display_selection(&self) -> tokio::sync::watch::Receiver<String> {
         self.display_selection.subscribe()
     }
+
+    #[cfg(feature = "media")]
+    pub fn display_selection_feedback_sender(&self) -> tokio::sync::watch::Sender<String> {
+        self.display_selection_feedback.clone()
+    }
 }
 
 #[cfg(feature = "media")]
@@ -627,50 +961,122 @@ fn spawn_input_worker(
     input: Arc<std::sync::Mutex<crate::input::InputController>>,
     lane: crate::input::InputLane,
     display_selection: Option<tokio::sync::watch::Sender<String>>,
-) {
+    mut display_selection_feedback: Option<tokio::sync::watch::Receiver<String>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    input_revoked: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(bytes) = receiver.recv().await {
-            let input = input.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                input
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?
-                    .dispatch(&bytes, lane)
-            })
-            .await;
-            match result {
-                Ok(Ok(Some(display_id))) => {
-                    if let Some(selection) = &display_selection {
-                        selection.send_replace(display_id);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                feedback = async {
+                    match display_selection_feedback.as_mut() {
+                        Some(receiver) => receiver.changed().await.ok(),
+                        None => std::future::pending::<Option<()>>().await,
+                    }
+                } => {
+                    let Some(()) = feedback else {
+                        display_selection_feedback = None;
+                        continue;
+                    };
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    let Some(receiver) = display_selection_feedback.as_ref() else {
+                        continue;
+                    };
+                    let display_id = receiver.borrow().clone();
+                    if display_id.is_empty() {
+                        continue;
+                    }
+                    let input = input.clone();
+                    let input_revoked = input_revoked.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        if input_revoked.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        let mut input = input
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?;
+                        if input_revoked.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        input.select_display(&display_id)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(error = %error, "display feedback rejected"),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "display feedback worker stopped unexpectedly");
+                            break;
+                        }
                     }
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => tracing::warn!(error = %error, "control message rejected"),
-                Err(error) => {
-                    tracing::warn!(error = %error, "input worker stopped unexpectedly");
-                    break;
+                bytes = receiver.recv() => {
+                    let Some(bytes) = bytes else {
+                        break;
+                    };
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    let input = input.clone();
+                    let input_revoked = input_revoked.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut input = input
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?;
+                        if input_revoked.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        input.dispatch(&bytes, lane)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(Some(display_id))) => {
+                            if let Some(selection) = &display_selection {
+                                selection.send_replace(display_id);
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => tracing::warn!(error = %error, "control message rejected"),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "input worker stopped unexpectedly");
+                            break;
+                        }
+                    }
                 }
             }
         }
-    });
+    })
 }
 
-fn parse_offer(serialized: &str, expected_session: &str) -> Result<String> {
+fn parse_offer(serialized: &str, expected_session: &str) -> Result<(String, u64, String)> {
     if serialized.len() > 1_100_000 {
         anyhow::bail!("signal exceeds maximum size");
     }
     let envelope: SignalEnvelope =
         serde_json::from_str(serialized).context("offer envelope is invalid")?;
-    if envelope.version != PROTOCOL_VERSION
+    if !supported_version(envelope.version)
         || envelope.session_id != expected_session
-        || envelope.sequence != 0
         || envelope.sender != "controller"
         || envelope.sent_at == 0
+        || !envelope.host_epoch.as_deref().unwrap_or("").is_empty()
     {
         anyhow::bail!("offer identity does not match the session");
     }
+    let controller_epoch = envelope.controller_epoch.unwrap_or_default();
+    if controller_epoch.len() > 128 {
+        anyhow::bail!("controller epoch is too long");
+    }
+    let generation = envelope.generation.unwrap_or(0);
+    if generation > MAX_ICE_GENERATION {
+        anyhow::bail!("ICE generation is too large");
+    }
     match envelope.payload {
-        SignalPayload::Offer { sdp } if !sdp.is_empty() && sdp.len() <= 1_000_000 => Ok(sdp),
+        SignalPayload::Offer { sdp } if !sdp.is_empty() && sdp.len() <= 1_000_000 => {
+            Ok((sdp, generation, controller_epoch))
+        }
         _ => anyhow::bail!("signal is not a valid offer"),
     }
 }
@@ -679,10 +1085,46 @@ pub fn is_offer_for_session(serialized: &str, expected_session: &str) -> bool {
     parse_offer(serialized, expected_session).is_ok()
 }
 
+pub fn offer_generation_and_epoch(
+    serialized: &str,
+    expected_session: &str,
+) -> Result<(u64, String)> {
+    parse_offer(serialized, expected_session)
+        .map(|(_, generation, controller_epoch)| (generation, controller_epoch))
+}
+
+#[cfg(test)]
 fn serialize(session_id: &str, sequence: u64, payload: OutgoingPayload) -> Result<String> {
+    serialize_with_generation(session_id, "", "", 0, sequence, payload)
+}
+
+pub(crate) fn host_epoch_seed() -> String {
+    format!("host-{}", uuid::Uuid::new_v4())
+}
+
+fn host_sequence_seed() -> u64 {
+    // Convex transports sequences as JSON numbers, so use 53 random bits. Unlike a timestamp/PID
+    // recipe this remains fresh across rapid process restarts and PID reuse; the chance of
+    // colliding with retained signals is negligible. Database insertion time, not this seed,
+    // determines replay order across process epochs.
+    let random = (uuid::Uuid::new_v4().as_u128() & ((1_u128 << 53) - 1)) as u64;
+    random.clamp(1, 9_007_199_254_740_991_u64 - 4_096)
+}
+
+fn serialize_with_generation(
+    session_id: &str,
+    controller_epoch: &str,
+    host_epoch: &str,
+    generation: u64,
+    sequence: u64,
+    payload: OutgoingPayload,
+) -> Result<String> {
     Ok(serde_json::to_string(&OutgoingEnvelope {
         version: PROTOCOL_VERSION,
         session_id,
+        controller_epoch,
+        host_epoch,
+        generation,
         sequence,
         sender: "host",
         sent_at: SystemTime::now()
@@ -692,18 +1134,51 @@ fn serialize(session_id: &str, sequence: u64, payload: OutgoingPayload) -> Resul
     })?)
 }
 
+async fn remember_ice_ufrag(
+    generations: &tokio::sync::RwLock<HashMap<String, u64>>,
+    sdp: &str,
+    generation: u64,
+) {
+    let Some(ufrag) = sdp
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+    else {
+        return;
+    };
+    generations
+        .write()
+        .await
+        .insert(ufrag.to_owned(), generation);
+}
+
+fn supported_version(version: u8) -> bool {
+    (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
+
 pub async fn report_negotiation_failure(
     control_plane: &ControlPlane,
-    token: &Zeroizing<String>,
+    token: &Arc<Zeroizing<String>>,
     session_id: &str,
+    controller_epoch: &str,
+    host_epoch: &str,
+    generation: u64,
     reason: &str,
 ) -> Result<()> {
-    // Sequence zero is otherwise reserved for the initial answer. If peer construction fails there
-    // is no answer, so it is also the only host sequence that can have been published.
+    // A terminal signal gets its own fresh host epoch. Sequence zero has no semantic meaning and
+    // must not be required for an offer because ICE callbacks can race local-description setup.
     let reason = reason.chars().take(256).collect::<String>();
-    let envelope = serialize(session_id, 0, OutgoingPayload::End { reason })?;
-    control_plane
-        .send_signal(token, session_id, 0, &envelope)
+    let sequence = host_sequence_seed();
+    let envelope = serialize_with_generation(
+        session_id,
+        controller_epoch,
+        host_epoch,
+        generation,
+        sequence,
+        OutgoingPayload::End { reason },
+    )?;
+    SignalPublisher::control_plane(control_plane.clone(), Arc::clone(token))
+        .send_terminal(session_id, sequence, &envelope)
         .await
 }
 
@@ -723,10 +1198,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_noninitial_or_missing_timestamp_offer() {
-        let noninitial = r#"{"version":1,"sessionId":"session","sequence":7,"sender":"controller","sentAt":1,"payload":{"type":"offer","sdp":"v=0"}}"#;
+    fn accepts_initial_generation_and_rejects_missing_timestamp_offer() {
+        let nonzero_sequence = r#"{"version":1,"sessionId":"session","sequence":7,"sender":"controller","sentAt":1,"payload":{"type":"offer","sdp":"v=0"}}"#;
+        let restart_generation = r#"{"version":2,"sessionId":"session","controllerEpoch":"controller-a","generation":1,"sequence":0,"sender":"controller","sentAt":1,"payload":{"type":"offer","sdp":"v=0"}}"#;
         let missing_timestamp = r#"{"version":1,"sessionId":"session","sequence":0,"sender":"controller","sentAt":0,"payload":{"type":"offer","sdp":"v=0"}}"#;
-        assert!(parse_offer(noninitial, "session").is_err());
+        assert!(parse_offer(nonzero_sequence, "session").is_ok());
+        assert!(parse_offer(restart_generation, "session").is_ok());
+        assert_eq!(
+            offer_generation_and_epoch(restart_generation, "session").unwrap(),
+            (1, "controller-a".to_owned())
+        );
         assert!(parse_offer(missing_timestamp, "session").is_err());
     }
 
@@ -741,6 +1222,23 @@ mod tests {
         let value = serialize("session", 3, OutgoingPayload::IceComplete).unwrap();
         assert!(value.contains(r#""sender":"host""#));
         assert!(value.contains(r#""sequence":3"#));
+    }
+
+    #[tokio::test]
+    async fn terminal_signal_retries_after_normal_publication_is_closed() {
+        let (signals_tx, mut signals_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = SignalPublisher::flaky_test(signals_tx, Arc::new(AtomicU64::new(1)));
+        publisher
+            .send_terminal("session", 9, "terminal")
+            .await
+            .expect("terminal publication should retry once");
+        let signal = signals_rx
+            .recv()
+            .await
+            .expect("terminal signal should arrive");
+        assert_eq!(signal.session_id, "session");
+        assert_eq!(signal.sequence, 9);
+        assert_eq!(signal.envelope, "terminal");
     }
 
     #[test]
@@ -823,9 +1321,8 @@ mod tests {
             })
             .to_string();
             let accepted = parse_offer(&envelope, &expected_session).is_ok();
-            let should_accept = version == PROTOCOL_VERSION
+            let should_accept = supported_version(version)
                 && session_id == expected_session
-                && sequence == 0
                 && sender == "controller"
                 && sent_at != 0
                 && !sdp.is_empty();
@@ -862,6 +1359,7 @@ mod tests {
             &malformed_offer,
             Vec::new(),
             RTCIceTransportPolicy::All,
+            "host-test".to_owned(),
             false,
         )
         .await;
@@ -911,6 +1409,8 @@ mod tests {
         let serialized_offer = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "sessionId": session_id,
+            "controllerEpoch": "controller-test",
+            "hostEpoch": "",
             "sequence": 0,
             "sender": "controller",
             "sentAt": 1,
@@ -925,6 +1425,7 @@ mod tests {
             &serialized_offer,
             Vec::new(),
             RTCIceTransportPolicy::All,
+            "host-test".to_owned(),
             false,
         )
         .await
@@ -953,7 +1454,7 @@ mod tests {
             }
             match envelope["payload"]["type"].as_str() {
                 Some("answer") => {
-                    assert_eq!(signal.sequence, 0);
+                    assert!(signal.sequence > 0);
                     let sdp = envelope["payload"]["sdp"].as_str().unwrap().to_owned();
                     controller
                         .set_remote_description(RTCSessionDescription::answer(sdp).unwrap())
@@ -994,6 +1495,8 @@ mod tests {
         let malformed_candidate = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "sessionId": session_id,
+            "controllerEpoch": "controller-test",
+            "hostEpoch": "",
             "sequence": 1,
             "sender": "controller",
             "sentAt": 2,
@@ -1031,6 +1534,9 @@ mod tests {
         let restart_envelope = serde_json::json!({
             "version": PROTOCOL_VERSION,
             "sessionId": session_id,
+            "controllerEpoch": "controller-test",
+            "hostEpoch": "",
+            "generation": 1,
             "sequence": 2,
             "sender": "controller",
             "sentAt": 3,

@@ -23,9 +23,19 @@ type Evidence = {
   height?: unknown;
   average_fps?: unknown;
   first_frame_milliseconds?: unknown;
+  capture_to_encode_p50_milliseconds?: unknown;
+  capture_to_encode_p95_milliseconds?: unknown;
+  encode_p50_milliseconds?: unknown;
+  encode_p95_milliseconds?: unknown;
   p95_frame_milliseconds?: unknown;
   p99_frame_milliseconds?: unknown;
   p95_input_to_photon_milliseconds?: unknown;
+  frame_drops?: unknown;
+  packet_loss_percent?: unknown;
+  rtt_p95_milliseconds?: unknown;
+  decoded_fps?: unknown;
+  rendered_width?: unknown;
+  rendered_height?: unknown;
   rss_start_megabytes?: unknown;
   rss_end_megabytes?: unknown;
   rss_peak_megabytes?: unknown;
@@ -96,14 +106,46 @@ export function validatePerformanceEvidence(records: readonly unknown[]): string
     }
     for (const field of [
       "first_frame_milliseconds",
+      "capture_to_encode_p50_milliseconds",
+      "capture_to_encode_p95_milliseconds",
+      "encode_p50_milliseconds",
+      "encode_p95_milliseconds",
       "p95_frame_milliseconds",
       "p99_frame_milliseconds",
       "p95_input_to_photon_milliseconds",
+      "frame_drops",
+      "packet_loss_percent",
+      "rtt_p95_milliseconds",
+      "decoded_fps",
       "rss_start_megabytes",
       "rss_end_megabytes",
       "rss_peak_megabytes",
     ] as const) {
       if (!finiteAtLeast(record[field], 0)) errors.push(`${label}: invalid ${field}`);
+    }
+    for (const field of ["rendered_width", "rendered_height"] as const) {
+      if (!finiteAtLeast(record[field], 1)) errors.push(`${label}: invalid ${field}`);
+    }
+    if (
+      finiteAtLeast(record.capture_to_encode_p50_milliseconds, 0) &&
+      finiteAtLeast(record.capture_to_encode_p95_milliseconds, 0) &&
+      Number(record.capture_to_encode_p95_milliseconds) <
+        Number(record.capture_to_encode_p50_milliseconds)
+    ) {
+      errors.push(`${label}: capture-to-encode p95 is below p50`);
+    }
+    if (
+      finiteAtLeast(record.encode_p50_milliseconds, 0) &&
+      finiteAtLeast(record.encode_p95_milliseconds, 0) &&
+      Number(record.encode_p95_milliseconds) < Number(record.encode_p50_milliseconds)
+    ) {
+      errors.push(`${label}: encode p95 is below p50`);
+    }
+    if (finiteAtLeast(record.packet_loss_percent, 0) && Number(record.packet_loss_percent) > 100) {
+      errors.push(`${label}: packet_loss_percent exceeds 100`);
+    }
+    if (finiteAtLeast(record.decoded_fps, 0) && Number(record.decoded_fps) < minimumFps) {
+      errors.push(`${label}: decoded_fps is below ${minimumFps}`);
     }
     if (
       !Number.isSafeInteger(record.capture_queue_peak) ||

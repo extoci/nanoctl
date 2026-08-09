@@ -19,7 +19,7 @@ test("authenticated dashboard distinguishes readiness and exposes security activ
   const unready = page.locator(".device-card").filter({ hasText: "Linux laptop" });
   const offline = page.locator(".device-card").filter({ hasText: "Travel Mac" });
   await expect(ready.getByRole("button", { name: "Connect" })).toBeEnabled();
-  await expect(unready.getByText("needs attention")).toBeVisible();
+  await expect(unready.getByText("needs input permission")).toBeVisible();
   await expect(unready.getByRole("button", { name: "Connect" })).toBeDisabled();
   await expect(offline.getByText("offline", { exact: true })).toBeVisible();
   await expect(offline.getByRole("button", { name: "Connect" })).toBeDisabled();

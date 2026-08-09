@@ -1,39 +1,35 @@
 "use client";
 
-import { PROTOCOL_VERSION, type ControlMessage } from "@nanoctl/protocol";
-import { useAction, useMutation, useQuery } from "convex/react";
-import { useEffect, useRef, useState } from "react";
+import { useAction, useConvex, useMutation, useQuery } from "convex/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DisplayInfo } from "@nanoctl/protocol";
 import { functions } from "../lib/convex";
-import { reliableControlBufferIsSaturated } from "../lib/control-backpressure";
-import { processHostSignals } from "../lib/remote-signals";
-
-type ViewerMetrics = {
-  resolution: string;
-  fps: number;
-  bitrateKbps: number;
-  rttMs: number;
-  packetsLost: number;
-  framesDropped: number;
-  route: "direct" | "relay" | "unknown";
-};
+import {
+  RemoteSessionController,
+  createControllerEpoch,
+  type HostSignalRow,
+  type RemoteSessionOperations,
+  type RemoteSessionSnapshot,
+} from "../lib/remote-session";
 
 export type ViewerSession = {
   state: "requested" | "ringing" | "negotiating" | "connected" | "ended" | "failed";
   expiresAt: number;
   endReason?: string;
-  displays: {
-    id: string;
-    name: string;
-    width: number;
-    height: number;
-    scaleFactor: number;
-    primary: boolean;
-  }[];
+  controllerEpoch?: string;
+  remoteInput: boolean;
+  displays: DisplayInfo[];
 };
 
-type ViewerOperations = {
-  sendSignal: (args: { sessionId: string; envelope: string }) => Promise<unknown>;
-  endSession: (args: { sessionId: string; reason: string }) => Promise<unknown>;
+type ViewerOperations = RemoteSessionOperations & {
+  getSessionState?: () => Promise<ViewerSession>;
+  claimController: (args: {
+    sessionId: string;
+    controllerEpoch: string;
+    expectedControllerEpoch?: string;
+  }) => Promise<{
+    controllerEpoch: string;
+  }>;
   getTurnCredentials: (args: { sessionId: string }) => Promise<{
     urls: string[];
     username: string;
@@ -42,26 +38,30 @@ type ViewerOperations = {
   } | null>;
 };
 
-const NEGOTIATION_TIMEOUT_MS = 30_000;
-
-function isTerminalSession(session: ViewerSession | undefined): boolean {
-  return Boolean(
-    !session ||
-    session.state === "ended" ||
-    session.state === "failed" ||
-    session.expiresAt <= Date.now(),
-  );
-}
-
 export function RemoteViewer({ sessionId }: { sessionId: string }) {
   const sendSignal = useMutation(functions.signals.send);
   const endSession = useMutation(functions.sessions.end);
+  const claimController = useMutation(functions.sessions.claimController);
   const getTurnCredentials = useAction(functions.sessions.turnCredentials);
+  const convex = useConvex();
   const session = useQuery(functions.sessions.getState, { sessionId });
+  const getSessionState = useCallback(
+    () => convex.query(functions.sessions.getState, { sessionId }),
+    [convex, sessionId],
+  );
+  const [hostSignalCursor, setHostSignalCursor] = useState(-1);
+  useEffect(() => setHostSignalCursor(-1), [sessionId]);
   const incoming = useQuery(functions.signals.list, {
     sessionId,
-    afterSequence: -1,
+    // The Convex query replays a bounded recent window by insertion time. The controller
+    // deduplicates by generation and sequence, including across a native-agent restart.
+    afterSequence: Math.max(-1, hostSignalCursor - 64),
   });
+
+  const operations = useMemo(
+    () => ({ sendSignal, endSession, claimController, getTurnCredentials, getSessionState }),
+    [claimController, endSession, getSessionState, getTurnCredentials, sendSignal],
+  );
 
   return (
     <RemoteViewerCore
@@ -69,7 +69,9 @@ export function RemoteViewer({ sessionId }: { sessionId: string }) {
       sessionId={sessionId}
       session={session}
       incoming={incoming}
-      operations={{ sendSignal, endSession, getTurnCredentials }}
+      hostSignalCursor={hostSignalCursor}
+      onHostSignalCursor={setHostSignalCursor}
+      operations={operations}
     />
   );
 }
@@ -78,104 +80,108 @@ export function RemoteViewerCore({
   sessionId,
   session,
   incoming,
-  operations: { sendSignal, endSession, getTurnCredentials },
+  hostSignalCursor = -1,
+  onHostSignalCursor,
+  operations,
 }: {
   sessionId: string;
   session: ViewerSession | undefined;
-  incoming: { sequence: number; envelope: string }[] | undefined;
+  incoming: HostSignalRow[] | undefined;
+  hostSignalCursor?: number;
+  onHostSignalCursor?: (sequence: number) => void;
   operations: ViewerOperations;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const peerRef = useRef<RTCPeerConnection | null>(null);
-  const peerSessionRef = useRef<string | null>(null);
-  const sessionGenerationRef = useRef(0);
-  const sendSequenceRef = useRef(0);
-  const processedSignalsRef = useRef(new Set<number>());
-  const signalTaskRef = useRef<Promise<void>>(Promise.resolve());
-  const restartAttemptsRef = useRef(0);
-  const inputEnabledRef = useRef(true);
-  const releaseInputRef = useRef<() => void>(() => {});
-  const selectDisplayRef = useRef<(displayId: string) => boolean>(() => false);
-  const [status, setStatus] = useState("Negotiating");
+  const controllerRef = useRef<RemoteSessionController | null>(null);
+  const controllerSessionRef = useRef<string | null>(null);
+  const pendingControllerCleanupRef = useRef<{
+    timer: number;
+    sessionId: string;
+    controller: RemoteSessionController | null;
+  } | null>(null);
+  const controllerClaimRef = useRef<{
+    sessionId: string;
+    promise: Promise<string>;
+  } | null>(null);
+  const restoredControllerEpochRef = useRef<string | undefined>(undefined);
+  const controllerOwnershipLostRef = useRef(false);
+  const incomingRef = useRef(incoming);
+  incomingRef.current = incoming;
+  const iceServersSessionRef = useRef<string | null>(null);
   const [iceServers, setIceServers] = useState<RTCIceServer[] | null>(null);
   const [ending, setEnding] = useState(false);
-  const [inputEnabled, setInputEnabled] = useState(true);
+  const [endError, setEndError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const [selectedDisplay, setSelectedDisplay] = useState("");
-  const [metrics, setMetrics] = useState<ViewerMetrics | null>(null);
-  const iceServersSessionRef = useRef<string | null>(null);
-  const sessionActive = Boolean(session && !isTerminalSession(session));
-
-  // A viewer can be retained while the route changes between sessions. Reset every piece of
-  // signaling state before the new TURN/peer effects run; sequence zero is reserved for the
-  // initial offer that the Windows agent uses to discover a session.
+  const [controllerRestoreNonce, setControllerRestoreNonce] = useState(0);
+  const [snapshot, setSnapshot] = useState<RemoteSessionSnapshot>(() =>
+    snapshotForSession(session),
+  );
   useEffect(() => {
-    sessionGenerationRef.current += 1;
-    sendSequenceRef.current = 0;
-    processedSignalsRef.current = new Set<number>();
-    signalTaskRef.current = Promise.resolve();
-    restartAttemptsRef.current = 0;
-    peerSessionRef.current = null;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const sessionActive = Boolean(session && !isTerminalSession(session, now));
+  const displays = session?.displays ?? [];
+  const displaySignature = displays
+    .map((display) =>
+      [
+        display.id,
+        display.name,
+        display.width,
+        display.height,
+        display.scaleFactor,
+        display.primary,
+      ].join("\u0000"),
+    )
+    .join("\u0001");
+  const remoteInputEnabled = session?.remoteInput ?? false;
+  useEffect(() => {
     iceServersSessionRef.current = null;
     setIceServers(null);
     setSelectedDisplay("");
-    setMetrics(null);
-    setStatus("Negotiating");
     setEnding(false);
-    inputEnabledRef.current = true;
-    setInputEnabled(true);
+    setEndError(null);
+    setSnapshot(snapshotForSession(session, now));
+    setControllerRestoreNonce(0);
+    restoredControllerEpochRef.current = undefined;
+    controllerOwnershipLostRef.current = false;
   }, [sessionId]);
 
   useEffect(() => {
     if (!session) return;
+    if (isTerminalSession(session, now)) {
+      setSnapshot(snapshotForSession(session, now));
+      const controller = controllerRef.current;
+      if (controller) void controller.stop(session.endReason ?? "session ended", false);
+    }
+  }, [now, session]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
     if (
-      session.state === "ended" ||
-      session.state === "failed" ||
-      session.expiresAt <= Date.now()
+      !controller ||
+      controllerSessionRef.current !== sessionId ||
+      !session?.controllerEpoch ||
+      session.controllerEpoch === controller.controllerEpochId
     ) {
-      setStatus(session.endReason ? `ended: ${session.endReason}` : session.state);
-      peerRef.current?.close();
-      if (videoRef.current) videoRef.current.srcObject = null;
+      return;
     }
-  }, [session]);
-
-  useEffect(() => {
-    if (!session || !isTerminalSession(session)) return;
-    const endOnPageHide = () => {
-      void endSession({ sessionId, reason: "controller disconnected" }).catch(() => {});
-    };
-    window.addEventListener("pagehide", endOnPageHide, { once: true });
-    return () => window.removeEventListener("pagehide", endOnPageHide);
-  }, [endSession, session, sessionId]);
-
-  useEffect(() => {
-    if (selectedDisplay || !session?.displays.length) return;
-    setSelectedDisplay(
-      session.displays.find((display) => display.primary)?.id ?? session.displays[0]?.id ?? "",
-    );
-  }, [selectedDisplay, session]);
-
-  async function leaveSession() {
-    if (ending) return;
-    setEnding(true);
-    peerRef.current?.close();
-    try {
-      await endSession({ sessionId, reason: "ended by controller" });
-    } finally {
-      window.location.assign("/dashboard");
-    }
-  }
-
-  function setRemoteControl(enabled: boolean) {
-    inputEnabledRef.current = enabled;
-    setInputEnabled(enabled);
-    if (!enabled) releaseInputRef.current();
-    else videoRef.current?.focus();
-  }
+    // Convex propagates a replacement claim to the old page independently of WebRTC polling.
+    // Close the old data channels as soon as that lease changes, while the native host also
+    // revokes its input lane before asynchronous peer/media teardown.
+    controllerOwnershipLostRef.current = true;
+    controllerRef.current = null;
+    controllerSessionRef.current = null;
+    void controller.stop("controller replaced", false);
+  }, [session?.controllerEpoch, sessionId]);
 
   useEffect(() => {
     if (!sessionActive) return;
     let cancelled = false;
-    void getTurnCredentials({ sessionId })
+    void operations
+      .getTurnCredentials({ sessionId })
       .then((turn) => {
         if (cancelled) return;
         iceServersSessionRef.current = sessionId;
@@ -187,440 +193,260 @@ export function RemoteViewerCore({
         ]);
       })
       .catch(() => {
-        if (!cancelled) {
-          iceServersSessionRef.current = sessionId;
-          setIceServers([{ urls: "stun:stun.cloudflare.com:3478" }]);
-        }
+        if (cancelled) return;
+        iceServersSessionRef.current = sessionId;
+        setIceServers([{ urls: "stun:stun.cloudflare.com:3478" }]);
       });
     return () => {
       cancelled = true;
     };
-  }, [getTurnCredentials, sessionActive, sessionId]);
+  }, [operations, sessionActive, sessionId]);
 
   useEffect(() => {
-    if (!sessionActive || !iceServers || iceServersSessionRef.current !== sessionId) return;
-    const generation = sessionGenerationRef.current;
-    let disposed = false;
-    const isCurrent = () =>
-      !disposed &&
-      sessionGenerationRef.current === generation &&
-      peerSessionRef.current === sessionId;
-    const peer = new RTCPeerConnection({
-      iceServers,
-      bundlePolicy: "max-bundle",
-    });
-    peerRef.current = peer;
-    peerSessionRef.current = sessionId;
-    const endOnPageHide = () => {
-      if (!isCurrent()) return;
-      void endSession({ sessionId, reason: "controller disconnected" });
-    };
-    window.addEventListener("pagehide", endOnPageHide, { once: true });
-    const pointerChannel = peer.createDataChannel("nanoctl.pointer.v1", {
-      ordered: false,
-      maxRetransmits: 0,
-    });
-    const controlChannel = peer.createDataChannel("nanoctl.control.v1");
-    peer.addTransceiver("video", { direction: "recvonly" });
-
-    peer.ontrack = ({ receiver, streams, track }) => {
-      if (!isCurrent()) return;
-      if ("playoutDelayHint" in receiver) {
-        (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
-      }
-      const stream = streams[0] ?? new MediaStream([track]);
-      if (stream && videoRef.current) {
-        videoRef.current.srcObject = stream;
-        void videoRef.current.play().catch(() => {});
-      }
-    };
-    let restartTimer: number | null = null;
-    let negotiationTimer: number | null = null;
-    let offerInFlight = false;
-    const sendOffer = async (iceRestart: boolean) => {
-      if (!isCurrent() || offerInFlight || peer.signalingState === "closed") return;
-      offerInFlight = true;
-      try {
-        const offer = await peer.createOffer({ iceRestart });
-        if (!isCurrent()) return;
-        await peer.setLocalDescription(offer);
-        if (!isCurrent()) return;
-        const localDescription = peer.localDescription;
-        if (!localDescription || localDescription.type !== "offer") {
-          throw new Error("local offer was not installed");
-        }
-        await sendSignal({
-          sessionId,
-          envelope: JSON.stringify({
-            version: PROTOCOL_VERSION,
-            sessionId,
-            sequence: sendSequenceRef.current++,
-            sender: "controller",
-            sentAt: Date.now(),
-            payload: { type: "offer", sdp: localDescription.sdp ?? "" },
-          }),
-        });
-        if (!iceRestart && negotiationTimer === null) {
-          negotiationTimer = window.setTimeout(() => {
-            negotiationTimer = null;
-            if (
-              !isCurrent() ||
-              peer.connectionState === "connected" ||
-              peer.signalingState === "closed"
-            )
-              return;
-            setStatus("failed: host did not answer");
-            peer.close();
-            void endSession({
-              sessionId,
-              reason: "host did not answer within 30 seconds",
-            }).catch(() => {});
-          }, NEGOTIATION_TIMEOUT_MS);
-        }
-      } finally {
-        offerInFlight = false;
-      }
-    };
-    const restart = () => {
-      if (!isCurrent()) return;
-      if (restartAttemptsRef.current >= 3 || peer.signalingState === "closed") {
-        setStatus("failed");
-        peer.close();
-        void endSession({ sessionId, reason: "controller connection failed" }).catch(() => {});
-        return;
-      }
-      restartAttemptsRef.current += 1;
-      setStatus(`reconnecting (${restartAttemptsRef.current}/3)`);
-      void sendOffer(true).catch(() => {
-        if (isCurrent()) setStatus("signaling failed");
-      });
-    };
-    peer.onconnectionstatechange = () => {
-      if (!isCurrent()) return;
-      const state = peer.connectionState;
-      if (state === "connected") {
-        restartAttemptsRef.current = 0;
-        if (negotiationTimer !== null) window.clearTimeout(negotiationTimer);
-        negotiationTimer = null;
-        if (restartTimer !== null) window.clearTimeout(restartTimer);
-        restartTimer = null;
-      } else if (state === "disconnected" && restartTimer === null) {
-        restartTimer = window.setTimeout(() => {
-          restartTimer = null;
-          restart();
-        }, 3_000);
-      } else if (state === "failed") {
-        if (restartTimer !== null) window.clearTimeout(restartTimer);
-        restartTimer = null;
-        restart();
-        return;
-      } else if (state === "closed") {
-        return;
-      }
-      setStatus(state);
-    };
-    peer.onicecandidate = ({ candidate }) => {
-      if (!isCurrent()) return;
-      const payload = candidate
-        ? {
-            type: "ice-candidate" as const,
-            candidate: candidate.candidate,
-            sdpMid: candidate.sdpMid,
-            sdpMLineIndex: candidate.sdpMLineIndex,
-            usernameFragment: candidate.usernameFragment ?? null,
-          }
-        : { type: "ice-complete" as const };
-      void sendSignal({
-        sessionId,
-        envelope: JSON.stringify({
-          version: PROTOCOL_VERSION,
-          sessionId,
-          sequence: sendSequenceRef.current++,
-          sender: "controller",
-          sentAt: Date.now(),
-          payload,
-        }),
-      }).catch(() => {
-        if (isCurrent()) setStatus("signaling failed");
-      });
-    };
-
-    function sendControl(payload: ControlMessage) {
-      if (!isCurrent()) return;
-      if (
-        !inputEnabledRef.current &&
-        (payload.type === "pointer" || payload.type === "key" || payload.type === "display")
-      ) {
-        return;
-      }
-      const isMotion = payload.type === "pointer" && payload.action === "move";
-      const channel = isMotion ? pointerChannel : controlChannel;
-      if (isMotion && channel.bufferedAmount > 64 * 1024) return;
-      if (!isMotion && reliableControlBufferIsSaturated(channel.bufferedAmount)) {
-        if (peer.connectionState !== "closed") {
-          inputEnabledRef.current = false;
-          setInputEnabled(false);
-          setStatus("control channel stalled");
-          peer.close();
-          void endSession({
-            sessionId,
-            reason: "reliable control channel stalled",
-          }).catch(() => {});
-        }
-        return;
-      }
-      if (channel.readyState === "open") channel.send(JSON.stringify(payload));
-    }
     const video = videoRef.current;
-    const releaseInput = () => {
-      if (controlChannel.readyState === "open") {
-        controlChannel.send(JSON.stringify({ type: "release" } satisfies ControlMessage));
+
+    // React Strict Mode probes effects by cleaning them up and immediately mounting them again.
+    // Delay the destructive cleanup by one task so that probe is harmless, while a real unmount
+    // still releases the peer. A session swap is not a
+    // probe: release the old controller immediately and never let it own the new session's
+    // signals. Teardown is deliberately non-terminal; the host detects an abandoned page, while
+    // a refresh can claim a new controller epoch without racing an old end mutation.
+    const pendingCleanup = pendingControllerCleanupRef.current;
+    if (pendingCleanup && pendingCleanup.sessionId === sessionId) {
+      window.clearTimeout(pendingCleanup.timer);
+      pendingControllerCleanupRef.current = null;
+    }
+    if (pendingCleanup && pendingCleanup.sessionId !== sessionId) {
+      window.clearTimeout(pendingCleanup.timer);
+      pendingControllerCleanupRef.current = null;
+      if (pendingCleanup.controller) {
+        void pendingCleanup.controller.stop("controller disconnected", false);
       }
-      video?.blur();
-    };
-    releaseInputRef.current = releaseInput;
-    selectDisplayRef.current = (displayId) => {
-      if (!inputEnabledRef.current || controlChannel.readyState !== "open") return false;
-      controlChannel.send(JSON.stringify({ type: "display", displayId } satisfies ControlMessage));
-      return true;
-    };
-    const normalizedPosition = (event: MouseEvent) => {
-      if (!video || video.videoWidth === 0 || video.videoHeight === 0) return null;
-      const rect = video.getBoundingClientRect();
-      const sourceRatio = video.videoWidth / video.videoHeight;
-      const elementRatio = rect.width / rect.height;
-      const renderedWidth = sourceRatio > elementRatio ? rect.width : rect.height * sourceRatio;
-      const renderedHeight = sourceRatio > elementRatio ? rect.width / sourceRatio : rect.height;
-      const left = rect.left + (rect.width - renderedWidth) / 2;
-      const top = rect.top + (rect.height - renderedHeight) / 2;
-      return {
-        x: Math.max(0, Math.min(1, (event.clientX - left) / renderedWidth)),
-        y: Math.max(0, Math.min(1, (event.clientY - top) / renderedHeight)),
+    }
+    if (controllerClaimRef.current?.sessionId !== sessionId) {
+      controllerClaimRef.current = null;
+    }
+    const existingController = controllerRef.current;
+    if (existingController && controllerSessionRef.current !== sessionId) {
+      if (pendingCleanup) window.clearTimeout(pendingCleanup.timer);
+      pendingControllerCleanupRef.current = null;
+      controllerRef.current = null;
+      controllerSessionRef.current = null;
+      void existingController.stop("controller disconnected", false);
+    }
+    if (controllerRef.current && controllerSessionRef.current === sessionId) {
+      controllerRef.current.updateCapabilities(displays, remoteInputEnabled);
+    }
+
+    const scheduleControllerCleanup = (
+      controller: RemoteSessionController | null,
+      ownedSessionId: string,
+    ) => {
+      const timer = window.setTimeout(() => {
+        const ownsPeer = controller
+          ? controllerRef.current === controller && controllerSessionRef.current === ownedSessionId
+          : controllerRef.current === null && controllerSessionRef.current === null;
+        if (!ownsPeer) return;
+        pendingControllerCleanupRef.current = null;
+        controllerClaimRef.current = null;
+        if (controller) {
+          controllerRef.current = null;
+          controllerSessionRef.current = null;
+          void controller.stop("controller disconnected", false);
+        }
+      }, 0);
+      pendingControllerCleanupRef.current = {
+        timer,
+        sessionId: ownedSessionId,
+        controller,
       };
     };
-    const pointer = (event: PointerEvent) => {
-      if (!video || !inputEnabledRef.current) return;
-      const position = normalizedPosition(event);
-      if (!position) return;
-      if (event.type === "pointerdown") {
-        event.preventDefault();
-        video.focus();
-        video.setPointerCapture(event.pointerId);
+
+    if (!sessionActive && controllerRef.current) {
+      const controller = controllerRef.current;
+      controllerRef.current = null;
+      controllerSessionRef.current = null;
+      void controller.stop(session?.endReason ?? "controller disconnected", false);
+    }
+    if (!sessionActive && controllerClaimRef.current?.sessionId === sessionId) {
+      controllerClaimRef.current = null;
+    }
+    if (controllerOwnershipLostRef.current) return;
+    if (
+      !video ||
+      !sessionActive ||
+      !iceServers ||
+      iceServersSessionRef.current !== sessionId ||
+      controllerRef.current
+    ) {
+      if (controllerRef.current && controllerSessionRef.current === sessionId) {
+        return () => scheduleControllerCleanup(controllerRef.current!, sessionId);
       }
-      sendControl({
-        type: "pointer",
-        action:
-          event.type === "pointermove" ? "move" : event.type === "pointerdown" ? "down" : "up",
-        ...position,
-        button: event.button === 1 || event.button === 2 ? event.button : 0,
-      });
-    };
-    const wheel = (event: WheelEvent) => {
-      if (!inputEnabledRef.current) return;
-      const position = normalizedPosition(event);
-      if (!position) return;
-      event.preventDefault();
-      sendControl({
-        type: "pointer",
-        action: "wheel",
-        ...position,
-        deltaX: event.deltaX,
-        deltaY: event.deltaY,
-      });
-    };
-    const contextMenu = (event: MouseEvent) => {
-      if (inputEnabledRef.current) event.preventDefault();
-    };
-    const key = (event: KeyboardEvent) => {
-      if (!inputEnabledRef.current) return;
-      event.preventDefault();
-      sendControl({
-        type: "key",
-        action: event.type === "keydown" ? "down" : "up",
-        code: event.code,
-        key: event.key,
-        modifiers:
-          Number(event.shiftKey) |
-          (Number(event.ctrlKey) << 1) |
-          (Number(event.altKey) << 2) |
-          (Number(event.metaKey) << 3),
-        repeat: event.repeat,
-      });
-    };
-    const emergencyEscape = (event: KeyboardEvent) => {
-      if (
-        event.type === "keydown" &&
-        event.code === "Escape" &&
-        event.ctrlKey &&
-        event.altKey &&
-        event.shiftKey
-      ) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        inputEnabledRef.current = false;
-        setInputEnabled(false);
-        releaseInput();
-        if (document.fullscreenElement) void document.exitFullscreen();
-      }
-    };
-    const releaseOnBlur = () => releaseInput();
-    const releaseWhenHidden = () => {
-      if (document.visibilityState === "hidden") releaseInput();
-    };
-    video?.addEventListener("pointermove", pointer);
-    video?.addEventListener("pointerdown", pointer);
-    video?.addEventListener("pointerup", pointer);
-    video?.addEventListener("pointercancel", releaseInput);
-    video?.addEventListener("lostpointercapture", releaseInput);
-    video?.addEventListener("wheel", wheel, { passive: false });
-    video?.addEventListener("contextmenu", contextMenu);
-    video?.addEventListener("keydown", key);
-    video?.addEventListener("keyup", key);
-    window.addEventListener("keydown", emergencyEscape, true);
-    window.addEventListener("blur", releaseOnBlur);
-    document.addEventListener("visibilitychange", releaseWhenHidden);
-    let pingNonce = 0;
-    const keepalive = window.setInterval(
-      () => sendControl({ type: "ping", nonce: pingNonce++, sentAt: Date.now() }),
-      1_000,
-    );
-    let previousBytes: { value: number; timestamp: number } | null = null;
-    let statsInFlight = false;
-    let statsStopped = false;
-    const statsTimer = window.setInterval(() => {
-      if (statsInFlight || peer.connectionState === "closed") return;
-      statsInFlight = true;
-      void peer
-        .getStats()
-        .then((report) => {
-          if (statsStopped || !isCurrent()) return;
-          let inbound: RTCStats | undefined;
-          let candidatePair: RTCStats | undefined;
-          report.forEach((stats) => {
-            if (
-              stats.type === "inbound-rtp" &&
-              (stringStat(stats, "kind") === "video" || stringStat(stats, "mediaType") === "video")
-            ) {
-              inbound = stats;
-            }
-            if (
-              stats.type === "candidate-pair" &&
-              stringStat(stats, "state") === "succeeded" &&
-              booleanStat(stats, "nominated")
-            ) {
-              candidatePair = stats;
-            }
-          });
-          if (!inbound) return;
-          const bytes = numberStat(inbound, "bytesReceived") ?? 0;
-          const now = inbound.timestamp;
-          const elapsed = previousBytes ? now - previousBytes.timestamp : 0;
-          const bitrateKbps =
-            previousBytes && elapsed > 0
-              ? Math.max(0, Math.round(((bytes - previousBytes.value) * 8) / elapsed))
-              : 0;
-          previousBytes = { value: bytes, timestamp: now };
-          const remoteCandidateId = candidatePair
-            ? stringStat(candidatePair, "remoteCandidateId")
-            : undefined;
-          const remoteCandidate = remoteCandidateId ? report.get(remoteCandidateId) : undefined;
-          const route =
-            stringStat(remoteCandidate, "candidateType") === "relay"
-              ? "relay"
-              : remoteCandidate
-                ? "direct"
-                : "unknown";
-          const width = numberStat(inbound, "frameWidth") ?? 0;
-          const height = numberStat(inbound, "frameHeight") ?? 0;
-          setMetrics({
-            resolution: width > 0 && height > 0 ? `${width}×${height}` : "—",
-            fps: Math.round(numberStat(inbound, "framesPerSecond") ?? 0),
-            bitrateKbps,
-            rttMs: Math.round((numberStat(candidatePair, "currentRoundTripTime") ?? 0) * 1_000),
-            packetsLost: Math.max(0, Math.round(numberStat(inbound, "packetsLost") ?? 0)),
-            framesDropped: Math.max(0, Math.round(numberStat(inbound, "framesDropped") ?? 0)),
-            route,
-          });
-        })
-        .catch(() => {})
-        .finally(() => {
-          statsInFlight = false;
-        });
-    }, 1_000);
+      return;
+    }
+    if (controllerRef.current) {
+      return () => scheduleControllerCleanup(controllerRef.current, sessionId);
+    }
 
-    void sendOffer(false).catch(() => {
-      if (isCurrent()) setStatus("signaling failed");
-    });
-
-    return () => {
-      disposed = true;
-      video?.removeEventListener("pointermove", pointer);
-      video?.removeEventListener("pointerdown", pointer);
-      video?.removeEventListener("pointerup", pointer);
-      video?.removeEventListener("pointercancel", releaseInput);
-      video?.removeEventListener("lostpointercapture", releaseInput);
-      video?.removeEventListener("wheel", wheel);
-      video?.removeEventListener("contextmenu", contextMenu);
-      video?.removeEventListener("keydown", key);
-      video?.removeEventListener("keyup", key);
-      window.removeEventListener("keydown", emergencyEscape, true);
-      window.removeEventListener("blur", releaseOnBlur);
-      document.removeEventListener("visibilitychange", releaseWhenHidden);
-      releaseInput();
-      releaseInputRef.current = () => {};
-      selectDisplayRef.current = () => false;
-      statsStopped = true;
-      window.clearInterval(keepalive);
-      window.clearInterval(statsTimer);
-      if (restartTimer !== null) window.clearTimeout(restartTimer);
-      if (negotiationTimer !== null) window.clearTimeout(negotiationTimer);
-      pointerChannel.close();
-      controlChannel.close();
-      peer.close();
-      if (videoRef.current) videoRef.current.srcObject = null;
-      if (peerRef.current === peer) peerRef.current = null;
-      if (peerSessionRef.current === sessionId) peerSessionRef.current = null;
-      window.removeEventListener("pagehide", endOnPageHide);
-    };
-  }, [endSession, iceServers, sendSignal, sessionActive, sessionId]);
-
-  useEffect(() => {
-    const peer = peerRef.current;
-    const generation = sessionGenerationRef.current;
-    if (!peer || peerSessionRef.current !== sessionId || !incoming) return;
-    signalTaskRef.current = signalTaskRef.current
-      .then(() => {
-        if (
-          sessionGenerationRef.current !== generation ||
-          peerSessionRef.current !== sessionId ||
-          peerRef.current !== peer ||
-          peer.signalingState === "closed"
-        ) {
-          return;
-        }
-        return processHostSignals(
-          peer,
+    const expectedControllerEpoch = restoredControllerEpochRef.current ?? session?.controllerEpoch;
+    const claim =
+      controllerClaimRef.current?.sessionId === sessionId
+        ? controllerClaimRef.current.promise
+        : (() => {
+            const proposedEpoch = createControllerEpoch();
+            const promise = operations
+              .claimController({
+                sessionId,
+                controllerEpoch: proposedEpoch,
+                ...(expectedControllerEpoch ? { expectedControllerEpoch } : {}),
+              })
+              .then((result) => result.controllerEpoch);
+            controllerClaimRef.current = { sessionId, promise };
+            return promise;
+          })();
+    let cancelled = false;
+    let controller: RemoteSessionController | null = null;
+    void claim
+      .then((controllerEpoch) => {
+        if (cancelled || controllerRef.current || !sessionActive) return;
+        controllerOwnershipLostRef.current = false;
+        restoredControllerEpochRef.current = undefined;
+        if (controllerClaimRef.current?.promise === claim) controllerClaimRef.current = null;
+        controller = new RemoteSessionController({
           sessionId,
-          incoming,
-          processedSignalsRef.current,
-          (reason) => {
-            if (sessionGenerationRef.current === generation) setStatus(`ended: ${reason}`);
+          controllerEpoch,
+          displays,
+          remoteInputEnabled,
+          iceServers,
+          video,
+          operations,
+          getIceServers: async () => {
+            try {
+              const turn = await operations.getTurnCredentials({ sessionId });
+              return [
+                { urls: "stun:stun.cloudflare.com:3478" },
+                ...(turn
+                  ? [{ urls: turn.urls, username: turn.username, credential: turn.credential }]
+                  : []),
+              ];
+            } catch {
+              return [{ urls: "stun:stun.cloudflare.com:3478" }];
+            }
           },
-          () =>
-            sessionGenerationRef.current === generation &&
-            peerSessionRef.current === sessionId &&
-            peerRef.current === peer &&
-            peer.signalingState !== "closed",
-        );
+          revalidateController: operations.getSessionState
+            ? async () => {
+                const current = await operations.getSessionState!();
+                return {
+                  owned: current.controllerEpoch === controllerEpoch,
+                  ...(current.controllerEpoch ? { controllerEpoch: current.controllerEpoch } : {}),
+                };
+              }
+            : undefined,
+          onPageRestore: (currentControllerEpoch) => {
+            if (controllerRef.current !== controller) return;
+            const pending = pendingControllerCleanupRef.current;
+            if (pending) window.clearTimeout(pending.timer);
+            pendingControllerCleanupRef.current = null;
+            controllerOwnershipLostRef.current = false;
+            restoredControllerEpochRef.current = currentControllerEpoch;
+            controllerRef.current = null;
+            controllerSessionRef.current = null;
+            setControllerRestoreNonce((value) => value + 1);
+          },
+          onSnapshot: setSnapshot,
+        });
+        controllerRef.current = controller;
+        controllerSessionRef.current = sessionId;
+        const startPromise = controller.start();
+        // The initial replay may already be in the reactive query when the claim resolves. Feed it
+        // after the local offer has been published so an answer cannot be consumed before there is
+        // an outstanding local offer to match it.
+        void startPromise.then(() => {
+          if (controllerRef.current === controller) {
+            controller?.ingestHostSignals(incomingRef.current ?? []);
+          }
+        });
       })
       .catch(() => {
-        if (sessionGenerationRef.current === generation) setStatus("signaling failed");
+        if (cancelled) return;
+        if (controllerClaimRef.current?.promise === claim) controllerClaimRef.current = null;
+        controllerOwnershipLostRef.current = true;
+        setSnapshot((current) => ({
+          ...current,
+          phase: "failed",
+          reason: "controller claim failed",
+        }));
       });
-  }, [iceServers, incoming, sessionId]);
+    return () => {
+      cancelled = true;
+      scheduleControllerCleanup(controller, sessionId);
+    };
+  }, [
+    controllerRestoreNonce,
+    displaySignature,
+    iceServers,
+    operations,
+    remoteInputEnabled,
+    sessionActive,
+    sessionId,
+    session?.controllerEpoch,
+  ]);
 
+  useEffect(() => {
+    controllerRef.current?.ingestHostSignals(incoming ?? []);
+    const latest = incoming?.reduce(
+      (maximum, row) =>
+        Math.max(maximum, Number.isSafeInteger(row.sequence) ? row.sequence : maximum),
+      -1,
+    );
+    if (latest !== undefined && latest > hostSignalCursor) onHostSignalCursor?.(latest);
+  }, [hostSignalCursor, incoming, onHostSignalCursor]);
+
+  useEffect(() => {
+    const available = session?.displays ?? [];
+    if (available.length === 0) {
+      if (selectedDisplay) setSelectedDisplay("");
+      return;
+    }
+    if (!available.some((display) => display.id === selectedDisplay)) {
+      setSelectedDisplay(
+        available.find((display) => display.primary)?.id ?? available[0]?.id ?? "",
+      );
+    }
+  }, [selectedDisplay, session?.displays]);
+
+  async function leaveSession(): Promise<void> {
+    if (ending) return;
+    setEnding(true);
+    setEndError(null);
+    const controller = controllerRef.current;
+    const controllerEpoch = controller?.controllerEpochId;
+    await controller?.stop("ended by controller", false);
+    try {
+      await operations.endSession({
+        sessionId,
+        reason: "ended by controller",
+        ...(controllerEpoch ? { controllerEpoch } : {}),
+      });
+      window.location.assign("/dashboard");
+    } catch {
+      setEndError("The stream is closed, but the session could not be finalized. Retry.");
+      setEnding(false);
+    }
+  }
+
+  function setRemoteControl(enabled: boolean): void {
+    if (!session?.remoteInput) return;
+    controllerRef.current?.setInputEnabled(enabled);
+    if (!controllerRef.current) {
+      setSnapshot((current) => ({ ...current, inputEnabled: enabled }));
+    }
+  }
+
+  const status = statusLabel(snapshot, session);
   return (
     <main className="viewer">
-      <div className="viewer-bar">
+      <header className="viewer-bar">
         <a
           className="viewer-back"
           href="/dashboard"
@@ -631,30 +457,27 @@ export function RemoteViewerCore({
         >
           ← Devices
         </a>
-        <div className="viewer-health">
-          <span>{status}</span>
-          {metrics ? (
-            <small>
-              {metrics.resolution} · {metrics.fps} fps · {formatBitrate(metrics.bitrateKbps)} ·{" "}
-              {metrics.rttMs} ms · {metrics.route} · {metrics.packetsLost} lost ·{" "}
-              {metrics.framesDropped} dropped
-            </small>
-          ) : null}
+        <div className="viewer-health" aria-live="polite">
+          <span className={`viewer-state ${snapshot.phase}`}>
+            <i aria-hidden="true" />
+            {status}
+          </span>
+          {snapshot.metrics ? <small>{formatMetrics(snapshot.metrics)}</small> : null}
         </div>
         <div className="viewer-actions">
-          {session && session.displays.length > 1 ? (
+          {displays.length > 1 ? (
             <label className="display-picker">
               <span>Display</span>
               <select
                 value={selectedDisplay}
-                disabled={!inputEnabled}
+                disabled={!snapshot.inputEnabled}
                 onChange={(event) => {
-                  if (selectDisplayRef.current(event.target.value)) {
+                  if (controllerRef.current?.selectDisplay(event.target.value)) {
                     setSelectedDisplay(event.target.value);
                   }
                 }}
               >
-                {session.displays.map((display) => (
+                {displays.map((display) => (
                   <option key={display.id} value={display.id}>
                     {display.name} ({display.width}×{display.height})
                   </option>
@@ -665,9 +488,13 @@ export function RemoteViewerCore({
           <button
             type="button"
             title="Emergency release: Ctrl+Alt+Shift+Escape"
-            onClick={() => setRemoteControl(!inputEnabled)}
+            aria-pressed={snapshot.inputEnabled}
+            disabled={!session?.remoteInput}
+            onClick={() => setRemoteControl(!snapshot.inputEnabled)}
           >
-            Control: {inputEnabled ? "on" : "off"}
+            {session?.remoteInput
+              ? `Control: ${snapshot.inputEnabled ? "on" : "off"}`
+              : "View only"}
           </button>
           <button type="button" onClick={() => void videoRef.current?.requestFullscreen()}>
             Fullscreen
@@ -675,34 +502,118 @@ export function RemoteViewerCore({
           <button
             className="danger"
             type="button"
-            disabled={ending}
+            disabled={
+              ending || (!endError && (snapshot.phase === "ended" || snapshot.phase === "failed"))
+            }
             onClick={() => void leaveSession()}
           >
-            {ending ? "Ending…" : "End session"}
+            {ending ? "Ending…" : endError ? "Retry end" : "End session"}
           </button>
         </div>
-      </div>
-      <video ref={videoRef} autoPlay playsInline tabIndex={0} />
+      </header>
+      {endError ? (
+        <p className="viewer-error" role="alert">
+          {endError}
+        </p>
+      ) : null}
+      <section className="viewer-stage" aria-label="Remote desktop">
+        <video ref={videoRef} autoPlay playsInline tabIndex={0} disablePictureInPicture />
+        {snapshot.phase !== "connected" || !snapshot.firstFrameReceived ? (
+          <div className="viewer-overlay" role="status">
+            {snapshot.phase !== "failed" && snapshot.phase !== "ended" ? (
+              <span className="viewer-spinner" aria-hidden="true" />
+            ) : null}
+            <strong>{status}</strong>
+            <small>
+              {snapshot.phase === "connected" && !snapshot.firstFrameReceived
+                ? "The connection is ready; waiting for the first video frame."
+                : snapshot.phase === "reconnecting"
+                  ? "The connection is recovering. Your input is released until the stream returns."
+                  : snapshot.phase === "failed" || snapshot.phase === "ended"
+                    ? (snapshot.reason ?? "The session is no longer available.")
+                    : "Negotiating a direct connection, with relay fallback when needed."}
+            </small>
+          </div>
+        ) : null}
+        {snapshot.phase === "connected" && snapshot.firstFrameReceived ? (
+          <p className="viewer-hint">Click the desktop to capture keyboard and pointer input.</p>
+        ) : null}
+      </section>
     </main>
   );
 }
 
-function statValue(stats: RTCStats | undefined, key: string): unknown {
-  return stats ? (stats as unknown as Record<string, unknown>)[key] : undefined;
+function isTerminalSession(session: ViewerSession | undefined, now = Date.now()): boolean {
+  return Boolean(
+    !session || session.state === "ended" || session.state === "failed" || session.expiresAt <= now,
+  );
 }
 
-function numberStat(stats: RTCStats | undefined, key: string): number | undefined {
-  const value = statValue(stats, key);
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+function snapshotForSession(
+  session: ViewerSession | undefined,
+  now = Date.now(),
+): RemoteSessionSnapshot {
+  if (!session) {
+    return {
+      phase: "negotiating",
+      reason: "Loading session",
+      reconnectAttempt: 0,
+      iceGeneration: 0,
+      inputEnabled: false,
+      firstFrameReceived: false,
+      metrics: null,
+    };
+  }
+  if (session.state === "ended" || session.expiresAt <= now) {
+    return {
+      phase: "ended",
+      reason: session?.endReason ?? "session expired",
+      reconnectAttempt: 0,
+      iceGeneration: 0,
+      inputEnabled: false,
+      firstFrameReceived: false,
+      metrics: null,
+    };
+  }
+  if (session.state === "failed") {
+    return {
+      phase: "failed",
+      reason: session.endReason ?? "session failed",
+      reconnectAttempt: 0,
+      iceGeneration: 0,
+      inputEnabled: false,
+      firstFrameReceived: false,
+      metrics: null,
+    };
+  }
+  return {
+    phase: "negotiating",
+    reconnectAttempt: 0,
+    iceGeneration: 0,
+    inputEnabled: false,
+    firstFrameReceived: false,
+    metrics: null,
+  };
 }
 
-function stringStat(stats: RTCStats | undefined, key: string): string | undefined {
-  const value = statValue(stats, key);
-  return typeof value === "string" ? value : undefined;
+function statusLabel(snapshot: RemoteSessionSnapshot, session: ViewerSession | undefined): string {
+  if (!session) return "Loading session…";
+  if (snapshot.phase === "ended")
+    return `ended: ${snapshot.reason ?? session?.endReason ?? "session ended"}`;
+  if (snapshot.phase === "failed") return "failed";
+  if (snapshot.phase === "connected") {
+    return snapshot.firstFrameReceived ? "Live" : "Connected · waiting for video";
+  }
+  if (snapshot.phase === "reconnecting") {
+    return `reconnecting (${snapshot.reconnectAttempt}/3)`;
+  }
+  return "Negotiating";
 }
 
-function booleanStat(stats: RTCStats | undefined, key: string): boolean {
-  return statValue(stats, key) === true;
+function formatMetrics(metrics: NonNullable<RemoteSessionSnapshot["metrics"]>): string {
+  return `${metrics.resolution} · ${metrics.fps} fps · ${formatBitrate(metrics.bitrateKbps)} · ${
+    metrics.rttMs
+  } ms · ${metrics.route} · ${metrics.packetsLost} lost · ${metrics.framesDropped} dropped`;
 }
 
 function formatBitrate(kbps: number): string {

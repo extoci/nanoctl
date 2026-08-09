@@ -21,7 +21,7 @@ update to the latest release without enrolling again. It also adds `nanoctl` to 
 PATH for new terminals.
 
 Windows prints the resolved release and target before downloading, for example
-`Downloading nanoctl 1.0.19 for windows-x64...`, verifies that the executable reports that exact
+`Downloading nanoctl 2.0.0-alpha.1 for windows-x64...`, verifies that the executable reports that exact
 version, and prints the installed command path when the upgrade completes. A failed health-gated
 upgrade restores the previous task and executable rather than claiming that the new version is
 installed.
@@ -76,15 +76,37 @@ The command asks the running per-user agent to close active sessions, waits for 
 encoder resources to be released, and succeeds if the agent is already stopped. The normal
 login-triggered registration remains installed, so it starts again at the next login or reinstall.
 
+Nanoctl 2.0 requires a protocol-v2 agent for new sessions. An older enrolled agent remains visible
+while it is being upgraded, and the dashboard explains why Connect is unavailable.
+
 ## Advanced and development setup
 
 The installer supports these environment overrides:
 
-- `NANOCTL_VERSION=v1.2.3` installs a specific release instead of `latest`.
+- `NANOCTL_VERSION=v2.0.0-alpha.1` installs a specific release instead of `latest`.
 - `NANOCTL_REPOSITORY=owner/repository` downloads from another GitHub repository.
 - `NANOCTL_CONTROL_PLANE=https://example.convex.site` enrolls against another deployment.
 - `NANOCTL_ENROLL_CODE=...` supplies the setup code without an interactive prompt.
 - `NANOCTL_BINARY=/path/to/nanoctl` uses a local Unix executable instead of downloading.
+
+## Alpha testing
+
+The first nanoctl 2.0 alpha is a prerelease and must be selected explicitly; stable `latest`
+continues to resolve to the latest stable release.
+
+Linux and macOS:
+
+```sh
+curl -fsSL https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.sh \
+  | NANOCTL_VERSION=v2.0.0-alpha.1 sh
+```
+
+Windows PowerShell:
+
+```powershell
+$env:NANOCTL_VERSION = "v2.0.0-alpha.1"
+irm https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.ps1 | iex
+```
 
 The scripts under `packaging/` remain low-level development and removal helpers. Normal
 installation and updates should use the one-command installer.

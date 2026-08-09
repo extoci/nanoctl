@@ -95,7 +95,7 @@ and impairment configuration with the signed release record.
 On reference hardware, sustain 1080p60 for 30 minutes without monotonic memory growth, queue growth,
 or latency creep. Soak for eight hours at 1080p30. Measure idle resource use, first-frame latency,
 input-to-photon using a high-speed camera, and quality under constrained bandwidth. Averages cannot
-hide p95/p99 stalls. System audio is explicitly outside protocol v1, so audio drift is not a v1
+hide p95/p99 stalls. System audio is explicitly outside protocol v2, so audio drift is not a v2
 acceptance metric.
 
 Collect both profiles on all six OS/architecture targets and validate the 12-record set:
@@ -106,9 +106,10 @@ bun run evidence:performance -- evidence/performance/*.json
 
 The `interactive-1080p60` profile requires at least 30 minutes and 54 average FPS; the
 `soak-1080p30` profile requires eight hours and 27 average FPS. Both require at least 1920×1080,
-bounded one-frame capture and encode queues, finite first-frame/frame-time/input-to-photon/RSS
-metrics, consistent agent and web versions, and an explicit finding that monotonic memory growth was
-not observed. Preserve the time series used to reach that finding; the summary verifier cannot
+bounded one-frame capture and encode queues, finite first-frame/capture-to-encode/encode
+percentile/frame-time/input-to-photon/RSS/RTT/packet-loss metrics, decoded FPS and rendered
+resolution, consistent agent and web versions, and an explicit finding that monotonic memory growth
+was not observed. Preserve the time series used to reach that finding; the summary verifier cannot
 detect a dishonest or statistically weak measurement.
 
 Run the native capture/encoder gate from the signed candidate on every physical host:
@@ -119,8 +120,9 @@ nanoctl --config ./acceptance.toml media-smoke --require-hardware --seconds 1800
 
 The command opens the real platform capture session, requires the hardware backend, encodes at the
 configured dimensions/FPS/bitrate, rejects malformed or non-Annex-B output, and requires observed
-IDR, SPS, and PPS units. It exits 2 when it produces fewer than 75% of the requested frames or any
-required bitstream evidence is absent. Use `--seconds 3600` for the longest single invocation and
+IDR, SPS, and PPS units, plus capture-to-encode and encode p50/p95 timing samples. It exits 2 when it
+produces fewer than 75% of the requested frames or any required bitstream evidence is absent. Use
+`--seconds 3600` for the longest single invocation and
 repeat under the network/controller soak for the eight-hour gate. Preserve the JSON together with
 external process RSS/GPU/thermal traces; this command does not substitute for input-to-photon,
 browser decode, memory-growth, or network measurements.

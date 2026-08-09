@@ -106,6 +106,40 @@ http.route({
 });
 
 http.route({
+  path: "/v1/agent/claim-host",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const auth = await authenticateAgent(ctx, request);
+    if (auth.status !== "ok") return authenticationFailure(auth.status);
+    const parsed = await readJson(request, 16_000);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.value;
+    if (
+      typeof body.sessionId !== "string" ||
+      typeof body.controllerEpoch !== "string" ||
+      typeof body.hostEpoch !== "string" ||
+      (body.expectedHostEpoch !== undefined &&
+        body.expectedHostEpoch !== null &&
+        typeof body.expectedHostEpoch !== "string") ||
+      !Number.isSafeInteger(body.generation)
+    ) {
+      return json({ error: "invalid_request" }, 400);
+    }
+    const ok = await ctx.runMutation(internal.agent.claimHost, {
+      deviceId: auth.deviceId,
+      sessionId: body.sessionId,
+      controllerEpoch: body.controllerEpoch,
+      hostEpoch: body.hostEpoch,
+      ...(typeof body.expectedHostEpoch === "string"
+        ? { expectedHostEpoch: body.expectedHostEpoch }
+        : {}),
+      generation: Number(body.generation),
+    });
+    return ok ? json({ ok: true }) : json({ error: "session_unavailable" }, 409);
+  }),
+});
+
+http.route({
   path: "/v1/agent/turn",
   method: "GET",
   handler: httpAction(async (ctx, request) => {

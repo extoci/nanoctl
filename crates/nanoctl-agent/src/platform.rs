@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, EncoderPreference};
 
 #[cfg(target_os = "windows")]
 pub const PLATFORM: &str = "windows";
@@ -28,7 +28,9 @@ pub struct Capabilities {
     codecs: Vec<&'static str>,
     encoder_backends: Vec<&'static str>,
     ready: bool,
+    readiness: &'static str,
     input: bool,
+    remote_input: bool,
     clipboard: bool,
     system_audio: bool,
     displays: Vec<DisplayCapability>,
@@ -58,11 +60,36 @@ pub struct DoctorCheck {
     pub detail: String,
 }
 
-pub fn capabilities(remote_input_enabled: bool) -> Capabilities {
+pub fn capabilities(
+    remote_input_enabled: bool,
+    encoder_preference: EncoderPreference,
+) -> Capabilities {
     let displays = display_capabilities();
     let input = input_available();
+    let encoder_ready = {
+        #[cfg(feature = "media")]
+        {
+            crate::media::probe_encoder(encoder_preference).is_ok()
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = encoder_preference;
+            false
+        }
+    };
+    let readiness = if !cfg!(feature = "media") {
+        "encoder-unavailable"
+    } else if displays.is_empty() {
+        "no-display"
+    } else if !encoder_ready {
+        "encoder-unavailable"
+    } else if remote_input_enabled && !input {
+        "input-permission"
+    } else {
+        "ready"
+    };
     Capabilities {
-        protocol_version: 1,
+        protocol_version: 2,
         platform: PLATFORM,
         architecture: ARCHITECTURE,
         codecs: if cfg!(feature = "media") {
@@ -77,8 +104,13 @@ pub fn capabilities(remote_input_enabled: bool) -> Capabilities {
         } else {
             Vec::new()
         },
-        ready: cfg!(feature = "media") && !displays.is_empty() && (!remote_input_enabled || input),
+        ready: cfg!(feature = "media")
+            && !displays.is_empty()
+            && encoder_ready
+            && (!remote_input_enabled || input),
+        readiness,
         input: remote_input_enabled && input,
+        remote_input: remote_input_enabled && input,
         clipboard: false,
         system_audio: false,
         displays,
@@ -175,7 +207,11 @@ async fn control_plane_check(
         let credential = credential.context("device credential is unavailable")?;
         let client = crate::control_plane::ControlPlane::new(config.control_plane_url.clone())?;
         client
-            .heartbeat(credential, config.features.remote_input)
+            .heartbeat(
+                credential,
+                config.features.remote_input,
+                config.quality.encoder,
+            )
             .await
     }
     .await;

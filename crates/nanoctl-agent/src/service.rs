@@ -1,9 +1,12 @@
+use std::sync::Arc;
 #[cfg(feature = "rtc")]
-use std::{collections::HashMap, collections::HashSet, sync::Arc};
+use std::{collections::HashMap, collections::HashSet};
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use tokio::time::{Instant, MissedTickBehavior};
+#[cfg(feature = "rtc")]
+use tokio::time::Instant;
+use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 #[cfg(feature = "rtc")]
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -14,10 +17,16 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use crate::config::IceTransport;
 use crate::{
     config::AgentConfig,
-    control_plane::{ControlPlane, SessionPollError},
+    control_plane::{ControlPlane, SessionList, SessionPollError},
     credential,
     service_control::ServiceControl,
 };
+
+// Reconciliation must not hold the lifecycle owner on a control-plane request for the full
+// reqwest client timeout. The stop protocol waits for native capture teardown, so network setup
+// gets a short independent budget and falls back to direct ICE when it misses that budget.
+#[cfg(feature = "rtc")]
+const CONTROL_PLANE_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run(
     config: AgentConfig,
@@ -32,24 +41,86 @@ pub async fn run(
         .device_id
         .as_deref()
         .context("agent is not enrolled")?;
-    let token = credential::load(device_id)?;
+    let token = Arc::new(credential::load(device_id)?);
     let client = ControlPlane::new(config.control_plane_url.clone())?;
     let _ready_file = ready_file
         .map(|path| ReadyFile::create(path, ready_token.as_deref()))
         .transpose()?;
-    let mut heartbeat =
-        tokio::time::interval(Duration::from_secs(config.network.heartbeat_seconds));
-    let mut sessions =
-        tokio::time::interval(Duration::from_millis(config.network.poll_milliseconds));
     let mut stop_requests = tokio::time::interval(Duration::from_millis(100));
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    sessions.set_missed_tick_behavior(MissedTickBehavior::Skip);
     stop_requests.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut next_heartbeat = Instant::now();
+
+    // Network work is isolated from the lifecycle loop. A slow control-plane request can no
+    // longer delay stop requests, revocation handling, or session teardown.
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+    let heartbeat_client = client.clone();
+    let heartbeat_token = token.clone();
+    let heartbeat_config = config.clone();
+    let heartbeat_events = events_tx.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            heartbeat_config.network.heartbeat_seconds,
+        ));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                heartbeat_client.heartbeat(
+                    token_ref(&heartbeat_token),
+                    heartbeat_config.features.remote_input,
+                    heartbeat_config.quality.encoder,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("heartbeat timed out"))
+            .and_then(|result| result);
+            if heartbeat_events
+                .send(ServiceEvent::Heartbeat(result))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let poll_client = client.clone();
+    let poll_token = token.clone();
+    let poll_config = config.clone();
+    let poll_events = events_tx.clone();
+    let poll_task = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(poll_config.network.poll_milliseconds));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let result = poll_client.sessions(token_ref(&poll_token)).await;
+            let revoked = matches!(result, Err(SessionPollError::Revoked));
+            if poll_events
+                .send(ServiceEvent::Sessions(result))
+                .await
+                .is_err()
+                || revoked
+            {
+                break;
+            }
+        }
+    });
+    drop(events_tx);
+
     #[cfg(feature = "rtc")]
-    let token = Arc::new(token);
-    #[cfg(feature = "rtc")]
-    let mut active_sessions: HashMap<String, ActiveSession> = HashMap::new();
+    let (session_commands, mut session_manager) = {
+        // Session updates are snapshots, not a work queue. Keep only one pending snapshot so a
+        // stop command cannot sit behind a backlog of stale polls.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let manager = tokio::spawn(run_session_manager(
+            receiver,
+            client.clone(),
+            token.clone(),
+            config.clone(),
+        ));
+        (sender, manager)
+    };
 
     info!(
         device_id,
@@ -62,39 +133,32 @@ pub async fn run(
             _ = stop_requests.tick() => {
                 if service_control.take_stop_request()? {
                     info!("graceful service stop requested");
+                    heartbeat_task.abort();
+                    poll_task.abort();
                     #[cfg(feature = "rtc")]
-                    close_all_sessions(&mut active_sessions).await;
+                    stop_session_manager(&session_commands, &mut session_manager).await;
                     return Ok(());
                 }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutdown requested");
+                heartbeat_task.abort();
+                poll_task.abort();
                 #[cfg(feature = "rtc")]
-                close_all_sessions(&mut active_sessions).await;
+                stop_session_manager(&session_commands, &mut session_manager).await;
                 return Ok(());
             }
-            _ = heartbeat.tick() => {
-                if Instant::now() >= next_heartbeat {
-                    if let Err(error) = client
-                        .heartbeat(token_ref(&token), config.features.remote_input)
-                        .await
-                    {
+            event = events_rx.recv() => {
+                match event {
+                    Some(ServiceEvent::Heartbeat(Err(error))) => {
                         warn!(error = %redact(&error), "heartbeat failed");
                     }
-                    next_heartbeat = Instant::now() + Duration::from_secs(config.network.heartbeat_seconds);
-                }
-            }
-            _ = sessions.tick() => {
-                match client.sessions(token_ref(&token)).await {
-                    Ok(result) => {
+                    Some(ServiceEvent::Heartbeat(Ok(()))) => {}
+                    Some(ServiceEvent::Sessions(Ok(result))) => {
                         #[cfg(feature = "rtc")]
-                        reconcile_sessions(
-                            &mut active_sessions,
-                            &client,
-                            &token,
-                            &config,
-                            &result.sessions,
-                        ).await;
+                        if session_commands.try_send(SessionCommand::Update(result.sessions)).is_err() {
+                            warn!("session manager is busy; retaining its current lifecycle state");
+                        }
                         #[cfg(not(feature = "rtc"))]
                         for session in result.sessions {
                             // The media engine consumes authorized offers. Until capture readiness is
@@ -120,19 +184,33 @@ pub async fn run(
                             );
                         }
                     }
-                    Err(SessionPollError::Revoked) => {
+                    Some(ServiceEvent::Sessions(Err(SessionPollError::Revoked))) => {
+                        heartbeat_task.abort();
+                        poll_task.abort();
                         #[cfg(feature = "rtc")]
-                        close_all_sessions(&mut active_sessions).await;
+                        stop_session_manager(&session_commands, &mut session_manager).await;
                         info!("agent credential revoked; service stopped");
                         return Ok(());
                     }
-                    Err(SessionPollError::Request(error)) => {
+                    Some(ServiceEvent::Sessions(Err(SessionPollError::Request(error)))) => {
                         warn!(error = %redact(&error), "session poll failed");
+                    }
+                    None => {
+                        heartbeat_task.abort();
+                        poll_task.abort();
+                        #[cfg(feature = "rtc")]
+                        stop_session_manager(&session_commands, &mut session_manager).await;
+                        return Ok(());
                     }
                 }
             }
         }
     }
+}
+
+enum ServiceEvent {
+    Heartbeat(Result<()>),
+    Sessions(std::result::Result<SessionList, SessionPollError>),
 }
 
 struct ReadyFile {
@@ -196,35 +274,85 @@ mod readiness_tests {
     }
 }
 
+fn token_ref(token: &Credential) -> &zeroize::Zeroizing<String> {
+    token.as_ref()
+}
+
+type Credential = Arc<zeroize::Zeroizing<String>>;
+
+#[cfg(feature = "rtc")]
+enum SessionCommand {
+    Update(Vec<crate::control_plane::PendingSession>),
+    Stop,
+}
+
+#[cfg(feature = "rtc")]
+async fn run_session_manager(
+    mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    client: ControlPlane,
+    token: Credential,
+    config: AgentConfig,
+) {
+    let mut active = HashMap::new();
+    while let Some(command) = commands.recv().await {
+        match command {
+            SessionCommand::Update(pending) => {
+                // Reconciliation owns native capture tasks. Cancelling it after a wall-clock
+                // deadline would drop VideoPipeline::stop while its spawn_blocking worker still
+                // owns the desktop, allowing the next peer to overlap native resources.
+                reconcile_sessions(&mut active, &client, &token, &config, &pending).await;
+            }
+            SessionCommand::Stop => break,
+        }
+    }
+    close_all_sessions(&mut active).await;
+}
+
+#[cfg(feature = "rtc")]
+async fn stop_session_manager(
+    commands: &tokio::sync::mpsc::Sender<SessionCommand>,
+    manager: &mut tokio::task::JoinHandle<()>,
+) {
+    let _ = commands.send(SessionCommand::Stop).await;
+    if let Err(error) = manager.await {
+        warn!(error = %error, "session manager stopped unexpectedly");
+    }
+}
+
 #[cfg(feature = "rtc")]
 async fn close_all_sessions(active: &mut HashMap<String, ActiveSession>) {
-    for (_, session) in active.drain() {
-        #[cfg(feature = "media")]
-        session.media_task.stop().await;
-        let _ = session.peer.close().await;
-    }
+    // Sessions own independent capture and peer resources. Stop them concurrently so the service
+    // stop deadline is governed by the slowest native teardown rather than session count. Each
+    // pipeline is still awaited; dropping its wrapper would allow its spawn_blocking worker to
+    // overlap a later capture session.
+    let shutdowns = active
+        .drain()
+        .map(|(session_id, session)| async move {
+            #[cfg(feature = "media")]
+            session.peer.revoke_input();
+            #[cfg(feature = "media")]
+            session.media_task.stop().await;
+            if let Err(error) = session.peer.close().await {
+                warn!(
+                    session_id,
+                    error = %redact(&error),
+                    "peer did not close cleanly during shutdown"
+                );
+            }
+        })
+        .collect::<Vec<_>>();
+    futures_util::future::join_all(shutdowns).await;
 }
-
-fn token_ref(token: &Credential) -> &zeroize::Zeroizing<String> {
-    #[cfg(feature = "rtc")]
-    {
-        token.as_ref()
-    }
-    #[cfg(not(feature = "rtc"))]
-    {
-        token
-    }
-}
-
-#[cfg(feature = "rtc")]
-type Credential = Arc<zeroize::Zeroizing<String>>;
-#[cfg(not(feature = "rtc"))]
-type Credential = zeroize::Zeroizing<String>;
 
 #[cfg(feature = "rtc")]
 struct ActiveSession {
     peer: crate::rtc::HostPeer,
     processed: HashSet<u64>,
+    offer_sequence: u64,
+    offer_created_at: u64,
+    offer_controller_epoch: String,
+    offer_generation: u64,
+    host_epoch: String,
     failed_since: Option<Instant>,
     #[cfg(feature = "media")]
     media_task: crate::media::VideoPipeline,
@@ -255,6 +383,8 @@ async fn reconcile_sessions(
     for session_id in stale {
         if let Some(session) = active.remove(&session_id) {
             #[cfg(feature = "media")]
+            session.peer.revoke_input();
+            #[cfg(feature = "media")]
             session.media_task.stop().await;
             let _ = session.peer.close().await;
         }
@@ -273,6 +403,8 @@ async fn reconcile_sessions(
         .collect::<Vec<_>>();
     for session_id in failed {
         if let Some(session) = active.remove(&session_id) {
+            #[cfg(feature = "media")]
+            session.peer.revoke_input();
             #[cfg(feature = "media")]
             session.media_task.stop().await;
             if let Err(error) = session.peer.fail("peer connection failed").await {
@@ -299,6 +431,11 @@ async fn reconcile_sessions(
             let ActiveSession {
                 peer,
                 processed,
+                offer_sequence,
+                offer_created_at,
+                offer_controller_epoch,
+                offer_generation,
+                host_epoch,
                 failed_since,
                 media_task,
                 media_restarts,
@@ -336,6 +473,11 @@ async fn reconcile_sessions(
                     ActiveSession {
                         peer,
                         processed,
+                        offer_sequence,
+                        offer_created_at,
+                        offer_controller_epoch,
+                        offer_generation,
+                        host_epoch,
                         failed_since,
                         media_task,
                         media_restarts: 1,
@@ -359,12 +501,65 @@ async fn reconcile_sessions(
     }
 
     for session in pending.iter().filter(|session| session.expires_at > now) {
-        if !active.contains_key(&session.session_id) {
-            let offer = session.signals.iter().find(|signal| {
+        // The control-plane snapshot is also the host input lease. A controller CAS claim clears
+        // the host epoch before its replacement offer exists, so revoke the old input lane before
+        // looking for that next offer; otherwise the stale data channel could remain usable while
+        // the manager waits for a second poll.
+        let lease_replaced = active
+            .get(&session.session_id)
+            .is_some_and(|active_session| {
+                let controller_replaced = session
+                    .controller_epoch
+                    .as_deref()
+                    .is_some_and(|epoch| epoch != active_session.offer_controller_epoch);
+                let host_replaced =
+                    session.host_epoch.as_deref() != Some(active_session.host_epoch.as_str());
+                controller_replaced || host_replaced
+            });
+        if lease_replaced && let Some(previous) = active.remove(&session.session_id) {
+            #[cfg(feature = "media")]
+            previous.peer.revoke_input();
+            #[cfg(feature = "media")]
+            previous.media_task.stop().await;
+            let _ = previous.peer.close().await;
+        }
+
+        let offer = session
+            .signals
+            .iter()
+            .filter(|signal| {
                 signal.sender == "controller"
                     && crate::rtc::is_offer_for_session(&signal.envelope, &session.session_id)
+            })
+            .max_by_key(|signal| (signal.created_at, signal.sequence));
+        let Some(offer) = offer else { continue };
+        let Ok((offer_generation, offer_controller_epoch)) =
+            crate::rtc::offer_generation_and_epoch(&offer.envelope, &session.session_id)
+        else {
+            continue;
+        };
+
+        // A browser refresh creates a new controller peer for the same session. It intentionally
+        // starts a fresh generation, so an existing host peer must be replaced instead of
+        // treating the new generation-0 offer as a stale duplicate. In-place ICE restarts have a
+        // strictly higher generation and stay on the existing peer.
+        let replace_active = active
+            .get(&session.session_id)
+            .is_some_and(|active_session| {
+                (active_session.offer_sequence != offer.sequence
+                    || active_session.offer_created_at != offer.created_at)
+                    && (offer_controller_epoch != active_session.offer_controller_epoch
+                        || offer_generation <= active_session.offer_generation)
             });
-            let Some(offer) = offer else { continue };
+        if replace_active && let Some(previous) = active.remove(&session.session_id) {
+            #[cfg(feature = "media")]
+            previous.peer.revoke_input();
+            #[cfg(feature = "media")]
+            previous.media_task.stop().await;
+            let _ = previous.peer.close().await;
+        }
+
+        if !active.contains_key(&session.session_id) {
             let mut ice_servers = if _config.network.stun_urls.is_empty() {
                 Vec::new()
             } else {
@@ -373,10 +568,14 @@ async fn reconcile_sessions(
                     ..Default::default()
                 }]
             };
-            match client
-                .turn_credentials(token.as_ref(), &session.session_id)
-                .await
-            {
+            let turn_result = tokio::time::timeout(
+                CONTROL_PLANE_SETUP_TIMEOUT,
+                client.turn_credentials(token.as_ref(), &session.session_id),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("TURN credentials request timed out"))
+            .and_then(|result| result);
+            match turn_result {
                 Ok(Some(turn)) => {
                     if turn.expires_at <= now {
                         warn!(
@@ -422,13 +621,37 @@ async fn reconcile_sessions(
                 IceTransport::All => RTCIceTransportPolicy::All,
                 IceTransport::Relay => RTCIceTransportPolicy::Relay,
             };
-            let peer_result = crate::rtc::HostPeer::answer(
+            let host_epoch = crate::rtc::host_epoch_seed();
+            let claim_result = tokio::time::timeout(
+                CONTROL_PLANE_SETUP_TIMEOUT,
+                client.claim_host(
+                    token.as_ref(),
+                    &session.session_id,
+                    &offer_controller_epoch,
+                    &host_epoch,
+                    session.host_epoch.as_deref(),
+                    offer_generation,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("native peer claim request timed out"))
+            .and_then(|result| result);
+            if let Err(error) = claim_result {
+                warn!(
+                    session_id = session.session_id,
+                    error = %redact(&error),
+                    "native peer claim was rejected"
+                );
+                continue;
+            }
+            let peer_result = crate::rtc::HostPeer::answer_with_host_epoch(
                 client.clone(),
                 token.clone(),
                 session.session_id.clone(),
                 &offer.envelope,
                 ice_servers,
                 ice_transport_policy,
+                host_epoch.clone(),
                 _config.features.remote_input,
             )
             .await;
@@ -441,6 +664,11 @@ async fn reconcile_sessions(
                         ActiveSession {
                             peer,
                             processed: HashSet::from([offer.sequence]),
+                            offer_sequence: offer.sequence,
+                            offer_created_at: offer.created_at,
+                            offer_controller_epoch: offer_controller_epoch.clone(),
+                            offer_generation,
+                            host_epoch: host_epoch.clone(),
                             failed_since: None,
                             #[cfg(feature = "media")]
                             media_task,
@@ -461,8 +689,11 @@ async fn reconcile_sessions(
                     );
                     if let Err(publish_error) = crate::rtc::report_negotiation_failure(
                         client,
-                        token.as_ref(),
+                        token,
                         &session.session_id,
+                        &offer_controller_epoch,
+                        &host_epoch,
+                        offer_generation,
                         "agent could not initialize the remote desktop session",
                     )
                     .await
@@ -493,6 +724,17 @@ async fn reconcile_sessions(
             {
                 Ok(keep_open) => {
                     active_session.processed.insert(signal.sequence);
+                    if let Ok((generation, controller_epoch)) =
+                        crate::rtc::offer_generation_and_epoch(
+                            &signal.envelope,
+                            &session.session_id,
+                        )
+                    {
+                        active_session.offer_sequence = signal.sequence;
+                        active_session.offer_created_at = signal.created_at;
+                        active_session.offer_controller_epoch = controller_epoch;
+                        active_session.offer_generation = generation;
+                    }
                     if !keep_open {
                         terminal = true;
                         break;
@@ -511,6 +753,7 @@ async fn reconcile_sessions(
             let removed = active.remove(&session.session_id);
             #[cfg(feature = "media")]
             if let Some(session) = removed {
+                session.peer.revoke_input();
                 session.media_task.stop().await;
                 let _ = session.peer.close().await;
             }
@@ -537,6 +780,7 @@ fn spawn_media(peer: &crate::rtc::HostPeer, config: &AgentConfig) -> crate::medi
         peer.keyframe_requests(),
         peer.bitrate_estimate_kbps(),
         peer.display_selection(),
+        peer.display_selection_feedback_sender(),
         crate::media::VideoQuality {
             max_bitrate_kbps: config.quality.max_bitrate_kbps,
             max_fps: config.quality.max_fps,
@@ -601,6 +845,7 @@ mod tests {
             assert!(!rendered.contains(sensitive));
         }
     }
+
     use tokio::time::Instant;
 
     #[test]

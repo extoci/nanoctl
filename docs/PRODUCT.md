@@ -6,14 +6,14 @@ People need reliable access to computers they own without installing a large int
 opening inbound firewall ports, or routing every frame through a vendor. Existing tools often trade
 latency for compatibility or simplicity for opaque privileged components.
 
-## v1 promise
+## v2 promise
 
 nanoctl lets an authenticated owner enroll a computer, see whether it is reachable, and open a
 remote desktop session from a modern browser. The normal path is peer-to-peer WebRTC. TURN provides
 an encrypted compatibility path. The agent has no persistent graphical UI; setup is a signed
 installer plus a short enrollment command or installer field.
 
-v1 includes:
+v2 includes:
 
 - Windows 11 x64/arm64, macOS 14+ x64/arm64, and current Linux x64/arm64.
 - One owner per device. One active controller per device.
@@ -21,12 +21,12 @@ v1 includes:
   backend exposes stable display identifiers.
 - H.264 baseline compatibility. VP9 and AV1 remain reserved for a later protocol capability.
 - Adaptive bitrate, 30/60 FPS presets, 120 FPS advanced maximum, resolution scaling, and automatic
-  recovery after ICE/network changes.
+  recovery after ICE/network changes without rebuilding native capture.
 - Device rename, revoke, online state, connection audit, and agent version visibility.
 - Unattended access after explicit enrollment and OS permission grant.
 - A diagnostics command that never prints credentials.
 
-v1 intentionally excludes:
+v2 intentionally excludes:
 
 - file transfer, clipboard synchronization, system audio, remote shell, multi-controller
   collaboration, recording, mobile host capture, wake-on-LAN brokerage, organization/RBAC features,
@@ -45,7 +45,10 @@ v1 intentionally excludes:
    facility with owner/service-only access.
 5. Agent guides the user through OS capture/input permissions where required, installs the service,
    starts it, and reports readiness.
-6. The device appears online. There is no tray process in v1.
+6. The device appears online. There is no tray process in v2.
+
+Agents from the 1.x line remain discoverable during migration, but the dashboard marks them as
+requiring a nanoctl 2.0 upgrade before Connect is enabled.
 
 macOS requires an interactive permission bootstrap because Screen Recording and Accessibility
 approval cannot be silently granted. Wayland may require a portal chooser on first use. The service
@@ -55,8 +58,9 @@ reports these as actionable readiness states rather than pretending the device i
 
 The web app creates a short-lived session bound to the authenticated owner and selected device.
 The agent polls/streams authorized session requests, then controller and host trickle ICE through
-the signaling plane. Once the data channel opens, input becomes active and the browser focuses the
-remote canvas. A persistent bar exposes connection state, decoded resolution/FPS, receive bitrate,
+the signaling plane. Once the control channel opens, input becomes active when the device permits
+remote input; view-only devices keep that lane disabled. The browser focuses the remote canvas. A
+persistent bar exposes connection state, decoded resolution/FPS, receive bitrate,
 RTT, direct/relay route, loss/drop counters, input enable/disable, fullscreen, and end.
 
 Disconnect is fail-closed: input state is released, capture stops, credentials stay resident, and
@@ -66,7 +70,7 @@ release input. A new browser tab does not inherit control unless it has the auth
 
 ## Advanced mode
 
-Advanced mode is explicit, local, and deny-by-default schema-validated configuration. Protocol v1
+Advanced mode is explicit, local, and deny-by-default schema-validated configuration. Protocol v2
 permits H.264/auto codec choice, auto/hardware/software encoder policy, maximum
 bitrate/FPS/resolution, a latency-mode policy value,
 direct-or-relay ICE policy, up to eight STUN endpoints, heartbeat/poll cadence, and remote-input

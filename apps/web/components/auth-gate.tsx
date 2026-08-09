@@ -64,7 +64,7 @@ function Landing() {
             <div className="preview-device">
               <div>
                 <strong>Studio workstation</strong>
-                <span>windows / x64 · agent 1.0.19</span>
+                <span>windows / x64 · agent 2.0.0-alpha.1</span>
               </div>
               <span className="preview-status">online</span>
             </div>

@@ -36,8 +36,8 @@ $resolvedVersion = if ($RequestedVersion -eq "latest") {
 } else {
   "v$RequestedVersion"
 }
-if ($resolvedVersion -notmatch "^v\d+\.\d+\.\d+$") {
-  throw "The release version '$resolvedVersion' is not a stable nanoctl version."
+if ($resolvedVersion -notmatch "^v\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$") {
+  throw "The release version '$resolvedVersion' is not a valid nanoctl semantic version."
 }
 $displayVersion = $resolvedVersion.Substring(1)
 $baseUrl = "https://github.com/$Repository/releases/download/$resolvedVersion"
@@ -251,10 +251,30 @@ function Wait-AgentTask {
 function Wait-AgentProcessExit {
   param([Parameter(Mandatory = $true)][string[]]$Paths)
 
-  for ($attempt = 0; $attempt -lt 300; $attempt++) {
+  $normalizedPaths = @(
+    foreach ($path in $Paths) {
+      if (-not $path) { continue }
+      try {
+        [IO.Path]::GetFullPath([string]$path)
+      } catch {
+        continue
+      }
+    }
+  )
+  for ($attempt = 0; $attempt -lt 600; $attempt++) {
     $running = @(Get-Process -Name nanoctl -ErrorAction SilentlyContinue | Where-Object {
-        $processPath = $_.Path
-        $processPath -and ($Paths -contains $processPath)
+        if (-not $_.Path) { return $false }
+        try {
+          $processPath = [IO.Path]::GetFullPath([string]$_.Path)
+        } catch {
+          return $false
+        }
+        foreach ($expectedPath in $normalizedPaths) {
+          if ([String]::Equals($processPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+          }
+        }
+        return $false
       })
     if ($running.Count -eq 0) { return }
     Start-Sleep -Milliseconds 100
@@ -367,7 +387,7 @@ function Assert-ExistingTaskOwner {
     throw "The existing nanoctl task is not a per-user interactive task. Remove the managed installation with its administrator script before using this installer."
   }
   $taskLogonType = [string]$Task.Principal.LogonType
-  if ($taskLogonType -and $taskLogonType -notmatch '(?i)^Interactive$') {
+  if ($taskLogonType -and $taskLogonType -notmatch '(?i)^(Interactive|InteractiveToken)$') {
     throw "The existing nanoctl task does not run in the interactive user session; refusing to migrate it."
   }
   try {

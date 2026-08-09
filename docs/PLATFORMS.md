@@ -21,8 +21,11 @@ administrator-only `packaging/windows/install-service.ps1` helper remains availa
 Program Files deployments; it applies explicit ACLs and uses the same hidden task action. Before a
 managed install changes state, it compares the configuration owner SID to the elevated identity,
 accepting only a legacy `BUILTIN\Administrators` owner when that same identity is an administrator;
-it rejects elevation through another administrator. A future supervisor/helper split may add a
-LocalSystem supervisor, but the capture/input process must remain in the authorized user session.
+it rejects elevation through another administrator. Re-running the managed helper preserves the
+configuration path from the existing task, stages the new executable, waits for the old process to
+exit, and restores the previous task/binary if startup health fails. A future supervisor/helper split
+may add a LocalSystem supervisor, but the capture/input process must remain in the authorized user
+session.
 UAC secure desktop, elevated applications, and Windows sign-in screens remain inaccessible.
 
 ## macOS

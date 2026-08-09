@@ -926,6 +926,7 @@ h2 {
 /* ——— Viewer ——— */
 
 .viewer {
+  position: relative;
   height: 100vh;
   display: grid;
   grid-template-rows: auto 1fr;
@@ -1042,6 +1043,94 @@ h2 {
   object-fit: contain;
   outline: none;
   background: #000;
+}
+
+.viewer-stage {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: #000;
+}
+
+.viewer-stage video:focus-visible,
+.viewer-actions button:focus-visible,
+.viewer-back:focus-visible,
+.display-picker select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.viewer-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.65rem;
+  padding: 2rem;
+  background: radial-gradient(circle at center, rgb(20 28 23 / 72%), rgb(0 0 0 / 88%));
+  text-align: center;
+  pointer-events: none;
+}
+
+.viewer-overlay strong {
+  color: var(--text);
+  font: 600 1rem/1.2 var(--font-mono);
+  text-transform: capitalize;
+}
+
+.viewer-overlay small {
+  max-width: 30rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.viewer-spinner {
+  width: 1.6rem;
+  height: 1.6rem;
+  border: 2px solid rgb(255 255 255 / 16%);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: viewer-spin 0.85s linear infinite;
+}
+
+.viewer-hint {
+  position: absolute;
+  right: 1rem;
+  bottom: 0.8rem;
+  margin: 0;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 999px;
+  background: rgb(0 0 0 / 58%);
+  padding: 0.35rem 0.65rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  pointer-events: none;
+}
+
+.viewer-error {
+  position: absolute;
+  z-index: 2;
+  top: 4.1rem;
+  left: 50%;
+  max-width: min(90vw, 42rem);
+  margin: 0;
+  transform: translateX(-50%);
+  border: 1px solid rgb(255 121 110 / 35%);
+  border-radius: var(--radius-sm);
+  background: rgb(75 24 22 / 94%);
+  padding: 0.55rem 0.75rem;
+  color: var(--danger);
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+@keyframes viewer-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ——— Responsive ——— */

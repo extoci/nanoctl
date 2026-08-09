@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { DeviceSummary } from "../lib/convex";
 import { BrandMark } from "./brand-mark";
 
@@ -33,14 +33,25 @@ export function DeviceDashboardView({
   const [busyDevice, setBusyDevice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 5_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   async function addDevice() {
+    if (pairingBusy) return;
     setError(null);
+    setPairingBusy(true);
     try {
       setPairing(await operations.createPairingCode());
       setCopiedCode(false);
     } catch {
       setError("Could not create a setup code. Try again.");
+    } finally {
+      setPairingBusy(false);
     }
   }
 
@@ -86,7 +97,19 @@ export function DeviceDashboardView({
 
   async function copyPairingCode(code: string) {
     try {
-      await navigator.clipboard.writeText(code);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(code);
+      } else {
+        const input = document.createElement("textarea");
+        input.value = code;
+        input.setAttribute("readonly", "true");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.append(input);
+        input.select();
+        if (!document.execCommand("copy")) throw new Error("copy unavailable");
+        input.remove();
+      }
       setCopiedCode(true);
       window.setTimeout(() => setCopiedCode(false), 1_500);
     } catch {
@@ -108,8 +131,13 @@ export function DeviceDashboardView({
           <button className="secondary" type="button" onClick={operations.signOut}>
             Sign out
           </button>
-          <button className="primary" type="button" onClick={() => void addDevice()}>
-            Add device
+          <button
+            className="primary"
+            type="button"
+            disabled={pairingBusy}
+            onClick={() => void addDevice()}
+          >
+            {pairingBusy ? "Creating…" : "Add device"}
           </button>
         </div>
       </header>
@@ -124,20 +152,34 @@ export function DeviceDashboardView({
         <section className="pairing-card" aria-live="polite">
           <div>
             <p className="eyebrow">One-time setup code</p>
-            <strong className="pairing-code">{pairing.code}</strong>
+            <strong className="pairing-code" aria-label="One-time setup code">
+              {pairing.code}
+            </strong>
             <p>
-              Run <code>nanoctl enroll {pairing.code}</code> on the computer. This code expires in
-              ten minutes.
+              {now < pairing.expiresAt
+                ? `Run nanoctl enroll ${pairing.code} on the computer. ${formatRemaining(pairing.expiresAt - now)} remaining.`
+                : "This setup code has expired. Create a new code to continue."}
             </p>
           </div>
           <div className="pairing-actions">
             <button
               className="secondary"
               type="button"
+              disabled={now >= pairing.expiresAt}
               onClick={() => void copyPairingCode(pairing.code)}
             >
               {copiedCode ? "Copied" : "Copy code"}
             </button>
+            {now >= pairing.expiresAt ? (
+              <button
+                className="secondary"
+                type="button"
+                disabled={pairingBusy}
+                onClick={() => void addDevice()}
+              >
+                New code
+              </button>
+            ) : null}
             <button className="secondary" type="button" onClick={() => setPairing(null)}>
               Done
             </button>
@@ -155,14 +197,15 @@ export function DeviceDashboardView({
           </article>
         ) : null}
         {devices?.map((device) => {
-          const statusKey = deviceStatusKey(device);
-          const statusLabel = deviceStatusLabel(device);
+          const status = effectiveDeviceStatus(device, now);
+          const statusKey = deviceStatusKey(device, status);
+          const statusLabel = deviceStatusLabel(device, status);
           return (
             <article className="device-card" key={device._id}>
               <div className="device-heading">
                 <span
                   className={`presence ${
-                    device.status === "online" && !device.ready ? "unready" : device.status
+                    status === "online" && !device.ready ? "unready" : status
                   }`}
                   aria-hidden="true"
                 />
@@ -193,9 +236,7 @@ export function DeviceDashboardView({
                 <button
                   className="primary connect"
                   type="button"
-                  disabled={
-                    device.status !== "online" || !device.ready || busyDevice === device._id
-                  }
+                  disabled={status !== "online" || !device.ready || busyDevice === device._id}
                   onClick={() => void connect(device._id)}
                 >
                   {busyDevice === device._id ? "Working…" : "Connect"}
@@ -211,7 +252,7 @@ export function DeviceDashboardView({
                 <button
                   className="danger"
                   type="button"
-                  disabled={busyDevice === device._id || device.status === "disabled"}
+                  disabled={busyDevice === device._id || status === "disabled"}
                   onClick={() => void remove(device._id, device.name)}
                 >
                   Remove
@@ -249,14 +290,46 @@ export function DeviceDashboardView({
   );
 }
 
-function deviceStatusKey(device: DeviceSummary): string {
-  if (device.status === "online" && !device.ready) return "unready";
-  return device.status;
+function effectiveDeviceStatus(device: DeviceSummary, now: number): DeviceSummary["status"] {
+  if (device.status === "disabled") return "disabled";
+  return device.status === "online" && now - device.lastSeenAt <= 45_000 ? "online" : "offline";
 }
 
-function deviceStatusLabel(device: DeviceSummary): string {
-  if (device.status === "online" && !device.ready) return "needs attention";
-  return device.status;
+function deviceStatusKey(device: DeviceSummary, status: DeviceSummary["status"]): string {
+  if (status === "online" && !device.ready) return "unready";
+  return status;
+}
+
+function deviceStatusLabel(device: DeviceSummary, status: DeviceSummary["status"]): string {
+  if (status !== "online") return status;
+  if (device.ready && !device.remoteInput) return "view only";
+  if (device.ready) return "online";
+  return readinessLabel(device.readiness);
+}
+
+function readinessLabel(readiness: DeviceSummary["readiness"]): string {
+  switch (readiness) {
+    case "capture-permission":
+      return "needs capture permission";
+    case "upgrade-required":
+      return "upgrade nanoctl to 2.0";
+    case "input-permission":
+      return "needs input permission";
+    case "no-display":
+      return "no display";
+    case "encoder-unavailable":
+      return "encoder unavailable";
+    case "starting":
+      return "starting";
+    default:
+      return "needs attention";
+  }
+}
+
+function formatRemaining(milliseconds: number): string {
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1_000));
+  const minutes = Math.floor(seconds / 60);
+  return minutes > 0 ? `Expires in ${minutes}m ${seconds % 60}s.` : `Expires in ${seconds}s.`;
 }
 
 function formatAuditAction(action: string): string {

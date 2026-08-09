@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::platform::{self, Capabilities};
+use crate::{
+    config::EncoderPreference,
+    platform::{self, Capabilities},
+};
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -52,14 +55,22 @@ impl From<anyhow::Error> for SessionPollError {
 pub struct PendingSession {
     pub session_id: String,
     pub expires_at: u64,
+    #[cfg(feature = "rtc")]
+    pub controller_epoch: Option<String>,
+    #[cfg(feature = "rtc")]
+    pub host_epoch: Option<String>,
     pub signals: Vec<SignalRow>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignalRow {
     pub sequence: u64,
     pub sender: String,
     pub envelope: String,
+    #[serde(default)]
+    #[cfg(feature = "rtc")]
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -100,6 +111,7 @@ impl ControlPlane {
         code: String,
         name: String,
         remote_input_enabled: bool,
+        encoder_preference: EncoderPreference,
     ) -> Result<Enrollment> {
         let response = self
             .client
@@ -110,7 +122,7 @@ impl ControlPlane {
                 platform: platform::PLATFORM,
                 architecture: platform::ARCHITECTURE,
                 agent_version: env!("CARGO_PKG_VERSION"),
-                capabilities: platform::capabilities(remote_input_enabled),
+                capabilities: platform::capabilities(remote_input_enabled, encoder_preference),
             })
             .send()
             .await?;
@@ -128,13 +140,14 @@ impl ControlPlane {
         &self,
         token: &Zeroizing<String>,
         remote_input_enabled: bool,
+        encoder_preference: EncoderPreference,
     ) -> Result<()> {
         self.client
             .post(self.endpoint("/v1/agent/heartbeat")?)
             .bearer_auth(token.as_str())
             .json(&serde_json::json!({
                 "agentVersion": env!("CARGO_PKG_VERSION"),
-                "capabilities": platform::capabilities(remote_input_enabled),
+                "capabilities": platform::capabilities(remote_input_enabled, encoder_preference),
             }))
             .send()
             .await?
@@ -181,6 +194,32 @@ impl ControlPlane {
                 "sessionId": session_id,
                 "sequence": sequence,
                 "envelope": envelope,
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "rtc")]
+    pub async fn claim_host(
+        &self,
+        token: &Zeroizing<String>,
+        session_id: &str,
+        controller_epoch: &str,
+        host_epoch: &str,
+        expected_host_epoch: Option<&str>,
+        generation: u64,
+    ) -> Result<()> {
+        self.client
+            .post(self.endpoint("/v1/agent/claim-host")?)
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({
+                "sessionId": session_id,
+                "controllerEpoch": controller_epoch,
+                "hostEpoch": host_epoch,
+                "expectedHostEpoch": expected_host_epoch,
+                "generation": generation,
             }))
             .send()
             .await?

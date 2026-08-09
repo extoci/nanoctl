@@ -2,6 +2,7 @@
 
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
+import type { Id } from "./_generated/dataModel";
 
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
@@ -25,7 +26,7 @@ async function seedDevice(t: ReturnType<typeof convexTest>, ownerId: string) {
       status: "online",
       tokenHash: `token-${ownerId}`,
       capabilitiesJson: JSON.stringify({
-        protocolVersion: 1,
+        protocolVersion: 2,
         codecs: ["h264"],
         ready: true,
         displays: [
@@ -49,6 +50,20 @@ function asOwner(t: ReturnType<typeof convexTest>, subject: string) {
   return t.withIdentity({ issuer: "https://shoo.dev", subject });
 }
 
+async function claimHostForTest(
+  t: ReturnType<typeof convexTest>,
+  args: {
+    deviceId: Id<"devices">;
+    sessionId: Id<"sessions">;
+    controllerEpoch: string;
+    hostEpoch: string;
+    expectedHostEpoch?: string;
+    generation: number;
+  },
+) {
+  expect(await t.mutation(internal.agent.claimHost, args)).toBe(true);
+}
+
 describe("control-plane authorization", () => {
   test("enforces authentication on every agent HTTP route except one-time enrollment", async () => {
     const t = convexTest(schema, modules);
@@ -56,6 +71,7 @@ describe("control-plane authorization", () => {
       ["/v1/agent/heartbeat", { method: "POST", body: "{}" }],
       ["/v1/agent/sessions", undefined],
       ["/v1/agent/signal", { method: "POST", body: "{}" }],
+      ["/v1/agent/claim-host", { method: "POST", body: "{}" }],
       ["/v1/agent/turn?sessionId=unknown", undefined],
     ];
     for (const [path, init] of protectedRequests) {
@@ -187,8 +203,11 @@ describe("control-plane authorization", () => {
     await expect(ownerA.mutation(api.sessions.create, { deviceId })).rejects.toThrow();
 
     const envelope = JSON.stringify({
-      version: 1,
+      version: 2,
       sessionId,
+      controllerEpoch: "controller-owner-a",
+      hostEpoch: "",
+      generation: 0,
       sequence: 0,
       sender: "controller",
       sentAt: Date.now(),
@@ -211,6 +230,25 @@ describe("control-plane authorization", () => {
     expect(evidence).toEqual({ state: "negotiating", signalCount: 1 });
   });
 
+  test("does not admit legacy v1 signaling into an active session", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const legacyOffer = JSON.stringify({
+      version: 1,
+      sessionId,
+      sequence: 0,
+      sender: "controller",
+      sentAt: Date.now(),
+      payload: { type: "offer", sdp: "v=0" },
+    });
+
+    await expect(
+      owner.mutation(api.signals.send, { sessionId, envelope: legacyOffer }),
+    ).rejects.toThrow("Unsupported signal protocol");
+  });
+
   test("handles replay, sequence gaps, wrong roles, expiry, and cross-device host signals", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");
@@ -219,8 +257,11 @@ describe("control-plane authorization", () => {
     const { sessionId } = await ownerA.mutation(api.sessions.create, { deviceId });
     const envelope = (sequence: number, payload: Record<string, unknown>, sender = "controller") =>
       JSON.stringify({
-        version: 1,
+        version: 2,
         sessionId,
+        controllerEpoch: "controller-owner-a",
+        hostEpoch: sender === "host" ? "host-owner-a" : "",
+        generation: 0,
         sequence,
         sender,
         sentAt: Date.now(),
@@ -230,6 +271,13 @@ describe("control-plane authorization", () => {
     const offer = envelope(0, { type: "offer", sdp: "v=0" });
     await ownerA.mutation(api.signals.send, { sessionId, envelope: offer });
     await ownerA.mutation(api.signals.send, { sessionId, envelope: offer });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-owner-a",
+      hostEpoch: "host-owner-a",
+      generation: 0,
+    });
     await ownerA.mutation(api.signals.send, {
       sessionId,
       envelope: envelope(7, {
@@ -273,6 +321,480 @@ describe("control-plane authorization", () => {
     ).toBe(false);
   });
 
+  test("replays a fresh host epoch even when its sequence is below the old cursor", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const hostEnvelope = (
+      sequence: number,
+      payload: Record<string, unknown>,
+      controllerEpoch: string,
+      hostEpoch: string,
+    ) =>
+      JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch,
+        hostEpoch,
+        generation: 0,
+        sequence,
+        sender: "host",
+        sentAt: Date.now(),
+        payload,
+      });
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-old",
+        hostEpoch: "",
+        generation: 0,
+        sequence: 0,
+        sender: "controller",
+        sentAt: Date.now(),
+        payload: { type: "offer", sdp: "v=0" },
+      }),
+    });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-old",
+      hostEpoch: "host-old",
+      generation: 0,
+    });
+    await t.mutation(internal.agent.sendSignal, {
+      deviceId,
+      sessionId,
+      sequence: 900,
+      envelope: hostEnvelope(900, { type: "answer", sdp: "v=0" }, "controller-old", "host-old"),
+    });
+    await owner.mutation(api.sessions.claimController, {
+      sessionId,
+      controllerEpoch: "controller-new",
+      expectedControllerEpoch: "controller-old",
+    });
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-new",
+        hostEpoch: "",
+        generation: 0,
+        sequence: 1,
+        sender: "controller",
+        sentAt: Date.now(),
+        payload: { type: "offer", sdp: "v=0 new-controller-epoch" },
+      }),
+    });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-new",
+      hostEpoch: "host-new",
+      generation: 0,
+    });
+    await t.mutation(internal.agent.sendSignal, {
+      deviceId,
+      sessionId,
+      sequence: 100,
+      envelope: hostEnvelope(
+        100,
+        { type: "answer", sdp: "v=0 new-host-epoch" },
+        "controller-new",
+        "host-new",
+      ),
+    });
+    await t.mutation(internal.agent.sendSignal, {
+      deviceId,
+      sessionId,
+      sequence: 101,
+      envelope: hostEnvelope(
+        101,
+        {
+          type: "ice-candidate",
+          candidate: "candidate:fresh-epoch",
+          sdpMid: "0",
+          sdpMLineIndex: 0,
+        },
+        "controller-new",
+        "host-new",
+      ),
+    });
+
+    const signals = await owner.query(api.signals.list, {
+      sessionId,
+      afterSequence: 900,
+    });
+    expect(signals.map((signal) => signal.sequence)).toEqual([100, 101]);
+  });
+
+  test("keeps candidates that were published before the replayed answer", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const envelope = (sequence: number, payload: Record<string, unknown>) =>
+      JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-a",
+        hostEpoch: "host-a",
+        generation: 0,
+        sequence,
+        sender: "host",
+        sentAt: Date.now(),
+        payload,
+      });
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-a",
+        hostEpoch: "",
+        generation: 0,
+        sequence: 1,
+        sender: "controller",
+        sentAt: Date.now(),
+        payload: { type: "offer", sdp: "v=0" },
+      }),
+    });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-a",
+      hostEpoch: "host-a",
+      generation: 0,
+    });
+    await t.mutation(internal.agent.sendSignal, {
+      deviceId,
+      sessionId,
+      sequence: 2,
+      envelope: envelope(2, {
+        type: "ice-candidate",
+        candidate: "candidate:before-answer",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      }),
+    });
+    await t.mutation(internal.agent.sendSignal, {
+      deviceId,
+      sessionId,
+      sequence: 3,
+      envelope: envelope(3, { type: "answer", sdp: "v=0 answer" }),
+    });
+    await t.mutation(internal.agent.sendSignal, {
+      deviceId,
+      sessionId,
+      sequence: 4,
+      envelope: envelope(4, { type: "answer", sdp: "v=0 retry" }),
+    });
+
+    const signals = await owner.query(api.signals.list, { sessionId, afterSequence: -1 });
+    expect(signals.map((signal) => signal.sequence)).toEqual([2, 4]);
+    expect(signals[0]?.envelope).toContain("before-answer");
+    expect(signals[1]?.envelope).toContain("retry");
+  });
+
+  test("rejects delayed host rows from a replaced controller epoch", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const envelope = (
+      sender: "controller" | "host",
+      epoch: string,
+      generation: number,
+      sequence: number,
+      payload: Record<string, unknown>,
+    ) =>
+      JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: epoch,
+        hostEpoch: sender === "host" ? "host-test" : "",
+        generation,
+        sequence,
+        sender,
+        sentAt: Date.now(),
+        payload,
+      });
+    const oldOffer = envelope("controller", "controller-old", 0, 10, {
+      type: "offer",
+      sdp: "v=0 old",
+    });
+    const newOffer = envelope("controller", "controller-new", 0, 20, {
+      type: "offer",
+      sdp: "v=0 new",
+    });
+    await owner.mutation(api.signals.send, { sessionId, envelope: oldOffer });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-old",
+      hostEpoch: "host-old",
+      generation: 0,
+    });
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 11,
+        envelope: JSON.stringify({
+          ...JSON.parse(envelope("host", "controller-old", 0, 11, { type: "answer", sdp: "old" })),
+          hostEpoch: "host-old",
+        }),
+      }),
+    ).toBe(true);
+    await owner.mutation(api.sessions.claimController, {
+      sessionId,
+      controllerEpoch: "controller-new",
+      expectedControllerEpoch: "controller-old",
+    });
+    await owner.mutation(api.signals.send, { sessionId, envelope: newOffer });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-new",
+      hostEpoch: "host-new",
+      generation: 0,
+    });
+
+    // Simulate a delayed old worker that bypassed the current request path before the epoch check
+    // was deployed. The replay query must still keep it out of the new browser peer.
+    await t.run(async (ctx) => {
+      const session = await ctx.db.get(sessionId);
+      await ctx.db.insert("signals", {
+        sessionId,
+        sender: "host",
+        kind: "answer",
+        sequence: 12,
+        envelope: envelope("host", "controller-new", 0, 12, { type: "answer", sdp: "late-old" }),
+        createdAt: Date.now(),
+        expiresAt: session!.expiresAt,
+      });
+    });
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 13,
+        envelope: envelope("host", "controller-old", 0, 13, { type: "answer", sdp: "old" }),
+      }),
+    ).toBe(false);
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 21,
+        envelope: JSON.stringify({
+          ...JSON.parse(envelope("host", "controller-new", 0, 21, { type: "answer", sdp: "new" })),
+          hostEpoch: "host-new",
+        }),
+      }),
+    ).toBe(true);
+
+    const signals = await owner.query(api.signals.list, { sessionId, afterSequence: 0 });
+    expect(signals.map((signal) => signal.sequence)).toEqual([21]);
+    expect(JSON.parse(signals[0]!.envelope).payload.sdp).toBe("new");
+  });
+
+  test("rejects delayed controller signals after a newer peer claim", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const signal = (controllerEpoch: string, sequence: number, payload: Record<string, unknown>) =>
+      JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch,
+        hostEpoch: "",
+        generation: 0,
+        sequence,
+        sender: "controller",
+        sentAt: Date.now(),
+        payload,
+      });
+
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: signal("controller-old", 1, { type: "offer", sdp: "v=0 old" }),
+    });
+    await owner.mutation(api.sessions.claimController, {
+      sessionId,
+      controllerEpoch: "controller-new",
+      expectedControllerEpoch: "controller-old",
+    });
+    await expect(
+      owner.mutation(api.signals.send, {
+        sessionId,
+        envelope: signal("controller-old", 2, {
+          type: "ice-candidate",
+          candidate: "candidate:old",
+          sdpMid: "0",
+          sdpMLineIndex: 0,
+        }),
+      }),
+    ).rejects.toThrow("Controller peer is no longer current");
+    await expect(
+      owner.mutation(api.signals.send, {
+        sessionId,
+        envelope: signal("controller-old", 3, { type: "end", reason: "late" }),
+      }),
+    ).rejects.toThrow("Controller peer is no longer current");
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: signal("controller-new", 4, { type: "offer", sdp: "v=0 new" }),
+    });
+    await expect(owner.query(api.sessions.getState, { sessionId })).resolves.toMatchObject({
+      state: "negotiating",
+    });
+  });
+
+  test("ignores a late scoped end from a replaced browser controller", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    await owner.mutation(api.signals.send, {
+      sessionId,
+      envelope: JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-old",
+        hostEpoch: "",
+        generation: 0,
+        sequence: 1,
+        sender: "controller",
+        sentAt: 1,
+        payload: { type: "offer", sdp: "v=0 old" },
+      }),
+    });
+    await owner.mutation(api.sessions.claimController, {
+      sessionId,
+      controllerEpoch: "controller-new",
+      expectedControllerEpoch: "controller-old",
+    });
+
+    await owner.mutation(api.sessions.end, {
+      sessionId,
+      reason: "late old page cleanup",
+      controllerEpoch: "controller-old",
+    });
+    await expect(owner.query(api.sessions.getState, { sessionId })).resolves.toMatchObject({
+      state: "negotiating",
+    });
+
+    await owner.mutation(api.sessions.end, {
+      sessionId,
+      reason: "explicit current controller end",
+      controllerEpoch: "controller-new",
+    });
+    await expect(owner.query(api.sessions.getState, { sessionId })).resolves.toMatchObject({
+      state: "ended",
+    });
+  });
+
+  test("uses compare-and-swap epochs instead of client clocks for controller ownership", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+
+    await owner.mutation(api.sessions.claimController, {
+      sessionId,
+      controllerEpoch: "controller-a",
+    });
+    await owner.mutation(api.sessions.claimController, {
+      sessionId,
+      controllerEpoch: "controller-b",
+      expectedControllerEpoch: "controller-a",
+    });
+    await expect(
+      owner.mutation(api.sessions.claimController, {
+        sessionId,
+        controllerEpoch: "delayed-controller",
+        expectedControllerEpoch: "controller-a",
+      }),
+    ).rejects.toThrow("Controller claim is stale");
+    await expect(owner.query(api.sessions.getState, { sessionId })).resolves.toMatchObject({
+      controllerEpoch: "controller-b",
+    });
+  });
+
+  test("switches host epochs so a native restart can recover after an old answer", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "owner-a");
+    const owner = asOwner(t, "owner-a");
+    const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+    const offer = JSON.stringify({
+      version: 2,
+      sessionId,
+      controllerEpoch: "controller-a",
+      hostEpoch: "",
+      generation: 0,
+      sequence: 1,
+      sender: "controller",
+      sentAt: Date.now(),
+      payload: { type: "offer", sdp: "v=0" },
+    });
+    await owner.mutation(api.signals.send, { sessionId, envelope: offer });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-a",
+      hostEpoch: "host-a",
+      generation: 0,
+    });
+    const answer = (hostEpoch: string, sequence: number) =>
+      JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-a",
+        hostEpoch,
+        generation: 0,
+        sequence,
+        sender: "host",
+        sentAt: Date.now(),
+        payload: { type: "answer", sdp: "v=0" },
+      });
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 2,
+        envelope: answer("host-a", 2),
+      }),
+    ).toBe(true);
+    expect(
+      await t.mutation(internal.agent.claimHost, {
+        deviceId,
+        sessionId,
+        controllerEpoch: "controller-a",
+        hostEpoch: "host-b",
+        expectedHostEpoch: "host-a",
+        generation: 0,
+      }),
+    ).toBe(true);
+    expect(
+      await t.mutation(internal.agent.sendSignal, {
+        deviceId,
+        sessionId,
+        sequence: 3,
+        envelope: answer("host-b", 3),
+      }),
+    ).toBe(true);
+    await expect(owner.query(api.signals.list, { sessionId, afterSequence: -1 })).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sequence: 3, envelope: expect.stringContaining('"host-b"') }),
+      ]),
+    );
+  });
+
   test("surfaces the agent's terminal negotiation reason", async () => {
     const t = convexTest(schema, modules);
     const deviceId = await seedDevice(t, "owner-a");
@@ -280,8 +802,11 @@ describe("control-plane authorization", () => {
     const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
     const envelope = (sender: "controller" | "host", payload: Record<string, unknown>) =>
       JSON.stringify({
-        version: 1,
+        version: 2,
         sessionId,
+        controllerEpoch: sender === "controller" ? "controller-test" : "controller-test",
+        hostEpoch: sender === "host" ? "host-test" : "",
+        generation: 0,
         sequence: 0,
         sender,
         sentAt: Date.now(),
@@ -290,6 +815,13 @@ describe("control-plane authorization", () => {
     await owner.mutation(api.signals.send, {
       sessionId,
       envelope: envelope("controller", { type: "offer", sdp: "v=0" }),
+    });
+    await claimHostForTest(t, {
+      deviceId,
+      sessionId,
+      controllerEpoch: "controller-test",
+      hostEpoch: "host-test",
+      generation: 0,
     });
     expect(
       await t.mutation(internal.agent.sendSignal, {
@@ -359,9 +891,26 @@ describe("control-plane authorization", () => {
     await ownerA.mutation(api.signals.send, {
       sessionId,
       envelope: JSON.stringify({
-        version: 1,
+        version: 2,
         sessionId,
+        controllerEpoch: "controller-test",
+        hostEpoch: "",
+        generation: 0,
         sequence: 0,
+        sender: "controller",
+        sentAt: Date.now(),
+        payload: { type: "offer", sdp: "v=0" },
+      }),
+    });
+    await ownerA.mutation(api.signals.send, {
+      sessionId,
+      envelope: JSON.stringify({
+        version: 2,
+        sessionId,
+        controllerEpoch: "controller-test",
+        hostEpoch: "",
+        generation: 0,
+        sequence: 1,
         sender: "controller",
         sentAt: Date.now(),
         payload: { type: "end", reason: "leaving" },
@@ -467,10 +1016,18 @@ describe("control-plane authorization", () => {
       const deviceId = await seedDevice(t, `owner-${seed}`);
       const owner = asOwner(t, `owner-${seed}`);
       const { sessionId } = await owner.mutation(api.sessions.create, { deviceId });
+      await owner.mutation(api.sessions.claimController, {
+        sessionId,
+        controllerEpoch: `controller-${seed}`,
+      });
       let model: State = "requested";
       let random = seed;
       let controllerSequence = 0;
       let hostSequence = 0;
+      let hasOffer = false;
+      let activeGeneration = -1;
+      const controllerEpoch = `controller-${seed}`;
+      const hostEpoch = `host-${seed}`;
       for (let step = 0; step < 12; step += 1) {
         random = (random * 1_664_525 + 1_013_904_223) >>> 0;
         const command = commands[random % commands.length]!;
@@ -478,11 +1035,16 @@ describe("control-plane authorization", () => {
         if (command.startsWith("controller")) {
           const kind = command === "controller-offer" ? "offer" : "end";
           const sequence = controllerSequence++;
+          const generation =
+            kind === "offer" ? activeGeneration + 1 : Math.max(0, activeGeneration);
           const operation = owner.mutation(api.signals.send, {
             sessionId,
             envelope: JSON.stringify({
-              version: 1,
+              version: 2,
               sessionId,
+              controllerEpoch,
+              hostEpoch: "",
+              generation,
               sequence,
               sender: "controller",
               sentAt: Date.now(),
@@ -497,7 +1059,19 @@ describe("control-plane authorization", () => {
           } else {
             await operation;
             if (kind === "end") model = "ended";
-            else if (model === "requested") model = "negotiating";
+            else {
+              activeGeneration = generation;
+              await claimHostForTest(t, {
+                deviceId,
+                sessionId,
+                controllerEpoch,
+                hostEpoch,
+                ...(hasOffer ? { expectedHostEpoch: hostEpoch } : {}),
+                generation,
+              });
+              hasOffer = true;
+              if (model === "requested") model = "negotiating";
+            }
           }
         } else {
           const kind = command === "host-answer" ? "answer" : "end";
@@ -507,8 +1081,11 @@ describe("control-plane authorization", () => {
             sessionId,
             sequence,
             envelope: JSON.stringify({
-              version: 1,
+              version: 2,
               sessionId,
+              controllerEpoch,
+              hostEpoch,
+              generation: activeGeneration,
               sequence,
               sender: "host",
               sentAt: Date.now(),
@@ -518,8 +1095,8 @@ describe("control-plane authorization", () => {
                   : { type: kind, reason: "model media failure" },
             }),
           });
-          expect(accepted).toBe(!terminal);
-          if (!terminal) {
+          expect(accepted).toBe(!terminal && hasOffer);
+          if (!terminal && hasOffer) {
             if (kind === "end") model = "failed";
             else if (model === "negotiating") model = "connected";
           }

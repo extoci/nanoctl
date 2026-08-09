@@ -83,6 +83,10 @@ impl MacOsEncoder {
             bail!("VideoToolbox input dimensions must be non-zero and even");
         }
         if self.restart_session || self.dimensions != dimensions {
+            // Release the previous hardware session before creating its replacement. Some Macs
+            // expose only one VideoToolbox encoder slot, and overlapping sessions fail silently.
+            self.session.take();
+            self.surface.take();
             self.session = Some(create_session(
                 dimensions.0,
                 dimensions.1,

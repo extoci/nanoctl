@@ -20,7 +20,7 @@ pub struct InputController {
     height: u32,
     held_keys: HashSet<Key>,
     held_buttons: HashSet<Button>,
-    last_activity: Instant,
+    last_physical_input: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +84,7 @@ impl InputController {
             height: monitor.height()?,
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
-            last_activity: Instant::now(),
+            last_physical_input: Instant::now(),
         })
     }
 
@@ -118,7 +118,12 @@ impl InputController {
             }
             (_, InputLane::Reliable) => {}
         }
-        self.last_activity = Instant::now();
+        if !matches!(
+            &message,
+            ControlMessage::Ping | ControlMessage::Release | ControlMessage::Unsupported
+        ) {
+            self.last_physical_input = Instant::now();
+        }
         match message {
             ControlMessage::Pointer {
                 action,
@@ -153,7 +158,7 @@ impl InputController {
         }
     }
 
-    fn select_display(&mut self, display_id: &str) -> Result<()> {
+    pub(crate) fn select_display(&mut self, display_id: &str) -> Result<()> {
         if display_id.len() > 128 {
             anyhow::bail!("display identifier is too long");
         }
@@ -239,7 +244,7 @@ impl InputController {
     }
 
     pub fn release_if_idle(&mut self, timeout: Duration) {
-        if self.last_activity.elapsed() >= timeout
+        if self.last_physical_input.elapsed() >= timeout
             && (!self.held_keys.is_empty() || !self.held_buttons.is_empty())
         {
             self.release_all();

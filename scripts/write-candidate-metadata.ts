@@ -1,11 +1,13 @@
 import { basename, join, resolve } from "node:path";
 
+const semanticVersion = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
 type Platform = "linux" | "macos" | "windows";
 
 function packageVersion(text: string): string {
   const parsed = JSON.parse(text) as { version?: unknown };
-  if (typeof parsed.version !== "string" || !/^\d+\.\d+\.\d+$/.test(parsed.version)) {
-    throw new Error("package.json must contain a stable semantic version");
+  if (typeof parsed.version !== "string" || !semanticVersion.test(parsed.version)) {
+    throw new Error("package.json must contain a semantic version");
   }
   return parsed.version;
 }
@@ -13,8 +15,8 @@ function packageVersion(text: string): string {
 function cargoVersion(text: string): string {
   const packageSection = text.match(/\[package\]([\s\S]*?)(?:\n\[|$)/)?.[1] ?? "";
   const version = packageSection.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m)?.[1];
-  if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
-    throw new Error("agent Cargo.toml must contain a stable semantic version");
+  if (!version || !semanticVersion.test(version)) {
+    throw new Error("agent Cargo.toml must contain a semantic version");
   }
   return version;
 }

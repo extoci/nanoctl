@@ -27,6 +27,7 @@ use crate::config::{EncoderPreference, LatencyMode};
 
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const CAPTURE_FRAME_STALE_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 struct VideoDeliveryUnavailable;
@@ -67,8 +68,15 @@ where
 
 #[derive(Default)]
 struct LatestFrame {
-    slot: Mutex<Option<xcap::Frame>>,
+    slot: Mutex<Option<CapturedFrame>>,
+    last: Mutex<Option<CapturedFrame>>,
     ready: Condvar,
+}
+
+#[derive(Clone)]
+struct CapturedFrame {
+    frame: xcap::Frame,
+    captured_at: Instant,
 }
 
 impl LatestFrame {
@@ -76,22 +84,43 @@ impl LatestFrame {
         let Ok(mut slot) = self.slot.lock() else {
             return false;
         };
-        *slot = Some(frame);
+        let captured = CapturedFrame {
+            frame,
+            captured_at: Instant::now(),
+        };
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some(captured.clone());
+        }
+        *slot = Some(captured);
         self.ready.notify_one();
         true
     }
 
-    fn take(&self, timeout: Duration) -> Result<xcap::Frame> {
+    fn take(&self, timeout: Duration) -> Result<CapturedFrame> {
         let slot = self
             .slot
             .lock()
             .map_err(|_| anyhow!("display capture queue was poisoned"))?;
+        if slot.is_none()
+            && let Some(last) = self
+                .last
+                .lock()
+                .map_err(|_| anyhow!("display capture queue was poisoned"))?
+                .clone()
+        {
+            return Ok(last);
+        }
         let (mut slot, timeout) = self
             .ready
             .wait_timeout_while(slot, timeout, |frame| frame.is_none())
             .map_err(|_| anyhow!("display capture queue was poisoned"))?;
         if timeout.timed_out() && slot.is_none() {
-            bail!("display capture timed out");
+            return self
+                .last
+                .lock()
+                .map_err(|_| anyhow!("display capture queue was poisoned"))?
+                .clone()
+                .context("display capture stopped without a frame");
         }
         slot.take()
             .context("display capture stopped without a frame")
@@ -101,7 +130,7 @@ impl LatestFrame {
         &self,
         timeout: Duration,
         stopped: &AtomicBool,
-    ) -> Result<Option<xcap::Frame>> {
+    ) -> Result<Option<CapturedFrame>> {
         let deadline = Instant::now() + timeout;
         let mut slot = self
             .slot
@@ -114,9 +143,23 @@ impl LatestFrame {
             if stopped.load(Ordering::Acquire) {
                 return Ok(None);
             }
+            if let Some(last) = self
+                .last
+                .lock()
+                .map_err(|_| anyhow!("display capture queue was poisoned"))?
+                .clone()
+            {
+                return Ok(Some(last));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("display capture timed out");
+                return self
+                    .last
+                    .lock()
+                    .map_err(|_| anyhow!("display capture queue was poisoned"))?
+                    .clone()
+                    .map(Some)
+                    .context("display capture stopped without a frame");
             }
             let (next_slot, _) = self
                 .ready
@@ -130,8 +173,10 @@ impl LatestFrame {
 pub struct CaptureEncoder {
     // Keeping the recorder alive preserves one native capture session instead of rebuilding the
     // OS capture pipeline for every frame.
-    recorder: xcap::VideoRecorder,
+    recorder: Option<xcap::VideoRecorder>,
+    forwarder: Option<std::thread::JoinHandle<()>>,
     latest_frame: Arc<LatestFrame>,
+    display_id: String,
     encoder: EncoderBackend,
 }
 
@@ -153,6 +198,7 @@ struct SoftwareEncoder {
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
+    dimensions: Option<(u32, u32)>,
     rgb: Vec<u8>,
     yuv: Option<YUVBuffer>,
 }
@@ -190,10 +236,16 @@ impl CaptureEncoder {
             latency_mode,
             (initial_width, initial_height),
         )?;
-        let (recorder, latest_frame) = start_capture(&monitor)?;
+        let display_id = monitor
+            .id()
+            .context("cannot read primary display identifier")?
+            .to_string();
+        let (recorder, latest_frame, forwarder) = start_capture(&monitor)?;
         Ok(Self {
-            recorder,
+            recorder: Some(recorder),
+            forwarder: Some(forwarder),
             latest_frame,
+            display_id,
             encoder,
         })
     }
@@ -207,12 +259,27 @@ impl CaptureEncoder {
             .into_iter()
             .find(|monitor| monitor.id().is_ok_and(|id| id.to_string() == display_id))
             .context("selected display is unavailable")?;
-        let (recorder, latest_frame) = start_capture(&monitor)?;
-        let _ = self.recorder.stop();
-        self.recorder = recorder;
+        // Start the replacement while the current recorder is still valid. If the new display
+        // cannot be opened, the caller keeps the current stream instead of losing video merely
+        // because a display-selection request was invalid or temporarily unavailable.
+        let (recorder, latest_frame, forwarder) = start_capture(&monitor)?;
+        if let Some(old_recorder) = self.recorder.take() {
+            let _ = old_recorder.stop();
+            drop(old_recorder);
+        }
+        if let Some(old_forwarder) = self.forwarder.take() {
+            let _ = old_forwarder.join();
+        }
+        self.recorder = Some(recorder);
+        self.forwarder = Some(forwarder);
         self.latest_frame = latest_frame;
+        self.display_id = display_id.to_owned();
         self.encoder.force_keyframe();
         Ok(())
+    }
+
+    fn current_display_id(&self) -> &str {
+        &self.display_id
     }
 
     pub fn apply_bitrate_estimate(
@@ -224,8 +291,25 @@ impl CaptureEncoder {
             .apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
     }
 
-    pub fn next_access_unit(&mut self, max_width: u32, max_height: u32) -> Result<EncodedFrame> {
-        let frame = self.latest_frame.take(Duration::from_secs(5))?;
+    fn next_access_unit_with_timings(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<(EncodedFrame, TimingSample)> {
+        let captured = self.latest_frame.take(Duration::from_secs(5))?;
+        self.encode_captured_frame(captured, max_width, max_height)
+    }
+
+    fn encode_captured_frame(
+        &mut self,
+        captured: CapturedFrame,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<(EncodedFrame, TimingSample)> {
+        let CapturedFrame { frame, captured_at } = captured;
+        if captured_at.elapsed() > CAPTURE_FRAME_STALE_GRACE {
+            bail!("display capture stopped producing fresh frames");
+        }
         let source = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.raw)
             .context("display capture returned an invalid RGBA frame")?;
         let (source_width, source_height) = source.dimensions();
@@ -245,7 +329,16 @@ impl CaptureEncoder {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
         }
-        self.encoder.encode(&image)
+        let encode_started = Instant::now();
+        let encoded = self.encoder.encode(&image)?;
+        let encoded_at = Instant::now();
+        Ok((
+            encoded,
+            TimingSample {
+                capture_to_encode: encoded_at.saturating_duration_since(captured_at),
+                encode: encoded_at.saturating_duration_since(encode_started),
+            },
+        ))
     }
 
     fn next_access_unit_until_stopped(
@@ -263,29 +356,10 @@ impl CaptureEncoder {
         if stopped.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let source = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.raw)
-            .context("display capture returned an invalid RGBA frame")?;
-        let (source_width, source_height) = source.dimensions();
-        let (target_width, target_height) =
-            fit_dimensions(source_width, source_height, max_width, max_height);
-        let image = if target_width == source_width && target_height == source_height {
-            source
-        } else {
-            xcap::image::imageops::resize(
-                &source,
-                target_width,
-                target_height,
-                xcap::image::imageops::FilterType::Triangle,
-            )
-        };
-        let (width, height) = image.dimensions();
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
-            bail!("captured display dimensions must be non-zero and even");
-        }
-        if stopped.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        Ok(Some(self.encoder.encode(&image)?))
+        Ok(Some(
+            self.encode_captured_frame(frame, max_width, max_height)
+                .map(|(encoded, _timing)| encoded)?,
+        ))
     }
 }
 
@@ -439,6 +513,7 @@ impl SoftwareEncoder {
             bitrate_kbps,
             max_fps,
             latency_mode,
+            dimensions: None,
             rgb: Vec::new(),
             yuv: None,
         })
@@ -457,7 +532,16 @@ impl SoftwareEncoder {
     }
 
     fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
-        let dimensions = (image.width() as usize, image.height() as usize);
+        let dimensions = (image.width(), image.height());
+        if self.dimensions != Some(dimensions) {
+            // OpenH264 does not promise dynamic resolution changes. Recreate the software
+            // encoder at a display handoff just as the hardware backends do, guaranteeing a
+            // fresh parameter set and an IDR for the new frame size.
+            self.encoder = create_encoder(self.bitrate_kbps, self.max_fps, self.latency_mode)?;
+            self.yuv = None;
+            self.dimensions = Some(dimensions);
+        }
+        let dimensions = (dimensions.0 as usize, dimensions.1 as usize);
         self.rgb.clear();
         self.rgb.reserve(dimensions.0 * dimensions.1 * 3);
         for pixel in image.as_raw().chunks_exact(4) {
@@ -480,13 +564,19 @@ impl SoftwareEncoder {
     }
 }
 
-fn start_capture(monitor: &Monitor) -> Result<(xcap::VideoRecorder, Arc<LatestFrame>)> {
+fn start_capture(
+    monitor: &Monitor,
+) -> Result<(
+    xcap::VideoRecorder,
+    Arc<LatestFrame>,
+    std::thread::JoinHandle<()>,
+)> {
     let (recorder, native_frames) = monitor
         .video_recorder()
         .context("continuous display capture is unavailable")?;
     let latest_frame = Arc::new(LatestFrame::default());
     let forwarding_slot = Arc::downgrade(&latest_frame);
-    std::thread::Builder::new()
+    let forwarder = std::thread::Builder::new()
         .name("nanoctl-capture".to_owned())
         .spawn(move || {
             while let Ok(frame) = native_frames.recv() {
@@ -500,10 +590,12 @@ fn start_capture(monitor: &Monitor) -> Result<(xcap::VideoRecorder, Arc<LatestFr
             }
         })
         .context("capture forwarding thread could not start")?;
-    recorder
-        .start()
-        .context("continuous display capture could not start")?;
-    Ok((recorder, latest_frame))
+    if let Err(error) = recorder.start() {
+        let _ = recorder.stop();
+        let _ = forwarder.join();
+        return Err(error).context("continuous display capture could not start");
+    }
+    Ok((recorder, latest_frame, forwarder))
 }
 
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
@@ -598,7 +690,13 @@ pub(crate) fn avcc_to_annex_b(
 
 impl Drop for CaptureEncoder {
     fn drop(&mut self) {
-        let _ = self.recorder.stop();
+        if let Some(recorder) = self.recorder.take() {
+            let _ = recorder.stop();
+            drop(recorder);
+        }
+        if let Some(forwarder) = self.forwarder.take() {
+            let _ = forwarder.join();
+        }
     }
 }
 
@@ -718,6 +816,66 @@ fn is_idr(bytes: &[u8]) -> bool {
     false
 }
 
+struct TimingSample {
+    capture_to_encode: Duration,
+    encode: Duration,
+}
+
+#[derive(Default)]
+struct TimingSamples {
+    capture_to_encode_micros: Vec<u64>,
+    encode_micros: Vec<u64>,
+}
+
+const MAX_TIMING_SAMPLES: usize = 524_288;
+
+impl TimingSamples {
+    fn observe(&mut self, sample: TimingSample) {
+        if self.capture_to_encode_micros.len() < MAX_TIMING_SAMPLES {
+            self.capture_to_encode_micros.push(
+                sample
+                    .capture_to_encode
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            self.encode_micros
+                .push(sample.encode.as_micros().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+
+    fn percentiles(&mut self) -> TimingPercentiles {
+        self.capture_to_encode_micros.sort_unstable();
+        self.encode_micros.sort_unstable();
+        TimingPercentiles {
+            capture_to_encode_p50_milliseconds: percentile_milliseconds(
+                &self.capture_to_encode_micros,
+                0.50,
+            ),
+            capture_to_encode_p95_milliseconds: percentile_milliseconds(
+                &self.capture_to_encode_micros,
+                0.95,
+            ),
+            encode_p50_milliseconds: percentile_milliseconds(&self.encode_micros, 0.50),
+            encode_p95_milliseconds: percentile_milliseconds(&self.encode_micros, 0.95),
+        }
+    }
+}
+
+struct TimingPercentiles {
+    capture_to_encode_p50_milliseconds: f64,
+    capture_to_encode_p95_milliseconds: f64,
+    encode_p50_milliseconds: f64,
+    encode_p95_milliseconds: f64,
+}
+
+fn percentile_milliseconds(samples: &[u64], percentile: f64) -> f64 {
+    let Some(last) = samples.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let index = ((last as f64) * percentile).round() as usize;
+    samples[index.min(last)] as f64 / 1_000.0
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct MediaSmokeReport {
     pub schema_version: u8,
@@ -737,6 +895,11 @@ pub struct MediaSmokeReport {
     pub frames_per_second: f64,
     pub encoded_bytes: u64,
     pub average_bitrate_kbps: f64,
+    /// Time from native capture delivery to the completed encoded access unit.
+    pub capture_to_encode_p50_milliseconds: f64,
+    pub capture_to_encode_p95_milliseconds: f64,
+    pub encode_p50_milliseconds: f64,
+    pub encode_p95_milliseconds: f64,
     pub width: u32,
     pub height: u32,
     pub idr_frames: u64,
@@ -748,7 +911,7 @@ impl MediaSmokeReport {
     pub fn print(&self) {
         println!(
             "media-smoke={} version={} target={}-{} backend={} frames={} fps={:.2} bitrate_kbps={:.2} \
-             dimensions={}x{} idr={} sps={} pps={}",
+             capture_to_encode_p95_ms={:.2} encode_p95_ms={:.2} dimensions={}x{} idr={} sps={} pps={}",
             if self.passed { "pass" } else { "fail" },
             self.agent_version,
             self.target_os,
@@ -757,6 +920,8 @@ impl MediaSmokeReport {
             self.frames,
             self.frames_per_second,
             self.average_bitrate_kbps,
+            self.capture_to_encode_p95_milliseconds,
+            self.encode_p95_milliseconds,
             self.width,
             self.height,
             self.idr_frames,
@@ -789,13 +954,16 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
     let mut sps_units = 0_u64;
     let mut pps_units = 0_u64;
     let mut dimensions = (0_u32, 0_u32);
+    let mut timing_samples = TimingSamples::default();
     while Instant::now() < deadline {
         let now = Instant::now();
         if now < next_frame {
             std::thread::sleep(next_frame - now);
         }
         next_frame = Instant::now() + frame_interval;
-        let frame = encoder.next_access_unit(quality.max_width, quality.max_height)?;
+        let (frame, timing) =
+            encoder.next_access_unit_with_timings(quality.max_width, quality.max_height)?;
+        timing_samples.observe(timing);
         if frame.bytes.is_empty() {
             continue;
         }
@@ -826,6 +994,7 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
     // Auto mode may switch from a native encoder to OpenH264 after the first real frame. Report
     // the backend that completed the smoke test, not merely the one that initialized.
     let backend = encoder.encoder.name();
+    let timing = timing_samples.percentiles();
     Ok(MediaSmokeReport {
         schema_version: 1,
         passed,
@@ -844,6 +1013,10 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         frames_per_second,
         encoded_bytes,
         average_bitrate_kbps,
+        capture_to_encode_p50_milliseconds: timing.capture_to_encode_p50_milliseconds,
+        capture_to_encode_p95_milliseconds: timing.capture_to_encode_p95_milliseconds,
+        encode_p50_milliseconds: timing.encode_p50_milliseconds,
+        encode_p95_milliseconds: timing.encode_p95_milliseconds,
         width: dimensions.0,
         height: dimensions.1,
         idr_frames,
@@ -952,6 +1125,7 @@ pub fn spawn_video(
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     bitrate_estimate_kbps: tokio::sync::watch::Receiver<u32>,
     display_selection: tokio::sync::watch::Receiver<String>,
+    display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
 ) -> VideoPipeline {
     let stopped = Arc::new(AtomicBool::new(false));
@@ -976,6 +1150,7 @@ pub fn spawn_video(
                 let mut keyframe_requests = keyframe_requests;
                 let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
                 let mut display_selection = display_selection;
+                let display_selection_feedback = display_selection_feedback;
                 let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
                 let mut next_frame = Instant::now();
                 loop {
@@ -1014,6 +1189,14 @@ pub fn spawn_video(
                                 error = %error,
                                 "display switch rejected; retaining current capture"
                             );
+                            // Input geometry is updated optimistically by the reliable control
+                            // worker. If capture rejects the same request, publish the actual
+                            // capture target so that worker rolls its geometry back. Do not
+                            // overwrite a newer request that arrived while the switch ran.
+                            if display_selection.borrow().as_str() == display_id.as_str() {
+                                display_selection_feedback
+                                    .send_replace(encoder.current_display_id().to_owned());
+                            }
                         }
                     }
                     let Some(frame) = encoder.next_access_unit_until_stopped(
@@ -1040,6 +1223,7 @@ pub fn spawn_video(
         let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
+        let mut recovery_keyframe_requested = false;
         let mut write_result = Ok(());
         loop {
             tokio::select! {
@@ -1049,13 +1233,12 @@ pub fn spawn_video(
                     }
                 }
                 frame = encoded_slot.take() => {
-                    let Some((frame, dropped)) = frame else { break };
-                    // Tell the RTP packetizer about frames discarded by the newest-frame slot so
-                    // timestamps keep pace with the capture clock instead of falling behind.
+                    let Some((frame, _dropped)) = frame else { break };
+                    // A replaced encoded frame is a local latency policy, not RTP packet loss.
+                    // Passing that count as prev_dropped_packets corrupts packet sequencing.
                     let sample = Sample {
                         data: frame.bytes.into(),
                         duration,
-                        prev_dropped_packets: dropped,
                         ..Default::default()
                     };
                     // A broken transport must not hold capture/encoder teardown hostage forever.
@@ -1089,10 +1272,17 @@ pub fn spawn_video(
                                 "video sample delivery recovered; keyframe requested"
                             );
                             delivery_error_count = 0;
+                            recovery_keyframe_requested = false;
                         }
                         Ok(()) => {}
                         Err(error) => {
                             delivery_error_count = delivery_error_count.saturating_add(1);
+                            if !recovery_keyframe_requested {
+                                delivery_recovery.send_modify(|generation| {
+                                    *generation = generation.wrapping_add(1);
+                                });
+                                recovery_keyframe_requested = true;
+                            }
                             if delivery_interrupted_since.is_none() {
                                 // RTP/SRTP writes can fail while ICE reconnects or a browser peer is
                                 // closing. Capture and encoding remain healthy, so restarting native
@@ -1287,7 +1477,7 @@ mod tests {
         assert!(queue.replace(xcap::Frame::new(1, 1, vec![1, 0, 0, 255])));
         assert!(queue.replace(xcap::Frame::new(1, 1, vec![2, 0, 0, 255])));
         let frame = queue.take(Duration::from_millis(1)).unwrap();
-        assert_eq!(frame.raw[0], 2);
+        assert_eq!(frame.frame.raw[0], 2);
     }
 
     #[test]

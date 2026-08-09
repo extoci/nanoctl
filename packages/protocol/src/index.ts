@@ -1,4 +1,14 @@
-export const PROTOCOL_VERSION = 1 as const;
+/**
+ * The small, boring contract shared by the browser, control plane, and native agent.
+ *
+ * Protocol 2 adds explicit peer epochs and ICE generations to the wire. Native readers retain
+ * bounded protocol-1 parsing for cleanup/diagnostics during rollout, but the control plane only
+ * admits protocol-2 sessions so an old browser cannot bypass the epoch ownership rules.
+ */
+export const PROTOCOL_VERSION = 2 as const;
+export const MIN_SUPPORTED_PROTOCOL_VERSION = 1 as const;
+
+export type SupportedProtocolVersion = 1 | typeof PROTOCOL_VERSION;
 
 export const SESSION_STATES = [
   "requested",
@@ -12,13 +22,38 @@ export const SESSION_STATES = [
 export type SessionState = (typeof SESSION_STATES)[number];
 export type SessionRole = "controller" | "host";
 
+/** A monotonic ICE generation. It is not the database signal sequence. */
+export type IceGeneration = number;
+
+/** Identifies one controller peer, independently of its ICE restart generation. */
+export type ControllerEpoch = string;
+
+/** Identifies one native host peer incarnation. */
+export type HostEpoch = string;
+
 export type SignalEnvelope = {
   readonly version: typeof PROTOCOL_VERSION;
   readonly sessionId: string;
+  readonly controllerEpoch: ControllerEpoch;
+  readonly hostEpoch: HostEpoch;
+  readonly generation: IceGeneration;
   readonly sequence: number;
   readonly sender: SessionRole;
   readonly sentAt: number;
   readonly payload: SignalPayload;
+};
+
+/** The decoded shape accepted from a v1 peer or a v2 peer. */
+export type WireSignalEnvelope = Omit<
+  SignalEnvelope,
+  "version" | "controllerEpoch" | "hostEpoch" | "generation"
+> & {
+  readonly version: SupportedProtocolVersion;
+  /** Protocol 1 peers do not know about controller epochs. */
+  readonly controllerEpoch?: ControllerEpoch;
+  /** Protocol 1 peers do not know about host peer incarnations. */
+  readonly hostEpoch?: HostEpoch;
+  readonly generation?: IceGeneration;
 };
 
 export type SignalPayload =
@@ -29,10 +64,13 @@ export type SignalPayload =
       readonly candidate: string;
       readonly sdpMid: string | null;
       readonly sdpMLineIndex: number | null;
-      /** ICE generation discriminator; null keeps compatibility with older agents. */
+      /** ICE ufrag lets a peer reject a candidate from an older restart. */
       readonly usernameFragment?: string | null;
     }
-  | { readonly type: "ice-complete" }
+  | {
+      readonly type: "ice-complete";
+      readonly sdpMid?: string | null;
+    }
   | { readonly type: "end"; readonly reason: string };
 
 export type ControlMessage =
@@ -59,7 +97,7 @@ export type ControlMessage =
   | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number };
 
 export type DeviceCapabilities = {
-  readonly protocolVersion: typeof PROTOCOL_VERSION;
+  readonly protocolVersion: SupportedProtocolVersion;
   readonly platform: "windows" | "macos" | "linux";
   readonly architecture: "x64" | "arm64";
   readonly displays: readonly DisplayInfo[];
@@ -67,7 +105,20 @@ export type DeviceCapabilities = {
   readonly input: boolean;
   readonly clipboard: boolean;
   readonly systemAudio: boolean;
+  /** Whether the enrolled agent can accept remote input in this capability state. */
+  readonly remoteInput?: boolean;
+  readonly ready?: boolean;
+  readonly readiness?: ReadinessState;
 };
+
+export type ReadinessState =
+  | "ready"
+  | "upgrade-required"
+  | "capture-permission"
+  | "input-permission"
+  | "no-display"
+  | "encoder-unavailable"
+  | "starting";
 
 export type DisplayInfo = {
   readonly id: string;
@@ -91,23 +142,98 @@ export type SessionPreferences = {
   readonly quality: "responsiveness" | "balanced" | "quality";
 };
 
+export type NormalizedSignal = Omit<
+  SignalEnvelope,
+  "version" | "controllerEpoch" | "hostEpoch" | "generation"
+> & {
+  readonly version: typeof PROTOCOL_VERSION;
+  readonly controllerEpoch: ControllerEpoch;
+  readonly hostEpoch: HostEpoch;
+  readonly generation: IceGeneration;
+};
+
+const MAX_SESSION_ID_BYTES = 128;
 const MAX_SDP_BYTES = 1_000_000;
 const MAX_CANDIDATE_BYTES = 8_192;
+const MAX_REASON_BYTES = 512;
+const MAX_GENERATION = 1_000_000;
+const MAX_CONTROLLER_EPOCH_BYTES = 128;
+export const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
 
-export function assertSignalEnvelope(value: unknown): asserts value is SignalEnvelope {
+/**
+ * Validate and normalize a signal at a trust seam. The returned value is safe for routing and
+ * has explicit epoch/generation values even when it came from a v1 peer.
+ */
+export function normalizeSignalEnvelope(value: unknown): NormalizedSignal {
   if (!isRecord(value)) throw new Error("signal must be an object");
-  if (value.version !== PROTOCOL_VERSION) throw new Error("unsupported protocol version");
-  if (!isBoundedString(value.sessionId, 1, 128)) throw new Error("invalid session id");
+  const isV2 = value.version === PROTOCOL_VERSION;
+  if (value.version !== 1 && !isV2) {
+    throw new Error("unsupported protocol version");
+  }
+  if (!isBoundedString(value.sessionId, 1, MAX_SESSION_ID_BYTES)) {
+    throw new Error("invalid session id");
+  }
+  if (isV2 && !isBoundedString(value.controllerEpoch, 1, MAX_CONTROLLER_EPOCH_BYTES)) {
+    throw new Error("invalid controller epoch");
+  }
+  if (
+    !isV2 &&
+    value.controllerEpoch !== undefined &&
+    !isBoundedString(value.controllerEpoch, 0, MAX_CONTROLLER_EPOCH_BYTES)
+  ) {
+    throw new Error("invalid controller epoch");
+  }
+  if (isV2 && !isBoundedString(value.hostEpoch, 0, MAX_CONTROLLER_EPOCH_BYTES)) {
+    throw new Error("invalid host epoch");
+  }
+  if (
+    !isV2 &&
+    value.hostEpoch !== undefined &&
+    !isBoundedString(value.hostEpoch, 0, MAX_CONTROLLER_EPOCH_BYTES)
+  ) {
+    throw new Error("invalid host epoch");
+  }
+  if (
+    !Number.isSafeInteger(value.generation ?? (isV2 ? Number.NaN : 0)) ||
+    Number(value.generation ?? 0) < 0
+  ) {
+    throw new Error("invalid signal generation");
+  }
+  if (Number(value.generation ?? 0) > MAX_GENERATION) {
+    throw new Error("signal generation is too large");
+  }
   if (!Number.isSafeInteger(value.sequence) || Number(value.sequence) < 0) {
     throw new Error("invalid signal sequence");
   }
   if (value.sender !== "controller" && value.sender !== "host") {
     throw new Error("invalid signal sender");
   }
+  if (
+    isV2 &&
+    ((value.sender === "host" && (value.hostEpoch as unknown) === "") ||
+      (value.sender === "controller" && value.hostEpoch !== ""))
+  ) {
+    throw new Error("invalid host epoch for signal sender");
+  }
   if (!Number.isSafeInteger(value.sentAt) || Number(value.sentAt) <= 0) {
     throw new Error("invalid signal timestamp");
   }
   assertSignalPayload(value.payload);
+  return {
+    version: PROTOCOL_VERSION,
+    sessionId: value.sessionId,
+    controllerEpoch: typeof value.controllerEpoch === "string" ? value.controllerEpoch : "",
+    hostEpoch: typeof value.hostEpoch === "string" ? value.hostEpoch : "",
+    generation: Number(value.generation ?? 0),
+    sequence: Number(value.sequence),
+    sender: value.sender,
+    sentAt: Number(value.sentAt),
+    payload: value.payload,
+  };
+}
+
+export function assertSignalEnvelope(value: unknown): asserts value is WireSignalEnvelope {
+  normalizeSignalEnvelope(value);
 }
 
 export function assertSignalPayload(value: unknown): asserts value is SignalPayload {
@@ -143,9 +269,16 @@ export function assertSignalPayload(value: unknown): asserts value is SignalPayl
       }
       return;
     case "ice-complete":
+      if (
+        value.sdpMid !== undefined &&
+        value.sdpMid !== null &&
+        !isBoundedString(value.sdpMid, 0, 256)
+      ) {
+        throw new Error("invalid ICE media section");
+      }
       return;
     case "end":
-      if (!isBoundedString(value.reason, 1, 512)) throw new Error("invalid reason");
+      if (!isBoundedString(value.reason, 1, MAX_REASON_BYTES)) throw new Error("invalid reason");
       return;
     default:
       throw new Error("unknown signal payload");

@@ -1,5 +1,7 @@
 import type { GenericQueryCtx, GenericMutationCtx } from "convex/server";
 import { ConvexError } from "convex/values";
+import { normalizeSignalEnvelope } from "@nanoctl/protocol";
+import type { ReadinessState, SupportedProtocolVersion } from "@nanoctl/protocol";
 import type { DataModel } from "./_generated/dataModel";
 
 export async function requireIdentity(
@@ -79,6 +81,24 @@ export function parseDeviceDisplays(capabilitiesJson: string): DeviceDisplay[] {
 }
 
 export function parseDeviceReadiness(capabilitiesJson: string): boolean {
+  return parseDeviceReadinessState(capabilitiesJson) === "ready";
+}
+
+export function parseDeviceProtocolVersion(
+  capabilitiesJson: string,
+): SupportedProtocolVersion | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(capabilitiesJson);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const protocolVersion = (value as Record<string, unknown>).protocolVersion;
+  return protocolVersion === 1 || protocolVersion === 2 ? protocolVersion : null;
+}
+
+export function parseDeviceRemoteInput(capabilitiesJson: string): boolean {
   let value: unknown;
   try {
     value = JSON.parse(capabilitiesJson);
@@ -87,13 +107,40 @@ export function parseDeviceReadiness(capabilitiesJson: string): boolean {
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const capabilities = value as Record<string, unknown>;
-  return (
-    capabilities.ready === true &&
-    capabilities.protocolVersion === 1 &&
-    Array.isArray(capabilities.codecs) &&
-    capabilities.codecs.includes("h264") &&
-    parseDeviceDisplays(capabilitiesJson).length > 0
-  );
+  if (typeof capabilities.remoteInput === "boolean") return capabilities.remoteInput;
+  return capabilities.input === true;
+}
+
+export function parseDeviceReadinessState(capabilitiesJson: string): ReadinessState {
+  let value: unknown;
+  try {
+    value = JSON.parse(capabilitiesJson);
+  } catch {
+    return "starting";
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "starting";
+  const capabilities = value as Record<string, unknown>;
+  const explicit = capabilities.readiness;
+  if (capabilities.protocolVersion !== 2) return "upgrade-required";
+  const hasH264 = Array.isArray(capabilities.codecs) && capabilities.codecs.includes("h264");
+  const hasDisplay = parseDeviceDisplays(capabilitiesJson).length > 0;
+  if (
+    explicit === "capture-permission" ||
+    explicit === "input-permission" ||
+    explicit === "no-display" ||
+    explicit === "encoder-unavailable" ||
+    explicit === "starting"
+  ) {
+    return explicit;
+  }
+  if (explicit === "ready" && hasH264 && hasDisplay) return "ready";
+  if (!hasDisplay) return "no-display";
+  if (!hasH264) {
+    return "encoder-unavailable";
+  }
+  if (capabilities.ready === true) return "ready";
+  if (capabilities.input === false) return "input-permission";
+  return "starting";
 }
 
 export type SignalKind = "offer" | "answer" | "ice-candidate" | "ice-complete" | "end";
@@ -102,70 +149,50 @@ export function parseSignalEnvelope(
   value: string,
   expectedSender: "controller" | "host",
 ): {
+  version: SupportedProtocolVersion;
   sessionId: string;
   sender: "controller" | "host";
+  controllerEpoch: string;
+  hostEpoch: string;
+  sentAt: number;
   sequence: number;
+  generation: number;
   kind: SignalKind;
   reason?: string;
 } {
-  let parsed: unknown;
+  let raw: unknown;
+  let parsed: ReturnType<typeof normalizeSignalEnvelope>;
   try {
-    parsed = JSON.parse(value);
+    raw = JSON.parse(value);
+    parsed = normalizeSignalEnvelope(raw);
   } catch {
     throw new ConvexError("Malformed signal envelope");
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new ConvexError("Malformed signal envelope");
-  }
-  const envelope = parsed as Record<string, unknown>;
-  const payload = envelope.payload;
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new ConvexError("Malformed signal payload");
-  }
-  const kind = (payload as Record<string, unknown>).type;
-  const fields = payload as Record<string, unknown>;
+  const version: SupportedProtocolVersion =
+    raw !== null &&
+    typeof raw === "object" &&
+    !Array.isArray(raw) &&
+    (raw as Record<string, unknown>).version === 1
+      ? 1
+      : 2;
+  const kind = parsed.payload.type;
   const permitted =
     expectedSender === "controller"
       ? ["offer", "ice-candidate", "ice-complete", "end"]
       : ["answer", "ice-candidate", "ice-complete", "end"];
-  if (
-    envelope.version !== 1 ||
-    typeof envelope.sessionId !== "string" ||
-    envelope.sender !== expectedSender ||
-    !Number.isSafeInteger(envelope.sequence) ||
-    Number(envelope.sequence) < 0 ||
-    !Number.isSafeInteger(envelope.sentAt) ||
-    Number(envelope.sentAt) <= 0 ||
-    typeof kind !== "string" ||
-    !permitted.includes(kind)
-  ) {
+  if (parsed.sender !== expectedSender || !permitted.includes(kind)) {
     throw new ConvexError("Malformed signal envelope");
   }
-  if (
-    ((kind === "offer" || kind === "answer") && !isBoundedString(fields.sdp, 1, 1_000_000)) ||
-    (kind === "ice-candidate" &&
-      (!isBoundedString(fields.candidate, 1, 8_192) ||
-        (fields.sdpMid !== null && !isBoundedString(fields.sdpMid, 0, 256)) ||
-        (fields.sdpMLineIndex !== null &&
-          (!Number.isInteger(fields.sdpMLineIndex) ||
-            Number(fields.sdpMLineIndex) < 0 ||
-            Number(fields.sdpMLineIndex) > 65_535)) ||
-        (fields.usernameFragment !== undefined &&
-          fields.usernameFragment !== null &&
-          !isBoundedString(fields.usernameFragment, 1, 256)))) ||
-    (kind === "end" && !isBoundedString(fields.reason, 1, 512))
-  ) {
-    throw new ConvexError("Malformed signal payload");
-  }
   return {
-    sessionId: envelope.sessionId,
+    version,
+    sessionId: parsed.sessionId,
     sender: expectedSender,
-    sequence: Number(envelope.sequence),
+    controllerEpoch: parsed.controllerEpoch,
+    hostEpoch: parsed.hostEpoch,
+    sentAt: parsed.sentAt,
+    sequence: parsed.sequence,
+    generation: parsed.generation,
     kind: kind as SignalKind,
-    reason: kind === "end" ? String(fields.reason) : undefined,
+    reason: kind === "end" ? parsed.payload.reason : undefined,
   };
-}
-
-function isBoundedString(value: unknown, min: number, max: number): value is string {
-  return typeof value === "string" && value.length >= min && value.length <= max;
 }

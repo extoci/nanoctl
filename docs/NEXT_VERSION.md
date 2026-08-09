@@ -1,14 +1,14 @@
-# Next version goal: nanoctl smooth desktop
+# nanoctl 2.0 release contract
 
 The next release should feel like a native remote-desktop product, not a collection of
 components: a Windows host is ready after login without a visible console, a Mac Chromium client
 can end and immediately reopen a session, and the first usable frame arrives quickly while motion
 stays smooth and current.
 
-This is an optimistic but achievable release target for the current architecture. It keeps the
-per-user interactive Windows task required by desktop capture, keeps the existing WebRTC protocol
-compatible, and concentrates engineering effort on lifecycle ownership, bounded media handoff, and
-health-gated packaging.
+This is the release contract for the rewrite. It keeps the per-user interactive Windows task
+required by desktop capture, preserves v1 readers during rollout, and concentrates engineering on
+one lifecycle owner per session, generation-safe signaling, bounded media handoff, and health-gated
+packaging.
 
 ## Ship criteria
 
@@ -28,11 +28,12 @@ health-gated packaging.
 
 ### Session reliability
 
-- Every session owns its signaling sequence, peer, input channels, capture worker, and encoder.
+- Every session owns its signaling epoch/generation, peer, input channels, capture worker, and
+  encoder.
 - Teardown is idempotent and cooperative. The blocking capture/Media Foundation worker is joined
   before the host accepts a replacement session.
 - A browser viewer that is retained across route/session changes resets sequence and processed-signal
-  state, ignores callbacks from an older generation, and sends sequence-zero for each new offer.
+  state, ignores callbacks from an older lifecycle, and gates every ICE message by generation.
 - The regression path “Windows host + Mac Chromium client: connect → end → connect again” succeeds
   for 20 consecutive cycles in a release smoke run, including one cycle after an ICE restart.
 - Rejected, cross-session, stale-generation, and terminal signals cannot mutate the replacement

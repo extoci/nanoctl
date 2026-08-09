@@ -1,7 +1,14 @@
 import { ConvexError, v } from "convex/values";
 import { action, internalMutation, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { cleanDeviceName, parseDeviceReadiness, requireIdentity } from "./lib";
+import {
+  cleanDeviceName,
+  parseDeviceReadiness,
+  parseDeviceProtocolVersion,
+  parseDeviceRemoteInput,
+  parseDeviceReadinessState,
+  requireIdentity,
+} from "./lib";
 
 const PAIRING_TTL_MS = 10 * 60 * 1000;
 const ONLINE_WINDOW_MS = 45 * 1000;
@@ -18,6 +25,9 @@ export const list = query({
     return devices.map(({ tokenHash: _tokenHash, capabilitiesJson: _capabilities, ...device }) => ({
       ...device,
       ready: parseDeviceReadiness(_capabilities),
+      readiness: parseDeviceReadinessState(_capabilities),
+      protocolVersion: parseDeviceProtocolVersion(_capabilities),
+      remoteInput: parseDeviceRemoteInput(_capabilities),
       status:
         device.status === "disabled"
           ? ("disabled" as const)

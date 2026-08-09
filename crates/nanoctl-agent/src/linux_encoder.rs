@@ -111,6 +111,9 @@ impl LinuxEncoder {
             .as_ref()
             .is_none_or(|active| active.layout.size != resolution);
         if recreate {
+            // Drop the old VA surface set before opening a replacement; a number of drivers only
+            // expose one encode context per process.
+            self.active.take();
             self.active = Some(self.create_active(resolution)?);
             self.force_keyframe = true;
         }
@@ -173,10 +176,15 @@ impl LinuxEncoder {
                 },
             ],
         };
+        let level = if resolution.width > 1_920 || resolution.height > 1_080 || self.max_fps > 60 {
+            Level::L5_2
+        } else {
+            Level::L4_2
+        };
         let config = EncoderConfig {
             resolution,
             profile: Profile::Baseline,
-            level: Level::L4,
+            level,
             pred_structure: PredictionStructure::LowDelay {
                 limit: self.max_fps.saturating_mul(2).max(1),
             },

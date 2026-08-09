@@ -121,6 +121,7 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("startup stability window");
     expect(installer).toContain("nanoctl.{0}.previous.exe");
     expect(installer).toContain("Migrated the existing configuration");
+    expect(installer).toContain("Interactive|InteractiveToken");
     expect(installer).not.toContain('New-ScheduledTaskAction -Execute $binaryPath -Argument "run"');
   });
 
@@ -177,6 +178,7 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("$logPath");
     expect(installer).toContain("LastTaskResult");
     expect(installer).toContain("Task.Principal.LogonType");
+    expect(installer).toContain("Interactive|InteractiveToken");
     expect(installer).toContain("Set-OwnerProtectedAcl");
     expect(installer).toContain("icacls.exe");
     expect(installer).toContain("failed its health check");
@@ -254,6 +256,17 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("-ReadyVersion $ReadyVersion");
     expect(installer).toContain("$installedVersion");
     expect(installer).toContain("$process.Path");
+    expect(installer).toContain("function Get-TaskConfigPath");
+    expect(installer).toContain("function Get-TaskBinaryPaths");
+    expect(installer).toContain("$previousProcessPaths");
+    expect(installer).toContain("Get-TaskBinaryPaths -Task $existingTask");
+    expect(installer).toContain("Preserving the existing configuration");
+    expect(installer).toContain("previous-task.xml");
+    expect(installer).toContain("Wait-AgentProcessExit");
+    expect(installer).toContain("install.lock");
+    expect(installer).toContain("reinstall rollback");
+    expect(installer).not.toContain("already installed. Uninstall or update it explicitly");
+    expect(installer).not.toContain("install directory already exists. Remove it explicitly");
   });
 
   test("makes signed updates retryable and health-gated", async () => {
@@ -264,6 +277,7 @@ describe("one-command Windows installer", () => {
     expect(updater).toContain("$configOwnerSid.Value -ne $currentIdentity.User.Value");
     expect(updater).toContain("function Assert-TaskOwner");
     expect(updater).toContain("Task.Principal.LogonType");
+    expect(updater).toContain("Interactive|InteractiveToken");
     expect(updater).toContain("Export-ScheduledTask");
     expect(updater).toContain("function Restore-PreviousTask");
     expect(updater).toContain("$previousTaskXml");

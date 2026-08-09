@@ -9,7 +9,10 @@ use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use tokio::time::Instant;
 
-const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+// The service must wait for native capture/encoder workers to release their OS handles before a
+// replacement process starts. Network setup is independently capped at five seconds, while the
+// generous outer deadline covers a slow driver without making stop an unbounded wait.
+const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_QUIET_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]

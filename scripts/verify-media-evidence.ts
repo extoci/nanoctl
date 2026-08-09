@@ -20,6 +20,10 @@ type Evidence = {
   elapsed_milliseconds?: unknown;
   frames?: unknown;
   encoded_bytes?: unknown;
+  capture_to_encode_p50_milliseconds?: unknown;
+  capture_to_encode_p95_milliseconds?: unknown;
+  encode_p50_milliseconds?: unknown;
+  encode_p95_milliseconds?: unknown;
   width?: unknown;
   height?: unknown;
   idr_frames?: unknown;
@@ -69,6 +73,10 @@ export function validateMediaEvidence(
       "elapsed_milliseconds",
       "frames",
       "encoded_bytes",
+      "capture_to_encode_p50_milliseconds",
+      "capture_to_encode_p95_milliseconds",
+      "encode_p50_milliseconds",
+      "encode_p95_milliseconds",
       "width",
       "height",
       "idr_frames",
@@ -76,6 +84,21 @@ export function validateMediaEvidence(
       "pps_units",
     ] as const) {
       if (!positiveNumber(record, field)) errors.push(`${label}: invalid ${field}`);
+    }
+    if (
+      positiveNumber(record, "capture_to_encode_p50_milliseconds") &&
+      positiveNumber(record, "capture_to_encode_p95_milliseconds") &&
+      Number(record.capture_to_encode_p95_milliseconds) <
+        Number(record.capture_to_encode_p50_milliseconds)
+    ) {
+      errors.push(`${label}: capture-to-encode p95 is below p50`);
+    }
+    if (
+      positiveNumber(record, "encode_p50_milliseconds") &&
+      positiveNumber(record, "encode_p95_milliseconds") &&
+      Number(record.encode_p95_milliseconds) < Number(record.encode_p50_milliseconds)
+    ) {
+      errors.push(`${label}: encode p95 is below p50`);
     }
     if (record.backend === "OpenH264" || typeof record.backend !== "string") {
       errors.push(`${label}: hardware encoder evidence is absent`);

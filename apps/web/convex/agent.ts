@@ -83,29 +83,78 @@ export const pendingSessions = internalQuery({
         ),
       )
     ).flat();
-    return Promise.all(
+    const pending = await Promise.all(
       sessions
         .filter((session) => session.expiresAt > Date.now())
         .map(async (session) => {
+          const offers = await ctx.db
+            .query("signals")
+            .withIndex("by_session_sender_kind_created", (q) =>
+              q.eq("sessionId", session._id).eq("sender", "controller").eq("kind", "offer"),
+            )
+            .order("desc")
+            .take(64);
+          const offer = offers
+            .sort((left, right) => right._creationTime - left._creationTime)
+            .find((row) => {
+              if (session.controllerEpoch === undefined) return true;
+              try {
+                return (
+                  parseSignalEnvelope(row.envelope, "controller").controllerEpoch ===
+                  session.controllerEpoch
+                );
+              } catch {
+                return false;
+              }
+            });
+          if (!offer) return null;
+          let parsedOffer: ReturnType<typeof parseSignalEnvelope>;
+          try {
+            parsedOffer = parseSignalEnvelope(offer.envelope, "controller");
+          } catch {
+            return null;
+          }
+          // Protocol-1 rows remain inspectable, but they cannot start a v2 native peer because
+          // they have no controller ownership epoch. Do not keep retrying an upgrade-required
+          // legacy offer on every agent poll.
+          if (parsedOffer.controllerEpoch.length === 0) return null;
           const latest = await ctx.db
             .query("signals")
-            .withIndex("by_session_sender_sequence", (q) =>
+            .withIndex("by_session_sender_created", (q) =>
               q.eq("sessionId", session._id).eq("sender", "controller"),
             )
             .order("desc")
-            .take(127);
-          const offer = await ctx.db
-            .query("signals")
-            .withIndex("by_session_sender_kind_sequence", (q) =>
-              q.eq("sessionId", session._id).eq("sender", "controller").eq("kind", "offer"),
-            )
-            .first();
+            .take(512)
+            .then((rows) =>
+              rows.filter((row) => {
+                if (row._creationTime < offer._creationTime) return false;
+                try {
+                  const parsed = parseSignalEnvelope(row.envelope, "controller");
+                  return (
+                    parsed.controllerEpoch === parsedOffer.controllerEpoch &&
+                    parsed.generation === parsedOffer.generation
+                  );
+                } catch {
+                  return false;
+                }
+              }),
+            );
           const signals = [
             ...new Map([offer, ...latest].filter(Boolean).map((row) => [row!._id, row!])).values(),
-          ].sort((left, right) => left.sequence - right.sequence);
-          return { sessionId: session._id, expiresAt: session.expiresAt, signals };
+          ].sort(
+            (left, right) =>
+              left._creationTime - right._creationTime || left.sequence - right.sequence,
+          );
+          return {
+            sessionId: session._id,
+            expiresAt: session.expiresAt,
+            controllerEpoch: session.controllerEpoch,
+            hostEpoch: session.hostEpoch,
+            signals,
+          };
         }),
     );
+    return pending.filter((session) => session !== null);
   },
 });
 
@@ -139,13 +188,59 @@ export const sendSignal = internalMutation({
     } catch {
       return false;
     }
+    if (parsed.version !== 2) return false;
     if (parsed.sessionId !== String(sessionId) || parsed.sequence !== args.sequence) {
+      return false;
+    }
+    const offerCandidates = await ctx.db
+      .query("signals")
+      .withIndex("by_session_sender_kind_created", (q) =>
+        q.eq("sessionId", sessionId).eq("sender", "controller").eq("kind", "offer"),
+      )
+      .order("desc")
+      .take(64);
+    const currentOffer = offerCandidates
+      .sort((left, right) => right._creationTime - left._creationTime)
+      .find((row) => {
+        if (session.controllerEpoch === undefined) return true;
+        try {
+          return (
+            parseSignalEnvelope(row.envelope, "controller").controllerEpoch ===
+            session.controllerEpoch
+          );
+        } catch {
+          return false;
+        }
+      });
+    if (!currentOffer) return false;
+    let parsedOffer: ReturnType<typeof parseSignalEnvelope>;
+    try {
+      parsedOffer = parseSignalEnvelope(currentOffer.envelope, "controller");
+    } catch {
+      return false;
+    }
+    // Host rows are accepted only from the currently visible controller peer. This prevents a
+    // delayed answer/end from an old native peer from changing the refreshed session's state.
+    if (
+      parsed.controllerEpoch !== parsedOffer.controllerEpoch ||
+      parsed.generation !== parsedOffer.generation
+    ) {
+      return false;
+    }
+    if (session.hostEpoch === undefined || parsed.hostEpoch !== session.hostEpoch) {
+      return false;
+    }
+    if (session.hostGeneration !== undefined && parsed.generation !== session.hostGeneration) {
       return false;
     }
     const duplicate = await ctx.db
       .query("signals")
-      .withIndex("by_session_sender_sequence", (q) =>
-        q.eq("sessionId", sessionId).eq("sender", "host").eq("sequence", args.sequence),
+      .withIndex("by_session_sender_epoch_sequence", (q) =>
+        q
+          .eq("sessionId", sessionId)
+          .eq("sender", "host")
+          .eq("peerEpoch", parsed.hostEpoch)
+          .eq("sequence", args.sequence),
       )
       .unique();
     if (!duplicate) {
@@ -156,6 +251,9 @@ export const sendSignal = internalMutation({
         sequence: args.sequence,
         envelope: args.envelope,
         createdAt: Date.now(),
+        peerEpoch: parsed.hostEpoch,
+        controllerEpoch: parsed.controllerEpoch,
+        generation: parsed.generation,
         expiresAt: session.expiresAt,
       });
       if (parsed.kind === "answer" && session.state === "negotiating") {
@@ -187,6 +285,90 @@ export const sendSignal = internalMutation({
         });
       }
     }
+    return true;
+  },
+});
+
+/** Claim one native peer incarnation before it publishes an answer or terminal status. */
+export const claimHost = internalMutation({
+  args: {
+    deviceId: v.id("devices"),
+    sessionId: v.string(),
+    controllerEpoch: v.string(),
+    hostEpoch: v.string(),
+    expectedHostEpoch: v.optional(v.string()),
+    generation: v.number(),
+  },
+  handler: async (ctx, args) => {
+    if (
+      args.controllerEpoch.length < 1 ||
+      args.controllerEpoch.length > 128 ||
+      args.hostEpoch.length < 1 ||
+      args.hostEpoch.length > 128 ||
+      (args.expectedHostEpoch !== undefined &&
+        (args.expectedHostEpoch.length < 1 || args.expectedHostEpoch.length > 128)) ||
+      !Number.isSafeInteger(args.generation) ||
+      args.generation < 0 ||
+      args.generation > 1_000_000
+    ) {
+      return false;
+    }
+    const sessionId = ctx.db.normalizeId("sessions", args.sessionId);
+    if (!sessionId) return false;
+    const session = await ctx.db.get(sessionId);
+    if (
+      !session ||
+      session.deviceId !== args.deviceId ||
+      session.expiresAt <= Date.now() ||
+      session.state === "ended" ||
+      session.state === "failed" ||
+      session.controllerEpoch !== args.controllerEpoch
+    ) {
+      return false;
+    }
+    // Compare-and-swap the host epoch. A second process cannot replace a peer based on a
+    // skewed/native wall clock after another claim has already won.
+    if (args.expectedHostEpoch !== session.hostEpoch) {
+      return false;
+    }
+    // A native process restart may happen after the old peer has already answered. The new host
+    // epoch is still allowed to claim the controller/generation: the browser treats the epoch
+    // change as a recovery boundary, ignores the replacement's bootstrap answer, and sends a new
+    // ICE-restart offer before accepting media. The compare-and-swap above ensures only one host
+    // process can own that replacement epoch.
+    const offers = await ctx.db
+      .query("signals")
+      .withIndex("by_session_sender_kind_created", (q) =>
+        q.eq("sessionId", sessionId).eq("sender", "controller").eq("kind", "offer"),
+      )
+      .order("desc")
+      .take(64);
+    const currentOffer = offers
+      .sort((left, right) => right._creationTime - left._creationTime)
+      .find((row) => {
+        try {
+          return (
+            parseSignalEnvelope(row.envelope, "controller").controllerEpoch === args.controllerEpoch
+          );
+        } catch {
+          return false;
+        }
+      });
+    if (!currentOffer) return false;
+    let parsedOffer: ReturnType<typeof parseSignalEnvelope>;
+    try {
+      parsedOffer = parseSignalEnvelope(currentOffer.envelope, "controller");
+    } catch {
+      return false;
+    }
+    if (parsedOffer.generation !== args.generation) return false;
+    const now = Date.now();
+    await ctx.db.patch(sessionId, {
+      hostEpoch: args.hostEpoch,
+      hostStartedAt: now,
+      hostGeneration: args.generation,
+      updatedAt: now,
+    });
     return true;
   },
 });

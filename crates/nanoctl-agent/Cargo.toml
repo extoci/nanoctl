@@ -1,6 +1,6 @@
 [package]
 name = "nanoctl-agent"
-version = "1.0.19"
+version = "2.0.0-alpha.1"
 edition = "2024"
 license = "MIT"
 description = "Headless nanoctl remote desktop agent"
@@ -50,9 +50,10 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
 webrtc = { version = "0.14.0", optional = true }
-xcap = { version = "0.9.7", optional = true }
+xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { parseDeviceDisplays, parseDeviceReadiness, parseSignalEnvelope } from "./lib";
+import {
+  parseDeviceDisplays,
+  parseDeviceReadiness,
+  parseDeviceRemoteInput,
+  parseDeviceReadinessState,
+  parseSignalEnvelope,
+} from "./lib";
 
 function envelope(sender: "controller" | "host", type: string) {
   const payload =
@@ -21,9 +27,14 @@ function envelope(sender: "controller" | "host", type: string) {
 describe("signal envelope indexing", () => {
   test("extracts an authenticated role-compatible kind", () => {
     expect(parseSignalEnvelope(envelope("controller", "offer"), "controller")).toEqual({
+      version: 1,
       sessionId: "session",
       sender: "controller",
+      controllerEpoch: "",
+      hostEpoch: "",
+      sentAt: 1,
       sequence: 7,
+      generation: 0,
       kind: "offer",
     });
     expect(parseSignalEnvelope(envelope("host", "answer"), "host").kind).toBe("answer");
@@ -79,7 +90,7 @@ describe("device capability parsing", () => {
     expect(parseDeviceDisplays("not json")).toEqual([]);
   });
 
-  test("requires an explicit usable v1 media readiness capability", () => {
+  test("requires an explicit usable v2 media readiness capability", () => {
     const capabilities = JSON.stringify({
       protocolVersion: 1,
       codecs: ["h264"],
@@ -95,8 +106,29 @@ describe("device capability parsing", () => {
         },
       ],
     });
-    expect(parseDeviceReadiness(capabilities)).toBe(true);
-    expect(parseDeviceReadiness(capabilities.replace('"ready":true', '"ready":false'))).toBe(false);
+    expect(parseDeviceReadiness(capabilities)).toBe(false);
+    expect(parseDeviceRemoteInput(capabilities)).toBe(false);
+    expect(
+      parseDeviceRemoteInput(JSON.stringify({ ...JSON.parse(capabilities), remoteInput: true })),
+    ).toBe(true);
+    expect(parseDeviceReadinessState(capabilities)).toBe("upgrade-required");
+    expect(parseDeviceReadinessState(capabilities.replace('"ready":true', '"ready":false'))).toBe(
+      "upgrade-required",
+    );
     expect(parseDeviceReadiness("{}")).toBe(false);
+    const v2Capabilities = JSON.stringify({
+      ...JSON.parse(capabilities),
+      protocolVersion: 2,
+    });
+    expect(
+      parseDeviceReadinessState(
+        JSON.stringify({ ...JSON.parse(v2Capabilities), readiness: "capture-permission" }),
+      ),
+    ).toBe("capture-permission");
+    expect(
+      parseDeviceReadinessState(
+        JSON.stringify({ protocolVersion: 2, codecs: [], displays: [], ready: false }),
+      ),
+    ).toBe("no-display");
   });
 });

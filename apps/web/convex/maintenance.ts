@@ -14,6 +14,14 @@ export const purgeExpired = internalMutation({
       .query("signals")
       .withIndex("by_expiry", (q) => q.lt("expiresAt", now))
       .take(BATCH_SIZE);
+    const expiredActiveSessions = await Promise.all(
+      (["requested", "ringing", "negotiating", "connected"] as const).map((state) =>
+        ctx.db
+          .query("sessions")
+          .withIndex("by_state_expiry", (q) => q.eq("state", state).lt("expiresAt", now))
+          .take(BATCH_SIZE),
+      ),
+    );
     const pairingCodes = await ctx.db
       .query("pairingCodes")
       .withIndex("by_expiry", (q) => q.lt("expiresAt", now - PAIRING_RETENTION_MS))
@@ -38,6 +46,25 @@ export const purgeExpired = internalMutation({
       .query("rateLimits")
       .withIndex("by_expiry", (q) => q.lt("expiresAt", now))
       .take(BATCH_SIZE);
+    const expiredSessions = expiredActiveSessions.flat();
+    await Promise.all(
+      expiredSessions.map(async (session) => {
+        await ctx.db.patch(session._id, {
+          state: "failed",
+          endedAt: now,
+          updatedAt: now,
+          endReason: "session expired",
+        });
+        await ctx.db.insert("auditEvents", {
+          ownerId: session.ownerId,
+          deviceId: session.deviceId,
+          sessionId: session._id,
+          action: "session.failed",
+          detail: "session expired",
+          createdAt: now,
+        });
+      }),
+    );
     await Promise.all(
       [
         ...signals,
@@ -51,9 +78,15 @@ export const purgeExpired = internalMutation({
       }),
     );
     if (
-      [signals, pairingCodes, endedSessions, failedSessions, auditEvents, rateLimits].some(
-        (batch) => batch.length === BATCH_SIZE,
-      )
+      [
+        signals,
+        pairingCodes,
+        endedSessions,
+        failedSessions,
+        auditEvents,
+        rateLimits,
+        ...expiredActiveSessions,
+      ].some((batch) => batch.length === BATCH_SIZE)
     ) {
       await ctx.scheduler.runAfter(0, internal.maintenance.purgeExpired);
     }

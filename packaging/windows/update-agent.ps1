@@ -104,7 +104,7 @@ function Assert-TaskOwner {
     throw "The nanoctl task is not a per-user interactive task; refusing to update it."
   }
   $taskLogonType = [string]$Task.Principal.LogonType
-  if ($taskLogonType -and $taskLogonType -notmatch '(?i)^Interactive$') {
+  if ($taskLogonType -and $taskLogonType -notmatch '(?i)^(Interactive|InteractiveToken)$') {
     throw "The nanoctl task does not run in the interactive user session; refusing to update it."
   }
   try {
@@ -216,9 +216,19 @@ function Get-AgentFailureDetails {
 }
 
 function Wait-AgentProcessExit {
-  for ($attempt = 0; $attempt -lt 300; $attempt++) {
+  $expectedPath = [IO.Path]::GetFullPath($resolvedBinary)
+  for ($attempt = 0; $attempt -lt 600; $attempt++) {
     $running = @(Get-Process -Name nanoctl -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -eq $resolvedBinary
+        if (-not $_.Path) { return $false }
+        try {
+          [String]::Equals(
+            [IO.Path]::GetFullPath([string]$_.Path),
+            $expectedPath,
+            [StringComparison]::OrdinalIgnoreCase
+          )
+        } catch {
+          return $false
+        }
       })
     if ($running.Count -eq 0) { return }
     Start-Sleep -Milliseconds 100
@@ -342,7 +352,7 @@ try {
   }
   $candidateVersionOutput = (& $candidate --log-file $logPath --version 2>&1 | Out-String).Trim()
   if ($LASTEXITCODE -ne 0 -or
-      $candidateVersionOutput -notmatch '(?m)^nanoctl\s+(\d+\.\d+\.\d+)\s*$') {
+      $candidateVersionOutput -notmatch '(?m)^nanoctl\s+(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)\s*$') {
     throw "The staged nanoctl executable is incompatible with the headless service runner."
   }
   $candidateVersion = $Matches[1]

@@ -206,7 +206,11 @@ test("viewer survives 20 retained reopen cycles with fresh offer sequences", asy
     return {
       offers: events
         .map((event) => JSON.parse(event.envelope as string))
-        .map((signal) => ({ sessionId: signal.sessionId, sequence: signal.sequence })),
+        .map((signal) => ({
+          sessionId: signal.sessionId,
+          controllerEpoch: signal.controllerEpoch,
+          sequence: signal.sequence,
+        })),
       peerCount: fixture.__nanoctlPeers?.length,
       closedPeers: fixture.__nanoctlPeers?.slice(0, -1).filter((peer) => peer.closed).length,
       currentPeerClosed: fixture.__nanoctlPeers?.at(-1)?.closed,
@@ -216,7 +220,10 @@ test("viewer survives 20 retained reopen cycles with fresh offer sequences", asy
   expect(evidence.closedPeers).toBe(20);
   expect(evidence.currentPeerClosed).toBe(false);
   expect(evidence.offers).toHaveLength(21);
-  expect(evidence.offers.every((offer) => offer.sequence === 0)).toBe(true);
+  expect(evidence.offers.every((offer) => typeof offer.controllerEpoch === "string")).toBe(true);
+  expect(new Set(evidence.offers.map((offer) => offer.controllerEpoch)).size).toBe(21);
+  expect(evidence.offers.every((offer) => Number.isSafeInteger(offer.sequence))).toBe(true);
+  expect(new Set(evidence.offers.map((offer) => offer.sequence)).size).toBe(21);
   expect(evidence.offers.map((offer) => offer.sessionId)).toEqual(
     Array.from({ length: 21 }, (_, index) =>
       index % 2 === 0 ? "viewer-fixture-a" : "viewer-fixture-b",
@@ -316,7 +323,7 @@ test("viewer exhausts bounded reconnect attempts and ends the session", async ({
     .toBe(true);
 });
 
-test("viewer handles terminal state and pagehide cleanup", async ({ page }) => {
+test("viewer handles terminal state without creating a peer", async ({ page }) => {
   await page.goto("/e2e/viewer?state=ended");
   await expect(page.getByText("ended: host stopped")).toBeVisible();
   await expect
@@ -331,18 +338,30 @@ test("viewer handles terminal state and pagehide cleanup", async ({ page }) => {
       ),
     )
     .toBe(0);
+});
+
+test("pagehide releases the peer without ending a refreshable session", async ({ page }) => {
+  await page.goto("/e2e/viewer");
+  await expect(page.getByText("Negotiating")).toBeVisible();
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide")));
   await expect
     .poll(() =>
       page.evaluate(() =>
         (
           window as typeof window & {
-            __nanoctlViewerEvents?: { operation: string; reason?: string }[];
+            __nanoctlPeers?: { closed: boolean }[];
           }
-        ).__nanoctlViewerEvents?.some(
-          (event) => event.operation === "end" && event.reason === "controller disconnected",
-        ),
+        ).__nanoctlPeers?.every((peer) => peer.closed),
       ),
     )
     .toBe(true);
+  expect(
+    await page.evaluate(() =>
+      (
+        window as typeof window & {
+          __nanoctlViewerEvents?: { operation: string; reason?: string }[];
+        }
+      ).__nanoctlViewerEvents?.some((event) => event.operation === "end"),
+    ),
+  ).toBe(false);
 });

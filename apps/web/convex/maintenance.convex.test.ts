@@ -165,4 +165,49 @@ describe("retention maintenance", () => {
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     expect(await t.run(async (ctx) => ctx.db.query("signals").collect())).toHaveLength(0);
   });
+
+  test("moves expired active sessions to a terminal state before retention", async () => {
+    const t = convexTest(schema, modules);
+    const now = Date.now();
+    let sessionId!: string;
+    await t.run(async (ctx) => {
+      const deviceId = await ctx.db.insert("devices", {
+        ownerId: "owner",
+        name: "Desktop",
+        platform: "linux",
+        architecture: "x64",
+        agentVersion: "1.0.0",
+        status: "online",
+        tokenHash: "token",
+        capabilitiesJson: "{}",
+        lastSeenAt: now,
+        createdAt: now,
+      });
+      sessionId = String(
+        await ctx.db.insert("sessions", {
+          ownerId: "owner",
+          deviceId,
+          state: "connected",
+          expiresAt: now - 1,
+          createdAt: now - 10_000,
+          updatedAt: now - 10_000,
+        }),
+      );
+    });
+
+    await t.mutation(internal.maintenance.purgeExpired);
+    const result = await t.run(async (ctx) => {
+      const session = await ctx.db.get(ctx.db.normalizeId("sessions", sessionId)!);
+      const audit = await ctx.db
+        .query("auditEvents")
+        .filter((query) => query.eq(query.field("sessionId"), session?._id))
+        .collect();
+      return { state: session?.state, reason: session?.endReason, audit: audit[0]?.detail };
+    });
+    expect(result).toEqual({
+      state: "failed",
+      reason: "session expired",
+      audit: "session expired",
+    });
+  });
 });

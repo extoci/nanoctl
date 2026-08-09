@@ -39,17 +39,26 @@ export function E2eRemoteViewerFixture({ terminal }: { terminal: boolean }) {
       state: sessionState,
       expiresAt: Date.now() + 600_000,
       endReason: terminal ? "host stopped" : undefined,
+      remoteInput: true,
       displays: DISPLAYS,
     }),
     [sessionState, terminal],
   );
   const operations = useMemo(
     () => ({
+      claimController: async (args: {
+        sessionId: string;
+        controllerEpoch: string;
+        expectedControllerEpoch?: string;
+      }) => {
+        appendFixtureEvent({ operation: "claim", ...args });
+        return { controllerEpoch: args.controllerEpoch };
+      },
       sendSignal: async (args: { sessionId: string; envelope: string }) => {
         appendFixtureEvent({ operation: "signal", ...args });
         return null;
       },
-      endSession: async (args: { sessionId: string; reason: string }) => {
+      endSession: async (args: { sessionId: string; reason: string; controllerEpoch?: string }) => {
         appendFixtureEvent({ operation: "end", ...args });
         return null;
       },

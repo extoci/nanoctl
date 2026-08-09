@@ -1,7 +1,12 @@
 import { ConvexError, v } from "convex/values";
 import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { parseDeviceDisplays, parseDeviceReadiness, requireIdentity } from "./lib";
+import {
+  parseDeviceDisplays,
+  parseDeviceReadiness,
+  parseDeviceRemoteInput,
+  requireIdentity,
+} from "./lib";
 import { consumeRateLimit } from "./rateLimits";
 import { mintTurnCredentials } from "./turn";
 
@@ -15,10 +20,14 @@ export const getState = query({
     if (!session || session.ownerId !== identity.subject)
       throw new ConvexError("Session not found");
     const device = await ctx.db.get(session.deviceId);
+    const expired =
+      session.expiresAt <= Date.now() && session.state !== "ended" && session.state !== "failed";
     return {
-      state: session.state,
+      state: expired ? ("failed" as const) : session.state,
       expiresAt: session.expiresAt,
-      endReason: session.endReason,
+      endReason: expired ? "session expired" : session.endReason,
+      controllerEpoch: session.controllerEpoch,
+      remoteInput: device ? parseDeviceRemoteInput(device.capabilitiesJson) : false,
       displays: device ? parseDeviceDisplays(device.capabilitiesJson) : [],
     };
   },
@@ -71,13 +80,78 @@ export const create = mutation({
   },
 });
 
+/**
+ * Claim the controller role for one browser peer. A refresh intentionally creates a new claim;
+ * every later controller signal must carry the currently stored epoch, so delayed rows from the
+ * previous page cannot become authoritative merely because they arrived later.
+ */
+export const claimController = mutation({
+  args: {
+    sessionId: v.id("sessions"),
+    controllerEpoch: v.string(),
+    expectedControllerEpoch: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const identity = await requireIdentity(ctx);
+    if (
+      args.controllerEpoch.length < 1 ||
+      args.controllerEpoch.length > 128 ||
+      (args.expectedControllerEpoch !== undefined &&
+        (args.expectedControllerEpoch.length < 1 || args.expectedControllerEpoch.length > 128))
+    ) {
+      throw new ConvexError("Invalid controller claim");
+    }
+    const session = await ctx.db.get(args.sessionId);
+    if (
+      !session ||
+      session.ownerId !== identity.subject ||
+      session.expiresAt <= Date.now() ||
+      session.state === "ended" ||
+      session.state === "failed"
+    ) {
+      throw new ConvexError("Session unavailable");
+    }
+    // This is a compare-and-swap claim. A delayed page can only replace the epoch it actually
+    // observed; once another page wins, the delayed mutation is rejected regardless of either
+    // client's wall clock.
+    if (args.expectedControllerEpoch !== session.controllerEpoch) {
+      throw new ConvexError("Controller claim is stale");
+    }
+    const now = Date.now();
+    await ctx.db.patch(args.sessionId, {
+      controllerEpoch: args.controllerEpoch,
+      controllerStartedAt: now,
+      hostEpoch: undefined,
+      hostStartedAt: undefined,
+      hostGeneration: undefined,
+      updatedAt: now,
+    });
+    return { controllerEpoch: args.controllerEpoch };
+  },
+});
+
 export const end = mutation({
-  args: { sessionId: v.id("sessions"), reason: v.string() },
+  args: {
+    sessionId: v.id("sessions"),
+    reason: v.string(),
+    controllerEpoch: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
     const identity = await requireIdentity(ctx);
     const session = await ctx.db.get(args.sessionId);
     if (!session || session.ownerId !== identity.subject)
       throw new ConvexError("Session not found");
+    if (
+      args.controllerEpoch !== undefined &&
+      (args.controllerEpoch.length < 1 || args.controllerEpoch.length > 128)
+    ) {
+      throw new ConvexError("Invalid controller epoch");
+    }
+    // Automatic browser failure cleanup is scoped to the peer that observed the failure. A
+    // delayed mutation from an old page must not end a replacement controller's session.
+    if (args.controllerEpoch !== undefined && session.controllerEpoch !== args.controllerEpoch) {
+      return null;
+    }
     if (session.state === "ended" || session.state === "failed") return null;
     const now = Date.now();
     await ctx.db.patch(args.sessionId, {

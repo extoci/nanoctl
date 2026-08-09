@@ -4,7 +4,7 @@ import { useState } from "react";
 import type { DeviceSummary } from "../lib/convex";
 import { DeviceDashboardView, type AuditSummary } from "./device-dashboard-view";
 
-const NOW = Date.UTC(2026, 6, 26, 12, 0, 0);
+const NOW = Date.now();
 
 const INITIAL_DEVICES: DeviceSummary[] = [
   {
@@ -12,9 +12,12 @@ const INITIAL_DEVICES: DeviceSummary[] = [
     name: "Studio workstation",
     platform: "windows",
     architecture: "x64",
-    agentVersion: "1.0.0",
+    agentVersion: "2.0.0-alpha.1",
+    protocolVersion: 2,
     status: "online",
     ready: true,
+    readiness: "ready",
+    remoteInput: true,
     lastSeenAt: NOW,
     createdAt: NOW,
   },
@@ -23,9 +26,12 @@ const INITIAL_DEVICES: DeviceSummary[] = [
     name: "Linux laptop",
     platform: "linux",
     architecture: "arm64",
-    agentVersion: "1.0.0",
+    agentVersion: "2.0.0-alpha.1",
+    protocolVersion: 2,
     status: "online",
     ready: false,
+    readiness: "input-permission",
+    remoteInput: false,
     lastSeenAt: NOW,
     createdAt: NOW,
   },
@@ -34,9 +40,12 @@ const INITIAL_DEVICES: DeviceSummary[] = [
     name: "Travel Mac",
     platform: "macos",
     architecture: "arm64",
-    agentVersion: "1.0.0",
+    agentVersion: "2.0.0-alpha.1",
+    protocolVersion: 2,
     status: "offline",
     ready: true,
+    readiness: "ready",
+    remoteInput: true,
     lastSeenAt: NOW - 86_400_000,
     createdAt: NOW,
   },

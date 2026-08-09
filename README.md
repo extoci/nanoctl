@@ -5,7 +5,9 @@ as an operating-system service on Windows, macOS, or Linux. The web application 
 [Shoo](https://shoo.dev), stores control-plane state in Convex, and negotiates an encrypted WebRTC
 connection directly to the host. A TURN relay is used only when a direct connection cannot be made.
 
-This repository is the v1 rewrite. The original LAN demo remains available on the `master` branch.
+This repository contains the nanoctl 2.0 rewrite. The release keeps the browser/WebRTC transport
+model while giving each session one lifecycle owner, generation-safe signaling, bounded newest-frame
+handoffs, and actionable readiness/recovery UX.
 
 ## Repository
 
@@ -43,6 +45,20 @@ The installer downloads and verifies the latest release, asks for the setup code
 and starts nanoctl automatically in the current desktop session. Run the same command again to
 update to the latest release.
 
+To test the v2 alpha explicitly:
+
+```sh
+curl -fsSL https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.sh \
+  | NANOCTL_VERSION=v2.0.0-alpha.1 sh
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:NANOCTL_VERSION = "v2.0.0-alpha.1"
+irm https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.ps1 | iex
+```
+
 ## Development
 
 ```sh
@@ -60,7 +76,8 @@ cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- enroll ABCDE-FGHJK-
 cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- run
 ```
 
-Run all repository checks with `bun run check`.
+Run all repository checks with `bun run check`. Media-feature builds also require the native desktop
+capture development libraries for the target platform.
 
 Host registration and removal instructions are in [docs/SETUP.md](docs/SETUP.md).
 

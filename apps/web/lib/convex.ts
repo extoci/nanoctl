@@ -1,4 +1,5 @@
 import { makeFunctionReference } from "convex/server";
+import type { ReadinessState, SupportedProtocolVersion } from "@nanoctl/protocol";
 
 export type DeviceSummary = {
   _id: string;
@@ -6,8 +7,11 @@ export type DeviceSummary = {
   platform: "windows" | "macos" | "linux";
   architecture: "x64" | "arm64";
   agentVersion: string;
+  protocolVersion: SupportedProtocolVersion | null;
   status: "online" | "offline" | "disabled";
   ready: boolean;
+  readiness: ReadinessState;
+  remoteInput: boolean;
   lastSeenAt: number;
   createdAt: number;
 };
@@ -46,6 +50,8 @@ export const functions = {
         state: "requested" | "ringing" | "negotiating" | "connected" | "ended" | "failed";
         expiresAt: number;
         endReason?: string;
+        controllerEpoch?: string;
+        remoteInput: boolean;
         displays: {
           id: string;
           name: string;
@@ -61,9 +67,16 @@ export const functions = {
       { deviceId: string },
       { sessionId: string; expiresAt: number }
     >("sessions:create"),
-    end: makeFunctionReference<"mutation", { sessionId: string; reason: string }, null>(
-      "sessions:end",
-    ),
+    claimController: makeFunctionReference<
+      "mutation",
+      { sessionId: string; controllerEpoch: string; expectedControllerEpoch?: string },
+      { controllerEpoch: string }
+    >("sessions:claimController"),
+    end: makeFunctionReference<
+      "mutation",
+      { sessionId: string; reason: string; controllerEpoch?: string },
+      null
+    >("sessions:end"),
     turnCredentials: makeFunctionReference<
       "action",
       { sessionId: string },
