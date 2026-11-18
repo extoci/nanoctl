@@ -3,6 +3,7 @@ import { action, internalQuery, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import {
   parseDeviceDisplays,
+  presenceWindowMs,
   parseDeviceReadiness,
   parseDeviceRemoteInput,
   requireIdentity,
@@ -46,7 +47,7 @@ export const create = mutation({
       device.ownerId !== identity.subject ||
       device.status === "disabled" ||
       !parseDeviceReadiness(device.capabilitiesJson) ||
-      Date.now() - device.lastSeenAt > 45_000
+      Date.now() - device.lastSeenAt > presenceWindowMs(device.heartbeatSeconds)
     ) {
       throw new ConvexError("Device is unavailable");
     }
@@ -54,8 +55,9 @@ export const create = mutation({
       const existing = await ctx.db
         .query("sessions")
         .withIndex("by_device_state", (q) => q.eq("deviceId", args.deviceId).eq("state", state))
+        .filter((q) => q.gt(q.field("expiresAt"), Date.now()))
         .first();
-      if (existing && existing.expiresAt > Date.now()) {
+      if (existing) {
         throw new ConvexError("Device already has an active session");
       }
     }

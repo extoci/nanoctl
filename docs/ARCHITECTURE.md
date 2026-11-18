@@ -146,7 +146,7 @@ and lints. The privileged media path does not embed a JavaScript runtime.
 ## Failure behavior
 
 - Control-plane unavailable: existing WebRTC session continues; new sessions wait with backoff.
-- Heartbeat fails: device appears offline after 45 seconds; credentials are retained.
+- Heartbeat fails: device appears offline after max(45 s, 2 × heartbeat interval + 15 s); credentials are retained.
 - Capture revoked/locked: video pauses and a typed status travels over reliable control.
 - RTP delivery interruption: native capture and encoding stay alive while ICE/DTLS recovers; the
   first post-outage frame is forced to an IDR. Only a genuine capture/encoder failure gets one

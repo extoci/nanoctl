@@ -96,6 +96,7 @@ export function DeviceDashboardView({
   }
 
   async function copyPairingCode(code: string) {
+    setError(null);
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(code);
@@ -106,14 +107,18 @@ export function DeviceDashboardView({
         input.style.position = "fixed";
         input.style.opacity = "0";
         document.body.append(input);
-        input.select();
-        if (!document.execCommand("copy")) throw new Error("copy unavailable");
-        input.remove();
+        try {
+          input.select();
+          if (!document.execCommand("copy")) throw new Error("copy unavailable");
+        } finally {
+          input.remove();
+        }
       }
       setCopiedCode(true);
       window.setTimeout(() => setCopiedCode(false), 1_500);
     } catch {
       setCopiedCode(false);
+      setError("Could not copy the setup code. Select and copy it manually.");
     }
   }
 
@@ -241,14 +246,16 @@ export function DeviceDashboardView({
                 >
                   {busyDevice === device._id ? "Working…" : "Connect"}
                 </button>
-                <button
-                  className="secondary"
-                  type="button"
-                  disabled={busyDevice === device._id}
-                  onClick={() => void rename(device._id, device.name)}
-                >
-                  Rename
-                </button>
+                {status !== "disabled" ? (
+                  <button
+                    className="secondary"
+                    type="button"
+                    disabled={busyDevice === device._id}
+                    onClick={() => void rename(device._id, device.name)}
+                  >
+                    Rename
+                  </button>
+                ) : null}
                 <button
                   className="danger"
                   type="button"
@@ -292,7 +299,9 @@ export function DeviceDashboardView({
 
 function effectiveDeviceStatus(device: DeviceSummary, now: number): DeviceSummary["status"] {
   if (device.status === "disabled") return "disabled";
-  return device.status === "online" && now - device.lastSeenAt <= 45_000 ? "online" : "offline";
+  return device.status === "online" && now - device.lastSeenAt <= device.presenceWindowMs
+    ? "online"
+    : "offline";
 }
 
 function deviceStatusKey(device: DeviceSummary, status: DeviceSummary["status"]): string {

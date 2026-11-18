@@ -1,5 +1,58 @@
 import { expect, test } from "@playwright/test";
 
+for (const failure of ["clipboard rejects", "execCommand throws", "execCommand returns false"]) {
+  test(`pairing copy reports failure and cleans up when ${failure}`, async ({ page }) => {
+    await page.addInitScript((mode) => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value:
+          mode === "clipboard rejects"
+            ? {
+                writeText: async () => {
+                  throw new Error("Clipboard denied");
+                },
+              }
+            : undefined,
+      });
+      document.execCommand = () => {
+        if (mode === "execCommand throws") throw new Error("Copy unavailable");
+        return false;
+      };
+    }, failure);
+    await page.goto("/e2e/dashboard?state=empty");
+    await page.getByRole("button", { name: "Add device" }).click();
+    await page.getByRole("button", { name: "Copy code" }).click();
+    await expect
+      .soft(page.locator(".inline-error[role=alert]"))
+      .toHaveText("Could not copy the setup code. Select and copy it manually.");
+    await expect(page.locator("textarea")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Copy code" })).toBeVisible();
+
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async () => {} },
+      });
+    });
+    await page.getByRole("button", { name: "Copy code" }).click();
+    await expect(page.getByRole("button", { name: "Copied", exact: true })).toBeVisible();
+    await expect(page.locator(".inline-error[role=alert]")).toHaveCount(0);
+  });
+}
+
+test("pairing copy fallback succeeds without leaving a textarea", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { value: undefined });
+    document.execCommand = () => true;
+  });
+  await page.goto("/e2e/dashboard?state=empty");
+  await page.getByRole("button", { name: "Add device" }).click();
+  await page.getByRole("button", { name: "Copy code" }).click();
+  await expect(page.getByRole("button", { name: "Copied", exact: true })).toBeVisible();
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(page.locator(".inline-error[role=alert]")).toHaveCount(0);
+});
+
 test("authenticated dashboard renders loading and empty states", async ({ page }) => {
   await page.goto("/e2e/dashboard?state=loading");
   await expect(page.getByText("Loading devices…")).toBeVisible();
@@ -51,6 +104,22 @@ test("authenticated dashboard supports pairing, rename, removal, and sign-out in
 
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("heading", { name: "Fixture signed out" })).toBeVisible();
+});
+
+test("authenticated dashboard hides Rename after a device is removed", async ({ page }) => {
+  await page.goto("/e2e/dashboard?state=mixed");
+  await page.waitForLoadState("networkidle");
+
+  const ready = page.locator(".device-card").filter({ hasText: "Studio workstation" });
+  const offline = page.locator(".device-card").filter({ hasText: "Travel Mac" });
+  await expect(ready.getByRole("button", { name: "Rename" })).toBeVisible();
+  await expect(offline.getByRole("button", { name: "Rename" })).toBeVisible();
+
+  page.once("dialog", async (dialog) => dialog.accept());
+  await ready.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(ready.getByText("disabled", { exact: true })).toBeVisible();
+  await expect(ready.getByRole("button", { name: "Rename" })).toHaveCount(0);
+  await expect(offline.getByRole("button", { name: "Rename" })).toBeVisible();
 });
 
 test("authenticated dashboard contains operation failures", async ({ page }) => {
