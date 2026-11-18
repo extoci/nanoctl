@@ -40,8 +40,28 @@ else
 fi
 
 temporary="$(mktemp -d 2>/dev/null || mktemp -d -t nanoctl)"
+staging=
+lock=
+rollback=0
 cleanup() {
-  rm -rf "$temporary"
+  status=$?
+  trap '' HUP INT TERM
+  if [ "$status" -ne 0 ] && [ "$rollback" -eq 1 ]; then
+    if restore_install; then
+      printf 'nanoctl installer: rolled back the failed installation\n' >&2
+    else
+      printf 'nanoctl installer: rollback incomplete; remaining files are in %s\n' "$staging" >&2
+      staging=
+    fi
+  fi
+  if [ -n "$staging" ]; then
+    rm -rf "$staging" || status=1
+  fi
+  rm -rf "$temporary" || status=1
+  if [ -n "$lock" ]; then
+    rmdir "$lock" || status=1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -71,32 +91,37 @@ else
   fi
   [ "$expected" = "$actual" ] || fail "release checksum did not match"
 fi
-chmod 755 "$temporary/nanoctl"
-"$temporary/nanoctl" --version >/dev/null
-
 install_dir="$HOME/.local/bin"
 binary_path="$install_dir/nanoctl"
 mkdir -p "$install_dir"
-
-if [ "$platform" = linux ]; then
-  command -v systemctl >/dev/null 2>&1 || fail "systemd is required on Linux"
-  systemctl --user stop nanoctl.service 2>/dev/null || true
-else
-  service_target="gui/$(id -u)/dev.nanoctl.agent"
-  launchctl bootout "$service_target" 2>/dev/null || true
-fi
-
-candidate="$install_dir/.nanoctl.install.$$"
+staging="$(mktemp -d "$install_dir/.nanoctl.install.XXXXXX")"
+candidate="$staging/nanoctl"
 cp "$temporary/nanoctl" "$candidate"
 chmod 755 "$candidate"
-mv -f "$candidate" "$binary_path"
+"$candidate" --version >/dev/null || fail "candidate binary could not run"
 
-config_output="$("$binary_path" paths)"
-config_path="${config_output#config=}"
-if [ "$config_path" = "$config_output" ]; then
-  fail "installed binary returned an invalid configuration path"
+config_output="$("$candidate" paths)" || fail "candidate could not report its configuration path"
+case "$config_output" in
+  *'
+'*) fail "candidate returned an invalid configuration path" ;;
+  config=/?*) config_path="${config_output#config=}" ;;
+  *) fail "candidate returned an invalid configuration path" ;;
+esac
+
+lock_path="$install_dir/.nanoctl.install.lock"
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+if mkdir "$lock_path" 2>/dev/null; then
+  lock="$lock_path"
+elif [ -d "$lock_path" ]; then
+  fail "another installation may be running; remove $lock_path only if no installer is running"
+else
+  fail "cannot create installation lock: $lock_path"
 fi
+trap 'exit 1' HUP INT TERM
+[ "$interrupted" -eq 0 ] || exit 1
 
+setup_code=
 if [ ! -f "$config_path" ]; then
   setup_code="${NANOCTL_ENROLL_CODE:-}"
   if [ -z "$setup_code" ]; then
@@ -105,13 +130,22 @@ if [ ! -f "$config_path" ]; then
     IFS= read -r setup_code </dev/tty
   fi
   [ -n "$setup_code" ] || fail "setup code cannot be empty"
-  "$binary_path" enroll "$setup_code" --control-plane "$CONTROL_PLANE"
 fi
 
+launchd_pid() {
+  awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }'
+}
+
+service_was_running=0
+launchd_was_loaded=0
 if [ "$platform" = linux ]; then
-  service_dir="$HOME/.config/systemd/user"
-  mkdir -p "$service_dir"
-  cat >"$service_dir/nanoctl.service" <<EOF
+  command -v systemctl >/dev/null 2>&1 || fail "systemd is required on Linux"
+  systemctl --user show-environment >/dev/null || fail "cannot connect to the systemd user manager"
+  service_path="$HOME/.config/systemd/user/nanoctl.service"
+  case "$(systemctl --user is-active nanoctl.service || true)" in
+    active|activating|reloading) service_was_running=1 ;;
+  esac
+  cat >"$staging/service" <<EOF
 [Unit]
 Description=nanoctl remote desktop agent
 After=network-online.target graphical-session.target
@@ -129,13 +163,20 @@ UMask=0077
 [Install]
 WantedBy=default.target
 EOF
-  systemctl --user daemon-reload
-  systemctl --user enable --now nanoctl.service
 else
-  agent_path="$HOME/Library/LaunchAgents/dev.nanoctl.agent.plist"
-  mkdir -p "$HOME/Library/LaunchAgents"
+  service_domain="gui/$(id -u)"
+  service_target="$service_domain/dev.nanoctl.agent"
+  service_path="$HOME/Library/LaunchAgents/dev.nanoctl.agent.plist"
+  launchctl print "$service_domain" >/dev/null || fail "cannot connect to the launchd user domain"
+  if job="$(launchctl print "$service_target" 2>/dev/null)"; then
+    [ -f "$service_path" ] || fail "existing launchd service has no installer-managed plist"
+    launchd_was_loaded=1
+    if [ -n "$(printf '%s\n' "$job" | launchd_pid)" ]; then
+      service_was_running=1
+    fi
+  fi
   escaped_binary="$(printf '%s' "$binary_path" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g')"
-  cat >"$agent_path" <<EOF
+  cat >"$staging/service" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -150,10 +191,125 @@ else
 </dict>
 </plist>
 EOF
-  chmod 600 "$agent_path"
-  launchctl bootstrap "gui/$(id -u)" "$agent_path"
+  chmod 600 "$staging/service"
+fi
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+restore_path() {
+  if path_exists "$1"; then
+    mv -f "$1" "$2"
+  else
+    rm -f "$2"
+  fi
+}
+
+restore_install() {
+  result=0
+  if [ "$start_attempted" -eq 1 ]; then
+    if [ "$platform" = linux ]; then
+      systemctl --user stop nanoctl.service || result=1
+    elif launchctl print "$service_target" >/dev/null 2>&1; then
+      launchctl bootout "$service_target" || result=1
+    fi
+  fi
+  if [ "$enable_attempted" -eq 1 ]; then
+    systemctl --user disable nanoctl.service || result=1
+  fi
+  if [ "$files_changed" -eq 1 ]; then
+    restore_path "$staging/previous-binary" "$binary_path" || result=1
+    restore_path "$staging/previous-service" "$service_path" || result=1
+    if [ "$platform" = linux ]; then
+      systemctl --user daemon-reload || result=1
+    fi
+  fi
+  if [ "$result" -eq 0 ] && [ "$service_was_running" -eq 1 ]; then
+    if [ "$platform" = linux ]; then
+      systemctl --user start nanoctl.service || result=1
+    elif ! launchctl print "$service_target" >/dev/null 2>&1; then
+      launchctl bootstrap "$service_domain" "$service_path" || result=1
+    fi
+  fi
+  return "$result"
+}
+
+service_pid() {
+  if [ "$platform" = linux ]; then
+    systemctl --user show --property=MainPID --value nanoctl.service
+  else
+    job="$(launchctl print "$service_target")" || return 1
+    printf '%s\n' "$job" | launchd_pid
+  fi
+}
+
+wait_for_service() {
+  # Check the same process survives startup; a restart policy can mask a crash.
+  for attempt in 1 2 3; do
+    pid="$(service_pid)" || return 1
+    case "$pid" in
+      ''|0|*[!0-9]*)
+        if [ "$attempt" -lt 3 ]; then
+          sleep 1 || return 1
+        fi
+        ;;
+      *)
+        sleep 2 || return 1
+        current_pid="$(service_pid)" || return 1
+        [ "$current_pid" = "$pid" ]
+        return "$?"
+        ;;
+    esac
+  done
+  return 1
+}
+
+mkdir -p "${service_path%/*}"
+for path in "$binary_path" "$service_path"; do
+  [ ! -d "$path" ] || fail "expected a file, found a directory: $path"
+done
+if path_exists "$binary_path"; then
+  cp -pP "$binary_path" "$staging/previous-binary"
+fi
+if path_exists "$service_path"; then
+  cp -pP "$service_path" "$staging/previous-service"
+fi
+
+files_changed=0
+start_attempted=0
+enable_attempted=0
+rollback=1
+if [ "$platform" = linux ]; then
+  if [ "$service_was_running" -eq 1 ] || path_exists "$service_path"; then
+    systemctl --user stop nanoctl.service
+  fi
+elif [ "$launchd_was_loaded" -eq 1 ]; then
+  launchctl bootout "$service_target"
+fi
+
+files_changed=1
+mv -f "$candidate" "$binary_path"
+mv -f "$staging/service" "$service_path"
+if [ -n "$setup_code" ]; then
+  # macOS Keychain grants trust to the application creating the credential.
+  "$binary_path" enroll "$setup_code" --control-plane "$CONTROL_PLANE"
+fi
+if [ "$platform" = linux ]; then
+  systemctl --user daemon-reload
+  start_attempted=1
+  systemctl --user start nanoctl.service
+else
+  start_attempted=1
+  launchctl bootstrap "$service_domain" "$service_path"
   launchctl kickstart -k "$service_target"
 fi
+wait_for_service || fail "candidate service did not stay running"
+if [ "$platform" = linux ] && ! path_exists "$staging/previous-service"; then
+  enable_attempted=1
+  systemctl --user enable nanoctl.service
+fi
+rollback=0
 
 printf '\nnanoctl is installed, enrolled, and running.\n'
 printf 'Run this installer again at any time to update.\n'

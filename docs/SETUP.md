@@ -39,10 +39,15 @@ a media session; it only performs lightweight control-plane checks while waiting
 session. Windows runtime
 output is written to `%LOCALAPPDATA%\nanoctl\agent.log`; no console window is opened by the task.
 
-Running the installer again is an in-place, health-gated upgrade. It preserves the existing
-configuration and enrollment, migrates an older explicit `--config` task path when needed, and
-retains the previous executable until the new task survives startup. If an upgrade fails, rerun the
-same installer; the transaction restores the previous binary and task automatically.
+On Linux and macOS, the installer checks that the candidate can run and report its configuration
+path before stopping the old service. If the candidate fails to start or exits during the startup
+check, the installer restores the previous executable and service registration and brings back
+the service if it was running before the upgrade. On macOS, a previously stopped LaunchAgent
+remains stopped and is loaded again at the next login.
+
+On Windows, an upgrade preserves the existing configuration and enrollment, migrates an older
+explicit `--config` task path when needed, and retains the previous executable until the new task
+passes its health checks. A failed upgrade restores the previous binary and task automatically.
 
 Configurations created by an older elevated setup may be owned by `BUILTIN\Administrators`. The
 installer detects that legacy ACL before changing the installation. If the same Windows account is
