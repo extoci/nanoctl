@@ -96,6 +96,7 @@ export function DeviceDashboardView({
   }
 
   async function copyPairingCode(code: string) {
+    setError(null);
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(code);
@@ -106,14 +107,18 @@ export function DeviceDashboardView({
         input.style.position = "fixed";
         input.style.opacity = "0";
         document.body.append(input);
-        input.select();
-        if (!document.execCommand("copy")) throw new Error("copy unavailable");
-        input.remove();
+        try {
+          input.select();
+          if (!document.execCommand("copy")) throw new Error("copy unavailable");
+        } finally {
+          input.remove();
+        }
       }
       setCopiedCode(true);
       window.setTimeout(() => setCopiedCode(false), 1_500);
     } catch {
       setCopiedCode(false);
+      setError("Could not copy the setup code. Select and copy it manually.");
     }
   }
 
