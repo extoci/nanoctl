@@ -246,14 +246,16 @@ export function DeviceDashboardView({
                 >
                   {busyDevice === device._id ? "Working…" : "Connect"}
                 </button>
-                <button
-                  className="secondary"
-                  type="button"
-                  disabled={busyDevice === device._id}
-                  onClick={() => void rename(device._id, device.name)}
-                >
-                  Rename
-                </button>
+                {status !== "disabled" ? (
+                  <button
+                    className="secondary"
+                    type="button"
+                    disabled={busyDevice === device._id}
+                    onClick={() => void rename(device._id, device.name)}
+                  >
+                    Rename
+                  </button>
+                ) : null}
                 <button
                   className="danger"
                   type="button"
