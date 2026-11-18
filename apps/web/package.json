@@ -13,7 +13,7 @@
     "@nanoctl/protocol": "workspace:*",
     "@shoojs/react": "0.2.2",
     "convex": "1.42.3",
-    "next": "16.2.12",
+    "next": "16.4.6",
     "react": "19.2.0",
     "react-dom": "19.2.0"
   },
