@@ -139,6 +139,7 @@ impl ControlPlane {
     pub async fn heartbeat(
         &self,
         token: &Zeroizing<String>,
+        heartbeat_seconds: u64,
         remote_input_enabled: bool,
         encoder_preference: EncoderPreference,
     ) -> Result<()> {
@@ -147,6 +148,7 @@ impl ControlPlane {
             .bearer_auth(token.as_str())
             .json(&serde_json::json!({
                 "agentVersion": env!("CARGO_PKG_VERSION"),
+                "heartbeatSeconds": heartbeat_seconds,
                 "capabilities": platform::capabilities(remote_input_enabled, encoder_preference),
             }))
             .send()
@@ -281,6 +283,56 @@ mod tests {
     use super::{ControlPlane, credential_was_rejected};
     use reqwest::StatusCode;
     use url::Url;
+
+    #[tokio::test]
+    async fn heartbeat_reports_configured_interval() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request[end + 4..end + 4 + length]).unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .unwrap();
+                        return body;
+                    }
+                }
+            }
+        });
+        let client = ControlPlane::new(Url::parse(&format!("http://{address}")).unwrap()).unwrap();
+        client
+            .heartbeat(
+                &zeroize::Zeroizing::new("test-token".into()),
+                60,
+                false,
+                crate::config::EncoderPreference::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(server.join().unwrap()["heartbeatSeconds"], 60);
+    }
 
     #[test]
     fn constructs_https_client_with_a_crypto_provider() {

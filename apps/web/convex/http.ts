@@ -57,10 +57,17 @@ http.route({
     const body = parsed.value;
     const capabilitiesJson = boundedCapabilities(body.capabilities);
     if (capabilitiesJson === null) return json({ error: "invalid_request" }, 400);
+    if (
+      body.heartbeatSeconds !== undefined &&
+      (typeof body.heartbeatSeconds !== "number" || !Number.isFinite(body.heartbeatSeconds))
+    ) {
+      return json({ error: "invalid_request" }, 400);
+    }
     const ok = await ctx.runMutation(internal.agent.heartbeat, {
       deviceId: auth.deviceId,
       agentVersion: typeof body.agentVersion === "string" ? body.agentVersion : "unknown",
       capabilitiesJson,
+      heartbeatSeconds: body.heartbeatSeconds as number | undefined,
     });
     return ok ? json({ ok: true }) : json({ error: "disabled" }, 403);
   }),

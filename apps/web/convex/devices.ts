@@ -3,6 +3,7 @@ import { action, internalMutation, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import {
   cleanDeviceName,
+  presenceWindowMs,
   parseDeviceReadiness,
   parseDeviceProtocolVersion,
   parseDeviceRemoteInput,
@@ -11,7 +12,6 @@ import {
 } from "./lib";
 
 const PAIRING_TTL_MS = 10 * 60 * 1000;
-const ONLINE_WINDOW_MS = 45 * 1000;
 
 export const list = query({
   args: {},
@@ -24,6 +24,7 @@ export const list = query({
     const now = Date.now();
     return devices.map(({ tokenHash: _tokenHash, capabilitiesJson: _capabilities, ...device }) => ({
       ...device,
+      presenceWindowMs: presenceWindowMs(device.heartbeatSeconds),
       ready: parseDeviceReadiness(_capabilities),
       readiness: parseDeviceReadinessState(_capabilities),
       protocolVersion: parseDeviceProtocolVersion(_capabilities),
@@ -31,7 +32,7 @@ export const list = query({
       status:
         device.status === "disabled"
           ? ("disabled" as const)
-          : now - device.lastSeenAt <= ONLINE_WINDOW_MS
+          : now - device.lastSeenAt <= presenceWindowMs(device.heartbeatSeconds)
             ? ("online" as const)
             : ("offline" as const),
     }));

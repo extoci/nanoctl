@@ -13,6 +13,7 @@ export type DeviceSummary = {
   readiness: ReadinessState;
   remoteInput: boolean;
   lastSeenAt: number;
+  presenceWindowMs: number;
   createdAt: number;
 };
 

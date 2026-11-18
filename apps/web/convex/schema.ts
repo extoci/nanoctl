@@ -12,6 +12,7 @@ export default defineSchema({
     tokenHash: v.string(),
     capabilitiesJson: v.string(),
     lastSeenAt: v.number(),
+    heartbeatSeconds: v.optional(v.number()),
     createdAt: v.number(),
     disabledAt: v.optional(v.number()),
   })

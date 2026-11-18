@@ -292,7 +292,9 @@ export function DeviceDashboardView({
 
 function effectiveDeviceStatus(device: DeviceSummary, now: number): DeviceSummary["status"] {
   if (device.status === "disabled") return "disabled";
-  return device.status === "online" && now - device.lastSeenAt <= 45_000 ? "online" : "offline";
+  return device.status === "online" && now - device.lastSeenAt <= device.presenceWindowMs
+    ? "online"
+    : "offline";
 }
 
 function deviceStatusKey(device: DeviceSummary, status: DeviceSummary["status"]): string {

@@ -19,6 +19,7 @@ const INITIAL_DEVICES: DeviceSummary[] = [
     readiness: "ready",
     remoteInput: true,
     lastSeenAt: NOW,
+    presenceWindowMs: 45_000,
     createdAt: NOW,
   },
   {
@@ -33,6 +34,7 @@ const INITIAL_DEVICES: DeviceSummary[] = [
     readiness: "input-permission",
     remoteInput: false,
     lastSeenAt: NOW,
+    presenceWindowMs: 45_000,
     createdAt: NOW,
   },
   {
@@ -47,6 +49,7 @@ const INITIAL_DEVICES: DeviceSummary[] = [
     readiness: "ready",
     remoteInput: true,
     lastSeenAt: NOW - 86_400_000,
+    presenceWindowMs: 45_000,
     createdAt: NOW,
   },
 ];
