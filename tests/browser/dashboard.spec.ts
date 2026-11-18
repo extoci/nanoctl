@@ -53,6 +53,22 @@ test("authenticated dashboard supports pairing, rename, removal, and sign-out in
   await expect(page.getByRole("heading", { name: "Fixture signed out" })).toBeVisible();
 });
 
+test("authenticated dashboard hides Rename after a device is removed", async ({ page }) => {
+  await page.goto("/e2e/dashboard?state=mixed");
+  await page.waitForLoadState("networkidle");
+
+  const ready = page.locator(".device-card").filter({ hasText: "Studio workstation" });
+  const offline = page.locator(".device-card").filter({ hasText: "Travel Mac" });
+  await expect(ready.getByRole("button", { name: "Rename" })).toBeVisible();
+  await expect(offline.getByRole("button", { name: "Rename" })).toBeVisible();
+
+  page.once("dialog", async (dialog) => dialog.accept());
+  await ready.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(ready.getByText("disabled", { exact: true })).toBeVisible();
+  await expect(ready.getByRole("button", { name: "Rename" })).toHaveCount(0);
+  await expect(offline.getByRole("button", { name: "Rename" })).toBeVisible();
+});
+
 test("authenticated dashboard contains operation failures", async ({ page }) => {
   await page.goto("/e2e/dashboard?state=errors");
   const error = page.locator(".inline-error");
