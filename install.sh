@@ -121,6 +121,7 @@ fi
 trap 'exit 1' HUP INT TERM
 [ "$interrupted" -eq 0 ] || exit 1
 
+setup_code=
 if [ ! -f "$config_path" ]; then
   setup_code="${NANOCTL_ENROLL_CODE:-}"
   if [ -z "$setup_code" ]; then
@@ -129,7 +130,6 @@ if [ ! -f "$config_path" ]; then
     IFS= read -r setup_code </dev/tty
   fi
   [ -n "$setup_code" ] || fail "setup code cannot be empty"
-  "$candidate" enroll "$setup_code" --control-plane "$CONTROL_PLANE"
 fi
 
 launchd_pid() {
@@ -291,6 +291,10 @@ fi
 files_changed=1
 mv -f "$candidate" "$binary_path"
 mv -f "$staging/service" "$service_path"
+if [ -n "$setup_code" ]; then
+  # macOS Keychain grants trust to the application creating the credential.
+  "$binary_path" enroll "$setup_code" --control-plane "$CONTROL_PLANE"
+fi
 if [ "$platform" = linux ]; then
   systemctl --user daemon-reload
   start_attempted=1

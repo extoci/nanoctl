@@ -187,6 +187,18 @@ describe("one-command Linux installer", () => {
   });
 });
 
+test("enrolls the macOS agent from its stable launch path", async () => {
+  const { home, source, environment } = await fixture("Darwin");
+  const original = await Bun.file(source).text();
+  await writeFile(
+    source,
+    original.replace("  enroll)", '  enroll) [ "$0" = "$HOME/.local/bin/nanoctl" ] || exit 42;'),
+  );
+
+  expect((await installUnix(environment, source)).exit).toBe(0);
+  expect(await Bun.file(join(home, "running")).text()).toBe("nanoctl 1.0.0\n");
+});
+
 for (const [platform, registration] of [
   ["Linux", ".config/systemd/user/nanoctl.service"],
   ["Darwin", "Library/LaunchAgents/dev.nanoctl.agent.plist"],
@@ -258,6 +270,22 @@ for (const [platform, registration] of [
 
       await writeFile(source, original.replace("  enroll)", "  enroll) exit 42;"));
       expect((await installUnix(environment, source)).exit).toBe(0);
+    });
+
+    test("rolls back without starting the service if enrollment fails", async () => {
+      const { home, source, environment } = await fixture(platform);
+      const original = await Bun.file(source).text();
+      await writeFile(source, original.replace("  enroll)", "  enroll) exit 42;"));
+
+      const install = await installUnix(environment, source);
+      expect(install.exit).toBe(42);
+      expect(install.stderr).toContain("rolled back the failed installation");
+      expect(await Bun.file(join(home, ".local/bin/nanoctl")).exists()).toBe(false);
+      expect(await Bun.file(join(home, registration)).exists()).toBe(false);
+      expect(await Bun.file(join(home, "running")).exists()).toBe(false);
+      expect(await Bun.file(join(home, "service-calls")).text()).not.toMatch(
+        /^(--user start|bootstrap|kickstart) /m,
+      );
     });
   });
 }
