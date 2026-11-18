@@ -18,6 +18,11 @@ export function cleanDeviceName(value: string): string {
   return name;
 }
 
+export function presenceWindowMs(heartbeatSeconds?: number): number {
+  // Legacy agents keep 45s; slower agents get two intervals plus 15s of jitter.
+  return Math.max(45_000, (heartbeatSeconds ?? 0) * 2_000 + 15_000);
+}
+
 export function assertActiveDeadline(expiresAt: number): void {
   if (expiresAt <= Date.now()) throw new Error("Expired");
 }

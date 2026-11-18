@@ -67,6 +67,7 @@ pub async fn run(
                 Duration::from_secs(10),
                 heartbeat_client.heartbeat(
                     token_ref(&heartbeat_token),
+                    heartbeat_config.network.heartbeat_seconds,
                     heartbeat_config.features.remote_input,
                     heartbeat_config.quality.encoder,
                 ),

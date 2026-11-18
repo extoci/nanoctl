@@ -56,12 +56,24 @@ export const authenticate = internalQuery({
 });
 
 export const heartbeat = internalMutation({
-  args: { deviceId: v.id("devices"), agentVersion: v.string(), capabilitiesJson: v.string() },
+  args: {
+    deviceId: v.id("devices"),
+    agentVersion: v.string(),
+    capabilitiesJson: v.string(),
+    heartbeatSeconds: v.optional(v.number()),
+  },
   handler: async (ctx, args) => {
+    if (args.heartbeatSeconds !== undefined && !Number.isFinite(args.heartbeatSeconds)) {
+      throw new Error("Invalid heartbeat interval");
+    }
     const device = await ctx.db.get(args.deviceId);
     if (!device || device.status === "disabled") return false;
     await ctx.db.patch(args.deviceId, {
       lastSeenAt: Date.now(),
+      heartbeatSeconds:
+        args.heartbeatSeconds === undefined
+          ? undefined
+          : Math.min(300, Math.max(5, args.heartbeatSeconds)),
       status: "online",
       agentVersion: args.agentVersion.slice(0, 32),
       capabilitiesJson: args.capabilitiesJson.slice(0, 64_000),

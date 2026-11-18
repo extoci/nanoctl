@@ -209,6 +209,7 @@ async fn control_plane_check(
         client
             .heartbeat(
                 credential,
+                config.network.heartbeat_seconds,
                 config.features.remote_input,
                 config.quality.encoder,
             )

@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 import { convexTest } from "convex-test";
+import { defineSchema } from "convex/server";
 import { describe, expect, test } from "vitest";
 import type { Id } from "./_generated/dataModel";
 
@@ -65,6 +66,74 @@ async function claimHostForTest(
 }
 
 describe("control-plane authorization", () => {
+  test.each([
+    [undefined, 45_000],
+    [5, 45_000],
+    [30, 75_000],
+    [60, 135_000],
+    [300, 615_000],
+  ])("presence boundaries for heartbeat %s", async (heartbeatSeconds, windowMs) => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "boundary-owner");
+    const device = (await t.run((ctx) => ctx.db.get(deviceId)))!;
+    expect(
+      await t.mutation(internal.agent.heartbeat, {
+        deviceId,
+        agentVersion: "test",
+        capabilitiesJson: device.capabilitiesJson,
+        heartbeatSeconds,
+      }),
+    ).toBe(true);
+    const owner = asOwner(t, "boundary-owner");
+    expect((await owner.query(api.devices.list))[0].presenceWindowMs).toBe(windowMs);
+    await t.run((ctx) => ctx.db.patch(deviceId, { lastSeenAt: Date.now() - windowMs - 1_000 }));
+    expect((await owner.query(api.devices.list))[0].status).toBe("offline");
+    await expect(owner.mutation(api.sessions.create, { deviceId })).rejects.toThrow(
+      "Device is unavailable",
+    );
+    await t.run((ctx) => ctx.db.patch(deviceId, { lastSeenAt: Date.now(), status: "disabled" }));
+    expect((await owner.query(api.devices.list))[0].status).toBe("disabled");
+    await expect(owner.mutation(api.sessions.create, { deviceId })).rejects.toThrow(
+      "Device is unavailable",
+    );
+  });
+
+  test("heartbeat clamps intervals and clears cadence for legacy agents", async () => {
+    const t = convexTest(schema, modules);
+    const deviceId = await seedDevice(t, "clamp-owner");
+    const args = { deviceId, agentVersion: "test", capabilitiesJson: "{}" };
+    for (const [input, expected] of [
+      [1, 5],
+      [900, 300],
+    ]) {
+      await t.mutation(internal.agent.heartbeat, { ...args, heartbeatSeconds: input });
+      expect((await t.run((ctx) => ctx.db.get(deviceId)))!.heartbeatSeconds).toBe(expected);
+    }
+    await expect(
+      t.mutation(internal.agent.heartbeat, { ...args, heartbeatSeconds: NaN }),
+    ).rejects.toThrow("Invalid heartbeat interval");
+    await t.mutation(internal.agent.heartbeat, args);
+    expect((await t.run((ctx) => ctx.db.get(deviceId)))!.heartbeatSeconds).toBeUndefined();
+  });
+
+  test.each(["list", "session"])(
+    "60s heartbeat remains available after 50s: %s",
+    async (operation) => {
+      const t = convexTest(defineSchema(schema.tables, { schemaValidation: false }), modules);
+      const deviceId = await seedDevice(t, "presence-owner");
+      const cadence = { heartbeatSeconds: 60 };
+      await t.run((ctx) => ctx.db.patch(deviceId, { ...cadence, lastSeenAt: Date.now() - 50_000 }));
+      const owner = asOwner(t, "presence-owner");
+      if (operation === "list") {
+        expect((await owner.query(api.devices.list))[0].status).toBe("online");
+      } else {
+        await expect(owner.mutation(api.sessions.create, { deviceId })).resolves.toHaveProperty(
+          "sessionId",
+        );
+      }
+    },
+  );
+
   test("enforces authentication on every agent HTTP route except one-time enrollment", async () => {
     const t = convexTest(schema, modules);
     const protectedRequests: Array<[string, RequestInit | undefined]> = [
