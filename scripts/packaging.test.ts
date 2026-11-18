@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -66,15 +67,22 @@ case "$1" in
   print)
     case "$2" in
       */dev.nanoctl.agent)
-        if [ -f "$HOME/running" ]; then printf '\\tpid = 123\\n'; else exit 1; fi ;;
+        [ -f "$HOME/registered" ] || exit 1
+        if [ -f "$HOME/running" ]; then printf '\\tpid = 123\\n'; fi ;;
     esac ;;
-  bootout) rm -f "$HOME/running" ;;
-  bootstrap|kickstart) "$HOME/.local/bin/nanoctl" --version >"$HOME/running" ;;
+  bootout) rm -f "$HOME/registered" "$HOME/running" ;;
+  bootstrap|kickstart)
+    : >"$HOME/registered"
+    "$HOME/.local/bin/nanoctl" --version >"$HOME/running" ;;
 esac`,
     ),
     command(
       "sleep",
-      `if [ -f "$HOME/running" ] && grep -q 'nanoctl 2.0.0-broken' "$HOME/running"; then
+      `if [ "\${NANOCTL_TEST_PAUSE_STARTUP:-}" = 1 ]; then
+  : >"$HOME/paused-startup"
+  while [ ! -f "$HOME/resume-startup" ]; do /bin/sleep 0.01; done
+fi
+if [ -f "$HOME/running" ] && grep -q 'nanoctl 2.0.0-broken' "$HOME/running"; then
   rm "$HOME/running"
 fi`,
     ),
@@ -157,6 +165,26 @@ describe("one-command Linux installer", () => {
     expect(await Bun.file(join(home, ".config/nanoctl/config.toml")).exists()).toBe(true);
     expect(await Bun.file(join(home, ".config/systemd/user/nanoctl.service")).exists()).toBe(true);
   });
+
+  test("rejects a concurrent installation until the first installer finishes", async () => {
+    const { home, source, environment } = await fixture();
+    const paused = join(home, "paused-startup");
+    const first = installUnix({ ...environment, NANOCTL_TEST_PAUSE_STARTUP: "1" }, source);
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(paused); attempt++) {
+        await Bun.sleep(10);
+      }
+      expect(existsSync(paused)).toBe(true);
+      const concurrent = await installUnix(environment, source);
+      expect(concurrent.exit).not.toBe(0);
+      expect(concurrent.stderr).toContain("another installation may be running");
+    } finally {
+      await writeFile(join(home, "resume-startup"), "");
+      await first;
+    }
+    expect((await first).exit).toBe(0);
+    expect((await installUnix(environment, source)).exit).toBe(0);
+  });
 });
 
 for (const [platform, registration] of [
@@ -199,6 +227,21 @@ for (const [platform, registration] of [
       expect(await Bun.file(join(home, ".config/nanoctl/config.toml")).text()).toBe(
         'device_id = "test"\n',
       );
+    });
+
+    test("keeps a previously stopped service stopped after rollback", async () => {
+      const { home, source, environment } = await fixture(platform);
+      expect((await installUnix(environment, source)).exit).toBe(0);
+      const original = await Bun.file(source).text();
+      await rm(join(home, "running"));
+      await writeFile(source, original.replace("nanoctl 1.0.0", "nanoctl 2.0.0-broken"));
+
+      const upgrade = await installUnix(environment, source);
+      expect(upgrade.exit).not.toBe(0);
+      expect(upgrade.stderr).toContain("candidate service did not stay running");
+      expect(await Bun.file(join(home, ".local/bin/nanoctl")).text()).toBe(original);
+      expect(await Bun.file(join(home, registration)).exists()).toBe(true);
+      expect(await Bun.file(join(home, "running")).exists()).toBe(false);
     });
 
     test("removes the broken binary and registration on a failed first install", async () => {

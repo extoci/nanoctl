@@ -41,6 +41,7 @@ fi
 
 temporary="$(mktemp -d 2>/dev/null || mktemp -d -t nanoctl)"
 staging=
+lock=
 rollback=0
 cleanup() {
   status=$?
@@ -54,9 +55,12 @@ cleanup() {
     fi
   fi
   if [ -n "$staging" ]; then
-    rm -rf "$staging"
+    rm -rf "$staging" || status=1
   fi
-  rm -rf "$temporary"
+  rm -rf "$temporary" || status=1
+  if [ -n "$lock" ]; then
+    rmdir "$lock" || status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -104,6 +108,19 @@ case "$config_output" in
   *) fail "candidate returned an invalid configuration path" ;;
 esac
 
+lock_path="$install_dir/.nanoctl.install.lock"
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+if mkdir "$lock_path" 2>/dev/null; then
+  lock="$lock_path"
+elif [ -d "$lock_path" ]; then
+  fail "another installation may be running; remove $lock_path only if no installer is running"
+else
+  fail "cannot create installation lock: $lock_path"
+fi
+trap 'exit 1' HUP INT TERM
+[ "$interrupted" -eq 0 ] || exit 1
+
 if [ ! -f "$config_path" ]; then
   setup_code="${NANOCTL_ENROLL_CODE:-}"
   if [ -z "$setup_code" ]; then
@@ -115,7 +132,12 @@ if [ ! -f "$config_path" ]; then
   "$candidate" enroll "$setup_code" --control-plane "$CONTROL_PLANE"
 fi
 
+launchd_pid() {
+  awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }'
+}
+
 service_was_running=0
+launchd_was_loaded=0
 if [ "$platform" = linux ]; then
   command -v systemctl >/dev/null 2>&1 || fail "systemd is required on Linux"
   systemctl --user show-environment >/dev/null || fail "cannot connect to the systemd user manager"
@@ -146,9 +168,12 @@ else
   service_target="$service_domain/dev.nanoctl.agent"
   service_path="$HOME/Library/LaunchAgents/dev.nanoctl.agent.plist"
   launchctl print "$service_domain" >/dev/null || fail "cannot connect to the launchd user domain"
-  if launchctl print "$service_target" >/dev/null 2>&1; then
+  if job="$(launchctl print "$service_target" 2>/dev/null)"; then
     [ -f "$service_path" ] || fail "existing launchd service has no installer-managed plist"
-    service_was_running=1
+    launchd_was_loaded=1
+    if [ -n "$(printf '%s\n' "$job" | launchd_pid)" ]; then
+      service_was_running=1
+    fi
   fi
   escaped_binary="$(printf '%s' "$binary_path" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g')"
   cat >"$staging/service" <<EOF
@@ -215,7 +240,7 @@ service_pid() {
     systemctl --user show --property=MainPID --value nanoctl.service
   else
     job="$(launchctl print "$service_target")" || return 1
-    printf '%s\n' "$job" | awk '$1 == "pid" && $2 == "=" { print $3; exit }'
+    printf '%s\n' "$job" | launchd_pid
   fi
 }
 
@@ -259,7 +284,7 @@ if [ "$platform" = linux ]; then
   if [ "$service_was_running" -eq 1 ] || path_exists "$service_path"; then
     systemctl --user stop nanoctl.service
   fi
-elif [ "$service_was_running" -eq 1 ]; then
+elif [ "$launchd_was_loaded" -eq 1 ]; then
   launchctl bootout "$service_target"
 fi
 

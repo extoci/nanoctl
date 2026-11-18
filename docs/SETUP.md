@@ -42,7 +42,8 @@ output is written to `%LOCALAPPDATA%\nanoctl\agent.log`; no console window is op
 On Linux and macOS, the installer checks that the candidate can run and report its configuration
 path before stopping the old service. If the candidate fails to start or exits during the startup
 check, the installer restores the previous executable and service registration and brings back
-the service if it was running before the upgrade.
+the service if it was running before the upgrade. On macOS, a previously stopped LaunchAgent
+remains stopped and is loaded again at the next login.
 
 On Windows, an upgrade preserves the existing configuration and enrollment, migrates an older
 explicit `--config` task path when needed, and retains the previous executable until the new task
