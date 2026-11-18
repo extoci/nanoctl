@@ -14,7 +14,7 @@ afterEach(async () => {
   );
 });
 
-async function fixture() {
+async function fixture(platform = "Linux") {
   const directory = await mkdtemp(join(tmpdir(), "nanoctl-package-test-"));
   temporaryDirectories.push(directory);
   const home = join(directory, "home");
@@ -25,7 +25,8 @@ async function fixture() {
     source,
     `#!/bin/sh
 case "\${1:-}" in
-  --version|doctor|unenroll) exit 0 ;;
+  --version) printf 'nanoctl 1.0.0\\n' ;;
+  doctor|unenroll) exit 0 ;;
   paths) printf 'config=%s\\n' "$HOME/.config/nanoctl/config.toml" ;;
   enroll)
     mkdir -p "$HOME/.config/nanoctl"
@@ -36,9 +37,48 @@ esac
 `,
   );
   await chmod(source, 0o755);
-  const systemctl = join(tools, "systemctl");
-  await writeFile(systemctl, "#!/bin/sh\nexit 0\n");
-  await chmod(systemctl, 0o755);
+  async function command(name: string, script: string) {
+    const path = join(tools, name);
+    await writeFile(path, `#!/bin/sh\n${script}\n`);
+    await chmod(path, 0o755);
+  }
+
+  await Promise.all([
+    command("uname", `case "$1" in -s) echo ${platform} ;; -m) echo x86_64 ;; esac`),
+    command(
+      "systemctl",
+      `printf '%s\\n' "$*" >>"$HOME/service-calls"
+case "$2" in
+  is-active)
+    if [ -f "$HOME/running" ]; then echo active; else echo inactive; exit 3; fi ;;
+  show)
+    if [ -f "$HOME/running" ]; then echo 123; else echo 0; fi ;;
+  stop) rm -f "$HOME/running" ;;
+  start) "$HOME/.local/bin/nanoctl" --version >"$HOME/running" ;;
+  enable)
+    if [ "$3" = --now ]; then "$HOME/.local/bin/nanoctl" --version >"$HOME/running"; fi ;;
+esac`,
+    ),
+    command(
+      "launchctl",
+      `printf '%s\\n' "$*" >>"$HOME/service-calls"
+case "$1" in
+  print)
+    case "$2" in
+      */dev.nanoctl.agent)
+        if [ -f "$HOME/running" ]; then printf '\\tpid = 123\\n'; else exit 1; fi ;;
+    esac ;;
+  bootout) rm -f "$HOME/running" ;;
+  bootstrap|kickstart) "$HOME/.local/bin/nanoctl" --version >"$HOME/running" ;;
+esac`,
+    ),
+    command(
+      "sleep",
+      `if [ -f "$HOME/running" ] && grep -q 'nanoctl 2.0.0-broken' "$HOME/running"; then
+  rm "$HOME/running"
+fi`,
+    ),
+  ]);
   return {
     home,
     source,
@@ -48,6 +88,25 @@ esac
       PATH: `${tools}:${process.env.PATH ?? ""}`,
     },
   };
+}
+
+async function installUnix(environment: NodeJS.ProcessEnv, source: string) {
+  const install = Bun.spawn(["sh", "install.sh"], {
+    cwd: repository,
+    env: {
+      ...environment,
+      NANOCTL_BINARY: source,
+      NANOCTL_ENROLL_CODE: "ABCDE-FGHJK-MNPQR-STVWX",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exit, stdout, stderr] = await Promise.all([
+    install.exited,
+    install.stdout.text(),
+    install.stderr.text(),
+  ]);
+  return { exit, stdout, stderr };
 }
 
 describe("Linux user-service packaging", () => {
@@ -86,27 +145,79 @@ describe("Linux user-service packaging", () => {
 describe("one-command Linux installer", () => {
   test("installs, enrolls, registers the user service, and updates in place", async () => {
     const { home, source, environment } = await fixture();
-    const installerEnvironment = {
-      ...environment,
-      NANOCTL_BINARY: source,
-      NANOCTL_ENROLL_CODE: "ABCDE-FGHJK-MNPQR-STVWX",
-    };
-
-    for (let run = 0; run < 2; run++) {
-      const install = Bun.spawn(["sh", "install.sh"], {
-        cwd: repository,
-        env: installerEnvironment,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      expect(await install.exited).toBe(0);
-    }
+    expect((await installUnix(environment, source)).exit).toBe(0);
+    const update = (await Bun.file(source).text())
+      .replace("nanoctl 1.0.0", "nanoctl 2.0.0")
+      .replace("  enroll)", "  enroll) exit 42;");
+    await writeFile(source, update);
+    expect((await installUnix(environment, source)).exit).toBe(0);
 
     expect(await Bun.file(join(home, ".local/bin/nanoctl")).exists()).toBe(true);
+    expect(await Bun.file(join(home, "running")).text()).toBe("nanoctl 2.0.0\n");
     expect(await Bun.file(join(home, ".config/nanoctl/config.toml")).exists()).toBe(true);
     expect(await Bun.file(join(home, ".config/systemd/user/nanoctl.service")).exists()).toBe(true);
   });
 });
+
+for (const [platform, registration] of [
+  ["Linux", ".config/systemd/user/nanoctl.service"],
+  ["Darwin", "Library/LaunchAgents/dev.nanoctl.agent.plist"],
+] as const) {
+  describe(`one-command ${platform} installer rollback`, () => {
+    test("rejects an invalid candidate before contacting the service manager", async () => {
+      const { home, source, environment } = await fixture(platform);
+      expect((await installUnix(environment, source)).exit).toBe(0);
+      const original = await Bun.file(source).text();
+      const calls = Bun.file(join(home, "service-calls"));
+      const before = await calls.text();
+      await writeFile(source, original.replace("printf 'config=%s", "printf 'invalid=%s"));
+
+      const upgrade = await installUnix(environment, source);
+      expect(upgrade.exit).not.toBe(0);
+      expect(await calls.text()).toBe(before);
+      expect(await Bun.file(join(home, ".local/bin/nanoctl")).text()).toBe(original);
+      expect(await Bun.file(join(home, "running")).text()).toBe("nanoctl 1.0.0\n");
+      expect(upgrade.stderr).toContain("invalid configuration path");
+    });
+
+    test("restores the previous binary and service when the candidate exits during startup", async () => {
+      const { home, source, environment } = await fixture(platform);
+      expect((await installUnix(environment, source)).exit).toBe(0);
+      const original = await Bun.file(source).text();
+      const servicePath = join(home, registration);
+      const service = `${await Bun.file(servicePath).text()}\n# Local service customization\n`;
+      await writeFile(servicePath, service);
+      await writeFile(source, original.replace("nanoctl 1.0.0", "nanoctl 2.0.0-broken"));
+
+      const upgrade = await installUnix(environment, source);
+      expect(upgrade.exit).not.toBe(0);
+      expect(upgrade.stderr).toContain("candidate service did not stay running");
+      expect(upgrade.stdout).not.toContain("installed, enrolled, and running");
+      expect(await Bun.file(join(home, ".local/bin/nanoctl")).text()).toBe(original);
+      expect(await Bun.file(servicePath).text()).toBe(service);
+      expect(await Bun.file(join(home, "running")).text()).toBe("nanoctl 1.0.0\n");
+      expect(await Bun.file(join(home, ".config/nanoctl/config.toml")).text()).toBe(
+        'device_id = "test"\n',
+      );
+    });
+
+    test("removes the broken binary and registration on a failed first install", async () => {
+      const { home, source, environment } = await fixture(platform);
+      const original = await Bun.file(source).text();
+      await writeFile(source, original.replace("nanoctl 1.0.0", "nanoctl 2.0.0-broken"));
+
+      const install = await installUnix(environment, source);
+      expect(install.exit).not.toBe(0);
+      expect(install.stderr).toContain("candidate service did not stay running");
+      expect(await Bun.file(join(home, ".local/bin/nanoctl")).exists()).toBe(false);
+      expect(await Bun.file(join(home, registration)).exists()).toBe(false);
+      expect(await Bun.file(join(home, "running")).exists()).toBe(false);
+
+      await writeFile(source, original.replace("  enroll)", "  enroll) exit 42;"));
+      expect((await installUnix(environment, source)).exit).toBe(0);
+    });
+  });
+}
 
 describe("one-command Windows installer", () => {
   test("uses a headless, restartable task with a stability check", async () => {
