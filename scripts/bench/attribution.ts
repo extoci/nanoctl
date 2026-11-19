@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { stripVTControlCharacters } from "node:util";
 import { distribution } from "./metrics";
 
 type Key = { at: number; code: string; repeat: boolean; trusted: boolean };
@@ -27,7 +28,7 @@ type Source = { keys: Key[]; inputPaints: { input: number; at: number }[] };
 
 export function attribute(result: Result, source: Source, pixelLog: string, agentLog: string) {
   const native = new Map<string, Map<number, number[]>>();
-  for (const line of agentLog.replace(/\x1b\[[0-9;]*m/g, "").split("\n")) {
+  for (const line of stripVTControlCharacters(agentLog).split("\n")) {
     const m = /stage="([\w_]+)" sequence=(\d+) mono_ms=([\d.]+)/.exec(line);
     if (!m) continue;
     const stage = native.get(m[1]) ?? new Map<number, number[]>();

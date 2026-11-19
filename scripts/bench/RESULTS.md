@@ -227,3 +227,112 @@ runtime library or external asset was added.
 Artifacts: `~/bench-results/{profile-baseline,receiver-zero,damage-driven,`
 `persistent-capture,rtp-clock,single-thread,playout-zero}.{json,md,pixels.log,source.json}`.
 Stage logs are the corresponding `*.agent.log` files where present.
+
+## Monotonic attribution and scheduling experiments
+
+**The remaining latency gap is not closed. No scheduling optimization from this
+step was retained.** Opt-in attribution tooling is retained; the final pacer is
+unchanged from `f60b68a`. All runs below matched 120/120 inputs. Motion runs remain
+720p software H.264 with the existing settings, sequentially on the same displays.
+
+### Baseline attribution (`attribution-full`)
+
+3324 matched source/native/rVFC/client-pixel frame observations; 120 input chains.
+Source/browser clocks were independently aligned to CLOCK_MONOTONIC. Source
+uncertainty was ±0.23 ms, viewer ±0.29 ms. Native stages use clock_gettime directly
+(damage receipt is reconstructed from the Instant taken in the XDamage drain).
+Encode includes preprocessing/color conversion. RTP write start/end surrounds
+write_sample_with_extensions, not a packet sniffer observation. Segment medians
+are not additive, and decoder processingDuration is a duration, not a separately
+observed decode-end timestamp.
+
+| Segment | p50 ms | p95 ms |
+| --- | ---: | ---: |
+| Source draw → damage received | 1.737 | 2.447 |
+| Damage received → capture start | 0.036 | 0.253 |
+| Capture start → end | 1.682 | 2.605 |
+| Capture end → encode start | 8.744 | 15.533 |
+| Encode start → end | 4.345 | 6.489 |
+| Encode end → RTP write start | 0.137 | 0.391 |
+| RTP write start → end | 0.042 | 0.064 |
+| RTP write end → rVFC receiveTime | 0.230 | 0.644 |
+| receiveTime → presentationTime | 0.700 | 3.600 |
+| Decode processingDuration | 0.400 | 0.700 |
+| presentationTime → expectedDisplayTime | 19.200 | 31.100 |
+| expectedDisplayTime → first client pixel | -9.917 | 9.360 |
+| presentationTime → first client pixel | 5.267 | 13.275 |
+| Source draw → first client pixel | 25.033 | 32.803 |
+| Client XTest → viewer DOM keydown | 0.729 | 3.811 |
+| Viewer DOM → datachannel send | 0.100 | 0.200 |
+| Datachannel send → agent receive | 0.205 | 0.672 |
+| Agent receive → inject start | 0.052 | 0.336 |
+| Inject start → end | 0.165 | 0.693 |
+| Inject end → source DOM | 0.270 | 0.773 |
+| Source DOM → repaint | 7.900 | 16.100 |
+| XTest → source repaint | 9.469 | 17.958 |
+
+**Browser prediction caveat:** expectedDisplayTime was later than already-visible
+pixels in 2852/3324 observations; presentation→expected also had 93 negative
+deltas. These raw metadata predictions are not physical compositing latency and
+do not establish that video compositing adds a full refresh. Three send→receive
+and two injection→source DOM deltas were negative near the clock uncertainty;
+none were clamped or silently discarded. See the raw attribution files for
+individual segment counts and negative counts. No WebCodecs change was made.
+
+### Verified reachability and attempted changes
+
+The active capture loop's XDamage receipt→capture start is only 0.036 ms p50.
+The encode loop in media.rs calls DamagePacer::on_frame and waits on
+DamagePacer::next_deadline when throttled; adaptive.rs uses the previous encode
+start plus the frame interval. As a disproof check against blaming that timer,
+the 3362 native frames with >1 ms queueing were compared with a deadline
+predicted from the preceding encode start plus 1000/60 ms: residual p50/p95
+was 0.066/0.238 ms (observed queue median 8.862 ms). This supports the timer as
+a contributor, but the experiments below did not prove a user-visible win.
+The first motion marker after idle waited only 0.457 ms from capture end to
+encode start in this baseline; this does not test every keepalive coincidence.
+
+Keys already use an ordered channel; pointer moves already use ordered=false,
+maxRetransmits=0 in remote-session.ts. The measured receive→worker wait and
+injection duration do not explain an 8 ms gap. A separate 1000-sample direct
+XTest Space-down + XFlush submission microbenchmark on the disposable host
+display measured 0.005533/0.013622 ms p50/p95 versus Enigo dispatch's
+0.165/0.693 ms. The direct test excludes server execution/DOM repaint, so it is
+not an end-to-end comparison. No input backend/channel change was made.
+
+| Run / disposition | Input p50/p95/p99 ms | Video p50/p95/p99 ms | FPS | CPU idle/motion % | RSS idle/motion MiB | Stalls >100ms |
+| --- | --- | --- | ---: | --- | --- | ---: |
+| Instrumented baseline | 35.89 / 44.29 / 48.07 | 24.98 / 33.16 / 46.00 | 59.51 | 0.68 / 40.46 | 43.38 / 54.90 | 0 |
+| Phase-stable deadlines; discarded | 44.05 / 76.19 / 88.22 | 56.20 / 64.51 / 76.24 | 59.67 | 0.50 / 41.86 | 43.23 / 54.49 | 1 |
+| Bounded one-frame credit; discarded | 40.08 / 60.25 / 64.71 | 38.94 / 44.26 / 49.45 | 59.76 | 0.60 / 42.56 | 43.67 / 54.93 | 0 |
+| Final, original pacer, tracing off | 32.24 / 48.05 / 55.12 | 22.93 / 31.11 / 37.39 | 59.52 | 0.60 / 39.21 | 43.42 / 55.03 | 0 |
+| Earlier Moonlight reference | 28.05 / 40.44 / 58.18 | 16.44 / 24.51 / 38.20 | 58.62 | 45.35 / 46.27 | 260.29 / 269.81 | 0 |
+
+The first candidate preserved timer phase across small overshoots but still had
+7.922/9.642 ms capture→encode wait. Source draw→damage shifted to
+33.721/34.955 ms in that run. The second candidate permitted one bounded burst
+frame while preserving the sustained FPS limit; capture→encode improved to
+4.163/11.221 ms, but presentation→pixels rose to 12.515/21.951 ms and headline
+latency worsened. These upstream/downstream shifts are observed, not proven to
+be caused by either pacer. Both candidates and their candidate-specific tests
+were removed, rather than retaining an unverified change.
+
+The final row is a new observation with the original pacer, not an attributable
+optimization. It has 14733 polls at 249.70 Hz, polling p99 4.88 ms, read p99
+0.69 ms, reader CPU 1.43%, and source clock uncertainty ±0.25 ms. Runtime is
+16,161,320 bytes (15.41 MiB), +11,232 bytes versus the previous final binary,
+from diagnostic support; strict zero-byte size growth is not achieved. No new
+runtime dependency was added. The approximately 4 ms detector quantization and
+unisolated instrumentation overhead remain significant. No separate visual or
+picture-quality check was performed.
+
+Next recommended investigation: repeat paired baseline/candidate runs while
+separately tracking source draw→damage and presentation→pixels variance, before
+attributing a small headline difference or attempting a renderer replacement.
+Initial `attribution-baseline` output was input-only because fixed-row marker
+sampling missed the actual marker; the retained sampler discovers/caches its
+row. That incomplete run is not used for the frame table.
+
+Artifacts: `~/bench-results/{attribution-full,phase-stable,burst-credit,`
+`final-attribution-step}.{json,md,pixels.log,source.json,agent.log}`;
+the first three also have `.attribution.{json,md}`. Tooling commit: `c9e1341`.
