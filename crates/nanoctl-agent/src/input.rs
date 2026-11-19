@@ -43,6 +43,9 @@ enum ControlMessage {
         repeat: bool,
     },
     Release,
+    Text {
+        text: String,
+    },
     Ping,
     Display {
         #[serde(rename = "displayId")]
@@ -147,6 +150,10 @@ impl InputController {
             }
             ControlMessage::Release => {
                 self.release_all();
+                Ok(None)
+            }
+            ControlMessage::Text { text } => {
+                self.enigo.text(&text)?;
                 Ok(None)
             }
             ControlMessage::Ping => Ok(None),
@@ -344,6 +351,9 @@ mod tests {
 
     #[test]
     fn parses_release_and_keepalive_messages() {
+        let text: ControlMessage =
+            serde_json::from_slice(br#"{"type":"text","text":"commit"}"#).unwrap();
+        assert!(matches!(text, ControlMessage::Text { text } if text == "commit"));
         let release: ControlMessage = serde_json::from_slice(br#"{"type":"release"}"#).unwrap();
         assert!(matches!(release, ControlMessage::Release));
         let ping: ControlMessage =

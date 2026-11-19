@@ -1,5 +1,59 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, chromium } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+
+test("an unpaced 200-character key burst reaches native input in order", async ({ page }) => {
+  test.skip(
+    process.env.NANOCTL_BROWSER_MEDIA !== "1" ||
+      process.platform !== "linux" ||
+      !process.env.DISPLAY,
+    "Requires Linux native input and an X display",
+  );
+  await page.addInitScript(() => {
+    const create = RTCPeerConnection.prototype.createDataChannel;
+    RTCPeerConnection.prototype.createDataChannel = function (...args) {
+      const channel = Reflect.apply(create, this, args) as RTCDataChannel;
+      if (args[0] === "nanoctl.control.v1")
+        (window as unknown as { control: RTCDataChannel }).control = channel;
+      return channel;
+    };
+  });
+  const targetBrowser = await chromium.launch({ headless: false });
+  try {
+    const target = await targetBrowser.newPage();
+    await target.setContent('<input aria-label="Native input target" autofocus>');
+    await page.goto("/");
+    await expect(page.getByTestId("connection-state")).toHaveText("Live");
+    await target.bringToFront();
+    await target.getByRole("textbox").focus();
+    const text = "abcdefghijklmnopqrstuvwxyz".repeat(8).slice(0, 200);
+    await page.evaluate((text) => {
+      const channel = (window as unknown as { control: RTCDataChannel }).control;
+      for (const key of text) {
+        for (const action of ["down", "up"])
+          channel.send(
+            JSON.stringify({
+              type: "key",
+              action,
+              code: `Key${key.toUpperCase()}`,
+              key,
+              repeat: false,
+            }),
+          );
+      }
+    }, text);
+    await expect(target.getByRole("textbox")).toHaveValue(text, { timeout: 5000 });
+    await page.evaluate(() => {
+      (window as unknown as { control: RTCDataChannel }).control.send(
+        JSON.stringify({ type: "text", text: "-paste-and-ime-commit" }),
+      );
+    });
+    await expect(target.getByRole("textbox")).toHaveValue(text + "-paste-and-ime-commit", {
+      timeout: 3000,
+    });
+  } finally {
+    await targetBrowser.close();
+  }
+});
 
 test("disabled input stays off across repeated video clicks", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
