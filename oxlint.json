@@ -5,5 +5,5 @@
     "suspicious": "error",
     "perf": "warn"
   },
-  "ignorePatterns": ["apps/web/convex/_generated/**", ".next/**", "target/**"]
+  "ignorePatterns": ["apps/viewer/dist/**", "target/**"]
 }

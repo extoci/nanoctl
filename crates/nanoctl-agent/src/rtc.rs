@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::setting_engine::SettingEngine;
 #[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
 #[cfg(feature = "media")]
@@ -31,9 +32,6 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use zeroize::Zeroizing;
-
-use crate::control_plane::ControlPlane;
 
 const PROTOCOL_VERSION: u8 = 2;
 const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
@@ -44,32 +42,56 @@ const MAX_ICE_GENERATION: u64 = 1_000_000;
 const H264_PROFILE_LEVEL_ID: &str = "42e034";
 #[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
-#[cfg(feature = "media")]
-// Reliable control is ordered, but it must remain a short queue. A remote desktop should fail
-// closed before stale keystrokes and clicks accumulate behind a slow native input call.
-const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 16;
+#[cfg(any(feature = "media", test))]
+const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 1024;
+
+#[cfg(any(feature = "media", test))]
+#[derive(Clone)]
+enum InputSender {
+    Reliable(tokio::sync::mpsc::Sender<Vec<u8>>),
+    Motion(tokio::sync::watch::Sender<Option<Vec<u8>>>),
+}
+
+#[cfg(any(feature = "media", test))]
+enum InputReceiver {
+    Reliable(tokio::sync::mpsc::Receiver<Vec<u8>>),
+    Motion(tokio::sync::watch::Receiver<Option<Vec<u8>>>),
+}
+
+#[cfg(any(feature = "media", test))]
+impl InputReceiver {
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Reliable(receiver) => receiver.recv().await,
+            Self::Motion(receiver) => {
+                receiver.changed().await.ok()?;
+                receiver.borrow_and_update().clone()
+            }
+        }
+    }
+}
 
 #[cfg(any(feature = "media", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum InputAdmission {
     Accepted,
-    Full,
     Oversized,
     Closed,
 }
 
 #[cfg(any(feature = "media", test))]
-fn admit_input_message(
-    sender: &tokio::sync::mpsc::Sender<Vec<u8>>,
-    bytes: Vec<u8>,
-) -> InputAdmission {
+async fn admit_input_message(sender: &InputSender, bytes: Vec<u8>) -> InputAdmission {
     if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return InputAdmission::Oversized;
     }
-    match sender.try_send(bytes) {
-        Ok(()) => InputAdmission::Accepted,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => InputAdmission::Full,
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => InputAdmission::Closed,
+    let accepted = match sender {
+        InputSender::Reliable(sender) => sender.send(bytes).await.is_ok(),
+        InputSender::Motion(sender) => sender.send(Some(bytes)).is_ok(),
+    };
+    if accepted {
+        InputAdmission::Accepted
+    } else {
+        InputAdmission::Closed
     }
 }
 
@@ -112,10 +134,7 @@ struct SignalPublisher {
 
 #[derive(Clone)]
 enum SignalPublisherInner {
-    ControlPlane {
-        client: ControlPlane,
-        token: Arc<Zeroizing<String>>,
-    },
+    WebSocket(tokio::sync::mpsc::Sender<serde_json::Value>),
     #[cfg(test)]
     Test(tokio::sync::mpsc::UnboundedSender<TestSignal>),
     #[cfg(test)]
@@ -134,9 +153,9 @@ struct TestSignal {
 }
 
 impl SignalPublisher {
-    fn control_plane(client: ControlPlane, token: Arc<Zeroizing<String>>) -> Self {
+    fn websocket(sender: tokio::sync::mpsc::Sender<serde_json::Value>) -> Self {
         Self {
-            inner: SignalPublisherInner::ControlPlane { client, token },
+            inner: SignalPublisherInner::WebSocket(sender),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
         }
@@ -232,10 +251,10 @@ impl SignalPublisher {
 
     async fn send_once(&self, session_id: &str, sequence: u64, envelope: &str) -> Result<()> {
         match &self.inner {
-            SignalPublisherInner::ControlPlane { client, token } => {
-                client
-                    .send_signal(token, session_id, sequence, envelope)
-                    .await
+            SignalPublisherInner::WebSocket(sender) => {
+                let _ = (session_id, sequence);
+                sender.send(serde_json::json!({"type":"signal","envelope":serde_json::from_str::<serde_json::Value>(envelope)?})).await
+                    .map_err(|_| anyhow::anyhow!("WebSocket receiver closed"))
             }
             #[cfg(test)]
             SignalPublisherInner::Test(sender) => sender
@@ -349,8 +368,7 @@ enum OutgoingPayload {
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
-        control_plane: ControlPlane,
-        token: Arc<Zeroizing<String>>,
+        sender: tokio::sync::mpsc::Sender<serde_json::Value>,
         session_id: String,
         serialized_offer: &str,
         ice_servers: Vec<RTCIceServer>,
@@ -359,7 +377,7 @@ impl HostPeer {
         allow_remote_input: bool,
     ) -> Result<Self> {
         Self::answer_with_publisher(
-            SignalPublisher::control_plane(control_plane, token),
+            SignalPublisher::websocket(sender),
             session_id,
             serialized_offer,
             ice_servers,
@@ -391,7 +409,17 @@ impl HostPeer {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+        let mut settings = SettingEngine::default();
+        let dev_loopback = crate::server::dev_user().is_some();
+        if matches!(publisher.inner, SignalPublisherInner::WebSocket(_)) {
+            settings.set_include_loopback_candidate(dev_loopback);
+            settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+            settings.set_ip_filter(Box::new(move |ip| {
+                crate::tailnet::is_tailnet_ip(ip) || (dev_loopback && ip.is_loopback())
+            }));
+        }
         let api = APIBuilder::new()
+            .with_setting_engine(settings)
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .build();
@@ -451,11 +479,10 @@ impl HostPeer {
             }
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
-            let (pointer_sender, pointer_receiver) = tokio::sync::mpsc::channel(1);
-            let fail_safe_release_pending = Arc::new(AtomicBool::new(false));
+            let (pointer_sender, pointer_receiver) = tokio::sync::watch::channel(None);
             if let Some(input) = &input {
                 input_tasks.push(spawn_input_worker(
-                    control_receiver,
+                    InputReceiver::Reliable(control_receiver),
                     input.clone(),
                     crate::input::InputLane::Reliable,
                     Some(display_selection.clone()),
@@ -464,7 +491,7 @@ impl HostPeer {
                     input_revoked.clone(),
                 ));
                 input_tasks.push(spawn_input_worker(
-                    pointer_receiver,
+                    InputReceiver::Motion(pointer_receiver),
                     input.clone(),
                     crate::input::InputLane::PointerMotion,
                     None,
@@ -480,45 +507,37 @@ impl HostPeer {
                 if input.is_none() {
                     return Box::pin(async {});
                 }
-                let (sender, drop_when_full) = match channel.label() {
-                    "nanoctl.control.v1" => (control_sender.clone(), false),
-                    "nanoctl.pointer.v1" => (pointer_sender.clone(), true),
+                let sender = match channel.label() {
+                    "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
+                    "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
                     _ => return Box::pin(async {}),
                 };
                 let message_input = input.clone();
-                let release_pending = fail_safe_release_pending.clone();
+                let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
                     let sender = sender.clone();
                     let input = message_input.clone();
-                    let release_pending = release_pending.clone();
+                    let weak_channel = weak_channel.clone();
                     let input_revoked = input_revoked.clone();
                     Box::pin(async move {
                         if !message.is_string || input_revoked.load(Ordering::Acquire) {
                             return;
                         }
-                        let admission = admit_input_message(&sender, message.data.to_vec());
-                        let must_release = !drop_when_full
-                            && matches!(
-                                admission,
-                                InputAdmission::Full | InputAdmission::Oversized
-                            );
-                        if must_release
-                            && release_pending
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                                .is_ok()
-                        {
-                            tracing::warn!(
-                                ?admission,
-                                "reliable input flood triggered fail-safe release"
-                            );
-                            let release_pending = release_pending.clone();
+                        let admission = admit_input_message(&sender, message.data.to_vec()).await;
+                        if admission != InputAdmission::Accepted {
+                            input_revoked.store(true, Ordering::Release);
+                            tracing::warn!(?admission, "input rejected; closing control channel");
+                            tokio::spawn(async move {
+                                if let Some(channel) = weak_channel.upgrade() {
+                                    let _ = channel.close().await;
+                                }
+                            });
                             tokio::task::spawn_blocking(move || {
                                 if let Some(input) = input
                                     && let Ok(mut input) = input.lock()
                                 {
                                     input.release_all();
                                 }
-                                release_pending.store(false, Ordering::Release);
                             });
                         }
                     })
@@ -957,7 +976,7 @@ impl HostPeer {
 
 #[cfg(feature = "media")]
 fn spawn_input_worker(
-    mut receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut receiver: InputReceiver,
     input: Arc<std::sync::Mutex<crate::input::InputController>>,
     lane: crate::input::InputLane,
     display_selection: Option<tokio::sync::watch::Sender<String>>,
@@ -1085,6 +1104,7 @@ pub fn is_offer_for_session(serialized: &str, expected_session: &str) -> bool {
     parse_offer(serialized, expected_session).is_ok()
 }
 
+#[cfg(test)]
 pub fn offer_generation_and_epoch(
     serialized: &str,
     expected_session: &str,
@@ -1103,10 +1123,7 @@ pub(crate) fn host_epoch_seed() -> String {
 }
 
 fn host_sequence_seed() -> u64 {
-    // Convex transports sequences as JSON numbers, so use 53 random bits. Unlike a timestamp/PID
-    // recipe this remains fresh across rapid process restarts and PID reuse; the chance of
-    // colliding with retained signals is negligible. Database insertion time, not this seed,
-    // determines replay order across process epochs.
+    // Keep sequence numbers exactly representable by JavaScript clients.
     let random = (uuid::Uuid::new_v4().as_u128() & ((1_u128 << 53) - 1)) as u64;
     random.clamp(1, 9_007_199_254_740_991_u64 - 4_096)
 }
@@ -1154,32 +1171,6 @@ async fn remember_ice_ufrag(
 
 fn supported_version(version: u8) -> bool {
     (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
-}
-
-pub async fn report_negotiation_failure(
-    control_plane: &ControlPlane,
-    token: &Arc<Zeroizing<String>>,
-    session_id: &str,
-    controller_epoch: &str,
-    host_epoch: &str,
-    generation: u64,
-    reason: &str,
-) -> Result<()> {
-    // A terminal signal gets its own fresh host epoch. Sequence zero has no semantic meaning and
-    // must not be required for an offer because ICE callbacks can race local-description setup.
-    let reason = reason.chars().take(256).collect::<String>();
-    let sequence = host_sequence_seed();
-    let envelope = serialize_with_generation(
-        session_id,
-        controller_epoch,
-        host_epoch,
-        generation,
-        sequence,
-        OutgoingPayload::End { reason },
-    )?;
-    SignalPublisher::control_plane(control_plane.clone(), Arc::clone(token))
-        .send_terminal(session_id, sequence, &envelope)
-        .await
 }
 
 #[cfg(test)]
@@ -1274,29 +1265,93 @@ mod tests {
         assert!(value.contains(r#""reason":"media pipeline failed""#));
     }
 
-    #[test]
-    fn bounds_control_queue_memory_and_work() {
+    #[tokio::test]
+    async fn bounds_control_queue_memory_and_work() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let sender = InputSender::Reliable(sender);
         assert_eq!(
-            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES]),
+            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES]).await,
             InputAdmission::Accepted
         );
-        assert_eq!(
-            admit_input_message(&sender, vec![0; 1]),
-            InputAdmission::Full
+        let pending = admit_input_message(&sender, vec![1]);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
         );
         assert_eq!(
             receiver.try_recv().unwrap().len(),
             MAX_CONTROL_MESSAGE_BYTES
         );
+        assert_eq!(pending.await, InputAdmission::Accepted);
+        assert_eq!(receiver.recv().await.unwrap(), vec![1]);
         assert_eq!(
-            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES + 1]),
+            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES + 1]).await,
             InputAdmission::Oversized
         );
         drop(receiver);
         assert_eq!(
-            admit_input_message(&sender, vec![0; 1]),
+            admit_input_message(&sender, vec![0; 1]).await,
             InputAdmission::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_key_and_text_bursts_arrive_in_order_without_pacing() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
+        let sender = InputSender::Reliable(sender);
+        let mut receiver = InputReceiver::Reliable(receiver);
+        let events: Vec<_> = (0..3000).map(|index| {
+            let event = match index % 3 {
+                0 => serde_json::json!({"type":"key", "action":"down", "code":"KeyA", "key":"a", "repeat":false, "sequence":index}),
+                1 => serde_json::json!({"type":"key", "action":"up", "code":"KeyA", "key":"a", "repeat":false, "sequence":index}),
+                _ => serde_json::json!({"type":"text", "text":format!("commit-{index}-日本語"), "sequence":index}),
+            };
+            serde_json::to_vec(&event).unwrap()
+        }).collect();
+        for event in &events[..1000] {
+            assert_eq!(
+                admit_input_message(&sender, event.clone()).await,
+                InputAdmission::Accepted
+            );
+        }
+        let expected = events.clone();
+        let producer = tokio::spawn(async move {
+            for event in &events[1000..] {
+                assert_eq!(
+                    admit_input_message(&sender, event.clone()).await,
+                    InputAdmission::Accepted
+                );
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for event in expected {
+                assert_eq!(receiver.recv().await.unwrap(), event);
+            }
+            producer.await.unwrap();
+            assert!(receiver.recv().await.is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pointer_motion_is_coalesced_to_the_latest_event() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let sender = InputSender::Motion(sender);
+        let mut receiver = InputReceiver::Motion(receiver);
+        for index in 0_u32..500 {
+            assert_eq!(
+                admit_input_message(&sender, index.to_be_bytes().to_vec()).await,
+                InputAdmission::Accepted
+            );
+        }
+        assert_eq!(receiver.recv().await.unwrap(), 499_u32.to_be_bytes());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err()
         );
     }
 

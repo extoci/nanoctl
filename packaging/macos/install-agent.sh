@@ -1,9 +1,11 @@
 #!/bin/sh
 set -eu
+# shellcheck source=packaging/tailnet.sh
+. "$(dirname "$0")/../tailnet.sh"
 
 source_binary=${1:?usage: install-agent.sh /path/to/nanoctl}
 [ "$(id -u)" -ne 0 ] || {
-  printf '%s\n' "Install nanoctl as the enrolled desktop user, not root." >&2
+  printf '%s\n' "Install nanoctl as the desktop user, not root." >&2
   exit 1
 }
 install_root="$HOME/Library/Application Support/nanoctl"
@@ -16,7 +18,7 @@ if [ -e "$binary_path" ] || [ -e "$agent_path" ]; then
 fi
 install -d -m 700 "$install_root/bin" "$HOME/Library/LaunchAgents"
 install -m 755 "$source_binary" "$binary_path"
-if ! "$binary_path" doctor; then
+if ! "$binary_path" config >/dev/null; then
   rm -f "$binary_path"
   rmdir "$install_root/bin" "$install_root" 2>/dev/null || true
   exit 1
@@ -28,3 +30,6 @@ launchctl bootout "gui/$(id -u)/dev.nanoctl.agent" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$agent_path"
 launchctl kickstart -k "gui/$(id -u)/dev.nanoctl.agent"
 printf '%s\n' "nanoctl LaunchAgent installed and started."
+remove_legacy_credential "$binary_path"
+check_tailnet
+print_tailnet_url "$binary_path"

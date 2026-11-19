@@ -3,7 +3,6 @@ set -eu
 
 REPOSITORY="${NANOCTL_REPOSITORY:-extoci/nanoctl}"
 VERSION="${NANOCTL_VERSION:-latest}"
-CONTROL_PLANE="${NANOCTL_CONTROL_PLANE:-https://nanoctl.vercel.app}"
 
 fail() {
   printf 'nanoctl installer: %s\n' "$*" >&2
@@ -121,16 +120,8 @@ fi
 trap 'exit 1' HUP INT TERM
 [ "$interrupted" -eq 0 ] || exit 1
 
-setup_code=
-if [ ! -f "$config_path" ]; then
-  setup_code="${NANOCTL_ENROLL_CODE:-}"
-  if [ -z "$setup_code" ]; then
-    [ -r /dev/tty ] || fail "set NANOCTL_ENROLL_CODE when installing without a terminal"
-    printf 'Setup code: ' >/dev/tty
-    IFS= read -r setup_code </dev/tty
-  fi
-  [ -n "$setup_code" ] || fail "setup code cannot be empty"
-fi
+"$candidate" config >/dev/null || fail "candidate configuration is invalid"
+(umask 077; mkdir -p "${config_path%/*}")
 
 launchd_pid() {
   awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }'
@@ -291,10 +282,6 @@ fi
 files_changed=1
 mv -f "$candidate" "$binary_path"
 mv -f "$staging/service" "$service_path"
-if [ -n "$setup_code" ]; then
-  # macOS Keychain grants trust to the application creating the credential.
-  "$binary_path" enroll "$setup_code" --control-plane "$CONTROL_PLANE"
-fi
 if [ "$platform" = linux ]; then
   systemctl --user daemon-reload
   start_attempted=1
@@ -311,7 +298,7 @@ if [ "$platform" = linux ] && ! path_exists "$staging/previous-service"; then
 fi
 rollback=0
 
-printf '\nnanoctl is installed, enrolled, and running.\n'
+printf '\nnanoctl is installed and running.\n'
 printf 'Run this installer again at any time to update.\n'
 case ":$PATH:" in
   *":$install_dir:"*) ;;
@@ -339,3 +326,27 @@ esac
 if [ "$platform" = macos ]; then
   printf 'macOS may ask you to allow Screen Recording and Accessibility for nanoctl.\n'
 fi
+
+if [ -f "$config_path" ]; then
+  legacy_device_id="$(awk -F '["\047]' '/^[[:space:]]*device_id[[:space:]]*=/ {print $2; exit}' "$config_path" 2>/dev/null || true)"
+  if [ -n "$legacy_device_id" ]; then
+    if [ "$platform" = macos ]; then
+      security delete-generic-password -s dev.nanoctl.agent -a "$legacy_device_id" >/dev/null 2>&1 || true
+    elif command -v keyctl >/dev/null 2>&1; then
+      for ring in @s @u "$(keyctl get_persistent "$(id -u)" 2>/dev/null || true)"; do
+        [ -n "$ring" ] || continue
+        key="$(keyctl search "$ring" user "keyring-rs:$legacy_device_id@dev.nanoctl.agent" 2>/dev/null || true)"
+        [ -z "$key" ] || keyctl invalidate "$key" >/dev/null 2>&1 || true
+      done
+    fi
+  fi
+fi
+tailscale_cli="$(command -v tailscale || true)"
+if [ -z "$tailscale_cli" ] && [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+  tailscale_cli=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+fi
+if [ -z "$tailscale_cli" ] || ! "$tailscale_cli" status --json 2>/dev/null |
+  grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+  printf '%s\n' 'Warning: install/start Tailscale and sign in: https://tailscale.com/download' >&2
+fi
+"$binary_path" url || printf '%s\n' 'URL unavailable yet; run nanoctl url after Tailscale is running.' >&2

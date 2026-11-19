@@ -1,8 +1,7 @@
 {
   "ignorePatterns": [
-    "apps/web/convex/_generated/**",
+    "apps/viewer/dist/**",
     "target/**",
-    ".next/**",
     "playwright-report/**",
     "test-results/**",
     "bun.lock"

@@ -1,159 +1,50 @@
 # Architecture
 
-## Components
-
-The browser is the controller. Next.js serves the application and static assets. Shoo authenticates
-the human and issues an ES256 token scoped to the web origin. Convex verifies that token, stores
-ownership and ephemeral coordination state, and exposes a narrow HTTPS agent API. The native agent
-owns capture, encoding, WebRTC, and input injection. coturn is a packet relay of last resort.
+[ADR 0004](adr/0004-tailnet-native.md) is the design authority for nanoctl 3.
 
 ```text
-Shoo ── signed identity ──> Browser ── authenticated functions ──> Convex
-                              │                                   ▲
-                              │ DTLS-SRTP + SCTP                   │ HTTPS agent API
-                              │ (direct or TURN)                   │
-                              ▼                                   │
-                         Native agent ───────── ICE ───────────────┘
-                              │
-                    OS capture / encoder / input
+Tailnet browser ── HTTPS + WebSocket ── Rust agent :7337
+       └──────── WebRTC video / input ──────┘
+                                      └── tailscale status / whois / cert
 ```
 
-Convex is not in the media path. TURN cannot decrypt DTLS-SRTP. Signaling contains SDP and ICE
-candidates, which reveal network addressing metadata and are therefore short-lived.
+There is no nanoctl control plane, hosted signaling, enrollment, credential store,
+Convex, Shoo, Vercel, STUN or TURN dependency. Tailscale itself handles network identity,
+WireGuard transport, NAT traversal and, when needed, DERP relay.
+
+## Host
+
+- `tailnet.rs` wraps CLI discovery, status and briefly cached peer whois behind a
+  testable `Tailnet` trait. The CLI is found on PATH, in the macOS app, in Windows
+  Program Files, or through `tailnet.tailscale_cli`.
+- `server.rs` binds only the node's tailnet addresses and discovers them periodically
+  while Tailscale is unavailable. Loopback is off by default; there is no wildcard listener.
+- `tls.rs` obtains the MagicDNS certificate with `tailscale cert`, stores it privately,
+  checks daily and renews within 14 days of expiry. Native HTTPS is the default;
+  issuance failure without a valid certificate produces a warned HTTP fallback.
+- `service.rs` owns shutdown and the ready marker. One WebSocket owns one session;
+  replacement or socket closure tears down and joins media/input work.
+- `rtc.rs` retains v2 epochs, ICE generations, input lanes and bounded recovery.
+  ICE has no servers and only gathers tailnet host candidates.
+- The media pipeline captures the interactive desktop, bounds its newest-frame queue,
+  encodes H.264 and sends RTP. Input requires config, platform capability and viewer permission.
+
+## Viewer
+
+`apps/viewer` is a static React SPA built with Bun into hashed assets in `dist`.
+The agent's `build.rs` embeds them; no separate web server or remote runtime assets
+are needed. `GET /v1/info` supplies host name, displays, capabilities and the viewer's
+tailnet identity. `/v1/connect` carries direct WebSocket signaling.
+
+The moved session engine owns peer lifecycle, reliable control, lossy pointer traffic,
+epochs and generations. Socket loss triggers bounded reconnect with a new session;
+`replaced` requires an explicit Reconnect. Stats use inbound RTP byte/frame deltas,
+show unknown rates before a baseline, and retain fractional rates on static desktops.
 
 ## Trust boundaries
 
-1. The browser is untrusted until Shoo JWT verification succeeds in Convex.
-2. The agent is untrusted until its bearer credential hash matches a non-revoked device.
-3. Both peers validate every protocol message despite WebRTC transport integrity.
-4. The native OS boundary decides whether capture and input are available.
-5. TURN is an untrusted transport relay with time-limited credentials.
-
-Device credentials authorize only agent endpoints for one device. User tokens authorize only data
-owned by their Shoo `subject`. A session joins these identities for no more than fifteen minutes.
-
-## Data model
-
-- `devices`: owner, display name, platform, version/capabilities, last heartbeat, credential hash,
-  and revocation status.
-- `pairingCodes`: owner, SHA-256 code digest, creation/expiry, and one-time consumption marker.
-- `sessions`: owner/device binding, strict state, expiry, and end reason.
-- `signals`: session, role, sender-epoch sequence, controller epoch, serialized versioned envelope,
-  insertion time, and expiry. A refreshed browser gets a new controller epoch; the agent echoes it
-  and Convex rejects delayed rows from another epoch. The browser replays a bounded recent window by
-  insertion time and keeps one latest host answer epoch, so an agent restart cannot hide a fresh host
-  epoch behind a lower random sequence or feed two answers into one peer.
-- `auditEvents`: append-only security-relevant ownership and session actions.
-
-Reachability and readiness are distinct. A fresh heartbeat makes a device online, while the
-authenticated capability document must also report protocol v2, H.264, at least one capturable
-display, and any locally enabled input permission before Convex permits a session. Older v1 devices
-remain visible so the UI can explain the required upgrade, but they are not admitted to a v2 session.
-Permission revocation therefore disables new Connect actions without pretending the service itself is
-offline.
-The capability document also carries `remoteInput`; a ready device may be intentionally view-only,
-in which case the controller never enables its input lane.
-
-Raw enrollment codes and agent bearer tokens are never stored. Signal rows and expired pairing rows
-must be deleted by scheduled maintenance. Audit retention is a deployment policy.
-
-## Session state machine
-
-```text
-requested ── controller offer ──> negotiating ── ICE/DTLS ──> connected
-    │                                  │                         │
-    └──────── timeout/end ─────────────┴──── failure/end ────────┘
-                                      ▼
-                                ended | failed
-```
-
-Only the owner can create or end a session. Only the bound device can publish host signals. Terminal
-states cannot transition back. One active session per device is enforced transactionally.
-
-The browser and native agent both use an actor-style session owner. A session owns its peer, ICE
-generation, signaling cursor, input lanes, capture/encoder worker, metrics, and terminal barrier.
-No callback from an older lifecycle may write to a replacement peer. ICE restart is a connection
-generation inside the same session; it does not restart native capture or input resources. A browser
-refresh is a new controller epoch and replaces the native peer after the old capture task has been
-joined.
-
-## Media pipeline
-
-The portable backend keeps one long-lived native capture session open. xcap currently selects WGC
-on Windows and PipeWire on supported Wayland desktops, with platform fallbacks elsewhere. A
-dedicated forwarding thread replaces a single pending frame atomically: if capture outpaces
-encoding, obsolete frames are discarded rather than accumulated. The encoded handoff is also a
-single newest-frame slot, so a busy packetizer never retains stale content or discards the newest
-recovery frame. Dropped local frames are not reported as RTP packet loss. RGBA
-frames are scaled and converted to I420 for bounded OpenH264 software
-encoding, then emitted directly to the WebRTC RTP packetizer. Decoder PLI/FIR feedback forces an
-IDR, with a two-second periodic IDR as a recovery backstop. Display metadata is refreshed in the
-signed-in owner’s device capability view. A display switch first proves that the replacement
-recorder can start while the current stream remains valid; only then does it stop and join the old
-recorder before swapping the handoff and forcing an IDR. A failed switch therefore retains the
-current stream, while a successful switch never leaves two encoders or forwarders active. Static
-desktops retain and pace the latest captured frame instead of mistaking a lack of damage
-notifications for capture failure. Session teardown signals and joins the blocking capture/encoder
-worker before a replacement session is admitted. Shutdown awaits that join rather than aborting an
-async wrapper around native code, because aborting the wrapper cannot cancel a thread already inside
-OS capture or encoder APIs.
-
-The portable path consumes receiver-estimated maximum bitrate (REMB), clamps it between 250 kbps and
-the local ceiling, and reconfigures OpenH264 only after a 20% decrease or 25% increase. Recreating
-the encoder also produces a clean recovery point; the hysteresis avoids reinitialization churn.
-OpenH264 runs in bitrate-control mode. Advanced latency policy maps responsiveness/balanced/quality
-to low/medium/high encoder complexity and controls whether the encoder may skip frames.
-On macOS, the same hysteresis recreates a hardware-confirmed VideoToolbox session, which also forces
-a recovery frame. Its AVCC samples are length-checked and converted to Annex-B with copied SPS/PPS
-before reaching the RTP packetizer. On Linux, a VA-API backend uses low-delay prediction, forced
-keyframes, dynamic CBR tuning, and constrained-baseline Annex-B output from `cros-codecs`; RGBA is
-converted to NV12 and uploaded using the driver's declared plane layout. On Windows, hardware-only
-Media Foundation enumeration excludes the inbox software encoder, uses the asynchronous MFT event
-contract with bounded watchdogs, requests recovery frames in place through `ICodecAPI`, and rebuilds
-a low-latency baseline session only for bitrate or dimension changes (or as a compatibility fallback
-when a vendor MFT cannot force a keyframe). The old transform is explicitly flushed and released
-before its replacement is created. Direct capture-to-encoder GPU surfaces, capture timestamps, and
-adaptive resolution/frame rate remain native performance-path release gates, not properties claimed
-for the portable backend.
-
-`quality.encoder` is a fail-closed policy rather than a hint. `auto` prefers a verified native
-backend and may fall back to OpenH264, `software` forces the portable backend, and `hardware` fails
-session startup if the platform backend is unavailable. This prevents an administrator who requires
-GPU isolation/performance from silently receiving software encoding.
-
-Input uses an unordered, zero-retransmit channel for pointer motion and a reliable ordered channel
-for key/button transitions and lifecycle messages. Pointer motion is coalesced; key-up and button-up
-are never dropped and are synthesized on disconnect. System audio and clipboard synchronization are
-reserved for a later protocol capability and are never advertised by a v2 agent.
-
-## Connectivity
-
-Trickle ICE starts with host/server-reflexive candidates. Production configuration supplies TURN
-over UDP, TCP, and TLS 443. TURN credentials are short-lived HMAC credentials minted for a session;
-static public TURN passwords are forbidden. ICE restart handles address changes. If `relay` policy
-is selected, no host candidates are exposed to the peer.
-
-“Peer-to-peer” is an optimization, not a correctness assumption. Symmetric NAT, enterprise
-firewalls, carrier networks, and UDP blocking make a relay necessary for dependable access.
-
-## Why a native agent
-
-The service is privileged and latency-sensitive. Rust provides small static-ish binaries, explicit
-memory ownership, native APIs, and cross-compilation support. Bun remains the repository task runner
-and the runtime for development tools; TypeScript 7 checks the web and shared protocol; oxc formats
-and lints. The privileged media path does not embed a JavaScript runtime.
-
-## Failure behavior
-
-- Control-plane unavailable: existing WebRTC session continues; new sessions wait with backoff.
-- Heartbeat fails: device appears offline after max(45 s, 2 × heartbeat interval + 15 s); credentials are retained.
-- Capture revoked/locked: video pauses and a typed status travels over reliable control.
-- RTP delivery interruption: native capture and encoding stay alive while ICE/DTLS recovers; the
-  first post-outage frame is forced to an IDR. Only a genuine capture/encoder failure gets one
-  bounded whole-pipeline restart; a second failure publishes a terminal host signal, marks the
-  Convex session failed with an audit event, and closes the peer.
-- Data channel closes: all injected input is released immediately.
-- Token revoked: the revoke transaction ends active session records immediately; the browser closes
-  from the reactive state update, and the agent closes every peer on its next session poll (bounded
-  by `network.poll_milliseconds`) before exiting successfully.
-- TURN unavailable: direct paths still work; the UI reports reachability rather than spinning.
+Tailnet reachability is necessary but not sufficient: the agent also requires
+owner/allow-list/capability authorization. Tagged callers require an allowed tag.
+Host validation rejects DNS rebinding and WebSocket Origin must match the listener.
+Only single-user machines fronted by `tailscale serve` should opt into loopback header
+trust; local OS users can forge that identity. See [security](SECURITY.md).

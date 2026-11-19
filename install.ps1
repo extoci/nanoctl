@@ -5,10 +5,41 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $Repository = if ($env:NANOCTL_REPOSITORY) { $env:NANOCTL_REPOSITORY } else { "extoci/nanoctl" }
 $RequestedVersion = if ($env:NANOCTL_VERSION) { $env:NANOCTL_VERSION.Trim() } else { "latest" }
-$ControlPlane = if ($env:NANOCTL_CONTROL_PLANE) {
-  $env:NANOCTL_CONTROL_PLANE
-} else {
-  "https://nanoctl.vercel.app"
+
+function Remove-LegacyCredential {
+  param([string]$ConfigPath)
+  try {
+    if ($ConfigPath -and (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+      $contents = Get-Content -LiteralPath $ConfigPath -Raw
+      if ($contents -match '(?m)^\s*device_id\s*=\s*["'']([^"'']+)["'']') {
+        & "$env:SystemRoot\System32\cmdkey.exe" "/delete:$($Matches[1]).dev.nanoctl.agent" *> $null
+      }
+    }
+  } catch {
+    Write-Verbose "Legacy credential cleanup was unavailable."
+  }
+}
+
+function Show-TailnetUrl {
+  param([string]$BinaryPath, [string]$ConfigPath)
+  $tailscale = Get-Command tailscale -ErrorAction SilentlyContinue
+  $tailscalePath = if ($tailscale) { $tailscale.Source } else {
+    Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+  }
+  try {
+    $status = & $tailscalePath status --json 2>$null | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $status.BackendState -ne "Running") {
+      throw "Tailscale is not running."
+    }
+  } catch {
+    Write-Warning "Install/start Tailscale and sign in: https://tailscale.com/download"
+  }
+  try {
+    & $BinaryPath --config $ConfigPath url
+    if ($LASTEXITCODE -ne 0) { throw "URL unavailable." }
+  } catch {
+    Write-Warning "URL unavailable yet; run nanoctl url after Tailscale is running."
+  }
 }
 
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") {
@@ -336,14 +367,13 @@ function Get-BinaryConfigPath {
   return $null
 }
 
-function Test-ConfigEnrolled {
+function Test-ConfigFile {
   param([string]$Path)
 
   if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     return $false
   }
-  $contents = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
-  return [bool]($contents -match '(?m)^\s*device_id\s*=\s*["''][^"'']+["'']\s*$')
+  return $true
 }
 
 function Assert-ConfigOwner {
@@ -356,7 +386,7 @@ function Assert-ConfigOwner {
   try {
     $ownerSid = Resolve-AccountSid -Account $owner
   } catch {
-    throw "Could not resolve the enrolled configuration owner '$owner'. Run the installer as the account that enrolled nanoctl."
+    throw "Could not resolve the configuration owner '$owner'. Run the installer as the account that installed nanoctl."
   }
   if ($ownerSid -eq $currentUserSid) {
     return
@@ -366,15 +396,15 @@ function Assert-ConfigOwner {
   }
   if ($ownerSid -eq "S-1-5-32-544") {
     throw (
-      "The enrolled configuration is owned by 'BUILTIN\Administrators', but '$currentUser' " +
+      "The configuration is owned by 'BUILTIN\Administrators', but '$currentUser' " +
       "is not running with an administrator token. Run the installer once from an elevated " +
-      "PowerShell window to repair this legacy enrollment."
+      "PowerShell window to repair this legacy configuration."
     )
   }
   if ($ownerSid -ne $currentUserSid) {
     throw (
-      "The enrolled configuration belongs to '$owner', but this installer is running as '$currentUser'. " +
-      "Sign in as the account that enrolled nanoctl; do not update another Windows user's installation."
+      "The configuration belongs to '$owner', but this installer is running as '$currentUser'. " +
+      "Sign in as the account that installed nanoctl; do not update another Windows user's installation."
     )
   }
 }
@@ -452,13 +482,11 @@ function Invoke-ElevatedInstaller {
   $scriptUri = "$baseUrl/install.ps1"
   $escapedRepository = $Repository.Replace("'", "''")
   $escapedVersion = $resolvedVersion.Replace("'", "''")
-  $escapedControlPlane = $ControlPlane.Replace("'", "''")
   $escapedScriptUri = $scriptUri.Replace("'", "''")
   $elevatedCommand = @"
 `$ErrorActionPreference = 'Stop'
 `$env:NANOCTL_REPOSITORY = '$escapedRepository'
 `$env:NANOCTL_VERSION = '$escapedVersion'
-`$env:NANOCTL_CONTROL_PLANE = '$escapedControlPlane'
 `$env:NANOCTL_ELEVATION_ATTEMPTED = '1'
 Invoke-Expression (Invoke-RestMethod -UseBasicParsing -Uri '$escapedScriptUri')
 "@
@@ -471,7 +499,7 @@ Invoke-Expression (Invoke-RestMethod -UseBasicParsing -Uri '$escapedScriptUri')
     (Get-Process -Id $PID).Path
   }
 
-  Write-Host "Repairing the legacy administrator-owned enrollment (Windows will ask once)."
+  Write-Host "Repairing the legacy administrator-owned configuration (Windows will ask once)."
   try {
     $process = Start-Process `
       -FilePath $powerShell `
@@ -542,7 +570,7 @@ function Ensure-ConfigUserAccess {
     /grant:r "*${currentUserSid}:(F)" | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw (
-      "The enrolled configuration is owned by 'BUILTIN\Administrators' and could not be " +
+      "The configuration is owned by 'BUILTIN\Administrators' and could not be " +
       "made writable by '$currentUser'. Run the installer from an elevated PowerShell window."
     )
   }
@@ -592,7 +620,7 @@ if (-not (Test-CurrentProcessElevated) -and
     throw "The elevated nanoctl repair completed, but the installed binary did not report version $displayVersion."
   }
   Set-CurrentProcessNanoctlPath
-  Write-Host "The legacy enrollment was repaired and nanoctl was updated."
+  Write-Host "The legacy configuration was repaired and nanoctl was updated."
   return
 }
 
@@ -645,7 +673,7 @@ try {
   if (-not $legacyConfigPath) {
     $legacyConfigPath = Get-BinaryConfigPath -Path $legacyBinaryPath
   }
-  if ($legacyConfigPath -and (Test-ConfigEnrolled -Path $legacyConfigPath)) {
+  if ($legacyConfigPath -and (Test-ConfigFile -Path $legacyConfigPath)) {
     Assert-ConfigOwner -Path $legacyConfigPath
     Ensure-ConfigUserAccess -Path $legacyConfigPath
   }
@@ -676,35 +704,12 @@ try {
   }
   $defaultConfigPath = $Matches[1].Trim()
   $configPath = $defaultConfigPath
-  if ($legacyConfigPath -and (Test-Path -LiteralPath $legacyConfigPath -PathType Leaf)) {
-    if (Test-ConfigEnrolled -Path $legacyConfigPath) {
-      # Preserve an explicit v1.0.9 --config location. A new default config can exist from a
-      # partially failed attempt and must not silently replace the enrolled configuration.
-      $configPath = (Resolve-Path -LiteralPath $legacyConfigPath).Path
-      if ($configPath -ne $defaultConfigPath) {
-        Write-Host "Preserving the existing configuration at $configPath."
-      }
-    } elseif (-not (Test-ConfigEnrolled -Path $defaultConfigPath)) {
-      New-Item -ItemType Directory -Path (Split-Path -Parent $defaultConfigPath) -Force | Out-Null
-      Copy-Item -LiteralPath $legacyConfigPath -Destination $defaultConfigPath
-      Write-Host "Migrated the existing configuration from $legacyConfigPath."
-    }
+  if (Test-ConfigFile -Path $legacyConfigPath) {
+    $configPath = (Resolve-Path -LiteralPath $legacyConfigPath).Path
+    Write-Host "Preserving the existing configuration at $configPath."
   }
   Assert-ConfigOwner -Path $configPath
   Ensure-ConfigUserAccess -Path $configPath
-  if (-not (Test-ConfigEnrolled -Path $configPath)) {
-    $setupCode = $env:NANOCTL_ENROLL_CODE
-    if (-not $setupCode) {
-      $setupCode = Read-Host "Setup code"
-    }
-    if (-not $setupCode) {
-      throw "The setup code cannot be empty."
-    }
-    & $binaryPath --config $configPath enroll $setupCode --control-plane $ControlPlane
-    if ($LASTEXITCODE -ne 0) {
-      throw "nanoctl enrollment failed."
-    }
-  }
 
   Register-AgentTask -ConfigPath $configPath
   Wait-AgentTask `
@@ -712,7 +717,7 @@ try {
     -BinaryPath $binaryPath `
     -ReadyToken $transactionId `
     -ReadyVersion $displayVersion
-  & $binaryPath --config $configPath doctor
+  & $binaryPath --config $configPath config | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "nanoctl installed but failed its health check. See $logPath for service diagnostics."
   }
@@ -768,11 +773,13 @@ try {
   $completed = $true
 
   Write-Host ""
-  Write-Host "nanoctl is installed, enrolled, and running."
+  Remove-LegacyCredential -ConfigPath $configPath
+  Write-Host "nanoctl is installed and running."
   Write-Host "Installed version: $(& $binaryPath --version)"
   Write-Host "Command path: $resolvedCommandPath"
   Write-Host "nanoctl is available in this PowerShell session and in newly opened terminals."
   Write-Host "Run this installer again at any time to update."
+  Show-TailnetUrl -BinaryPath $binaryPath -ConfigPath $configPath
 }
 catch {
   try {

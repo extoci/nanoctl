@@ -1,6 +1,6 @@
 # ADR 0002: Convex control plane with TURN fallback
 
-Status: accepted.
+Status: superseded by [ADR 0004: Tailnet-native nanoctl](0004-tailnet-native.md).
 
 Convex stores identity-bound devices, sessions, audit metadata, and transient signaling. It does not
 carry media. WebRTC prefers direct ICE paths. Standards-compliant TURN is mandatory in production as

@@ -20,20 +20,23 @@ async function fixture(platform = "Linux") {
   temporaryDirectories.push(directory);
   const home = join(directory, "home");
   const tools = join(directory, "tools");
-  await Promise.all([mkdir(home, { recursive: true }), mkdir(tools, { recursive: true })]);
+  await Promise.all([
+    mkdir(join(home, ".config/nanoctl"), { recursive: true }),
+    mkdir(tools, { recursive: true }),
+  ]);
+  await writeFile(join(home, ".config/nanoctl/config.toml"), 'device_id = "test"\n');
   const source = join(directory, "nanoctl");
   await writeFile(
     source,
     `#!/bin/sh
 case "\${1:-}" in
   --version) printf 'nanoctl 1.0.0\\n' ;;
-  doctor|unenroll) exit 0 ;;
+  config) exit 0 ;;
   paths) printf 'config=%s\\n' "$HOME/.config/nanoctl/config.toml" ;;
-  enroll)
-    mkdir -p "$HOME/.config/nanoctl"
-    printf 'device_id = "test"\\n' >"$HOME/.config/nanoctl/config.toml"
-    ;;
-  *) exit 0 ;;
+  url)
+    [ "\${NANOCTL_TEST_URL_FAIL:-}" != 1 ] || exit 1
+    printf 'https://test.tailnet.ts.net:7337\\n' ;;
+  *) exit 42 ;;
 esac
 `,
   );
@@ -45,6 +48,17 @@ esac
   }
 
   await Promise.all([
+    command("tailscale", `printf '{"BackendState":"%s"}\\n' "\${NANOCTL_TEST_TAILNET:-Running}"`),
+    command(
+      "security",
+      `printf '%s\\n' "$*" >>"$HOME/credential-cleanup"; exit "\${NANOCTL_TEST_CLEANUP_EXIT:-0}"`,
+    ),
+    command(
+      "keyctl",
+      `printf '%s\\n' "$*" >>"$HOME/credential-cleanup"
+[ "\${NANOCTL_TEST_CLEANUP_EXIT:-0}" = 0 ] || exit 1
+case "$1" in get_persistent) echo 77 ;; search) echo 42 ;; esac`,
+    ),
     command("uname", `case "$1" in -s) echo ${platform} ;; -m) echo x86_64 ;; esac`),
     command(
       "systemctl",
@@ -89,6 +103,7 @@ fi`,
   ]);
   return {
     home,
+    tools,
     source,
     environment: {
       ...process.env,
@@ -104,7 +119,6 @@ async function installUnix(environment: NodeJS.ProcessEnv, source: string) {
     env: {
       ...environment,
       NANOCTL_BINARY: source,
-      NANOCTL_ENROLL_CODE: "ABCDE-FGHJK-MNPQR-STVWX",
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -118,7 +132,7 @@ async function installUnix(environment: NodeJS.ProcessEnv, source: string) {
 }
 
 describe("Linux user-service packaging", () => {
-  test("installs, refuses overwrite, and uninstalls in the enrolled user home", async () => {
+  test("installs, refuses overwrite, and uninstalls in the desktop user home", async () => {
     const { home, source, environment } = await fixture();
     const install = Bun.spawn(["sh", "packaging/linux/install-user-service.sh", source], {
       cwd: repository,
@@ -151,12 +165,10 @@ describe("Linux user-service packaging", () => {
 });
 
 describe("one-command Linux installer", () => {
-  test("installs, enrolls, registers the user service, and updates in place", async () => {
+  test("installs, registers the user service, and updates without changing legacy config", async () => {
     const { home, source, environment } = await fixture();
     expect((await installUnix(environment, source)).exit).toBe(0);
-    const update = (await Bun.file(source).text())
-      .replace("nanoctl 1.0.0", "nanoctl 2.0.0")
-      .replace("  enroll)", "  enroll) exit 42;");
+    const update = (await Bun.file(source).text()).replace("nanoctl 1.0.0", "nanoctl 2.0.0");
     await writeFile(source, update);
     expect((await installUnix(environment, source)).exit).toBe(0);
 
@@ -187,12 +199,12 @@ describe("one-command Linux installer", () => {
   });
 });
 
-test("enrolls the macOS agent from its stable launch path", async () => {
+test("prints the macOS URL from its stable launch path", async () => {
   const { home, source, environment } = await fixture("Darwin");
   const original = await Bun.file(source).text();
   await writeFile(
     source,
-    original.replace("  enroll)", '  enroll) [ "$0" = "$HOME/.local/bin/nanoctl" ] || exit 42;'),
+    original.replace("  url)", '  url) [ "$0" = "$HOME/.local/bin/nanoctl" ] || exit 42;'),
   );
 
   expect((await installUnix(environment, source)).exit).toBe(0);
@@ -232,7 +244,7 @@ for (const [platform, registration] of [
       const upgrade = await installUnix(environment, source);
       expect(upgrade.exit).not.toBe(0);
       expect(upgrade.stderr).toContain("candidate service did not stay running");
-      expect(upgrade.stdout).not.toContain("installed, enrolled, and running");
+      expect(upgrade.stdout).not.toContain("installed and running");
       expect(await Bun.file(join(home, ".local/bin/nanoctl")).text()).toBe(original);
       expect(await Bun.file(servicePath).text()).toBe(service);
       expect(await Bun.file(join(home, "running")).text()).toBe("nanoctl 1.0.0\n");
@@ -268,29 +280,86 @@ for (const [platform, registration] of [
       expect(await Bun.file(join(home, registration)).exists()).toBe(false);
       expect(await Bun.file(join(home, "running")).exists()).toBe(false);
 
-      await writeFile(source, original.replace("  enroll)", "  enroll) exit 42;"));
+      await writeFile(source, original);
       expect((await installUnix(environment, source)).exit).toBe(0);
     });
 
-    test("rolls back without starting the service if enrollment fails", async () => {
+    test("rejects invalid config without starting or replacing the service", async () => {
       const { home, source, environment } = await fixture(platform);
       const original = await Bun.file(source).text();
-      await writeFile(source, original.replace("  enroll)", "  enroll) exit 42;"));
+      await writeFile(source, original.replace("  config)", "  config) exit 42;"));
 
       const install = await installUnix(environment, source);
-      expect(install.exit).toBe(42);
-      expect(install.stderr).toContain("rolled back the failed installation");
+      expect(install.exit).toBe(1);
+      expect(install.stderr).toContain("candidate configuration is invalid");
       expect(await Bun.file(join(home, ".local/bin/nanoctl")).exists()).toBe(false);
       expect(await Bun.file(join(home, registration)).exists()).toBe(false);
       expect(await Bun.file(join(home, "running")).exists()).toBe(false);
-      expect(await Bun.file(join(home, "service-calls")).text()).not.toMatch(
-        /^(--user start|bootstrap|kickstart) /m,
+      expect(await Bun.file(join(home, "service-calls")).exists()).toBe(false);
+    });
+
+    test("installs without a config, warns for stopped Tailscale and tolerates unavailable URL", async () => {
+      const { home, source, environment } = await fixture(platform);
+      await rm(join(home, ".config/nanoctl"), { recursive: true });
+      const install = await installUnix(
+        { ...environment, NANOCTL_TEST_TAILNET: "Stopped", NANOCTL_TEST_URL_FAIL: "1" },
+        source,
       );
+      expect(install.exit).toBe(0);
+      expect(install.stderr).toContain("https://tailscale.com/download");
+      expect(install.stderr).toContain("URL unavailable yet");
+      expect(install.stdout).toContain("installed and running");
+    });
+
+    test("prints the URL and removes only the legacy credential best-effort", async () => {
+      const { home, source, environment } = await fixture(platform);
+      const install = await installUnix(environment, source);
+      expect(install.exit).toBe(0);
+      expect(install.stdout.trim().endsWith("https://test.tailnet.ts.net:7337")).toBe(true);
+      expect(install.stderr).not.toContain("https://tailscale.com/download");
+      const cleanup = await Bun.file(join(home, "credential-cleanup")).text();
+      expect(cleanup).toContain(
+        platform === "Linux" ? "keyring-rs:test@dev.nanoctl.agent" : "-s dev.nanoctl.agent -a test",
+      );
+      expect(await Bun.file(join(home, ".config/nanoctl/config.toml")).text()).toBe(
+        'device_id = "test"\n',
+      );
+      expect(
+        (await installUnix({ ...environment, NANOCTL_TEST_CLEANUP_EXIT: "1" }, source)).exit,
+      ).toBe(0);
+    });
+
+    test("missing Tailscale is nonfatal", async () => {
+      const { source, tools, environment } = await fixture(platform);
+      await rm(join(tools, "tailscale"));
+      const install = await installUnix(environment, source);
+      expect(install.exit).toBe(0);
+      expect(install.stderr).toContain("https://tailscale.com/download");
     });
   });
 }
 
 describe("one-command Windows installer", () => {
+  test("uses nonfatal tailnet discovery and legacy-only credential cleanup without enrollment", async () => {
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    const helper = await Bun.file(join(repository, "packaging/tailnet.ps1")).text();
+    expect(installer).toContain(helper.trim());
+    expect(helper).toContain("https://tailscale.com/download");
+    expect(helper).toContain('BackendState -ne "Running"');
+    expect(helper).toContain('"/delete:$($Matches[1]).dev.nanoctl.agent"');
+    expect(helper).toContain("& $BinaryPath --config $ConfigPath url");
+    for (const path of [
+      "install.ps1",
+      "packaging/windows/install-service.ps1",
+      "packaging/windows/update-agent.ps1",
+      "packaging/windows/uninstall-agent.ps1",
+    ]) {
+      const script = await Bun.file(join(repository, path)).text();
+      expect(script).not.toMatch(
+        /Read-Host|\benroll\b|\bunenroll\b|Test-ConfigEnrolled|ControlPlane/,
+      );
+    }
+  });
   test("uses a headless, restartable task with a stability check", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("-RestartInterval (New-TimeSpan -Minutes 1)");
@@ -302,7 +371,7 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("-Hidden");
     expect(installer).toContain("startup stability window");
     expect(installer).toContain("nanoctl.{0}.previous.exe");
-    expect(installer).toContain("Migrated the existing configuration");
+    expect(installer).toContain("Preserving the existing configuration");
     expect(installer).toContain("Interactive|InteractiveToken");
     expect(installer).not.toContain('New-ScheduledTaskAction -Execute $binaryPath -Argument "run"');
   });
@@ -347,7 +416,7 @@ describe("one-command Windows installer", () => {
   test("migrates a legacy task's implicit config path and allows slow startup", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("function Get-BinaryConfigPath");
-    expect(installer).toContain("function Test-ConfigEnrolled");
+    expect(installer).toContain("function Test-ConfigFile");
     expect(installer).toContain("Get-BinaryConfigPath -Path $legacyBinaryPath");
     expect(installer).toContain("-log-file $probeLogPath --version");
     expect(installer).toContain("AddSeconds(90)");
@@ -389,7 +458,7 @@ describe("one-command Windows installer", () => {
     expect(installer).toContain("-Verb RunAs");
     expect(installer).toContain("NANOCTL_ELEVATION_ATTEMPTED");
     expect(installer).toContain('$scriptUri = "$baseUrl/install.ps1"');
-    expect(installer).toContain("Repairing the legacy administrator-owned enrollment");
+    expect(installer).toContain("Repairing the legacy administrator-owned configuration");
     expect(installer).toContain("function Set-CurrentProcessNanoctlPath");
     expect(installer).toContain("The elevated nanoctl repair completed");
     expect(installer).toMatch(
