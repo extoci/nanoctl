@@ -216,6 +216,7 @@ export function SoftKeyboard({
           <textarea
             ref={field}
             className="soft-keyboard-field"
+            tabIndex={-1}
             aria-label="Remote keyboard"
             disabled={!enabled}
             autoCapitalize="off"

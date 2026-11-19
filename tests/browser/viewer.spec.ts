@@ -177,6 +177,7 @@ test("disabled input stays off across repeated video clicks", async ({ page }) =
     await page.locator("video").click();
     await page.keyboard.press("a");
   }
+  await openPanel(page);
   await expect(page.getByRole("button", { name: "Input off", exact: true })).toHaveAttribute(
     "aria-pressed",
     "false",
@@ -378,4 +379,15 @@ test("session panel sends shortcuts, switches scale and disconnects cleanly", as
   await page.screenshot({ path: join(directory, "3-disconnected.png") });
   await page.getByRole("button", { name: "Reconnect", exact: true }).click();
   await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+});
+
+test("a closed session panel is out of the tab order", async ({ page }) => {
+  await page.goto("/");
+  await openPanel(page);
+  await closePanel(page);
+  for (let i = 0; i < 6; i++) await page.keyboard.press("Tab");
+  expect(
+    await page.evaluate(() => Boolean(document.activeElement?.closest(".session-panel"))),
+  ).toBe(false);
+  expect(await page.evaluate(() => document.querySelector(".viewer")!.scrollLeft)).toBe(0);
 });

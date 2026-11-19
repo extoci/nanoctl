@@ -308,7 +308,12 @@ function Viewer() {
         <span className={quality ? `quality-dot ${quality}` : "status-dot"} aria-hidden="true" />
         <span aria-hidden="true">{panelOpen ? "›" : "‹"}</span>
       </button>
-      <aside id="session-panel" className="session-panel" aria-label="Session panel">
+      <aside
+        id="session-panel"
+        className="session-panel"
+        aria-label="Session panel"
+        inert={!panelOpen}
+      >
         <header className="panel-head">
           <HostPicker name={hostName} />
           <div className="health">

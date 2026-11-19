@@ -69,14 +69,17 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
   await expect(page.getByRole("textbox", { name: "Remote keyboard" })).toBeFocused();
   await screenshot(page, "pixel7-keyboard-ctrl.png");
   await page.getByRole("button", { name: "Hide special keys" }).click();
+  await openPanel(page);
   await keyboard.click();
   await openPanel(page);
   await page.getByRole("button", { name: "Trackpad", exact: true }).click();
   await expect(page.getByRole("button", { name: "Direct", exact: true })).toBeVisible();
   await page.reload();
+  await openPanel(page);
   await expect(page.getByRole("button", { name: "Direct", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Direct", exact: true }).click();
   await page.reload();
+  await openPanel(page);
   await expect(page.getByRole("button", { name: "Trackpad", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Input on", exact: true })).toBeEnabled();
   if (process.env.NANOCTL_BROWSER_MEDIA === "1") {
