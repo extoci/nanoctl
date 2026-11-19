@@ -27,7 +27,8 @@ Native HTTPS uses `tailscale cert` after HTTPS is enabled in the tailnet admin c
 HTTP fallback remains encrypted by WireGuard but loses ordinary secure-context APIs.
 Tailnet networking must permit both signaling and WebRTC traffic.
 
-This alpha does not provide clipboard, audio, file transfer, multiple simultaneous
+Text clipboard sync is available to controlling viewers when enabled and supported by the host.
+This alpha does not provide audio, file transfer, multiple simultaneous
 viewers, unattended sign-in-screen access, UAC secure-desktop control or a public
 internet gateway. Hardware encoder availability and OS capture/input consent vary;
 see [platforms](PLATFORMS.md). Do not equate a successful local test with physical

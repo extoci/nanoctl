@@ -94,4 +94,18 @@ WebRTC uses empty ICE servers, tailnet host candidates, H.264 RTP, DTLS-SRTP vid
 SCTP data channels. No application-level TURN/STUN is used; Tailscale may relay its
 underlying encrypted transport through DERP. Reliable control carries discrete commands;
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
-host input. Audio and clipboard are not implemented.
+host input or clipboard access. Audio is not implemented.
+
+### Clipboard
+
+Text clipboard sync uses a viewer-created reliable ordered SCTP channel labeled
+`nanoctl.clipboard.v1`. Both directions carry JSON `{"type":"clipboard","text":"..."}`.
+The serialized UTF-8 message must be smaller than 64 KiB. Invalid, binary, non-string
+text and oversized messages are ignored; oversized host clipboard text is logged and skipped.
+Sync requires `features.clipboard` (default true), a media build with an available OS
+clipboard backend, and permission to control the host. View-only sessions get neither direction.
+The agent keeps its clipboard owner thread alive and polls every 350 ms. Viewer-originated
+text is not echoed back. The browser writes host text when focused, retaining only the latest
+pending text otherwise. It reads local text on paste and focus/visibility regain, suppressing
+echoes. Clipboard permissions and a secure browser context are required; denied browser APIs
+are silently ignored. A remote paste shortcut sends local clipboard text before its key event.

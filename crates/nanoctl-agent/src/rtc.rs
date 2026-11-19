@@ -351,6 +351,7 @@ impl HostPeer {
         ice_transport_policy: RTCIceTransportPolicy,
         host_epoch: String,
         allow_remote_input: bool,
+        allow_clipboard: bool,
     ) -> Result<Self> {
         Self::answer_with_publisher(
             SignalPublisher::websocket(sender),
@@ -360,10 +361,12 @@ impl HostPeer {
             ice_transport_policy,
             host_epoch,
             allow_remote_input,
+            allow_clipboard,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn answer_with_publisher(
         publisher: SignalPublisher,
         session_id: String,
@@ -372,6 +375,7 @@ impl HostPeer {
         ice_transport_policy: RTCIceTransportPolicy,
         host_epoch: String,
         allow_remote_input: bool,
+        allow_clipboard: bool,
     ) -> Result<Self> {
         let (offer, initial_generation, controller_epoch) =
             parse_offer(serialized_offer, &session_id)?;
@@ -400,7 +404,7 @@ impl HostPeer {
             .with_interceptor_registry(registry)
             .build();
         #[cfg(not(feature = "media"))]
-        let _ = allow_remote_input;
+        let _ = (allow_remote_input, allow_clipboard);
         let peer = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
@@ -478,9 +482,52 @@ impl HostPeer {
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
+            let clipboard = if allow_clipboard {
+                crate::clipboard::backend()
+            } else {
+                None
+            };
+            let clipboard_shutdown = input_shutdown.subscribe();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let input_revoked = input_revoked_for_channel.clone();
+                if channel.label() == "nanoctl.clipboard.v1" {
+                    if let Some(backend) = clipboard.clone() {
+                        let changes = backend.changes.clone();
+                        let shutdown = clipboard_shutdown.clone();
+                        let output = channel.clone();
+                        let revoked = input_revoked.clone();
+                        channel.on_open(Box::new(move || {
+                            let mut changes = changes.clone();
+                            let mut shutdown = shutdown.clone();
+                            let output = output.clone();
+                            let revoked = revoked.clone();
+                            Box::pin(async move {
+                            tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = shutdown.changed() => break,
+                                    result = changes.changed() => {
+                                        if result.is_err() || revoked.load(Ordering::Acquire) { break; }
+                                        let message = changes.borrow_and_update().clone();
+                                        if let Some(message) = message {
+                                            let _ = output.send_text(message).await;
+                                        }
+                                    }
+                                }
+                            }
+                            });
+                            })
+                        }));
+                        channel.on_message(Box::new(move |message: DataChannelMessage| {
+                            if message.is_string && !input_revoked.load(Ordering::Acquire)
+                                && let Some(text) = crate::clipboard::parse(&message.data)
+                            { backend.set(text); }
+                            Box::pin(async {})
+                        }));
+                    }
+                    return Box::pin(async {});
+                }
                 if input.is_none() {
                     return Box::pin(async {});
                 }
@@ -1337,6 +1384,7 @@ mod tests {
             RTCIceTransportPolicy::All,
             "host-test".to_owned(),
             false,
+            false,
         )
         .await;
 
@@ -1402,6 +1450,7 @@ mod tests {
             Vec::new(),
             RTCIceTransportPolicy::All,
             "host-test".to_owned(),
+            false,
             false,
         )
         .await

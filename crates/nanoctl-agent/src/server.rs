@@ -67,6 +67,7 @@ impl ServerState {
         let node = self.node.read().await;
         let capabilities = serde_json::to_value(crate::platform::capabilities(
             self.config.features.remote_input && control,
+            self.config.features.clipboard && control,
             self.config.quality.encoder,
         ))
         .unwrap();
@@ -379,7 +380,8 @@ async fn session(
                         match crate::rtc::HostPeer::answer_with_host_epoch(
                             outgoing.clone(), id.clone(), &serialized, Vec::new(),
                             webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
-                            crate::rtc::host_epoch_seed(), state.config.features.remote_input && control).await {
+                            crate::rtc::host_epoch_seed(), state.config.features.remote_input && control,
+                            state.config.features.clipboard && state.config.features.remote_input && control).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
                                 { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }

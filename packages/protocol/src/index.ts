@@ -1,3 +1,27 @@
+export type ClipboardMessage = { readonly type: "clipboard"; readonly text: string };
+
+export function parseClipboardMessage(data: unknown): ClipboardMessage | null {
+  if (
+    typeof data !== "string" ||
+    new TextEncoder().encode(data).length >= MAX_CONTROL_MESSAGE_BYTES
+  )
+    return null;
+  try {
+    const value: unknown = JSON.parse(data);
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !("type" in value) ||
+      value.type !== "clipboard" ||
+      !("text" in value) ||
+      typeof value.text !== "string"
+    )
+      return null;
+    return { type: "clipboard", text: value.text };
+  } catch {
+    return null;
+  }
+}
 /** The wire contract shared by the tailnet viewer and native agent. */
 export const PROTOCOL_VERSION = 2 as const;
 export const MIN_SUPPORTED_PROTOCOL_VERSION = 1 as const;

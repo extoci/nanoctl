@@ -5,14 +5,58 @@ import { RemoteSessionController, type HostSignalRow } from "./remote-session";
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
 const originalMediaStream = globalThis.MediaStream;
+const originalNavigator = globalThis.navigator;
 
 afterEach(() => {
   defineGlobal("window", originalWindow);
   defineGlobal("document", originalDocument);
   defineGlobal("MediaStream", originalMediaStream);
+  defineGlobal("navigator", originalNavigator);
 });
 
 describe("remote session lifecycle", () => {
+  test("clipboard is control-only and sends text before a remote paste key", async () => {
+    installBrowserGlobals();
+    Object.assign(document, { hasFocus: () => true });
+    defineGlobal("navigator", {
+      clipboard: { readText: async () => "local paste", writeText: async () => {} },
+    });
+    for (const mayControl of [false, true]) {
+      const peer = new FakePeer();
+      const video = new FakeVideo();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: video as unknown as HTMLVideoElement,
+        clipboardEnabled: true,
+        remoteInputPolicy: mayControl,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(mayControl);
+      if (mayControl) {
+        video.listeners.get("keydown")?.({
+          type: "keydown",
+          code: "KeyV",
+          key: "v",
+          ctrlKey: true,
+          preventDefault: () => {},
+        } as unknown as Event);
+        await flushSignals();
+        expect(peer.sent.map(([label]) => label)).toEqual([
+          "nanoctl.clipboard.v1",
+          "nanoctl.control.v1",
+        ]);
+        expect(JSON.parse(peer.sent[0]![1]).text).toBe("local paste");
+      }
+      await controller.stop();
+    }
+  });
+
   test("refreshes mutable input capabilities without tearing down the peer", async () => {
     installBrowserGlobals();
     const peer = new FakePeer();
@@ -254,11 +298,14 @@ function defineGlobal(name: string, value: unknown): void {
 }
 
 class FakeVideo {
+  listeners = new Map<string, (event: Event) => void>();
   srcObject: unknown = null;
   videoWidth = 1920;
   videoHeight = 1080;
 
-  addEventListener(): void {}
+  addEventListener(type: string, listener: (event: Event) => void): void {
+    this.listeners.set(type, listener);
+  }
 
   removeEventListener(): void {}
 
@@ -274,12 +321,15 @@ class FakeMediaStream {
 }
 
 class FakeDataChannel {
+  constructor(private readonly record: (message: string) => void = () => {}) {}
   readyState: RTCDataChannelState = "open";
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
 
-  send(): void {}
+  send(message: string): void {
+    this.record(message);
+  }
 
   close(): void {
     this.readyState = "closed";
@@ -288,6 +338,8 @@ class FakeDataChannel {
 }
 
 class FakePeer {
+  channels = new Map<string, FakeDataChannel>();
+  sent: [string, string][] = [];
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription: RTCSessionDescriptionInit | null = null;
@@ -296,8 +348,10 @@ class FakePeer {
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onRemoteDescription: ((sdp: string) => void) | null = null;
 
-  createDataChannel(): FakeDataChannel {
-    return new FakeDataChannel();
+  createDataChannel(label: string): FakeDataChannel {
+    const channel = new FakeDataChannel((message) => this.sent.push([label, message]));
+    this.channels.set(label, channel);
+    return channel;
   }
 
   addTransceiver(): void {}

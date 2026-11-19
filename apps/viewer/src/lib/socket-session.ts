@@ -127,6 +127,8 @@ export class SocketSession {
                 video: this.options.video,
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
+                clipboardEnabled:
+                  message.host.capabilities.clipboard && message.host.viewer.mayControl,
                 operations: {
                   sendSignal: async ({ envelope }) =>
                     this.send(socket, { type: "signal", envelope: JSON.parse(envelope) }),

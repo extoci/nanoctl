@@ -112,7 +112,7 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             system_audio: false,
-            clipboard: false,
+            clipboard: true,
             remote_input: true,
         }
     }
@@ -160,8 +160,8 @@ impl AgentConfig {
         {
             bail!("quality resolution limits are outside the supported range");
         }
-        if self.features.system_audio || self.features.clipboard {
-            bail!("system audio and clipboard are reserved and unavailable in protocol v2");
+        if self.features.system_audio {
+            bail!("system audio is reserved and unavailable in protocol v2");
         }
         if !matches!(
             self.quality.codec,
@@ -201,7 +201,7 @@ mod tests {
     fn rejects_reserved_v1_features() {
         let mut config = AgentConfig::default();
         config.features.clipboard = true;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
         config.features.clipboard = false;
         config.features.system_audio = true;
         assert!(config.validate().is_err());

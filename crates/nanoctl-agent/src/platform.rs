@@ -61,6 +61,7 @@ pub struct DoctorCheck {
 
 pub fn capabilities(
     remote_input_enabled: bool,
+    clipboard_enabled: bool,
     encoder_preference: EncoderPreference,
 ) -> Capabilities {
     let displays = display_capabilities();
@@ -110,9 +111,21 @@ pub fn capabilities(
         readiness,
         input: remote_input_enabled && input,
         remote_input: remote_input_enabled && input,
-        clipboard: false,
+        clipboard: clipboard_available(clipboard_enabled),
         system_audio: false,
         displays,
+    }
+}
+
+fn clipboard_available(enabled: bool) -> bool {
+    #[cfg(feature = "media")]
+    {
+        enabled && crate::clipboard::backend().is_some()
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = enabled;
+        false
     }
 }
 

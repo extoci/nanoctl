@@ -72,7 +72,7 @@ packaging.
   user task.
 - A tray UI: the background agent should be invisible and quiet first; a tray surface can be added
   after the lifecycle is proven.
-- New audio, clipboard, VP9, or AV1 protocol features.
+- New audio, VP9, or AV1 protocol features.
 - Unbounded buffering or a quality preset that hides network congestion by accumulating latency.
 
 The release is ready only when the ship criteria are demonstrated, not merely when the installer or
