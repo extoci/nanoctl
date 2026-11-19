@@ -13,6 +13,93 @@ afterEach(() => {
 });
 
 describe("remote session lifecycle", () => {
+  test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
+    installBrowserGlobals();
+    const preferences = { inputEnabled: true, displayId: "secondary" };
+    const display = {
+      id: "secondary",
+      name: "Secondary",
+      width: 1920,
+      height: 1080,
+      scaleFactor: 1,
+      primary: false,
+    };
+    for (const [mayControl, displays] of [
+      [true, [display]],
+      [false, [display]],
+      [true, []],
+    ] as const) {
+      const peer = new FakePeer();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays,
+        iceServers: [],
+        preferences,
+        remoteInputPolicy: mayControl,
+        video: new FakeVideo() as unknown as HTMLVideoElement,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      if (mayControl && displays.length) expect(controller.selectDisplay("secondary")).toBe(true);
+      controller.setInputEnabled(false);
+      peer.channels[1]!.sent = [];
+      peer.channels[1]!.onopen?.();
+      expect(controller.snapshot.inputEnabled).toBe(false);
+      expect(peer.channels[1]!.sent).toEqual(
+        mayControl && displays.length
+          ? [JSON.stringify({ type: "display", displayId: "secondary" })]
+          : [],
+      );
+      await controller.stop();
+    }
+  });
+  test("input preference survives new peers and never overrides view-only policy", async () => {
+    installBrowserGlobals();
+    const preferences = { inputEnabled: true };
+    for (const mayControl of [true, true, false]) {
+      const peer = new FakePeer();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        preferences,
+        remoteInputPolicy: mayControl,
+        video: new FakeVideo() as unknown as HTMLVideoElement,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(controller.snapshot.inputEnabled).toBe(preferences.inputEnabled && mayControl);
+      peer.channels[1]!.onopen?.();
+      expect(controller.snapshot.inputEnabled).toBe(preferences.inputEnabled && mayControl);
+      controller.setInputEnabled(false);
+      expect(preferences.inputEnabled).toBe(false);
+      await controller.stop();
+      if (!mayControl) {
+        preferences.inputEnabled = true;
+        const viewOnly = new RemoteSessionController({
+          sessionId: "view",
+          controllerEpoch: "controller",
+          displays: [],
+          iceServers: [],
+          preferences,
+          remoteInputPolicy: false,
+          video: new FakeVideo() as unknown as HTMLVideoElement,
+          operations: { sendSignal: async () => null, endSession: async () => null },
+          peerFactory: () => new FakePeer() as unknown as RTCPeerConnection,
+          onSnapshot: () => {},
+        });
+        await viewOnly.start();
+        expect(viewOnly.snapshot.inputEnabled).toBe(false);
+        await viewOnly.stop();
+      }
+    }
+  });
   test("refreshes mutable input capabilities without tearing down the peer", async () => {
     installBrowserGlobals();
     const peer = new FakePeer();
@@ -274,12 +361,15 @@ class FakeMediaStream {
 }
 
 class FakeDataChannel {
+  sent: string[] = [];
   readyState: RTCDataChannelState = "open";
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
 
-  send(): void {}
+  send(data: string): void {
+    this.sent.push(data);
+  }
 
   close(): void {
     this.readyState = "closed";
@@ -288,6 +378,7 @@ class FakeDataChannel {
 }
 
 class FakePeer {
+  channels: FakeDataChannel[] = [];
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription: RTCSessionDescriptionInit | null = null;
@@ -297,7 +388,9 @@ class FakePeer {
   onRemoteDescription: ((sdp: string) => void) | null = null;
 
   createDataChannel(): FakeDataChannel {
-    return new FakeDataChannel();
+    const channel = new FakeDataChannel();
+    this.channels.push(channel);
+    return channel;
   }
 
   addTransceiver(): void {}
