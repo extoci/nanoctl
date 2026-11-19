@@ -17,6 +17,7 @@ use openh264_sys2::{
 };
 use xcap::Monitor;
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -38,7 +39,27 @@ const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
+struct SendRateWindow {
+    writes: VecDeque<(Instant, usize)>,
+}
+
+impl SendRateWindow {
+    fn kbps(&mut self, now: Instant) -> f64 {
+        while self
+            .writes
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > Duration::from_secs(2))
+        {
+            self.writes.pop_front();
+        }
+        self.writes.iter().map(|(_, bytes)| *bytes).sum::<usize>() as f64 * 8.0 / 2000.0
+    }
+}
+
+#[derive(Default)]
 pub struct PipelineStats {
+    send_window: Mutex<SendRateWindow>,
+    pub send_kbps: AtomicU32,
     #[cfg(target_os = "linux")]
     pub capture_parked: AtomicBool,
     #[cfg(target_os = "linux")]
@@ -89,6 +110,7 @@ impl PipelineStats {
             skipped_unchanged = self.skipped_unchanged.load(Ordering::Relaxed),
             keepalives = self.keepalives.load(Ordering::Relaxed),
             bytes_sent = self.bytes_sent.load(Ordering::Relaxed),
+            send_kbps = self.send_kbps.load(Ordering::Relaxed),
             target_kbps = self.target_kbps.load(Ordering::Relaxed),
             target_fps = self.target_fps.load(Ordering::Relaxed),
             encoded_width = self.encoded_width.load(Ordering::Relaxed),
@@ -1501,6 +1523,12 @@ pub fn spawn_video(
                         delivery_recovery_requests.borrow_and_update();
                         forced_keyframe = true;
                     }
+                    let now = Instant::now();
+                    let send_kbps = producer_stats.send_window.lock().unwrap().kbps(now);
+                    producer_stats
+                        .send_kbps
+                        .store(send_kbps as u32, Ordering::Relaxed);
+                    controller.update_sender(send_kbps, pacer.idle(), now);
                     if link_feedback.has_changed().unwrap_or(false)
                         && let Some(sample) = *link_feedback.borrow_and_update()
                         && let Some(decision) = controller.observe(sample)
@@ -1689,6 +1717,7 @@ pub fn spawn_video(
                     if result.is_ok() {
                         previous_written = Some(written_at);
                         writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
+                        writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
                     }
                     match result {
                         Ok(()) if delivery_interrupted_since.is_some() => {
@@ -1777,6 +1806,21 @@ mod tests {
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn send_rate_window_counts_successful_payloads_and_expires_idle_bytes() {
+        let now = Instant::now();
+        let mut window = super::SendRateWindow::default();
+        assert_eq!(window.kbps(now), 0.0);
+        window.writes.push_back((now, 125_000));
+        window
+            .writes
+            .push_back((now + Duration::from_secs(1), 125_000));
+        assert_eq!(window.kbps(now + Duration::from_secs(1)), 1_000.0);
+        assert_eq!(window.kbps(now + Duration::from_millis(2001)), 500.0);
+        assert_eq!(window.kbps(now + Duration::from_secs(4)), 0.0);
+        assert!(window.writes.is_empty());
+    }
 
     #[tokio::test]
     async fn stopping_a_video_pipeline_waits_for_the_blocking_capture_worker() {

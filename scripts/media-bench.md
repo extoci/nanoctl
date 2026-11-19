@@ -9,7 +9,8 @@ controller with default RTCP report/NACK interceptors. Both RTP and receiver RTC
 are drained; reading RTCP is required for webrtc-rs to process incoming sender
 reports and populate RR LSR/DLSR. JSON includes received/matching sender-report
 counts and last encoded dimensions. Controller ICE candidates
-are restricted to loopback. No synthetic loss reports or REMB are injected.
+are restricted to loopback. No synthetic loss reports are injected. REMB
+emulation is opt-in with `NANOCTL_BENCH_CHROME_REMB=1`.
 Capture/encode/send uses the real `spawn_video` pipeline, OpenH264, an 8000 kbps
 ceiling, 60 fps and a 1920x1080 size limit. Software is selected explicitly so both
 revisions use the same encoder on machines without a render device.
@@ -76,3 +77,34 @@ keepalive and forced-keyframe encoding do not interact with the capture gate.
 
 The direct Linux dependency is xcb 1.7 (MIT), already used by xcap; its `damage`
 feature also enables xfixes. libc (MIT OR Apache-2.0) supplies descriptor polling.
+
+## Application-limited REMB and recovery
+
+`bash scripts/media-remb-bench.sh BINARY OUTPUT_DIR PREFIX [SCENARIOS...]` runs
+idle, motion, throttled (30 seconds each), idle-motion (10 seconds static then
+20 seconds motion), and recovery (20 seconds throttled then 30 seconds clean).
+It uses the same scene, quality, warmup and shaping parameters as above. A
+`NANOCTL_BENCH_READY_FILE` marker synchronizes transitions to measurement start;
+the runner polls it every 50 ms. Phase timing is therefore nominal to 50 ms,
+plus scene startup. Cleanup also stops the agent on interruption.
+
+The emulated controller sends real REMB RTCP once per second for the video SSRC:
+`1.5 * incoming_kbps + 10` over a rolling two-second payload window, or
+`0.85 * incoming_kbps` when sender-report one-way delay rises by over 5 ms.
+Sender/receiver share the system clock, so SR NTP arrival delay is measurable.
+`incoming_delay_ms` and `feedback.remb_kbps` expose the emulation and delivery.
+This is a regression stress model, not a full implementation of Chrome AIMD:
+upstream AIMD uses the 1.5x+10 expression as an increase ceiling, not an
+unconditional idle-time decrease. No actual browser runs in this harness.
+
+`send_kbps` measures successful writer payloads over two seconds. New REMB values
+bind only below 95% of that rate; an old value carried by later Receiver Reports
+cannot recap a new probe. Idle damage pacing freezes the target/FPS; the first two
+seconds of resumed motion ignore stale idle REMB while loss/RTT remain active.
+After three clean measured seconds, recovery probes multiplicatively with an
+RTT-weighted gain (up to 1.5x/s on low RTT); congestion memory expires after ten
+clean seconds. Resolution hysteresis restores full size at 1800 kbps.
+Targets, FPS and sizes are absolute gauges, not measurement-window deltas.
+Time to target >=4000 kbps can be read from `target_series` at one-second
+resolution, relative to second 10 (idle-motion) or 20 (recovery). Idle never
+needs to fill the link; its keepalive gaps are intentional.

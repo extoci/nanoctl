@@ -1,6 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, atomic::Ordering};
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU32, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -20,6 +23,39 @@ use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use crate::config::{EncoderPreference, LatencyMode};
 use crate::media::{VideoPipeline, VideoQuality};
 use crate::rtc::HostPeer;
+
+#[derive(Default)]
+struct ChromeRemb {
+    bytes: VecDeque<(Instant, usize)>,
+    delay_ms: f64,
+    previous_delay_ms: f64,
+}
+
+impl ChromeRemb {
+    fn estimate(&mut self, now: Instant) -> f32 {
+        while self
+            .bytes
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(2))
+        {
+            self.bytes.pop_front();
+        }
+        let incoming =
+            self.bytes.iter().map(|(_, bytes)| *bytes).sum::<usize>() as f64 * 8.0 / 2000.0;
+        let rising = self.delay_ms > self.previous_delay_ms + 5.0;
+        self.previous_delay_ms = self.delay_ms;
+        chrome_remb_kbps(incoming, rising)
+    }
+}
+
+fn chrome_remb_kbps(incoming: f64, rising: bool) -> f32 {
+    if rising {
+        incoming * 0.85
+    } else {
+        incoming * 1.5 + 10.0
+    }
+    .max(1.0) as f32
+}
 
 #[derive(Default)]
 struct Received {
@@ -81,6 +117,7 @@ fn pipeline_stats(pipeline: &VideoPipeline) -> Value {
     let stats = &pipeline.stats;
     json!({
         "frames_captured": stats.frames_captured.load(Ordering::Relaxed),
+        "send_kbps": stats.send_kbps.load(Ordering::Relaxed),
         "damage_enabled": stats.damage_enabled.load(Ordering::Relaxed),
         "capture_parked": stats.capture_parked.load(Ordering::Relaxed),
         "damage_resumes": stats.damage_resumes.load(Ordering::Relaxed),
@@ -137,25 +174,35 @@ pub async fn run(seconds: u64) -> Result<Value> {
     .trim()
     .parse()?;
     let received = Arc::new(Mutex::new(Received::default()));
+    let chrome_remb = std::env::var_os("NANOCTL_BENCH_CHROME_REMB").is_some();
+    let incoming = Arc::new(Mutex::new(ChromeRemb::default()));
+    let video_ssrc = Arc::new(AtomicU32::new(0));
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
     let mut settings = SettingEngine::default();
     settings.set_include_loopback_candidate(true);
     settings.set_ip_filter(Box::new(|ip| ip.is_loopback()));
-    let controller = APIBuilder::new()
-        .with_setting_engine(settings)
-        .with_media_engine(media_engine)
-        .with_interceptor_registry(registry)
-        .build()
-        .new_peer_connection(RTCConfiguration::default())
-        .await?;
+    let controller = Arc::new(
+        APIBuilder::new()
+            .with_setting_engine(settings)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build()
+            .new_peer_connection(RTCConfiguration::default())
+            .await?,
+    );
     controller.on_track({
         let received = received.clone();
+        let incoming = incoming.clone();
+        let video_ssrc = video_ssrc.clone();
         Box::new(move |track, receiver, _| {
             let received = received.clone();
+            let incoming = incoming.clone();
+            video_ssrc.store(track.ssrc(), Ordering::Relaxed);
             Box::pin(async move {
                 let reports = received.clone();
+                let report_delay = incoming.clone();
                 let ssrc = track.ssrc();
                 tokio::spawn(async move {
                     while let Ok((packets, _)) = receiver.read_rtcp().await {
@@ -168,6 +215,12 @@ pub async fn run(seconds: u64) -> Result<Value> {
                                 reports.sender_reports += 1;
                                 if sr.ssrc == ssrc && sr.ntp_time != 0 {
                                     reports.matching_sender_reports += 1;
+                                    let now =
+                                        webrtc::rtp::extension::abs_send_time_extension::unix2ntp(
+                                            SystemTime::now(),
+                                        );
+                                    report_delay.lock().unwrap().delay_ms =
+                                        now.saturating_sub(sr.ntp_time) as f64 / 4_294_967.296;
                                 }
                             }
                         }
@@ -175,6 +228,13 @@ pub async fn run(seconds: u64) -> Result<Value> {
                 });
                 while let Ok((packet, _)) = track.read_rtp().await {
                     let now = Instant::now();
+                    if chrome_remb {
+                        incoming
+                            .lock()
+                            .unwrap()
+                            .bytes
+                            .push_back((now, packet.payload.len()));
+                    }
                     let mut received = received.lock().unwrap();
                     let Some(start) = received.start else {
                         continue;
@@ -261,6 +321,23 @@ pub async fn run(seconds: u64) -> Result<Value> {
     })
     .await
     .context("loopback ICE connection timed out")??;
+    let mut remb_tasks = tokio::task::JoinSet::new();
+    if chrome_remb {
+        let controller = controller.clone();
+        let incoming = incoming.clone();
+        remb_tasks.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let ssrc = video_ssrc.load(Ordering::Relaxed);
+                if ssrc == 0 { continue; }
+                let kbps = incoming.lock().unwrap().estimate(Instant::now());
+                let packet = webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate {
+                    sender_ssrc: 1, bitrate: kbps * 1000.0, ssrcs: vec![ssrc],
+                };
+                if controller.write_rtcp(&[Box::new(packet)]).await.is_err() { break; }
+            }
+        });
+    }
     let pipeline = crate::media::spawn_video(
         host.video_track(),
         host.keyframe_requests(),
@@ -286,6 +363,9 @@ pub async fn run(seconds: u64) -> Result<Value> {
         bytes: vec![0; seconds as usize],
         ..Default::default()
     };
+    if let Some(path) = std::env::var_os("NANOCTL_BENCH_READY_FILE") {
+        std::fs::write(path, b"ready\n")?;
+    }
     let mut target_series = Vec::new();
     for second in 1..=seconds {
         tokio::time::sleep_until(tokio::time::Instant::from_std(
@@ -294,6 +374,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
         .await;
         let mut snapshot = pipeline_stats(&pipeline);
         snapshot["feedback"] = feedback_stats(&host);
+        snapshot["incoming_delay_ms"] = json!(incoming.lock().unwrap().delay_ms);
         target_series.push(snapshot);
     }
     let end_ticks = cpu_ticks()?;
@@ -316,6 +397,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
     let final_stats = pipeline_stats(&pipeline);
     let finished_early = pipeline.is_finished();
     pipeline.stop().await;
+    remb_tasks.abort_all();
     host.close().await?;
     controller.close().await?;
     ensure!(
@@ -358,6 +440,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
     }
     Ok(json!({
         "schema_version": 1, "seconds": elapsed, "warmup_seconds": 5,
+        "chrome_remb_emulation": chrome_remb,
         "quality": {"max_width": 1920, "max_height": 1080, "ceiling_kbps": 8000, "max_fps": 60, "encoder": "OpenH264"},
         "process_cpu_percent": (end_ticks - start_ticks) as f64 / ticks_per_second / elapsed * 100.0,
         "thread_cpu_percent": thread_cpu,
@@ -375,6 +458,20 @@ pub async fn run(seconds: u64) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_remb_tracks_idle_incoming_and_signals_rising_delay() {
+        assert_eq!(chrome_remb_kbps(1.3, false), 11.95);
+        assert_eq!(chrome_remb_kbps(1000.0, false), 1510.0);
+        assert_eq!(chrome_remb_kbps(1000.0, true), 850.0);
+        let now = Instant::now();
+        let mut estimate = ChromeRemb::default();
+        estimate.bytes.push_back((now, 250_000));
+        assert_eq!(estimate.estimate(now), 1510.0);
+        estimate.delay_ms = 40.0;
+        assert_eq!(estimate.estimate(now), 850.0);
+        assert_eq!(estimate.estimate(now + Duration::from_secs(3)), 10.0);
+    }
 
     #[test]
     fn percentiles_handle_empty_singleton_and_nearest_rank() {
