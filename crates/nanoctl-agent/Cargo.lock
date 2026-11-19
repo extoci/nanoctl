@@ -2514,6 +2514,7 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "cc",
  "clap",
  "cros-codecs",
  "cros-libva",

@@ -2,12 +2,13 @@ use std::ffi::c_void;
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
+use apple_cf::cf::CFNumber;
 use apple_cf::iosurface::IOSurface;
 use videotoolbox::compression::{CompressionSession, ProfileLevel};
 use videotoolbox::session::Codec;
 
 use crate::config::LatencyMode;
-use crate::media::{EncodedFrame, avcc_to_annex_b, bitrate_target};
+use crate::media::{EncodedFrame, FrameEncoder, avcc_to_annex_b};
 
 const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
@@ -36,11 +37,13 @@ pub struct MacOsEncoder {
 }
 
 impl MacOsEncoder {
-    pub fn new(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
-        // Probe eagerly so `hardware` fails before capture begins. The selected display dimensions
-        // replace this small session on the first frame.
-        create_session(16, 16, bitrate_kbps, max_fps, latency_mode)?;
-        Ok(Self {
+    pub fn new(
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        dimensions: (u32, u32),
+    ) -> Result<Self> {
+        let mut encoder = Self {
             session: None,
             surface: None,
             dimensions: (0, 0),
@@ -49,31 +52,59 @@ impl MacOsEncoder {
             latency_mode,
             frame_index: 0,
             restart_session: true,
-        })
+        };
+        encoder.recreate_session(dimensions)?;
+        Ok(encoder)
     }
 
-    pub fn force_keyframe(&mut self) {
+    fn recreate_session(&mut self, (width, height): (u32, u32)) -> Result<()> {
+        // Release the old session before asking for another hardware encoder slot.
+        self.session.take();
+        self.session = Some(create_session(
+            width,
+            height,
+            self.bitrate_kbps,
+            self.max_fps,
+            self.latency_mode,
+        )?);
+        if self.dimensions != (width, height) || self.surface.is_none() {
+            self.surface = Some(
+                IOSurface::create(width as usize, height as usize, BGRA, 4)
+                    .context("cannot allocate VideoToolbox IOSurface")?,
+            );
+        }
+        self.dimensions = (width, height);
+        self.frame_index = 0;
+        self.restart_session = false;
+        Ok(())
+    }
+}
+
+impl FrameEncoder for MacOsEncoder {
+    fn force_keyframe(&mut self) {
         // A new VTCompressionSession guarantees that the next frame begins a fresh GOP.
         self.restart_session = true;
     }
 
-    pub fn apply_bitrate_estimate(
-        &mut self,
-        estimate_kbps: u32,
-        ceiling_kbps: u32,
-    ) -> Result<bool> {
-        let floor_kbps = 250.min(ceiling_kbps);
-        let Some(target_kbps) =
-            bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
-        else {
-            return Ok(false);
-        };
+    fn set_bitrate(&mut self, target_kbps: u32) -> Result<()> {
         self.bitrate_kbps = target_kbps;
-        self.restart_session = true;
-        Ok(true)
+        let bps = CFNumber::from_i64(i64::from(target_kbps) * 1_000);
+        if !self.session.as_ref().is_some_and(|session| {
+            // SAFETY: the framework key is static and the CFNumber is valid for this call.
+            unsafe {
+                session.set_property(
+                    videotoolbox::ffi::kVTCompressionPropertyKey_AverageBitRate,
+                    bps.as_ptr().cast(),
+                )
+            }
+            .is_ok()
+        }) {
+            self.restart_session = true;
+        }
+        Ok(())
     }
 
-    pub fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
         let dimensions = image.dimensions();
         if dimensions.0 == 0
             || dimensions.1 == 0
@@ -83,24 +114,7 @@ impl MacOsEncoder {
             bail!("VideoToolbox input dimensions must be non-zero and even");
         }
         if self.restart_session || self.dimensions != dimensions {
-            // Release the previous hardware session before creating its replacement. Some Macs
-            // expose only one VideoToolbox encoder slot, and overlapping sessions fail silently.
-            self.session.take();
-            self.surface.take();
-            self.session = Some(create_session(
-                dimensions.0,
-                dimensions.1,
-                self.bitrate_kbps,
-                self.max_fps,
-                self.latency_mode,
-            )?);
-            self.surface = Some(
-                IOSurface::create(dimensions.0 as usize, dimensions.1 as usize, BGRA, 4)
-                    .context("cannot allocate VideoToolbox IOSurface")?,
-            );
-            self.dimensions = dimensions;
-            self.frame_index = 0;
-            self.restart_session = false;
+            self.recreate_session(dimensions)?;
         }
         let surface = self
             .surface
