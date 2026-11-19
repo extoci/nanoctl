@@ -1,3 +1,101 @@
+# screen-relay Docker versus current nanoctl, five runs each
+
+Measured sequentially on 2026-11-19: screen-relay 0.1.2 x5, then the current
+nanoctl release (retained half-frame pacer and teardown trimming) x5. Both use the
+same VM, Chromium 151.0.7922.34 source/client, 1280x720 displays, software H.264,
+default 60-fps ceiling and otherwise default streaming settings. Every run
+matched 120/120 trusted XTest inputs: **5/5 valid runs and 600/600 inputs per
+product**. No outlier was removed. Cells below are **median of per-run metrics
+[minimum–maximum]**, not pooled percentiles or confidence intervals.
+
+| Product | Input p50 ms | Input p95 ms | Input p99 ms | Video p50 ms | Video p95 ms | Video p99 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| screen-relay | 64.23 [56.05–96.09] | 72.25 [72.22–108.05] | 76.05 [73.83–108.46] | 55.06 [46.27–88.15] | 57.48 [57.39–91.03] | 62.47 [61.75–98.10] |
+| nanoctl | 32.16 [31.94–40.37] | 40.33 [36.42–52.38] | 44.23 [40.40–64.04] | 21.09 [19.94–35.77] | 37.77 [22.31–38.88] | 38.79 [27.28–43.72] |
+
+| Product | Unique FPS | Frame interval p50 ms | Frame interval p95 ms | Frame interval p99 ms | Stalls >100 ms |
+| --- | --- | --- | --- | --- | --- |
+| screen-relay | 59.74 [59.45–59.89] | 16.01 [16.01–16.02] | 20.26 [20.15–20.34] | 28.00 [24.19–28.18] | 0 [0–0] |
+| nanoctl | 59.96 [59.85–59.99] | 16.03 [16.03–16.04] | 20.23 [20.20–20.25] | 23.97 [20.45–24.30] | 0 [0–0] |
+
+| Product | Idle CPU % | Motion CPU % | Idle RSS MiB | Motion RSS MiB | Runtime MiB |
+| --- | --- | --- | --- | --- | --- |
+| screen-relay | 0.88 [0.49–0.99] | 26.53 [25.97–27.73] | 48.27 [48.27–48.27] | 48.27 [48.27–48.27] | 139.59 [139.59–139.59] |
+| nanoctl | 0.60 [0.50–0.88] | 36.15 [33.55–36.79] | 49.55 [43.53–57.63] | 56.57 [53.45–61.97] | 23.46 [23.46–23.46] |
+
+Nanoctl is faster and smaller in this workload; screen-relay uses less motion
+CPU and engine RSS. Screen-relay's between-run latency spread is substantial.
+This marker workload does not establish general picture quality or throughput
+at comparable visual quality. No product tuning or product-code changes were
+made for this comparison.
+
+## Working setup and scope
+
+The upstream Docker page was checked. `screen-relay.Dockerfile` uses Ubuntu
+24.04 plus Node 24 (resolved version 24.22.3), installs the pinned npm package,
+then runs `screen-relay install --backend x11 --desktop none --yes` without
+patches. Built image identity:
+`sha256:e353b3230bd8090877d11f1fbe47ccfb6be0fefc6c48c2c83e58d99d5dee5a6c`.
+The full build image is 1,163,872,443 bytes, including its OS and development
+tools; that is **not** the runtime figure in the table.
+
+Container `nanoctl-screen-relay` uses host networking and host IPC, sharing
+`/tmp/.X11-unix`. Xvfb :93 is inside the container; the identical VM source
+Chromium connects to it. Headed viewer Chromium and the persistent detector use
+VM display :94. The service binds only `127.0.0.1:8088`, with no remote auth token
+required. See README for the exact build, startup, PID selection and run commands.
+Nanoctl uses source :97, the same client :94, localhost :7338 and the existing
+explicit dev-loopback identity. Its agent was restarted before its five runs.
+
+The screen-relay viewer is **WebCodecs -> canvas#screen**, not WebRTC video. It
+starts view-only. `VIEWER_SETUP_CLICKS` opens the toolbar and clicks the actual
+Take control button; both viewers then use the existing surface-focus/center-click
+setup before XTest trials. A separate post-measurement check verified a trusted
+Space targeted `#screen`, a trusted source Space incremented the counter, and the
+decoded viewer marker reached input 1. Visual evidence:
+`~/bench-candidates/screen-relay-input-verified.png` (visible counter 1 and
+"you have control"). An initial diagnostic used a fixed marker row and timed
+out because browser chrome shifts the marker; scanning rows fixed that check.
+The benchmark already discovers the marker row and required no such change.
+
+Host process-tree sampling rooted at host PID **137681** counts the screen-relay
+engine and descendants, **not** parent Node supervisor, container init or Xvfb.
+One CPU core is 100%. `/metrics` cgroup figures were not used. Runtime snapshots
+include the **npm package + bundled viewer/JS dependencies/sources**, built
+engine, **Node runtime**, listed X11/CLI helper executables and their transitive
+ELF shared-library closure. Nanoctl includes its release binary and its own ELF
+library closure. Logical runtime bytes: screen-relay **146,374,952**; nanoctl
+**24,603,072**. Both exclude other base-OS utilities, Xvfb, source/viewer browsers,
+development toolchain, headers/static build archives, caches and Docker layers.
+Older nanoctl app-only sizes (~15.42 MiB) excluded shared libraries and therefore
+are not directly comparable with this expanded counting scope.
+
+Screen-relay bitrate defaults are **1/8/40 Mbps min/start/max**; a run-five
+`/metrics` sample reported a **40,000,000-bps encoder target**. That is not
+measured payload throughput. Nanoctl's default ceiling is 24 Mbps, with measured
+received video RTP **0.203 [0.202–0.203] Mbps** across these sparse-marker runs.
+No equivalent WebSocket throughput measurement was collected for screen-relay;
+do not infer one from its target or compare that target to nanoctl's RTP rate.
+
+## Detector and artifacts
+
+| Product | Poll Hz | Poll interval p99 ms | Capture p99 ms | Reader CPU % | Clock uncertainty ±ms |
+| --- | --- | --- | --- | --- | --- |
+| screen-relay | 249.35 [248.76–249.38] | 4.66 [4.62–5.42] | 0.52 [0.50–0.53] | 1.35 [1.33–1.42] | 0.23 [0.21–0.29] |
+| nanoctl | 249.43 [249.16–249.76] | 4.63 [4.47–4.67] | 0.59 [0.54–0.63] | 1.60 [1.53–1.65] | 0.27 [0.23–0.52] |
+
+The roughly 4-ms polling quantization remains significant. Reader CPU excludes
+the client X server's capture-serving work. Total screen-relay/nanoctl detector
+polls: **73,527 / 73,588**; joined video observations: **17,317 / 17,384**.
+Each product has 200 idle resource samples; motion samples are 1,276 / 1,281.
+These remain software input-to-client-pixels measurements, not optical photon
+measurements or a network/physical-display benchmark.
+
+Raw JSON, source traces, pixel logs, per-run Markdown and repeat summaries are
+preserved as `~/bench-results/docker-{screen-relay,nanoctl}*`. Runtime snapshots
+and adjacent manifests: `~/bench-runtime/{screen-relay,nanoctl}{,.json}`. Build,
+agent and run logs: `~/bench-candidates/`. Native Rust code was unchanged.
+
 # Cross-product runs
 
 Ubuntu 22.04 VM, no GPU, loopback, 1280x720 host/client X displays,

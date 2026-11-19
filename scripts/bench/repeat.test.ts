@@ -46,3 +46,18 @@ test("empty, invalid and missing runs never fabricate successful comparisons", (
   incomplete.videoMs.p95 = null;
   expect(summarizeRuns("missing metric", [incomplete], 1).complete).toBe(false);
 });
+
+test("runtime spread uses per-run MiB and leaves unavailable sizes explicit", () => {
+  const small = { ...run(10), runtime: { bytes: 1048576 } };
+  const large = { ...run(20), runtime: { bytes: 3145728 } };
+  expect(summarizeRuns("runtime", [small, large], 2).runtimeMiB).toEqual({
+    count: 2,
+    median: 2,
+    min: 1,
+    max: 3,
+  });
+  expect(summarizeRuns("unknown", [run(10)], 1).runtimeMiB.median).toBeNull();
+  expect(
+    summarizeRuns("invalid size", [{ ...run(10), runtime: { bytes: NaN } }], 1).runtimeMiB.count,
+  ).toBe(0);
+});

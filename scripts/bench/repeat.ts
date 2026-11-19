@@ -14,6 +14,7 @@ export type BenchRun = {
   inputMs: { count: number; p50: number | null; p95: number | null };
   videoMs: { p50: number | null; p95: number | null };
   uniqueFps: number;
+  runtime?: { bytes: number | null };
   resources: { motion: { cpuPercent: number; rssMiB: number } };
 };
 
@@ -65,6 +66,7 @@ export function summarizeRuns(product: string, runs: BenchRun[], requested: numb
     fps: metric((run) => run.uniqueFps),
     cpu: metric((run) => run.resources.motion.cpuPercent),
     rss: metric((run) => run.resources.motion.rssMiB),
+    runtimeMiB: metric((run) => (run.runtime?.bytes == null ? null : run.runtime.bytes / 1048576)),
   };
 }
 
@@ -73,5 +75,5 @@ export function summaryMarkdown(summary: ReturnType<typeof summarizeRuns>) {
     v.median === null
       ? "n/a"
       : `${v.median.toFixed(2)} [${v.min!.toFixed(2)}–${v.max!.toFixed(2)}]`;
-  return `| Product | Valid/requested | Input p50 ms | Input p95 ms | Video p50 ms | Video p95 ms | Motion CPU % | Motion RSS MiB | FPS |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| ${summary.product} | ${summary.validRuns}/${summary.requested} | ${cell(summary.inputP50)} | ${cell(summary.inputP95)} | ${cell(summary.videoP50)} | ${cell(summary.videoP95)} | ${cell(summary.cpu)} | ${cell(summary.rss)} | ${cell(summary.fps)} |\n\nCells are median of per-run metrics [min–max], not pooled percentiles. Complete: ${summary.complete}. Matched inputs: ${summary.matchedInputs}. Invalid/missing runs are excluded from metrics but make the comparison incomplete.\n`;
+  return `| Product | Valid/requested | Input p50 ms | Input p95 ms | Video p50 ms | Video p95 ms | Motion CPU % | Motion RSS MiB | FPS | Runtime MiB |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| ${summary.product} | ${summary.validRuns}/${summary.requested} | ${cell(summary.inputP50)} | ${cell(summary.inputP95)} | ${cell(summary.videoP50)} | ${cell(summary.videoP95)} | ${cell(summary.cpu)} | ${cell(summary.rss)} | ${cell(summary.fps)} | ${cell(summary.runtimeMiB)} |\n\nCells are median of per-run metrics [min–max], not pooled percentiles. Complete: ${summary.complete}. Matched inputs: ${summary.matchedInputs}. Invalid/missing runs are excluded from metrics but make the comparison incomplete.\n`;
 }

@@ -2,13 +2,16 @@ import { chromium } from "@playwright/test";
 import { dlopen, ptr } from "bun:ffi";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { markerBits, readMarker, readMarkerRow } from "../../tests/browser/latency-marker";
 import { analyze } from "./metrics";
 import { repeatArgs, summarizeRuns, summaryMarkdown, type BenchRun } from "./repeat";
+import { runtimeBytes } from "./runtime";
+import { setupClicks } from "./viewer";
 
 const options = repeatArgs(process.argv.slice(2));
+const viewerSetupClicks = setupClicks(process.env.VIEWER_SETUP_CLICKS);
 const [product, hostDisplay, clientDisplay, pidText, outputText] = options.args;
 if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
   throw new Error(
@@ -277,6 +280,7 @@ if (process.env.VIEWER_URL) {
   });
   viewer = await context.newPage();
   await viewer.goto(process.env.VIEWER_URL);
+  for (const selector of viewerSetupClicks) await viewer.locator(selector).click();
   await viewer.locator(viewerSelector).waitFor();
   await viewer.waitForFunction((selector) => {
     const element = document.querySelector(selector);
@@ -472,16 +476,6 @@ function resourceSummary(label: string) {
     rssMiB: rows.reduce((sum, r) => sum + r.rssKiB * r.ms, 0) / elapsed / 1024,
   };
 }
-const seen = new Set<string>();
-function bytes(path: string): number {
-  const resolved = resolve(path);
-  if (seen.has(resolved)) return 0;
-  seen.add(resolved);
-  const stat = statSync(resolved);
-  return stat.isDirectory()
-    ? readdirSync(resolved).reduce((sum, name) => sum + bytes(join(resolved, name)), 0)
-    : stat.size;
-}
 const paths = (process.env.RUNTIME_PATHS ?? "").split(":").filter(Boolean);
 const result = {
   schemaVersion: 1,
@@ -498,6 +492,8 @@ const result = {
     trials,
     seed: 1729,
     chrome: hostBrowser.version(),
+    viewerSelector,
+    viewerSetupClicks,
   },
   source: {
     frames: state.paints.length,
@@ -510,8 +506,8 @@ const result = {
   resources: { idle: resourceSummary("idle"), motion: resourceSummary("motion") },
   runtime: {
     paths,
-    bytes: paths.length ? paths.reduce((sum, path) => sum + bytes(path), 0) : null,
-    excludes: "build caches and system shared libraries",
+    bytes: paths.length ? runtimeBytes(paths) : null,
+    excludes: process.env.RUNTIME_EXCLUDES ?? "build caches and system shared libraries",
   },
   raw: {
     attribution:

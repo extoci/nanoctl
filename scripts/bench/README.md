@@ -40,6 +40,10 @@ BITRATE_NOTE='24 Mbps default max; measured inbound RTP in raw.webRtcStats' \
 defaults to `video`; set it to `canvas` or the appropriate input surface for
 non-video browser viewers. Browser windows are explicitly sized to the display;
 browser chrome and viewer controls remain part of the default viewing experience.
+`VIEWER_SETUP_CLICKS` is an optional JSON array of CSS selectors to click in order
+after navigation, before focusing the streaming surface. Use real UI controls to
+grant input permissions rather than modifying viewer internals. Select a unique
+streaming canvas when the viewer also has a cursor/overlay canvas.
 Without `VIEWER_URL`,
 the runner attaches to an already streaming native viewer. For Moonlight, first
 pair with Sunshine, then start a 720p software H.264 stream on its own X display:
@@ -66,6 +70,87 @@ geometry is wrong.
 Browser and native clients must forward Space to the source. In particular,
 verify input permissions on Sunshine; video streaming alone is insufficient.
 Do not run these trials on a display with sensitive applications.
+
+## screen-relay in Ubuntu 24.04 Docker
+
+The [upstream Docker guide](https://screen-relay.dev/docs/docker) builds its own
+desktop image. This benchmark instead pins the npm release to 0.1.2, builds its
+unmodified X11 engine on Ubuntu 24.04, and uses an existing 720p Xvfb display with
+no desktop. The Node 24 base supplies Node/npm; `screen-relay install` installs
+the native dependencies and compiles the engine. Run from the repository root:
+
+```sh
+docker build -f scripts/bench/screen-relay.Dockerfile -t nanoctl-screen-relay:0.1.2 scripts/bench
+docker run -d --name nanoctl-screen-relay --network host --ipc host \
+  -v /tmp/.X11-unix:/tmp/.X11-unix nanoctl-screen-relay:0.1.2
+docker exec -d nanoctl-screen-relay Xvfb :93 -screen 0 1280x720x24 -nolisten tcp -ac
+docker exec nanoctl-screen-relay screen-relay up --backend x11 --desktop none \
+  --display :93 --bind 127.0.0.1 --port 8088 --detach --timeout 30
+ENGINE_PID=$(docker top nanoctl-screen-relay -eo pid,comm | awk '$2 == "relay-engine" { print $1 }')
+```
+
+Use unused display/port/container names. Only loopback HTTP is exposed. This
+trusted local benchmark shares the X socket and IPC namespace so the **same VM
+Chromium source** can use the container's display, including MIT-SHM. This keeps
+the source browser identical across products; the engine and Xvfb are inside the
+container, the source browser and headed viewer are on the VM. The client Xvfb
+`:94` and persistent XShm detector remain on the VM as usual.
+
+The viewer is WebCodecs -> `canvas#screen` (a second canvas draws the cursor).
+It starts **view-only**. Open the toolbar and click Take control; the harness
+then focuses/clicks the canvas before trusted XTest Space trials. Ordinary click
+release preserves canvas focus. No codec, frame pacing, buffering or bitrate
+settings are overridden. Defaults: software x264 H.264, 60 fps, min/start/max
+bitrate 1/8/40 Mbps. `/metrics` exposes the current encoder target, not measured
+viewer throughput; its cgroup CPU/RAM are **not** the process-tree measurements.
+
+### Comparable runtime sizes, including linked libraries
+
+To count container files without relying on `/proc/PID/root` access, export an
+immutable runtime snapshot before measurement. The helper refuses an existing
+destination or manifest. Explicit executable roots get their transitive `ldd`
+dependencies; asset directories are copied whole. Pass native addons as explicit
+ELF roots too if a different product needs them. Missing libraries fail the
+export. The adjacent `.json` manifest records roots, dependency paths and bytes.
+
+```sh
+mkdir -p "$HOME/bench-runtime"
+bun scripts/bench/runtime.ts --container nanoctl-screen-relay "$HOME/bench-runtime/screen-relay" \
+  /usr/local/lib/node_modules/screen-relay /root/.local/share/screen-relay/engine/0.1.2/relay-engine \
+  /usr/local/bin/node /usr/bin/setpriv /usr/bin/xdpyinfo /usr/bin/xprop \
+  /usr/bin/xwininfo /usr/bin/setxkbmap /usr/bin/xauth
+bun scripts/bench/runtime.ts "$HOME/bench-runtime/nanoctl" \
+  "$PWD/crates/nanoctl-agent/target/release/nanoctl"
+
+VIEWER_URL=http://127.0.0.1:8088 VIEWER_SELECTOR='#screen' \
+VIEWER_SETUP_CLICKS='["#toolbar-toggle","[data-action=control]"]' \
+RUNTIME_PATHS="$HOME/bench-runtime/screen-relay" \
+RUNTIME_EXCLUDES='Other OS files, Xvfb, browsers, toolchain, caches; linked ELF runtime libraries included' \
+BITRATE_NOTE='defaults: 1/8/40 Mbps min/start/max, software x264, 60 fps' \
+  bun scripts/bench/run.ts screen-relay :93 :94 "$ENGINE_PID" "$HOME/bench-results" --repeat 5
+
+# After screen-relay finishes, repeat nanoctl using its HOST_PID and :97 source.
+VIEWER_URL=http://127.0.0.1:7338 RUNTIME_PATHS="$HOME/bench-runtime/nanoctl" \
+RUNTIME_EXCLUDES='Other OS files, Xvfb, browsers, toolchain, caches; linked ELF runtime libraries included' \
+BITRATE_NOTE='default 24 Mbps max; received RTP in raw.webRtcStats' \
+  bun scripts/bench/run.ts nanoctl :97 :94 "$HOST_PID" "$HOME/bench-results" --repeat 5
+```
+
+Runtime bytes count logical file lengths, deduplicating symlink aliases and
+overlapping paths. Both snapshots include their ELF shared-library closure;
+screen-relay additionally includes its npm package (bundled viewer, sources and
+JS dependencies), built engine, Node runtime and the listed CLI helpers. Other
+base-OS utilities, browsers, Xvfb, development packages, caches, and Docker layers
+are excluded. This differs from older app-only sizes; do not compare them without
+normalizing the counting scope. The full Docker image retains build tools and is
+not the runtime-size figure. Repeat summaries include runtime MiB; absent sizes
+remain `n/a` and do not by themselves invalidate timing results.
+
+CPU/RSS use the engine's **host-namespace PID and descendants**, not the container
+init, Xvfb, source browser or parent Node CLI supervisor. The supervisor remains
+running but is deliberately outside the requested engine process tree. Container
+cleanup: `docker exec nanoctl-screen-relay screen-relay down`, then
+`docker stop nanoctl-screen-relay`.
 
 ## Method and outputs
 
