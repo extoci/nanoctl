@@ -61,6 +61,8 @@ pub struct DoctorCheck {
 
 pub fn capabilities(
     remote_input_enabled: bool,
+    clipboard_enabled: bool,
+    system_audio_enabled: bool,
     encoder_preference: EncoderPreference,
 ) -> Capabilities {
     let displays = display_capabilities();
@@ -110,9 +112,33 @@ pub fn capabilities(
         readiness,
         input: remote_input_enabled && input,
         remote_input: remote_input_enabled && input,
-        clipboard: false,
-        system_audio: false,
+        clipboard: clipboard_available(clipboard_enabled && remote_input_enabled && input),
+        system_audio: system_audio_available(system_audio_enabled),
         displays,
+    }
+}
+
+fn clipboard_available(enabled: bool) -> bool {
+    #[cfg(feature = "media")]
+    {
+        enabled && crate::clipboard::backend().is_some()
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = enabled;
+        false
+    }
+}
+
+fn system_audio_available(enabled: bool) -> bool {
+    #[cfg(feature = "media")]
+    {
+        enabled && crate::audio::available()
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = enabled;
+        false
     }
 }
 
@@ -331,4 +357,14 @@ fn platform_input_guidance() -> &'static str {
 #[cfg(feature = "media")]
 fn platform_input_guidance() -> &'static str {
     "grant Accessibility permission, then rerun doctor"
+}
+
+#[cfg(test)]
+mod audio_tests {
+    #[test]
+    fn disabled_audio_is_never_advertised() {
+        assert!(!super::system_audio_available(false));
+        #[cfg(any(not(feature = "media"), target_os = "macos"))]
+        assert!(!super::system_audio_available(true));
+    }
 }

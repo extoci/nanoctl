@@ -45,6 +45,8 @@ discover_peers = true # Probe online tailnet peers for the viewer host picker
 
 [features]
 remote_input = true
+clipboard = true
+system_audio = true
 ```
 
 An empty `allow_users` allows the host node's owner by default. A nonempty list
@@ -53,6 +55,13 @@ replaces that default. Grants can authorize control or view-only through
 See [security](SECURITY.md#authorization) for a sample tailnet `grants` policy.
 Permit TCP 7337 and dynamic WebRTC UDP traffic through tailnet policy and host firewalls.
 Restart the agent after config changes.
+
+Clipboard and system audio default to enabled. Clipboard is restricted to controlling
+viewers; system audio is available to view-only viewers too. Disable either feature above
+to prevent its transport from being negotiated. Linux audio requires `pulseaudio-utils`
+(`parec` and `pactl`) and a reachable PulseAudio or PipeWire-pulse server in the desktop
+user session. Windows captures the default output device via WASAPI loopback. macOS
+system audio is currently unsupported. Viewers must click **Enable sound** to hear audio.
 
 Native HTTPS does not require `tailscale serve`. If you choose serve instead,
 explicitly opt into loopback only on a single-user host: local users can forge its

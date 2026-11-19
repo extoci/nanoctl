@@ -113,8 +113,8 @@ impl Default for TailnetConfig {
 impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
-            system_audio: false,
-            clipboard: false,
+            system_audio: true,
+            clipboard: true,
             remote_input: true,
         }
     }
@@ -162,9 +162,6 @@ impl AgentConfig {
         {
             bail!("quality resolution limits are outside the supported range");
         }
-        if self.features.system_audio || self.features.clipboard {
-            bail!("system audio and clipboard are reserved and unavailable in protocol v2");
-        }
         if !matches!(
             self.quality.codec,
             CodecPreference::Auto | CodecPreference::H264
@@ -203,13 +200,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_v1_features() {
+    fn accepts_clipboard_and_system_audio() {
         let mut config = AgentConfig::default();
         config.features.clipboard = true;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
         config.features.clipboard = false;
         config.features.system_audio = true;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
+        assert!(AgentConfig::default().features.system_audio);
     }
 
     #[test]

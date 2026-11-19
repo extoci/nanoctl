@@ -5,6 +5,7 @@ import type { RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
+import { setSoundEnabled } from "./lib/sound";
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
 
@@ -20,6 +21,8 @@ type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => vo
 
 function Viewer() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [soundEnabled, setSound] = useState(false);
   const transport = useRef<SocketSession | null>(null);
   const [info, setInfo] = useState<HostInfo | null>(null);
   const [snapshot, setSnapshot] = useState(initial);
@@ -101,6 +104,7 @@ function Viewer() {
     }
     const session = new SocketSession({
       video: videoRef.current,
+      audio: audioRef.current ?? undefined,
       onInfo: (host) => {
         setInfo(host);
         setSelectedDisplay((previous) =>
@@ -202,6 +206,9 @@ function Viewer() {
           <span>
             {info?.platform ?? "Tailnet connection"} <i>·</i>{" "}
             {info?.remoteInput ? "Control" : "View only"}
+            {info?.capabilities.clipboard && info.remoteInput && info.viewer.mayControl
+              ? " · Clipboard sync on"
+              : ""}
           </span>
         </div>
         <div className="identity">
@@ -210,6 +217,7 @@ function Viewer() {
         </div>
       </header>
       <section className="stage" aria-label="Remote desktop">
+        <audio ref={audioRef} autoPlay muted={!soundEnabled} />
         <video
           ref={videoRef}
           autoPlay
@@ -291,6 +299,17 @@ function Viewer() {
           <button onClick={() => setTouchMode(touchMode === "trackpad" ? "direct" : "trackpad")}>
             {touchMode === "trackpad" ? "Trackpad" : "Direct"}
           </button>
+          {info?.capabilities.systemAudio && (
+            <button
+              aria-pressed={soundEnabled}
+              onClick={async () => {
+                if (audioRef.current)
+                  setSound(await setSoundEnabled(audioRef.current, !soundEnabled));
+              }}
+            >
+              {soundEnabled ? "Mute sound" : "Enable sound"}
+            </button>
+          )}
           <label className="display-picker">
             <span>Display</span>
             <select
