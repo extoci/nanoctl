@@ -101,7 +101,13 @@ impl LinuxEncoder {
         Ok(true)
     }
 
-    pub fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    pub fn encode(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+    ) -> Result<EncodedFrame> {
         let resolution = Resolution {
             width: image.width(),
             height: image.height(),
