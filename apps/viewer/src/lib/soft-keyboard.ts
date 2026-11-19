@@ -1,6 +1,7 @@
 import type { ControlMessage } from "@nanoctl/protocol";
 
 export const SENTINEL = "\u200b";
+export const MAX_INPUT_CHARACTERS = 256;
 export const namedKeys: Record<string, string> = {
   Backspace: "Backspace",
   Enter: "Enter",
@@ -44,7 +45,9 @@ export function inputMessages(
     ].includes(inputType)
   )
     return [];
-  return [...(data ?? "")].flatMap((key) => keyMessages(key, "", modifiers));
+  return [...(data ?? "")]
+    .slice(0, MAX_INPUT_CHARACTERS)
+    .flatMap((key) => keyMessages(key, "", modifiers));
 }
 
 export const modifierKeys = {

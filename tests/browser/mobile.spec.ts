@@ -145,22 +145,28 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
   const field = page.getByRole("textbox", { name: "Remote keyboard" });
   await expect(field).toBeFocused();
   await clearControls(page);
-  await page.keyboard.insertText("hi");
+  const text = "hi" + "phone ready ".repeat(3) + "ok";
+  await page.keyboard.insertText(text);
   await page.keyboard.press("Enter");
   await expect
-    .poll(async () =>
-      (await controls(page))
-        .filter((m) => m.type === "key")
-        .map((m) => (m.type === "key" ? [m.key, m.action] : null)),
+    .poll(
+      async () =>
+        (await controls(page))
+          .filter((m) => m.type === "key")
+          .map((m) => (m.type === "key" ? [m.key, m.action] : null)),
+      { timeout: 15_000 },
     )
-    .toEqual([
-      ["h", "down"],
-      ["h", "up"],
-      ["i", "down"],
-      ["i", "up"],
-      ["Enter", "down"],
-      ["Enter", "up"],
-    ]);
+    .toEqual(
+      [...text]
+        .flatMap((key) => [
+          [key, "down"],
+          [key, "up"],
+        ])
+        .concat([
+          ["Enter", "down"],
+          ["Enter", "up"],
+        ]),
+    );
   await page.getByRole("button", { name: "Ctrl", exact: true }).click();
   await expect(field).toBeFocused();
   await screenshot(page, "pixel7-live-keyboard-ctrl.png");

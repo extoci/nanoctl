@@ -28,14 +28,18 @@ export function SoftKeyboard({
   enabled,
   platform,
   send,
+  resetKeys,
 }: {
   enabled: boolean;
   platform?: string;
   send: (message: ControlMessage) => unknown;
+  resetKeys: () => void;
 }) {
   const field = useRef<HTMLTextAreaElement>(null);
   const sink = useRef(send);
   sink.current = send;
+  const resetSink = useRef(resetKeys);
+  resetSink.current = resetKeys;
   const [sticky] = useState(() => new StickyModifiers((message) => sink.current(message)));
   const [, refresh] = useState(0);
   const [open, setOpen] = useState(false);
@@ -140,6 +144,7 @@ export function SoftKeyboard({
       composing = false;
       committed = null;
       sticky.reset();
+      resetSink.current();
       update();
     };
     const blur = () => {
@@ -168,6 +173,7 @@ export function SoftKeyboard({
     return () => {
       clearTimeout(commitTimer);
       sticky.reset();
+      resetSink.current();
       input.removeEventListener("beforeinput", before);
       input.removeEventListener("input", onInput);
       input.removeEventListener("compositionstart", start);

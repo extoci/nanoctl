@@ -286,6 +286,7 @@ function Viewer() {
             enabled={snapshot.inputEnabled && status === "online"}
             platform={info?.platform}
             send={(message) => transport.current?.controller?.sendControl(message)}
+            resetKeys={() => transport.current?.controller?.resetControlKeys()}
           />
           <button onClick={() => setTouchMode(touchMode === "trackpad" ? "direct" : "trackpad")}>
             {touchMode === "trackpad" ? "Trackpad" : "Direct"}
