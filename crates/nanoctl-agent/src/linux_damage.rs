@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use xcap::Monitor;
-use xcb::{Xid, damage, x, xfixes};
+use xcb::{Xid, damage, randr, x, xfixes};
 
 use super::{LatestFrame, PipelineStats};
 
@@ -61,6 +61,8 @@ impl Gate {
 struct DamageWatch {
     connection: xcb::Connection,
     damage: damage::Damage,
+    root: x::Window,
+    fast_capture: bool,
 }
 
 impl DamageWatch {
@@ -95,7 +97,68 @@ impl DamageWatch {
             level: damage::ReportLevel::NonEmpty,
         }))?;
         connection.flush()?;
-        Ok(Self { connection, damage })
+        let screen = connection
+            .get_setup()
+            .roots()
+            .nth(screen as usize)
+            .context("X11 screen unavailable")?;
+        let fast_capture = connection.get_setup().image_byte_order() == x::ImageOrder::LsbFirst
+            && connection
+                .get_setup()
+                .pixmap_formats()
+                .iter()
+                .any(|format| {
+                    format.depth() == screen.root_depth() && format.bits_per_pixel() == 32
+                })
+            && screen
+                .allowed_depths()
+                .flat_map(|depth| depth.visuals())
+                .any(|visual| {
+                    visual.visual_id() == screen.root_visual()
+                        && visual.red_mask() == 0xff0000
+                        && visual.green_mask() == 0xff00
+                        && visual.blue_mask() == 0xff
+                });
+        Ok(Self {
+            connection,
+            damage,
+            root,
+            fast_capture,
+        })
+    }
+
+    fn capture(&self, monitor_id: u32) -> Result<xcap::image::RgbaImage> {
+        let monitors = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&randr::GetMonitors {
+                window: self.root,
+                get_active: true,
+            }))?;
+        let region = monitors
+            .monitors()
+            .find(|monitor| {
+                monitor
+                    .outputs()
+                    .iter()
+                    .any(|output| output.resource_id() == monitor_id)
+            })
+            .context("X11 monitor disappeared")?;
+        let reply = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&x::GetImage {
+                format: x::ImageFormat::ZPixmap,
+                drawable: x::Drawable::Window(self.root),
+                x: region.x(),
+                y: region.y(),
+                width: region.width(),
+                height: region.height(),
+                plane_mask: u32::MAX,
+            }))?;
+        let width = u32::from(region.width());
+        let height = u32::from(region.height());
+        let mut pixels = reply.data().to_vec();
+        bgra_to_rgba(&mut pixels, width, height)?;
+        xcap::image::RgbaImage::from_raw(width, height, pixels).context("Invalid X11 image")
     }
 
     fn drain(&self) -> Result<Option<Instant>> {
@@ -138,11 +201,26 @@ impl DamageWatch {
     }
 }
 
+fn bgra_to_rgba(pixels: &mut [u8], width: u32, height: u32) -> Result<()> {
+    let length = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4));
+    if width == 0 || height == 0 || length != Some(pixels.len()) {
+        bail!("Invalid X11 BGRA image size");
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+    Ok(())
+}
+
 pub(super) fn start(
     monitor: &Monitor,
     stats: Arc<PipelineStats>,
 ) -> Result<(Arc<LatestFrame>, JoinHandle<()>)> {
     let watch = DamageWatch::new()?;
+    let monitor_id = monitor.id()?;
     let monitor = monitor.clone();
     let latest = Arc::new(LatestFrame {
         stats: stats.clone(),
@@ -177,7 +255,17 @@ pub(super) fn start(
             }
             if gate.should_capture(Instant::now(), damaged, initial, watch.is_none()) {
                 let started = Instant::now();
-                match monitor.capture_image() {
+                let image = if let Some(events) = watch.as_mut().filter(|events| events.fast_capture) {
+                    match events.capture(monitor_id) {
+                        Ok(image) => Ok(image),
+                        Err(error) => {
+                            tracing::debug!(%error, "Persistent X11 capture unavailable; retaining xcap capture");
+                            events.fast_capture = false;
+                            monitor.capture_image().map_err(anyhow::Error::from)
+                        }
+                    }
+                } else { monitor.capture_image().map_err(anyhow::Error::from) };
+                match image {
                     Ok(image) => {
                         initial = false;
                         stats.capture_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -221,6 +309,16 @@ pub(super) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_x11_pixels_preserve_rgb_and_reject_invalid_layouts() {
+        let mut pixels = [1, 2, 3, 0, 254, 127, 42, 99];
+        bgra_to_rgba(&mut pixels, 2, 1).unwrap();
+        assert_eq!(pixels, [3, 2, 1, 255, 42, 127, 254, 255]);
+        assert!(bgra_to_rgba(&mut [], 0, 0).is_err());
+        assert!(bgra_to_rgba(&mut pixels, 3, 1).is_err());
+        assert!(bgra_to_rgba(&mut [], u32::MAX, u32::MAX).is_err());
+    }
 
     #[test]
     fn park_resume_and_empty_repaints() {
