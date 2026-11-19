@@ -53,16 +53,16 @@ jobs:
       - name: Validate POSIX package scripts
         if: runner.os != 'Windows'
         shell: bash
-        run: sh -n install.sh packaging/linux/*.sh packaging/macos/*.sh
+        run: for script in install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh; do sh -n "$script"; done
       - name: Lint POSIX package scripts
         if: runner.os == 'Linux'
-        run: shellcheck install.sh packaging/linux/*.sh packaging/macos/*.sh
+        run: shellcheck install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh
       - name: Validate PowerShell package scripts
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $parseErrors = @()
-          @(Get-Item install.ps1) + @(Get-ChildItem packaging/windows -Filter *.ps1) | ForEach-Object {
+          @(Get-Item install.ps1, packaging/tailnet.ps1) + @(Get-ChildItem packaging/windows -Filter *.ps1) | ForEach-Object {
             $tokens = $null
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile(
