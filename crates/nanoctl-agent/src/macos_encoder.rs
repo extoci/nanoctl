@@ -73,7 +73,13 @@ impl MacOsEncoder {
         Ok(true)
     }
 
-    pub fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    pub fn encode(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+    ) -> Result<EncodedFrame> {
         let dimensions = image.dimensions();
         if dimensions.0 == 0
             || dimensions.1 == 0
@@ -182,7 +188,10 @@ fn create_session(
     Ok(session)
 }
 
-fn copy_rgba_to_bgra_surface(image: &xcap::image::RgbaImage, surface: &IOSurface) -> Result<()> {
+fn copy_rgba_to_bgra_surface(
+    image: &xcap::image::ImageBuffer<xcap::image::Rgba<u8>, impl std::ops::Deref<Target = [u8]>>,
+    surface: &IOSurface,
+) -> Result<()> {
     let width_bytes = image.width() as usize * 4;
     let mut guard = surface
         .lock_read_write()

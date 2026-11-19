@@ -10,7 +10,7 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     UsageType,
 };
-use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::YUVSource;
 use openh264_sys2::{
     ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
     SPATIAL_LAYER_ALL,
@@ -37,6 +37,8 @@ const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct PipelineStats {
     pub frames_captured: AtomicU64,
     pub frames_encoded: AtomicU64,
+    pub changed_encodes: AtomicU64,
+    pub unchanged_encodes: AtomicU64,
     pub skipped_unchanged: AtomicU64,
     pub keepalives: AtomicU64,
     pub bytes_sent: AtomicU64,
@@ -44,6 +46,16 @@ pub struct PipelineStats {
     pub target_fps: AtomicU16,
     pub encoded_width: AtomicU32,
     pub encoded_height: AtomicU32,
+    pub fresh_frames: AtomicU64,
+    pub compare_ns: AtomicU64,
+    pub capture_wait_ns: AtomicU64,
+    pub preprocess_ns: AtomicU64,
+    pub backend_ns: AtomicU64,
+    pub color_convert_ns: AtomicU64,
+    pub encode_attempts: AtomicU64,
+    pub empty_encodes: AtomicU64,
+    pub pacer_skips: AtomicU64,
+    pub producer_tid: AtomicU32,
 }
 
 impl PipelineStats {
@@ -161,6 +173,14 @@ struct CapturedFrame {
     captured_at: Instant,
 }
 
+impl CapturedFrame {
+    fn differs_from(&self, previous: &Self) -> bool {
+        self.frame.width != previous.frame.width
+            || self.frame.height != previous.frame.height
+            || frame_changed(&previous.frame.raw, &self.frame.raw)
+    }
+}
+
 impl LatestFrame {
     fn replace(&self, frame: xcap::Frame) -> bool {
         let Ok(mut slot) = self.slot.lock() else {
@@ -271,8 +291,93 @@ struct SoftwareEncoder {
     max_fps: u16,
     latency_mode: LatencyMode,
     dimensions: Option<(u32, u32)>,
-    rgb: Vec<u8>,
-    yuv: Option<YUVBuffer>,
+    yuv: Option<I420Frame>,
+    color_convert_ns: u64,
+}
+
+struct I420Frame {
+    width: usize,
+    height: usize,
+    bytes: Vec<u8>,
+}
+
+impl I420Frame {
+    fn new(width: usize, height: usize) -> Result<Self> {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            bail!("I420 dimensions must be non-zero and even");
+        }
+        let pixels = width
+            .checked_mul(height)
+            .context("I420 dimensions overflow")?;
+        let length = pixels
+            .checked_add(pixels / 2)
+            .context("I420 size overflows")?;
+        Ok(Self {
+            width,
+            height,
+            bytes: vec![0; length],
+        })
+    }
+
+    fn read_rgba(&mut self, rgba: &[u8]) -> Result<()> {
+        let pixels = self.width * self.height;
+        if Some(rgba.len()) != pixels.checked_mul(4) {
+            bail!("RGBA pixel buffer does not match I420 dimensions");
+        }
+        let (y, uv) = self.bytes.split_at_mut(pixels);
+        let (u, v) = uv.split_at_mut(pixels / 4);
+        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
+            *y = (((66 * u32::from(pixel[0])
+                + 129 * u32::from(pixel[1])
+                + 25 * u32::from(pixel[2]))
+                >> 8)
+                + 16) as u8;
+        }
+        for ((rows, u), v) in rgba
+            .chunks_exact(self.width * 8)
+            .zip(u.chunks_exact_mut(self.width / 2))
+            .zip(v.chunks_exact_mut(self.width / 2))
+        {
+            let (top, bottom) = rows.split_at(self.width * 4);
+            for (((top, bottom), u), v) in top
+                .chunks_exact(8)
+                .zip(bottom.chunks_exact(8))
+                .zip(u)
+                .zip(v)
+            {
+                let average = |channel| {
+                    (i16::from(top[channel])
+                        + i16::from(top[channel + 4])
+                        + i16::from(bottom[channel])
+                        + i16::from(bottom[channel + 4])
+                        + 2)
+                        / 4
+                };
+                let (r, g, b) = (average(0), average(1), average(2));
+                *u = (((-38 * r + 112 * b - 74 * g) >> 8) + 128) as u8;
+                *v = (((112 * r - 18 * b - 94 * g) >> 8) + 128) as u8;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl YUVSource for I420Frame {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+    fn y(&self) -> &[u8] {
+        &self.bytes[..self.width * self.height]
+    }
+    fn u(&self) -> &[u8] {
+        &self.bytes[self.width * self.height..self.width * self.height * 5 / 4]
+    }
+    fn v(&self) -> &[u8] {
+        &self.bytes[self.width * self.height * 5 / 4..]
+    }
 }
 
 impl CaptureEncoder {
@@ -382,28 +487,58 @@ impl CaptureEncoder {
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let CapturedFrame { frame, captured_at } = captured;
-        let source = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.raw.clone())
-            .context("display capture returned an invalid RGBA frame")?;
+        let preprocess_started = Instant::now();
+        let source = rgba_view(frame)?;
         let (source_width, source_height) = source.dimensions();
         let (target_width, target_height) =
             fit_dimensions(source_width, source_height, max_width, max_height);
+        let resized;
         let image = if target_width == source_width && target_height == source_height {
             source
         } else {
-            xcap::image::imageops::resize(
+            resized = xcap::image::imageops::resize(
                 &source,
                 target_width,
                 target_height,
                 xcap::image::imageops::FilterType::Triangle,
+            );
+            xcap::image::ImageBuffer::from_raw(
+                target_width,
+                target_height,
+                resized.as_raw().as_slice(),
             )
+            .context("resized capture returned an invalid RGBA frame")?
         };
         let (width, height) = image.dimensions();
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
         }
         let encode_started = Instant::now();
+        self.latest_frame.stats.preprocess_ns.fetch_add(
+            encode_started.duration_since(preprocess_started).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.latest_frame
+            .stats
+            .encode_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let color_before = self.encoder.color_convert_ns();
         let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
+        self.latest_frame.stats.backend_ns.fetch_add(
+            encoded_at.duration_since(encode_started).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.latest_frame.stats.color_convert_ns.fetch_add(
+            self.encoder.color_convert_ns().saturating_sub(color_before),
+            Ordering::Relaxed,
+        );
+        if encoded.bytes.is_empty() {
+            self.latest_frame
+                .stats
+                .empty_encodes
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok((
             encoded,
             TimingSample {
@@ -415,6 +550,14 @@ impl CaptureEncoder {
 }
 
 impl EncoderBackend {
+    fn color_convert_ns(&self) -> u64 {
+        match self {
+            Self::Software(encoder) => encoder.color_convert_ns,
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            _ => 0,
+        }
+    }
+
     fn new(
         preference: EncoderPreference,
         bitrate_kbps: u32,
@@ -510,7 +653,13 @@ impl EncoderBackend {
         }
     }
 
-    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+    ) -> Result<EncodedFrame> {
         match self {
             #[cfg(target_os = "linux")]
             Self::VaApi(encoder) => encoder.encode(image),
@@ -565,8 +714,8 @@ impl SoftwareEncoder {
             max_fps,
             latency_mode,
             dimensions: None,
-            rgb: Vec::new(),
             yuv: None,
+            color_convert_ns: 0,
         })
     }
 
@@ -613,7 +762,13 @@ impl SoftwareEncoder {
         Ok(true)
     }
 
-    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+    ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.dimensions != Some(dimensions) {
             // OpenH264 does not promise dynamic resolution changes. Recreate the software
@@ -624,19 +779,17 @@ impl SoftwareEncoder {
             self.dimensions = Some(dimensions);
         }
         let dimensions = (dimensions.0 as usize, dimensions.1 as usize);
-        self.rgb.clear();
-        self.rgb.reserve(dimensions.0 * dimensions.1 * 3);
-        for pixel in image.as_raw().chunks_exact(4) {
-            self.rgb.extend_from_slice(&pixel[..3]);
-        }
-        let source = RgbSliceU8::new(&self.rgb, dimensions);
-        let yuv = self
+        let color_started = Instant::now();
+        if self
             .yuv
-            .get_or_insert_with(|| YUVBuffer::new(dimensions.0, dimensions.1));
-        if yuv.dimensions() != dimensions {
-            *yuv = YUVBuffer::new(dimensions.0, dimensions.1);
+            .as_ref()
+            .is_none_or(|frame| frame.dimensions() != dimensions)
+        {
+            self.yuv = Some(I420Frame::new(dimensions.0, dimensions.1)?);
         }
-        yuv.read_rgb8(source);
+        let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
+        yuv.read_rgba(image.as_raw())?;
+        self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
         let stream = self.encoder.encode(yuv).context("H.264 encode failed")?;
         Ok(EncodedFrame {
             bytes: stream.to_vec(),
@@ -644,6 +797,13 @@ impl SoftwareEncoder {
             height: image.height(),
         })
     }
+}
+
+fn rgba_view(
+    frame: &xcap::Frame,
+) -> Result<xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &[u8]>> {
+    xcap::image::ImageBuffer::from_raw(frame.width, frame.height, frame.raw.as_slice())
+        .context("display capture returned an invalid RGBA frame")
 }
 
 fn start_capture(
@@ -1242,6 +1402,14 @@ pub fn spawn_video(
         let producer_stopped = worker_stopped.clone();
         let producer_stats = writer_stats.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+            #[cfg(target_os = "linux")]
+            producer_stats.producer_tid.store(
+                std::fs::read_link("/proc/thread-self")
+                    .ok()
+                    .and_then(|path| path.file_name()?.to_str()?.parse().ok())
+                    .unwrap_or_default(),
+                Ordering::Relaxed,
+            );
             let result = (|| -> Result<()> {
                 let mut encoder = CaptureEncoder::primary(
                     initial.bitrate_kbps,
@@ -1282,9 +1450,13 @@ pub fn spawn_video(
                         Duration::from_millis(50)
                     }
                     .min(Duration::from_millis(50));
+                    let wait_started = Instant::now();
                     let fresh = encoder
                         .latest_frame
                         .take_until_stopped(wait, &producer_stopped)?;
+                    producer_stats
+                        .capture_wait_ns
+                        .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     if producer_stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -1345,11 +1517,15 @@ pub fn spawn_video(
                     }
                     let mut changed = false;
                     if !switched && let Some(fresh) = fresh {
-                        changed = last_encoded.as_ref().is_none_or(|previous| {
-                            previous.frame.width != fresh.frame.width
-                                || previous.frame.height != fresh.frame.height
-                                || frame_changed(&previous.frame.raw, &fresh.frame.raw)
-                        });
+                        producer_stats.fresh_frames.fetch_add(1, Ordering::Relaxed);
+                        let compare_started = Instant::now();
+                        changed = last_encoded
+                            .as_ref()
+                            .is_none_or(|previous| fresh.differs_from(previous));
+                        producer_stats.compare_ns.fetch_add(
+                            compare_started.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
                         if !changed {
                             producer_stats
                                 .skipped_unchanged
@@ -1366,6 +1542,7 @@ pub fn spawn_video(
                     let keepalive = pacer.idle() && !changed && !forced_keyframe;
                     if pacer.on_frame(Instant::now(), changed, forced_keyframe) == PaceAction::Skip
                     {
+                        producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     if forced_keyframe {
@@ -1378,6 +1555,18 @@ pub fn spawn_video(
                         encoder.encode_captured_frame(captured, max_width, max_height)?;
                     if frame.bytes.is_empty() {
                         continue;
+                    }
+                    let changed_output = last_encoded
+                        .as_ref()
+                        .is_none_or(|previous| captured.differs_from(previous));
+                    if changed_output {
+                        producer_stats
+                            .changed_encodes
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        producer_stats
+                            .unchanged_encodes
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     last_encoded = Some(captured.clone());
                     producer_stats
@@ -1529,6 +1718,7 @@ mod tests {
         bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
+    use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -1663,6 +1853,92 @@ mod tests {
             assert!(!types.contains(&5));
         }
         assert!(!encoder.apply_bitrate_estimate(1_200, 4_000).unwrap());
+    }
+
+    #[test]
+    fn captured_rgba_view_borrows_pixels_and_validates_layout() {
+        let frame = xcap::Frame::new(2, 2, vec![128; 16]);
+        let view = super::rgba_view(&frame).unwrap();
+        assert_eq!(view.as_raw().as_ptr(), frame.raw.as_ptr());
+        assert_eq!(view.dimensions(), (2, 2));
+        assert_eq!(view.get_pixel(1, 1).0, [128; 4]);
+        assert!(super::rgba_view(&xcap::Frame::new(2, 2, vec![0; 15])).is_err());
+        assert_eq!(
+            super::rgba_view(&xcap::Frame::new(0, 0, vec![]))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn captured_frame_comparison_checks_pixels_and_dimensions_not_timestamps() {
+        let now = Instant::now();
+        let previous = super::CapturedFrame {
+            frame: xcap::Frame::new(2, 2, vec![0; 16]),
+            captured_at: now,
+        };
+        let mut next = previous.clone();
+        next.captured_at += Duration::from_secs(1);
+        assert!(!next.differs_from(&previous));
+        next.frame.raw[15] = 1;
+        assert!(next.differs_from(&previous));
+        next.frame.raw.clear();
+        assert!(next.differs_from(&previous));
+        next.frame.raw = previous.frame.raw.clone();
+        next.frame.width = 4;
+        next.frame.height = 1;
+        assert!(next.differs_from(&previous));
+        next.frame.raw.clear();
+        next.frame.width = 0;
+        next.frame.height = 0;
+        assert!(!next.differs_from(&next));
+    }
+
+    #[test]
+    fn direct_rgba_conversion_matches_packed_rgb_reference() {
+        let mut seed = 0x12345678_u32;
+        for (width, height) in [(2, 2), (4, 6), (32, 18), (64, 64)] {
+            let mut converted = super::I420Frame::new(width, height).unwrap();
+            let allocation = converted.bytes.as_ptr();
+            for solid in [Some(0), Some(255), None] {
+                let rgba: Vec<_> = (0..width * height * 4)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        solid.unwrap_or((seed >> 24) as u8)
+                    })
+                    .collect();
+                let packed: Vec<_> = rgba
+                    .chunks_exact(4)
+                    .flat_map(|pixel| pixel[..3].iter().copied())
+                    .collect();
+                let reference =
+                    YUVBuffer::from_rgb8_source(RgbSliceU8::new(&packed, (width, height)));
+                converted.read_rgba(&rgba).unwrap();
+                assert_eq!(converted.bytes.as_ptr(), allocation);
+                assert_eq!(converted.strides(), reference.strides());
+                assert_eq!(converted.y(), reference.y());
+                assert_eq!(converted.u(), reference.u());
+                assert_eq!(converted.v(), reference.v());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_rgba_conversion_rejects_invalid_layouts() {
+        for (width, height) in [(0, 0), (1, 2), (2, 3), (usize::MAX - 1, 2)] {
+            assert!(super::I420Frame::new(width, height).is_err());
+        }
+        let mut converted = super::I420Frame::new(2, 2).unwrap();
+        for length in [0, 15, 17] {
+            assert!(converted.read_rgba(&vec![0; length]).is_err());
+        }
+        converted.read_rgba(&[0; 16]).unwrap();
+        let original = converted.bytes.clone();
+        converted
+            .read_rgba(&[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255])
+            .unwrap();
+        assert_eq!(converted.bytes, original);
     }
 
     #[test]

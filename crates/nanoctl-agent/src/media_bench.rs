@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use std::time::{Duration, Instant};
 
@@ -49,10 +49,32 @@ fn percentile(sorted: &[f64], fraction: f64) -> Option<f64> {
 
 fn cpu_ticks() -> Result<u64> {
     let stat = std::fs::read_to_string("/proc/self/stat")?;
+    stat_ticks(&stat).map(|(_, ticks)| ticks)
+}
+
+fn stat_ticks(stat: &str) -> Result<(String, u64)> {
     let (_, fields) = stat.rsplit_once(')').context("malformed process stat")?;
     let fields: Vec<_> = fields.split_whitespace().collect();
-    Ok(fields.get(11).context("missing utime")?.parse::<u64>()?
-        + fields.get(12).context("missing stime")?.parse::<u64>()?)
+    let ticks = fields.get(11).context("missing utime")?.parse::<u64>()?
+        + fields.get(12).context("missing stime")?.parse::<u64>()?;
+    let (prefix, _) = stat.rsplit_once(')').context("malformed process stat")?;
+    let name = prefix.split_once('(').context("missing thread name")?.1;
+    Ok((name.to_owned(), ticks))
+}
+
+fn thread_ticks() -> Result<HashMap<String, (String, u64)>> {
+    let mut threads = HashMap::new();
+    for entry in std::fs::read_dir("/proc/self/task")? {
+        let entry = entry?;
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        threads.insert(
+            entry.file_name().to_string_lossy().into_owned(),
+            stat_ticks(&stat)?,
+        );
+    }
+    Ok(threads)
 }
 
 fn pipeline_stats(pipeline: &VideoPipeline) -> Value {
@@ -60,6 +82,8 @@ fn pipeline_stats(pipeline: &VideoPipeline) -> Value {
     json!({
         "frames_captured": stats.frames_captured.load(Ordering::Relaxed),
         "frames_encoded": stats.frames_encoded.load(Ordering::Relaxed),
+        "changed_encodes": stats.changed_encodes.load(Ordering::Relaxed),
+        "unchanged_encodes": stats.unchanged_encodes.load(Ordering::Relaxed),
         "skipped_unchanged": stats.skipped_unchanged.load(Ordering::Relaxed),
         "keepalives": stats.keepalives.load(Ordering::Relaxed),
         "bytes_sent": stats.bytes_sent.load(Ordering::Relaxed),
@@ -67,6 +91,16 @@ fn pipeline_stats(pipeline: &VideoPipeline) -> Value {
         "target_fps": stats.target_fps.load(Ordering::Relaxed),
         "encoded_width": stats.encoded_width.load(Ordering::Relaxed),
         "encoded_height": stats.encoded_height.load(Ordering::Relaxed),
+        "fresh_frames": stats.fresh_frames.load(Ordering::Relaxed),
+        "compare_ns": stats.compare_ns.load(Ordering::Relaxed),
+        "capture_wait_ns": stats.capture_wait_ns.load(Ordering::Relaxed),
+        "preprocess_ns": stats.preprocess_ns.load(Ordering::Relaxed),
+        "backend_ns": stats.backend_ns.load(Ordering::Relaxed),
+        "color_convert_ns": stats.color_convert_ns.load(Ordering::Relaxed),
+        "encode_attempts": stats.encode_attempts.load(Ordering::Relaxed),
+        "empty_encodes": stats.empty_encodes.load(Ordering::Relaxed),
+        "pacer_skips": stats.pacer_skips.load(Ordering::Relaxed),
+        "producer_tid": stats.producer_tid.load(Ordering::Relaxed),
     })
 }
 
@@ -236,6 +270,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
     );
     tokio::time::sleep(Duration::from_secs(5)).await;
     let initial = pipeline_stats(&pipeline);
+    let initial_threads = thread_ticks()?;
     let start_ticks = cpu_ticks()?;
     let start = Instant::now();
     *received.lock().unwrap() = Received {
@@ -255,6 +290,16 @@ pub async fn run(seconds: u64) -> Result<Value> {
     }
     let end_ticks = cpu_ticks()?;
     let elapsed = start.elapsed().as_secs_f64();
+    let mut thread_cpu: Vec<_> = thread_ticks()?.into_iter().map(|(tid, (name, ticks))| {
+        let previous = initial_threads.get(&tid).map_or(0, |(_, ticks)| *ticks);
+        json!({"tid": tid, "name": name, "cpu_percent": ticks.saturating_sub(previous) as f64 / ticks_per_second / elapsed * 100.0})
+    }).collect();
+    thread_cpu.sort_by(|a, b| {
+        b["cpu_percent"]
+            .as_f64()
+            .unwrap()
+            .total_cmp(&a["cpu_percent"].as_f64().unwrap())
+    });
     let mut received = {
         let mut received = received.lock().unwrap();
         received.start = None;
@@ -281,9 +326,20 @@ pub async fn run(seconds: u64) -> Result<Value> {
     for key in [
         "frames_captured",
         "frames_encoded",
+        "changed_encodes",
+        "unchanged_encodes",
         "skipped_unchanged",
         "keepalives",
         "bytes_sent",
+        "fresh_frames",
+        "compare_ns",
+        "capture_wait_ns",
+        "preprocess_ns",
+        "backend_ns",
+        "color_convert_ns",
+        "encode_attempts",
+        "empty_encodes",
+        "pacer_skips",
     ] {
         delta[key] = match (final_stats[key].as_u64(), initial[key].as_u64()) {
             (Some(end), Some(start)) => json!(end.saturating_sub(start)),
@@ -294,6 +350,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
         "schema_version": 1, "seconds": elapsed, "warmup_seconds": 5,
         "quality": {"max_width": 1920, "max_height": 1080, "ceiling_kbps": 8000, "max_fps": 60, "encoder": "OpenH264"},
         "process_cpu_percent": (end_ticks - start_ticks) as f64 / ticks_per_second / elapsed * 100.0,
+        "thread_cpu_percent": thread_cpu,
         "received_payload_kbps_avg": bytes as f64 * 8.0 / elapsed / 1000.0,
         "received_payload_kbps_per_second": received.bytes.drain(..).map(|bytes| bytes as f64 * 8.0 / 1000.0).collect::<Vec<_>>(),
         "frames_received": received.frames,
@@ -320,6 +377,21 @@ mod tests {
     #[test]
     fn reads_process_cpu_ticks() {
         assert!(cpu_ticks().is_ok());
+        assert!(!thread_ticks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stat_parser_handles_thread_names_and_invalid_or_empty_records() {
+        let stat = "123 (a (worker)) S 0 0 0 0 0 0 0 0 0 0 7 3";
+        assert_eq!(stat_ticks(stat).unwrap(), ("a (worker)".to_owned(), 10));
+        for invalid in [
+            "",
+            "123 no parentheses",
+            "123 (a) S",
+            "123 (a) S 0 0 0 0 0 0 0 0 0 0 x 3",
+        ] {
+            assert!(stat_ticks(invalid).is_err());
+        }
     }
 
     #[test]

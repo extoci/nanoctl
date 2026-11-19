@@ -35,3 +35,22 @@ removes the owned qdisc and stops the scene; an existing root qdisc is refused.
 The shaping affects all loopback traffic while active. Do not run builds, tests,
 or unrelated workloads concurrently. One run per cell is exploratory evidence,
 not a statistically controlled performance claim.
+
+Stage counters expose `fresh_frames` consumed by the producer, `pacer_skips`,
+`encode_attempts`, `empty_encodes`, and cumulative wall nanoseconds in
+`capture_wait_ns`, `compare_ns`, `preprocess_ns` (view/resize), and `backend_ns`
+(color conversion plus encoder). `color_convert_ns` isolates software RGBA→I420
+conversion within `backend_ns`. Measurement-window counters are deltas; the
+per-second series is cumulative. Timings are wall time, not thread CPU.
+`thread_cpu_percent` samples `/proc/self/task/*/stat` across the measurement;
+`pipeline.producer_tid` identifies the blocking producer, and `nanoctl-capture`
+is the forwarding thread. Other thread names include xcap and Tokio workers.
+Threads that exit during the window are absent from the final thread snapshot;
+whole-process CPU still counts them. Exact unchanged-frame comparison is retained:
+sampling or hashing cannot eliminate that work without a full equality check or
+a risk of missing small changes. Capture cadence is not reduced while idle.
+`changed_encodes` / `unchanged_encodes` classify successful encoder outputs by
+exact captured RGBA equality with the preceding successful output. These are
+source-pixel classifications, not decoded-picture validation. Raw received-marker
+FPS includes redundant images in the fixed-timer baseline, so it is not by itself
+a measure of unique motion updates.

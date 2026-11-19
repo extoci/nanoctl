@@ -30,6 +30,7 @@ pub struct RateController {
     last_delay_cut: Option<Instant>,
     last_congestion: Option<Instant>,
     congestion_rate: Option<f64>,
+    clean_since: Option<Instant>,
     low_fps_since: Option<Instant>,
 }
 
@@ -54,6 +55,7 @@ impl RateController {
             last_delay_cut: None,
             last_congestion: None,
             congestion_rate: None,
+            clean_since: None,
             low_fps_since: None,
         }
     }
@@ -126,6 +128,11 @@ impl RateController {
             self.last_congestion = Some(sample.at);
             self.congestion_rate = Some(self.rate);
         }
+        if loss < 0.02 && !delay_congested && sample.rtt.is_some() {
+            self.clean_since.get_or_insert(sample.at);
+        } else {
+            self.clean_since = None;
+        }
         if loss > 0.1 {
             self.rate *= 1.0 - 0.5 * loss;
         } else if loss < 0.02 && !delay_congested {
@@ -142,7 +149,18 @@ impl RateController {
                     self.rate += step * elapsed.min(2.0);
                 }
             } else {
-                self.rate *= 1.08_f64.powf(elapsed);
+                let startup = self.rate < f64::from(self.ceiling) * 0.75
+                    && self.clean_since.is_some_and(|since| {
+                        sample.at.duration_since(since) >= Duration::from_secs(3)
+                    });
+                self.rate *= if startup {
+                    let gain = sample.rtt.map_or(1.08, |rtt| {
+                        (1.0 + 0.004 / rtt.as_secs_f64().max(0.001)).clamp(1.08, 1.5)
+                    });
+                    gain.powf(elapsed.min(2.0))
+                } else {
+                    1.08_f64.powf(elapsed)
+                };
             }
         }
         if delay_cut {
@@ -311,6 +329,59 @@ mod tests {
             None
         );
         assert_eq!(controller.decision().bitrate_kbps, 1_800);
+    }
+
+    #[test]
+    fn stable_measured_link_probes_quickly_only_before_congestion() {
+        let now = Instant::now();
+        let mut clean = RateController::new(8_000, 60);
+        let mut cut = RateController::new(8_000, 60);
+        cut.observe(sample(now, 0.2));
+        for seconds in 0..=7 {
+            let mut input = sample(now + Duration::from_secs(seconds), 0.0);
+            input.rtt = Some(Duration::from_millis(1));
+            clean.observe(input);
+            cut.observe(input);
+        }
+        assert_eq!(clean.decision().bitrate_kbps, 8_000);
+        assert_eq!(clean.decision().fps, 60);
+        assert!(cut.decision().bitrate_kbps < 2_000);
+    }
+
+    #[test]
+    fn moderate_loss_or_missing_rtt_resets_fast_probe_eligibility() {
+        let now = Instant::now();
+        for missing_rtt in [false, true] {
+            let mut controller = RateController::new(8_000, 60);
+            for seconds in 0..=6 {
+                let mut input = sample(now + Duration::from_secs(seconds), 0.0);
+                input.rtt = Some(Duration::from_millis(1));
+                if seconds % 3 == 2 {
+                    if missing_rtt {
+                        input.rtt = None;
+                    } else {
+                        input.fraction_lost = 0.05;
+                    }
+                }
+                controller.observe(input);
+            }
+            assert!(controller.decision().bitrate_kbps < 3_500);
+        }
+    }
+
+    #[test]
+    fn startup_probe_slows_with_feedback_latency() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        for seconds in 0..=7 {
+            let mut input = sample(now + Duration::from_secs(seconds), 0.0);
+            input.rtt = Some(Duration::from_millis(80));
+            controller.observe(input);
+        }
+        assert_eq!(
+            controller.decision().bitrate_kbps,
+            (2_000.0 * 1.08_f64.powi(7)).floor() as u32
+        );
     }
 
     #[test]
@@ -552,6 +623,20 @@ mod tests {
             pacer.on_frame(now + Duration::from_millis(360), false, false),
             PaceAction::Encode
         );
+    }
+
+    #[test]
+    fn first_damage_after_idle_encodes_on_arrival_without_waiting_for_refresh() {
+        let now = Instant::now();
+        let mut pacer = DamagePacer::new(60);
+        assert_eq!(pacer.on_frame(now, true, false), PaceAction::Encode);
+        assert_eq!(
+            pacer.on_frame(now + REFRESH_DELAY, false, false),
+            PaceAction::Encode
+        );
+        let arrival = now + Duration::from_secs(1);
+        assert!(pacer.next_deadline(arrival, 60) > arrival);
+        assert_eq!(pacer.on_frame(arrival, true, false), PaceAction::Encode);
     }
 
     #[test]
