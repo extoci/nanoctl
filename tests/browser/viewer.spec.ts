@@ -19,6 +19,15 @@ test("disabled input stays off across repeated video clicks", async ({ page }) =
   });
   await page.locator("video").click();
   await page.locator("video").click();
+  if (process.platform !== "win32") {
+    const pid = Number(await readFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE!, "utf8"));
+    process.kill(pid, "SIGUSR2");
+    await expect(page.getByTestId("connection-state")).toHaveText("Reconnecting");
+    await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+    await page.locator("video").click();
+    await page.locator("video").click();
+    await page.keyboard.press("a");
+  }
   await expect(page.getByRole("button", { name: "Input off", exact: true })).toHaveAttribute(
     "aria-pressed",
     "false",

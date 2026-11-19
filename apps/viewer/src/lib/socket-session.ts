@@ -23,6 +23,7 @@ export class SocketSession {
   private revision = 0;
   private attempt = 0;
   private disposed = false;
+  private readonly preferences = { inputEnabled: true };
   private readonly restored = (event: PageTransitionEvent) => {
     if (event.persisted) this.connect();
   };
@@ -132,6 +133,7 @@ export class SocketSession {
                 remoteInputPolicy: message.host.viewer.mayControl,
                 clipboardEnabled:
                   message.host.capabilities.clipboard && message.host.viewer.mayControl,
+                preferences: this.preferences,
                 operations: {
                   sendSignal: async ({ envelope }) =>
                     this.send(socket, { type: "signal", envelope: JSON.parse(envelope) }),

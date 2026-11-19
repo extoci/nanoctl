@@ -47,8 +47,10 @@ function Viewer() {
       audio: audioRef.current ?? undefined,
       onInfo: (host) => {
         setInfo(host);
-        setSelectedDisplay(
-          host.displays.find((display) => display.primary)?.id ?? host.displays[0]?.id ?? "",
+        setSelectedDisplay((previous) =>
+          host.displays.some((display) => display.id === previous)
+            ? previous
+            : (host.displays.find((display) => display.primary)?.id ?? host.displays[0]?.id ?? ""),
         );
       },
       onSnapshot: setSnapshot,
