@@ -278,11 +278,36 @@ async fn hosts(
         }
         discovered = cache.as_ref().unwrap().1.clone();
     }
-    let hosts: Vec<_> = discovered.into_iter().map(|p| {
-        let url = host_url(&Node { dns_name: p.dns_name.clone(), ips: p.ips, ..Default::default() }, state.config.tailnet.port, tls);
-        json!({"hostName":p.host_name,"dnsName":p.dns_name,"os":p.os,"online":p.online,"url":url})
-    }).collect();
-    axum::Json(json!({"self":{"hostName":node.host_name,"dnsName":node.dns_name,"url":host_url(&node,state.config.tailnet.port,tls)},"hosts":hosts})).into_response()
+    let hosts: Vec<_> = discovered
+        .into_iter()
+        .map(|p| {
+            let url = host_url(
+                &Node {
+                    dns_name: p.dns_name.clone(),
+                    ips: p.ips,
+                    ..Default::default()
+                },
+                state.config.tailnet.port,
+                tls,
+            );
+            json!({
+                "hostName": p.host_name,
+                "dnsName": p.dns_name,
+                "os": p.os,
+                "online": p.online,
+                "url": url,
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "self": {
+            "hostName": node.host_name,
+            "dnsName": node.dns_name,
+            "url": host_url(&node, state.config.tailnet.port, tls),
+        },
+        "hosts": hosts,
+    }))
+    .into_response()
 }
 
 async fn info(
@@ -611,6 +636,8 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[tokio::test]
     async fn peer_probe_connects_and_skips_offline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -627,8 +654,6 @@ mod tests {
         drop(listener);
         assert!(super::probe_peer(peer, port).await.is_none());
     }
-    use super::*;
-
     #[cfg(feature = "rtc")]
     #[tokio::test]
     async fn websocket_offer_answer_and_replacement() {
