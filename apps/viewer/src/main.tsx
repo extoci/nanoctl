@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 import type { HostInfo } from "@nanoctl/protocol";
 import type { RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
+import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
+import { SoftKeyboard } from "./soft-keyboard";
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
 
@@ -28,6 +30,63 @@ function Viewer() {
   const [fullscreen, setFullscreen] = useState(false);
   const [keyboardLocked, setKeyboardLocked] = useState(false);
   const [notice, setNotice] = useState("");
+  const [touchMode, setTouchMode] = useState<TouchMode>(() => {
+    try {
+      return localStorage.getItem("touch-mode") === "direct" ? "direct" : "trackpad";
+    } catch {
+      return "trackpad";
+    }
+  });
+  const cursorRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      localStorage.setItem("touch-mode", touchMode);
+    } catch {
+      /* Storage may be unavailable. */
+    }
+    let cursor = { x: 0.5, y: 0.5 };
+    const paintCursor = () => {
+      const geometry = videoGeometry(
+        video.getBoundingClientRect(),
+        video.videoWidth,
+        video.videoHeight,
+      );
+      const stage = video.parentElement?.getBoundingClientRect();
+      if (!geometry || !stage || !cursorRef.current) return;
+      cursorRef.current.style.left = `${geometry.left - stage.left + cursor.x * geometry.width}px`;
+      cursorRef.current.style.top = `${geometry.top - stage.top + cursor.y * geometry.height}px`;
+    };
+    const gestures = new TouchGestures({
+      mode: touchMode,
+      geometry: () =>
+        videoGeometry(video.getBoundingClientRect(), video.videoWidth, video.videoHeight),
+      send: (message) => transport.current?.controller?.sendControl(message),
+      onCursor: (position) => {
+        cursor = position;
+        paintCursor();
+      },
+      onZoom: (zoom) => {
+        video.style.transform = `translate(${zoom.offsetX}px, ${zoom.offsetY}px) scale(${zoom.scale})`;
+        paintCursor();
+      },
+    });
+    const detach = attachTouchInput(video, gestures);
+    const resize = new ResizeObserver(paintCursor);
+    resize.observe(video);
+    video.addEventListener("loadeddata", paintCursor);
+    window.addEventListener("resize", paintCursor);
+    paintCursor();
+    return () => {
+      detach();
+      resize.disconnect();
+      video.removeEventListener("loadeddata", paintCursor);
+      window.removeEventListener("resize", paintCursor);
+      video.style.transform = "";
+    };
+  }, [touchMode, snapshot.inputEnabled]);
 
   useEffect(() => {
     if (info?.hostName) document.title = `${info.hostName} · nanoctl`;
@@ -159,6 +218,9 @@ function Viewer() {
           tabIndex={0}
           aria-label="Remote desktop video"
         />
+        {touchMode === "trackpad" && live && (
+          <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
+        )}
         {!live && (
           <div className="overlay" role={terminal ? "alert" : "status"}>
             <div className="status-card">
@@ -221,6 +283,14 @@ function Viewer() {
           </span>
         </div>
         <div className="actions">
+          <SoftKeyboard
+            enabled={snapshot.inputEnabled && status === "online"}
+            platform={info?.platform}
+            send={(message) => transport.current?.controller?.sendControl(message)}
+          />
+          <button onClick={() => setTouchMode(touchMode === "trackpad" ? "direct" : "trackpad")}>
+            {touchMode === "trackpad" ? "Trackpad" : "Direct"}
+          </button>
           <label className="display-picker">
             <span>Display</span>
             <select
