@@ -95,6 +95,9 @@ pub struct PipelineStats {
     pub preprocess_ns: AtomicU64,
     pub backend_ns: AtomicU64,
     pub color_convert_ns: AtomicU64,
+    pub capture_ns: AtomicU64,
+    pub send_ns: AtomicU64,
+    pub sample_writes: AtomicU64,
     pub encode_attempts: AtomicU64,
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
@@ -115,6 +118,16 @@ impl PipelineStats {
             target_fps = self.target_fps.load(Ordering::Relaxed),
             encoded_width = self.encoded_width.load(Ordering::Relaxed),
             encoded_height = self.encoded_height.load(Ordering::Relaxed),
+            capture_ns = self.capture_ns.load(Ordering::Relaxed),
+            compare_ns = self.compare_ns.load(Ordering::Relaxed),
+            preprocess_ns = self.preprocess_ns.load(Ordering::Relaxed),
+            color_convert_ns = self.color_convert_ns.load(Ordering::Relaxed),
+            backend_ns = self.backend_ns.load(Ordering::Relaxed),
+            encode_attempts = self.encode_attempts.load(Ordering::Relaxed),
+            send_ns = self.send_ns.load(Ordering::Relaxed),
+            sample_writes = self.sample_writes.load(Ordering::Relaxed),
+            fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
+            pacer_skips = self.pacer_skips.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
     }
@@ -1714,6 +1727,8 @@ pub fn spawn_video(
                         VIDEO_SAMPLE_WRITE_TIMEOUT,
                     )
                     .await;
+                    writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
                     if result.is_ok() {
                         previous_written = Some(written_at);
                         writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);

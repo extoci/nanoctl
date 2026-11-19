@@ -160,8 +160,10 @@ pub(super) fn start(
                 }
             }
             if !gate.parked {
+                let started = Instant::now();
                 match monitor.capture_image() {
                     Ok(image) => {
+                        stats.capture_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let changed = latest.last.lock().unwrap().as_ref().is_none_or(|old| {
                             old.frame.width != image.width() || old.frame.height != image.height()
                                 || old.frame.raw.as_slice() != image.as_raw().as_slice()
