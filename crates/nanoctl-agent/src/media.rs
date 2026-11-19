@@ -42,6 +42,8 @@ pub struct PipelineStats {
     pub bytes_sent: AtomicU64,
     pub target_kbps: AtomicU32,
     pub target_fps: AtomicU16,
+    pub encoded_width: AtomicU32,
+    pub encoded_height: AtomicU32,
 }
 
 impl PipelineStats {
@@ -54,8 +56,46 @@ impl PipelineStats {
             bytes_sent = self.bytes_sent.load(Ordering::Relaxed),
             target_kbps = self.target_kbps.load(Ordering::Relaxed),
             target_fps = self.target_fps.load(Ordering::Relaxed),
+            encoded_width = self.encoded_width.load(Ordering::Relaxed),
+            encoded_height = self.encoded_height.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
+    }
+}
+
+struct EncodeScale(u32);
+
+impl EncodeScale {
+    fn new(kbps: u32) -> Self {
+        Self(if kbps < 600 {
+            4
+        } else if kbps < 1500 {
+            2
+        } else {
+            1
+        })
+    }
+
+    fn update(&mut self, kbps: u32) -> bool {
+        let previous = self.0;
+        self.0 = match self.0 {
+            1 if kbps < 1500 => Self::new(kbps).0,
+            2 if kbps < 600 => 4,
+            4 if kbps >= 800 => {
+                if kbps >= 1800 {
+                    1
+                } else {
+                    2
+                }
+            }
+            2 if kbps >= 1800 => 1,
+            _ => self.0,
+        };
+        self.0 != previous
+    }
+
+    fn limits(&self, width: u32, height: u32) -> (u32, u32) {
+        ((width / self.0).max(2), (height / self.0).max(2))
     }
 }
 
@@ -1219,6 +1259,7 @@ pub fn spawn_video(
                 let mut controller = controller;
                 let mut fps = initial.fps;
                 let mut pacer = DamagePacer::new(fps);
+                let mut scale = EncodeScale::new(initial.bitrate_kbps);
                 let mut last: Option<Arc<CapturedFrame>> = None;
                 let mut last_encoded: Option<Arc<CapturedFrame>> = None;
                 let mut forced_keyframe = false;
@@ -1265,6 +1306,7 @@ pub fn spawn_video(
                         )?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
+                        forced_keyframe |= scale.update(decision.bitrate_kbps);
                         producer_stats
                             .target_kbps
                             .store(decision.bitrate_kbps, Ordering::Relaxed);
@@ -1330,15 +1372,20 @@ pub fn spawn_video(
                         encoder.encoder.force_keyframe();
                         forced_keyframe = false;
                     }
-                    let (frame, _) = encoder.encode_captured_frame(
-                        captured,
-                        quality.max_width,
-                        quality.max_height,
-                    )?;
+                    let (max_width, max_height) =
+                        scale.limits(quality.max_width, quality.max_height);
+                    let (frame, _) =
+                        encoder.encode_captured_frame(captured, max_width, max_height)?;
                     if frame.bytes.is_empty() {
                         continue;
                     }
                     last_encoded = Some(captured.clone());
+                    producer_stats
+                        .encoded_width
+                        .store(frame.width, Ordering::Relaxed);
+                    producer_stats
+                        .encoded_height
+                        .store(frame.height, Ordering::Relaxed);
                     producer_stats
                         .frames_encoded
                         .fetch_add(1, Ordering::Relaxed);
@@ -1499,6 +1546,22 @@ mod tests {
         pipeline.stop().await;
 
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn encode_scale_bounds_low_rate_keyframes_and_has_recovery_hysteresis() {
+        let mut scale = super::EncodeScale::new(2_000);
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
+        assert!(scale.update(1_400));
+        assert_eq!(scale.limits(1920, 1080), (960, 540));
+        assert!(!scale.update(1_700));
+        assert!(scale.update(500));
+        assert_eq!(scale.limits(1920, 1080), (480, 270));
+        assert!(!scale.update(700));
+        assert!(scale.update(900));
+        assert!(scale.update(1_900));
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
+        assert_eq!(super::EncodeScale::new(0).limits(0, 1), (2, 2));
     }
 
     #[test]

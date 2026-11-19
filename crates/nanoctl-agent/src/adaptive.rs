@@ -28,6 +28,8 @@ pub struct RateController {
     last_sample: Option<Instant>,
     rtts: VecDeque<(Instant, Duration)>,
     last_delay_cut: Option<Instant>,
+    last_congestion: Option<Instant>,
+    congestion_rate: Option<f64>,
     low_fps_since: Option<Instant>,
 }
 
@@ -50,6 +52,8 @@ impl RateController {
             last_sample: None,
             rtts: VecDeque::new(),
             last_delay_cut: None,
+            last_congestion: None,
+            congestion_rate: None,
             low_fps_since: None,
         }
     }
@@ -94,26 +98,52 @@ impl RateController {
             self.rtts.pop_front();
         }
         if let Some(rtt) = sample.rtt {
+            let trend = self.rtts.back().and_then(|(at, previous)| {
+                let seconds = sample.at.duration_since(*at).as_secs_f64();
+                (seconds >= 0.1).then(|| (rtt.as_secs_f64() - previous.as_secs_f64()) / seconds)
+            });
             self.rtts.push_back((sample.at, rtt));
             let baseline = self
                 .rtts
                 .iter()
                 .map(|(_, rtt)| rtt.as_secs_f64())
                 .fold(f64::INFINITY, f64::min);
-            delay_congested = rtt.as_secs_f64() > baseline * 1.5 + 0.03;
+            let rising = trend.is_some_and(|slope| slope > 0.015);
+            let draining = trend.is_some_and(|slope| slope < -0.005);
+            delay_congested = rtt.as_secs_f64() > baseline + (baseline * 0.25).max(0.03) || rising;
             if delay_congested
+                && !draining
                 && self.last_delay_cut.is_none_or(|last| {
-                    sample.at.duration_since(last) >= rtt.max(Duration::from_millis(300))
+                    sample.at.duration_since(last)
+                        >= rtt.clamp(Duration::from_millis(300), Duration::from_secs(1))
                 })
             {
                 delay_cut = true;
                 self.last_delay_cut = Some(sample.at);
             }
         }
+        if loss > 0.1 || delay_cut {
+            self.last_congestion = Some(sample.at);
+            self.congestion_rate = Some(self.rate);
+        }
         if loss > 0.1 {
             self.rate *= 1.0 - 0.5 * loss;
         } else if loss < 0.02 && !delay_congested {
-            self.rate *= 1.08_f64.powf(elapsed);
+            if let Some(last) = self.last_congestion {
+                if sample.at.duration_since(last) >= Duration::from_secs(3) {
+                    let near_congestion = self
+                        .congestion_rate
+                        .is_some_and(|rate| self.rate >= rate * 0.85);
+                    let step = if near_congestion {
+                        (self.rate * 0.005).min(10.0)
+                    } else {
+                        (self.rate * 0.02).min(30.0)
+                    };
+                    self.rate += step * elapsed.min(2.0);
+                }
+            } else {
+                self.rate *= 1.08_f64.powf(elapsed);
+            }
         }
         if delay_cut {
             self.rate *= 0.85;
@@ -379,6 +409,75 @@ mod tests {
         input.at += Duration::from_millis(100);
         assert_eq!(controller.observe(input), None);
         assert_eq!(controller.decision().bitrate_kbps, 1_700);
+    }
+
+    #[test]
+    fn delay_trend_cuts_before_absolute_threshold_and_drain_does_not_recursively_cut() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        let mut input = sample(now, 0.0);
+        input.rtt = Some(Duration::from_millis(80));
+        controller.observe(input);
+        input.at += Duration::from_secs(1);
+        input.rtt = Some(Duration::from_millis(100));
+        assert_eq!(controller.observe(input).unwrap().bitrate_kbps, 1_700);
+        input.at += Duration::from_secs(1);
+        input.rtt = Some(Duration::from_millis(200));
+        assert_eq!(controller.observe(input).unwrap().bitrate_kbps, 1_445);
+        input.at += Duration::from_secs(1);
+        input.rtt = Some(Duration::from_millis(160));
+        assert_eq!(controller.observe(input), None);
+        assert_eq!(controller.decision().bitrate_kbps, 1_445);
+    }
+
+    #[test]
+    fn recovery_holds_then_approaches_congestion_rate_cautiously_without_rtt() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        controller.observe(sample(now, 0.2));
+        for second in 1..=2 {
+            controller.observe(sample(now + Duration::from_secs(second), 0.0));
+            assert_eq!(controller.decision().bitrate_kbps, 1_800);
+        }
+        for second in 3..=20 {
+            controller.observe(sample(now + Duration::from_secs(second), 0.0));
+        }
+        let recovered = controller.decision().bitrate_kbps;
+        assert!((1_800..2_000).contains(&recovered));
+        controller.observe(sample(now + Duration::from_secs(200), 0.0));
+        assert!(controller.decision().bitrate_kbps <= recovered + 20);
+    }
+
+    #[test]
+    fn small_rtt_noise_does_not_trigger_delay_backoff() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        for second in 0..5 {
+            let mut input = sample(now + Duration::from_secs(second), 0.0);
+            input.rtt = Some(Duration::from_millis(80 + second % 3));
+            controller.observe(input);
+        }
+        assert!(controller.decision().bitrate_kbps > 2_000);
+    }
+
+    #[test]
+    fn delay_feedback_bounds_queue_and_recovers_on_a_two_megabit_link() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        let mut applied = controller.decision().bitrate_kbps;
+        let mut queued_kbits = 0.0_f64;
+        let mut max_queue = 0.0_f64;
+        for second in 0..60 {
+            let mut input = sample(now + Duration::from_secs(second), 0.0);
+            input.rtt = Some(Duration::from_secs_f64(0.08 + queued_kbits / 2_000.0));
+            if let Some(decision) = controller.observe(input) {
+                applied = decision.bitrate_kbps;
+            }
+            queued_kbits = (queued_kbits + f64::from(applied) - 2_000.0).max(0.0);
+            max_queue = max_queue.max(queued_kbits);
+        }
+        assert!(max_queue / 2_000.0 < 0.5);
+        assert!((1_000..=2_200).contains(&applied));
     }
 
     #[test]

@@ -5,7 +5,10 @@ Run `DISPLAY=:0 NANOCTL_DEV_LOOPBACK_USER=bench RUST_LOG=error nanoctl media-ben
 Use `--log-file PATH` to keep diagnostic logs separate from JSON.
 
 The hidden command connects a real production `HostPeer` to an in-process webrtc-rs
-controller with default RTCP report/NACK interceptors. Controller ICE candidates
+controller with default RTCP report/NACK interceptors. Both RTP and receiver RTCP
+are drained; reading RTCP is required for webrtc-rs to process incoming sender
+reports and populate RR LSR/DLSR. JSON includes received/matching sender-report
+counts and last encoded dimensions. Controller ICE candidates
 are restricted to loopback. No synthetic loss reports or REMB are injected.
 Capture/encode/send uses the real `spawn_video` pipeline, OpenH264, an 8000 kbps
 ceiling, 60 fps and a 1920x1080 size limit. Software is selected explicitly so both

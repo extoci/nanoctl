@@ -647,6 +647,14 @@ impl HostPeer {
                     if let Some(sample) =
                         reception_report_sample(report, video_ssrc, remb_kbps, compact_ntp, at)
                     {
+                        tracing::debug!(
+                            video_ssrc,
+                            lsr = report.last_sender_report,
+                            dlsr = report.delay,
+                            compact_ntp,
+                            rtt_ms = sample.rtt.map(|rtt| rtt.as_secs_f64() * 1000.0),
+                            "video receiver report"
+                        );
                         latest_sample = Some(sample);
                         link_samples.send_replace(Some(sample));
                         reported = true;

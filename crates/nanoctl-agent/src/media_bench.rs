@@ -28,6 +28,8 @@ struct Received {
     frames: u64,
     timestamps: HashSet<u32>,
     arrivals_ms: Vec<f64>,
+    sender_reports: u64,
+    matching_sender_reports: u64,
 }
 
 impl Received {
@@ -63,6 +65,8 @@ fn pipeline_stats(pipeline: &VideoPipeline) -> Value {
         "bytes_sent": stats.bytes_sent.load(Ordering::Relaxed),
         "target_kbps": stats.target_kbps.load(Ordering::Relaxed),
         "target_fps": stats.target_fps.load(Ordering::Relaxed),
+        "encoded_width": stats.encoded_width.load(Ordering::Relaxed),
+        "encoded_height": stats.encoded_height.load(Ordering::Relaxed),
     })
 }
 
@@ -106,9 +110,27 @@ pub async fn run(seconds: u64) -> Result<Value> {
         .await?;
     controller.on_track({
         let received = received.clone();
-        Box::new(move |track, _, _| {
+        Box::new(move |track, receiver, _| {
             let received = received.clone();
             Box::pin(async move {
+                let reports = received.clone();
+                let ssrc = track.ssrc();
+                tokio::spawn(async move {
+                    while let Ok((packets, _)) = receiver.read_rtcp().await {
+                        for packet in packets {
+                            if let Some(sr) = packet
+                                .as_any()
+                                .downcast_ref::<webrtc::rtcp::sender_report::SenderReport>(
+                            ) {
+                                let mut reports = reports.lock().unwrap();
+                                reports.sender_reports += 1;
+                                if sr.ssrc == ssrc && sr.ntp_time != 0 {
+                                    reports.matching_sender_reports += 1;
+                                }
+                            }
+                        }
+                    }
+                });
                 while let Ok((packet, _)) = track.read_rtp().await {
                     let now = Instant::now();
                     let mut received = received.lock().unwrap();
@@ -275,6 +297,8 @@ pub async fn run(seconds: u64) -> Result<Value> {
         "received_payload_kbps_avg": bytes as f64 * 8.0 / elapsed / 1000.0,
         "received_payload_kbps_per_second": received.bytes.drain(..).map(|bytes| bytes as f64 * 8.0 / 1000.0).collect::<Vec<_>>(),
         "frames_received": received.frames,
+        "sender_reports_received": received.sender_reports,
+        "sender_reports_matching_video": received.matching_sender_reports,
         "inter_frame_ms": {"p50": percentile(&intervals, 0.50), "p95": percentile(&intervals, 0.95),
             "p99": percentile(&intervals, 0.99), "max": intervals.last()},
         "pipeline": delta, "target_series": target_series,
