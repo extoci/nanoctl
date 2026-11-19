@@ -2,6 +2,38 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { distribution } from "./metrics";
 
+export function receivedVideoRates(samples: unknown[]) {
+  const streams = new Map<number, { bytes: number; at: number }[]>();
+  for (const value of samples) {
+    if (!value || typeof value !== "object") continue;
+    const row = value as Record<string, unknown>;
+    if (row.type !== "inbound-rtp" || row.kind !== "video") continue;
+    const { ssrc, bytesReceived: bytes, timestamp: at } = row;
+    if (
+      typeof ssrc !== "number" ||
+      !Number.isFinite(ssrc) ||
+      typeof bytes !== "number" ||
+      !Number.isFinite(bytes) ||
+      bytes < 0 ||
+      typeof at !== "number" ||
+      !Number.isFinite(at)
+    )
+      throw new Error("Invalid inbound video counters");
+    const rows = streams.get(ssrc) ?? [];
+    rows.push({ bytes, at });
+    streams.set(ssrc, rows);
+  }
+  return [...streams].flatMap(([ssrc, rows]) => {
+    rows.sort((a, b) => a.at - b.at);
+    if (rows.length < 2) return [];
+    const first = rows[0],
+      last = rows.at(-1)!;
+    if (last.at <= first.at || last.bytes < first.bytes)
+      throw new Error("Inbound video counters did not advance monotonically");
+    return [{ ssrc, mbps: ((last.bytes - first.bytes) * 8) / (last.at - first.at) / 1000 }];
+  });
+}
+
 export function qualityScores(log: string) {
   const ssim = Number(log.match(/SSIM[^\n]*All:([\d.]+)/)?.[1]);
   const value = log.match(/PSNR[^\n]*average:([\d.]+|inf)/)?.[1];

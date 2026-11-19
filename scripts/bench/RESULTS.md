@@ -743,3 +743,73 @@ quality/CPU tuning remains unfinished; the table must not be read as parity.
   display failure; clippy all-targets RTC/media; 69 RTC tests; 118 media tests,
   one preexisting X11 test ignored; release build. No new impaired-link,
   hardware-encoder or reconnect-RSS campaign was performed.
+
+## Software quantizer bounds: real-content quality follow-up
+
+Fresh 1280x720 software-H.264 comparisons, three sequential runs per workload
+and variant, with no competing streams/builds during measurement. Values are
+medians of per-run frame medians (quality/video), or per-run motion means
+(CPU/bitrate); not pooled percentiles or confidence intervals. Full min–max
+spreads remain in `~/bench-results/content/quality-gap-*.repeat.{json,md}`.
+All 27 runs completed and were valid. Quality captures/scoring remain separate
+from the 20-second motion resource/latency phase. No outlier was discarded.
+
+| Workload | Variant            | SSIM Y  | PSNR Y dB | Received Mbps | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ------------------ | ------- | --------- | ------------- | ----- | ------------ | ------------ |
+| Text     | Before             | 0.99513 | 39.67     | 0.90          | 58.85 | 20.60        | 59.72        |
+| Drag     | Before             | 0.99497 | 40.99     | 0.73          | 59.69 | 35.77        | 35.61        |
+| Gradient | Before             | 0.99107 | 42.71     | 3.26          | 59.67 | 36.46        | 46.65        |
+| Text     | QP 16–51, rejected | 0.99768 | 42.44     | 1.51          | 59.19 | 19.96        | 56.25        |
+| Drag     | QP 16–51, rejected | 0.99777 | 43.44     | 3.27          | 59.69 | 36.49        | 44.47        |
+| Gradient | QP 16–51, rejected | 0.99441 | 46.03     | 7.17          | 59.00 | 20.97        | 52.17        |
+| Text     | QP 20–51, kept     | 0.99715 | 41.73     | 1.10          | 59.26 | 20.08        | 51.69        |
+| Drag     | QP 20–51, kept     | 0.99721 | 42.86     | 1.89          | 59.79 | 20.33        | 37.06        |
+| Gradient | QP 20–51, kept     | 0.99346 | 44.82     | 5.17          | 59.68 | 36.31        | 48.57        |
+
+### Reached cause, not a new bitrate floor
+
+The software factory uses `EncoderConfig::new()`, whose OpenH264 wrapper default
+is QP 0–51. For bitrate-controlled screen content, the source vendored by
+`openh264-sys2 0.9.7` treats a nonpositive minimum in `ParamValidation()` as a sentinel and
+replaces **both** bounds with `MIN_SCREEN_QP=26`, `MAX_SCREEN_QP=35`.
+The reached path is `SoftwareEncoder::new` → `create_encoder` → source-built
+OpenH264 initialization with `SCREEN_CONTENT_REAL_TIME` and `RC_BITRATE_MODE`.
+In a diagnostic text run, 1,911 native attempts reported last-frame macroblock
+QP min/median/max **26/26/30**, while the actual encoder target rose from
+**4,000 to 24,000 kbps** (median 24,000). Raising the target did not lower QP
+below 26. The low payload rate therefore was not evidence of a 0.2–0.9-Mbps
+controller ceiling. Chrome's incoming-bandwidth field is diagnostic, not a
+substitute for the reached encoder target or received RTP bytes.
+
+| Text diagnostic                   | Native QP min/median/max | Encoder target min/median/max kbps | Chrome availableIncomingBitrate min/median/max Mbps |
+| --------------------------------- | ------------------------ | ---------------------------------- | --------------------------------------------------- |
+| Before, 1,911 attempts            | 26 / 26 / 30             | 4000 / 24000 / 24000               | 0.576 / 0.676 / 0.939                               |
+| QP 20–51, 1,932 nonempty attempts | 20 / 20 / 30             | 4000 / 24000 / 24000               | 0.676 / 1.170 / 1.633                               |
+
+Chrome exposed incoming estimates in 19 samples per probe, not as a guaranteed
+link-capacity measurement. It reported more than one nominated pair; the added
+transport snapshots identify selection explicitly. These diagnostic probes are
+not mixed into the three-run resource medians. Their artifacts use prefixes
+`quality-gap-profile` and `quality-gap-qp20-profile`.
+
+Explicit QP 16–51 improved fidelity, but drag CPU rose **8.86 points**, failing
+the approximately five-point budget. Explicit QP 20–51 is retained: PSNR improves
+**2.06/1.86/2.11 dB** for text/drag/gradient, with motion CPU changes
+**−8.03/+1.45/+1.91 points**, and no median video-p50 increase. Text CPU has a
+large baseline spread (45.54–64.94%), so its reduction is not attributed to this
+patch. Likewise, refresh-sized latency swings are not claimed as optimizations.
+The retained setting **does not close the remaining competitor quality gap**.
+
+Maximum QP remains 51 so allocation cuts can sacrifice fidelity/frame output;
+the adaptive controller, starting bitrate, bitrate bounds, feedback negotiation,
+frame pacing, VUI and encoder complexity are unchanged. Regression tests read
+back effective QP bounds and bitrate mode for every latency mode and exercise
+the actual software encoder after a 4,000→250-kbps allocation cut. OpenH264 can
+back off by skipping frames, not only by raising QP. No new impaired-network
+campaign is claimed. No idle-only rate-control bypass was introduced.
+
+Native QP/target diagnostics are opt-in (`RUST_LOG=info,nanoctl::encoder=debug`)
+and disabled for the comparisons. Browser probes now retain nominated candidate
+pairs and transports, including optional `availableIncomingBitrate`; received
+media Mbps remains strictly inbound-video RTP deltas. Tests prevent candidate
+pair or audio counters being counted as video and reject invalid/reset counters.

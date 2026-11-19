@@ -243,6 +243,21 @@ Other allocators/platforms are unchanged.
 
 ### Real content and picture quality
 
+For software-encoder diagnosis, start the agent with
+`RUST_LOG=info,nanoctl::encoder=debug`. Each encode attempt logs its input-frame
+count, last encoded frame's average macroblock QP, current target kbps, and output
+bytes. Zero-byte attempts are skipped frames, not new QP observations. These
+queries and per-frame logs are disabled at the normal info level; disable them
+for resource comparisons.
+
+Browser `raw.webRtcStats` includes nominated candidate pairs and transports as
+well as inbound video. Inspect `selectedCandidatePairId`, packet/byte activity,
+and optional `availableIncomingBitrate` together: nomination alone does not mean
+the pair carries video, and a missing bandwidth field is not zero capacity.
+Received media Mbps uses only inbound video RTP counter deltas, never candidate
+pair or transport bytes. Invalid/reset video counters fail the run rather than
+producing a misleading rate.
+
 `BENCH_WORKLOAD=text|drag|gradient` selects deterministic code editing/scrolling,
 large editor-window motion, or an animated color-gradient scene. The default
 `marker` workload remains unchanged. All retain the same checksummed source IDs.

@@ -10,7 +10,7 @@ import { repeatArgs, summarizeRuns, summaryMarkdown, type BenchRun } from "./rep
 import { runtimeBytes } from "./runtime";
 import { setupClicks } from "./viewer";
 import { drawWorkload, workloadName } from "./workloads";
-import { analyzeQuality, pcapPayloadBytes } from "./quality";
+import { analyzeQuality, pcapPayloadBytes, receivedVideoRates } from "./quality";
 
 const options = repeatArgs(process.argv.slice(2));
 const viewerSetupClicks = setupClicks(process.env.VIEWER_SETUP_CLICKS);
@@ -521,7 +521,12 @@ const statsTimer = viewer
             for (const p of peers) {
               const report = await p.getStats();
               for (const value of report.values())
-                if (value.type === "inbound-rtp" && value.kind === "video") entries.push(value);
+                if (
+                  (value.type === "inbound-rtp" && value.kind === "video") ||
+                  (value.type === "candidate-pair" && value.nominated) ||
+                  value.type === "transport"
+                )
+                  entries.push(value);
             }
             return entries;
           }),
@@ -599,20 +604,7 @@ await host.evaluate(() => {
   (window as unknown as { bench: { motion: boolean } }).bench.motion = false;
 });
 const metrics = analyze(raw, state.paints, best.offsetMs);
-const received = (
-  stats.flat() as { bytesReceived: number; timestamp: number; ssrc: number }[]
-).filter((s) => Number.isFinite(s.bytesReceived));
-const streams = [...new Set(received.map((s) => s.ssrc))];
-const receivedMediaMbps = streams.map((ssrc) => {
-  const rows = received.filter((s) => s.ssrc === ssrc);
-  const first = rows[0],
-    last = rows.at(-1)!;
-  return {
-    ssrc,
-    mbps:
-      ((last.bytesReceived - first.bytesReceived) * 8) / (last.timestamp - first.timestamp) / 1000,
-  };
-});
+const receivedMediaMbps = receivedVideoRates(stats.flat());
 const bitrateMeasurement = udp
   ? {
       mbps: (udp.bytes * 8) / bitrateSeconds / 1e6,

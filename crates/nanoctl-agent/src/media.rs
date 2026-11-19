@@ -8,12 +8,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, MatrixCoefficients,
-    RateControlMode, UsageType, VuiConfig,
+    QpRange, RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSource;
 use openh264_sys2::{
-    ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
-    SPATIAL_LAYER_ALL,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_GET_STATISTICS, ENCODER_OPTION_MAX_BITRATE,
+    SBitrateInfo, SEncoderStatistics, SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
 };
 use xcap::Monitor;
 
@@ -868,13 +868,43 @@ impl SoftwareEncoder {
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
         yuv.read_rgba(image.as_raw())?;
         self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
-        let stream = self.encoder.encode(yuv).context("H.264 encode failed")?;
+        let bytes = self
+            .encoder
+            .encode(yuv)
+            .context("H.264 encode failed")?
+            .to_vec();
+        if tracing::enabled!(target: "nanoctl::encoder", tracing::Level::DEBUG)
+            && let Ok(statistics) = encoder_statistics(&mut self.encoder)
+        {
+            tracing::debug!(target: "nanoctl::encoder",
+                frame = statistics.uiInputFrameCount,
+                qp = statistics.uiAverageFrameQP,
+                target_kbps = self.bitrate_kbps,
+                bytes = bytes.len(),
+                "software encoder frame"
+            );
+        }
         Ok(EncodedFrame {
-            bytes: stream.to_vec(),
+            bytes,
             width: image.width(),
             height: image.height(),
         })
     }
+}
+
+fn encoder_statistics(encoder: &mut Encoder) -> Result<SEncoderStatistics> {
+    let mut statistics = SEncoderStatistics::default();
+    // SAFETY: The initialized encoder writes the matching statistics structure synchronously.
+    let result = unsafe {
+        encoder.raw_api().get_option(
+            ENCODER_OPTION_GET_STATISTICS,
+            std::ptr::from_mut(&mut statistics).cast(),
+        )
+    };
+    if result != 0 {
+        bail!("OpenH264 statistics query failed: {result}");
+    }
+    Ok(statistics)
 }
 
 fn rgba_view(
@@ -959,6 +989,8 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
                 .matrix_coefficients(MatrixCoefficients::Smpte170M),
         )
         .rate_control_mode(RateControlMode::Bitrate)
+        // A zero minimum is OpenH264's sentinel for its lossy 26–35 screen default.
+        .qp(QpRange::new(20, 51))
         .complexity(complexity)
         .skip_frames(skip_frames);
     Encoder::with_api_config(OpenH264API::from_source(), config)
@@ -2016,6 +2048,41 @@ mod tests {
     }
 
     #[test]
+    fn software_quality_floor_still_honors_a_congestion_bitrate_cut() {
+        let mut encoder = SoftwareEncoder::new(4_000, 60, LatencyMode::Balanced).unwrap();
+        let mut image = xcap::image::RgbaImage::new(256, 128);
+        let mut seed = 1_u32;
+        let mut before_bytes = 0;
+        let mut after_bytes = 0;
+        for frame in 0..40 {
+            for pixel in image.pixels_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *pixel = xcap::image::Rgba([
+                    (seed >> 24) as u8,
+                    (seed >> 16) as u8,
+                    (seed >> 8) as u8,
+                    255,
+                ]);
+            }
+            if frame == 10 {
+                assert!(encoder.apply_bitrate_estimate(250, 24_000).unwrap());
+            }
+            let encoded = encoder.encode(&image).unwrap();
+            if frame < 10 {
+                before_bytes += encoded.bytes.len();
+            } else if frame >= 20 {
+                after_bytes += encoded.bytes.len();
+            }
+        }
+        assert_eq!(encoder.bitrate_kbps, 250);
+        assert!(before_bytes > 0);
+        assert!(
+            after_bytes < before_bytes / 2,
+            "congested twenty-frame output {after_bytes}, clean ten-frame output {before_bytes}"
+        );
+    }
+
+    #[test]
     fn software_bitrate_changes_at_runtime_without_forcing_an_idr() {
         let image =
             xcap::image::RgbaImage::from_pixel(64, 64, xcap::image::Rgba([32, 96, 160, 255]));
@@ -2353,6 +2420,20 @@ mod tests {
     }
 
     #[test]
+    fn software_encoder_reports_the_last_encoded_frame_statistics() {
+        let mut encoder = super::create_encoder(4_000, 60, LatencyMode::Balanced).unwrap();
+        assert!(super::encoder_statistics(&mut encoder).is_err());
+        let frame = super::I420Frame::new(32, 32).unwrap();
+        for count in 1..=3 {
+            assert!(!encoder.encode(&frame).unwrap().to_vec().is_empty());
+            let statistics = super::encoder_statistics(&mut encoder).unwrap();
+            assert_eq!(statistics.uiInputFrameCount, count);
+            assert_eq!((statistics.uiWidth, statistics.uiHeight), (32, 32));
+            assert!(statistics.uiAverageFrameQP <= 51);
+        }
+    }
+
+    #[test]
     fn software_encoder_signals_the_limited_bt601_matrix_of_its_srgb_input() {
         for mode in [
             LatencyMode::Responsiveness,
@@ -2372,6 +2453,8 @@ mod tests {
                 )
             };
             assert_eq!(result, 0);
+            assert_eq!((params.iMinQp, params.iMaxQp), (20, 51));
+            assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
             let layer = &params.sSpatialLayers[0];
             assert!(layer.bVideoSignalTypePresent);
             assert!(layer.bColorDescriptionPresent);

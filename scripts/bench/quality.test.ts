@@ -1,8 +1,31 @@
 import { expect, test } from "bun:test";
-import { qualityScores, analyzeQuality, pcapPayloadBytes } from "./quality";
+import { qualityScores, analyzeQuality, pcapPayloadBytes, receivedVideoRates } from "./quality";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+test("video bitrate excludes candidate-pair and audio transport counters", () => {
+  const video = { type: "inbound-rtp", kind: "video", ssrc: 123 };
+  expect(
+    receivedVideoRates([
+      { ...video, bytesReceived: 1000, timestamp: 100 },
+      { type: "candidate-pair", bytesReceived: 99999999, timestamp: 100 },
+      { ...video, kind: "audio", bytesReceived: 99999999, timestamp: 100 },
+      { ...video, bytesReceived: 126000, timestamp: 1100 },
+    ]),
+  ).toEqual([{ ssrc: 123, mbps: 1 }]);
+  expect(receivedVideoRates([])).toEqual([]);
+  expect(receivedVideoRates([null, { ...video, bytesReceived: 10, timestamp: 1 }])).toEqual([]);
+});
+
+test("video bitrate rejects invalid or reset counters", () => {
+  const video = { type: "inbound-rtp", kind: "video", ssrc: 123, timestamp: 1, bytesReceived: 100 };
+  expect(() => receivedVideoRates([{ ...video, bytesReceived: NaN }])).toThrow("Invalid");
+  expect(() => receivedVideoRates([video, { ...video, timestamp: 2, bytesReceived: 1 }])).toThrow(
+    "monotonically",
+  );
+  expect(() => receivedVideoRates([video, video])).toThrow("monotonically");
+});
 test("quality parser preserves finite scores and represents perfect PSNR explicitly", () => {
   expect(qualityScores("SSIM Y:0.99 All:0.998\nPSNR y:42 average:42.15 min:42")).toEqual({
     ssim: 0.998,
