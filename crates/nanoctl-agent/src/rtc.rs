@@ -341,6 +341,34 @@ enum OutgoingPayload {
     },
 }
 
+#[cfg(feature = "media")]
+async fn forward_clipboard(
+    backend: crate::clipboard::Backend,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    output: Arc<RTCDataChannel>,
+    revoked: Arc<AtomicBool>,
+) {
+    let mut changes = backend.changes.clone();
+    changes.borrow_and_update();
+    if !revoked.load(Ordering::Acquire)
+        && let Some(message) = backend.current()
+    {
+        let _ = output.send_text(message).await;
+    }
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            result = changes.changed() => {
+                if result.is_err() || revoked.load(Ordering::Acquire) { break; }
+                let message = changes.borrow_and_update().clone();
+                if let Some(message) = message {
+                    let _ = output.send_text(message).await;
+                }
+            }
+        }
+    }
+}
+
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
@@ -493,36 +521,26 @@ impl HostPeer {
                 let input_revoked = input_revoked_for_channel.clone();
                 if channel.label() == "nanoctl.clipboard.v1" {
                     if let Some(backend) = clipboard.clone() {
-                        let changes = backend.changes.clone();
+                        let initial_backend = backend.clone();
                         let shutdown = clipboard_shutdown.clone();
                         let output = channel.clone();
                         let revoked = input_revoked.clone();
                         channel.on_open(Box::new(move || {
-                            let mut changes = changes.clone();
-                            let mut shutdown = shutdown.clone();
-                            let output = output.clone();
-                            let revoked = revoked.clone();
-                            Box::pin(async move {
-                            tokio::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    _ = shutdown.changed() => break,
-                                    result = changes.changed() => {
-                                        if result.is_err() || revoked.load(Ordering::Acquire) { break; }
-                                        let message = changes.borrow_and_update().clone();
-                                        if let Some(message) = message {
-                                            let _ = output.send_text(message).await;
-                                        }
-                                    }
-                                }
-                            }
-                            });
-                            })
+                            tokio::spawn(forward_clipboard(
+                                initial_backend.clone(),
+                                shutdown.clone(),
+                                output.clone(),
+                                revoked.clone(),
+                            ));
+                            Box::pin(async {})
                         }));
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
-                            if message.is_string && !input_revoked.load(Ordering::Acquire)
+                            if message.is_string
+                                && !input_revoked.load(Ordering::Acquire)
                                 && let Some(text) = crate::clipboard::parse(&message.data)
-                            { backend.set(text); }
+                            {
+                                backend.set(text);
+                            }
                             Box::pin(async {})
                         }));
                     }

@@ -7,6 +7,7 @@ use tokio::sync::watch;
 pub struct Backend {
     sets: mpsc::SyncSender<String>,
     pub changes: watch::Receiver<Option<String>>,
+    current: watch::Receiver<Option<String>>,
 }
 
 pub fn backend() -> Option<Backend> {
@@ -49,6 +50,10 @@ impl State {
 }
 
 impl Backend {
+    pub fn current(&self) -> Option<String> {
+        self.current.borrow().clone()
+    }
+
     pub fn set(&self, text: String) {
         let _ = self.sets.try_send(text);
     }
@@ -57,6 +62,7 @@ impl Backend {
 fn start() -> Option<Backend> {
     let (sets, requests) = mpsc::sync_channel::<String>(16);
     let (changes, receiver) = watch::channel(None);
+    let (current, snapshot) = watch::channel(None);
     let (ready, opened) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("clipboard".into())
@@ -71,6 +77,7 @@ fn start() -> Option<Backend> {
                 match requests.recv_timeout(Duration::from_millis(350)) {
                     Ok(text) => {
                         if clipboard.set_text(text.clone()).is_ok() {
+                            current.send_replace(encode(&text));
                             state.last = Some(text);
                             changes.send_replace(None);
                         }
@@ -78,10 +85,11 @@ fn start() -> Option<Backend> {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                if let Ok(text) = clipboard.get_text()
-                    && let Some(message) = state.changed(text)
-                {
-                    changes.send_replace(Some(message));
+                if let Ok(text) = clipboard.get_text() {
+                    current.send_replace(encode(&text));
+                    if let Some(message) = state.changed(text) {
+                        changes.send_replace(Some(message));
+                    }
                 }
             }
         })
@@ -89,6 +97,7 @@ fn start() -> Option<Backend> {
     opened.recv().ok()?.then_some(Backend {
         sets,
         changes: receiver,
+        current: snapshot,
     })
 }
 
