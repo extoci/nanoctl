@@ -1,4 +1,4 @@
-import { chromium } from "@playwright/test";
+import { chromium, type Page } from "@playwright/test";
 import { dlopen, ptr } from "bun:ffi";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -9,9 +9,13 @@ import { analyze } from "./metrics";
 import { repeatArgs, summarizeRuns, summaryMarkdown, type BenchRun } from "./repeat";
 import { runtimeBytes } from "./runtime";
 import { setupClicks } from "./viewer";
+import { drawWorkload, workloadName } from "./workloads";
+import { analyzeQuality, pcapPayloadBytes } from "./quality";
 
 const options = repeatArgs(process.argv.slice(2));
 const viewerSetupClicks = setupClicks(process.env.VIEWER_SETUP_CLICKS);
+const qualityMode = process.env.BENCH_QUALITY === "1";
+const workload = workloadName(process.env.BENCH_WORKLOAD);
 const [product, hostDisplay, clientDisplay, pidText, outputText] = options.args;
 if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
   throw new Error(
@@ -19,12 +23,12 @@ if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
   );
 }
 const rootPid = Number(pidText),
-  trials = Number(process.env.TRIALS ?? 120);
+  trials = qualityMode ? 0 : Number(process.env.TRIALS ?? 120);
 if (
   !Number.isInteger(rootPid) ||
   rootPid < 1 ||
   !Number.isInteger(trials) ||
-  trials < 100 ||
+  (trials < 100 && !qualityMode) ||
   trials > 250
 )
   throw new Error("Invalid PID or trials (100..250)");
@@ -65,6 +69,13 @@ if (options.repeat !== null) {
   console.log(markdown);
   process.exit(summary.complete ? 0 : 1);
 }
+if (
+  existsSync(join(output, `${product}.json`)) ||
+  readdirSync(output).some(
+    (name) => name.startsWith(`${product}.quality`) || name === `${product}.pcap`,
+  )
+)
+  throw new Error(`Refusing to overwrite ${product} artifacts`);
 const helper = join(output, "pixels");
 execFileSync("cc", [
   "-O2",
@@ -86,6 +97,29 @@ const mono = () => {
   return Number(clockBuffer[0]) * 1000 + Number(clockBuffer[1]) / 1e6;
 };
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+async function qualityWindow(page: Page, window: string, display: string) {
+  const decoration = await page.evaluate(() => ({
+    width: outerWidth - innerWidth,
+    height: outerHeight - innerHeight,
+    dpr: devicePixelRatio,
+  }));
+  if (decoration.dpr !== 1) throw new Error("Quality capture requires devicePixelRatio=1");
+  execFileSync(
+    "xdotool",
+    [
+      "windowsize",
+      window,
+      String(1280 + decoration.width),
+      String(720 + decoration.height),
+      "windowmove",
+      window,
+      String(-Math.floor(decoration.width / 2)),
+      String(-decoration.height),
+    ],
+    { env: { ...process.env, DISPLAY: display } },
+  );
+  await page.waitForFunction(() => innerWidth === 1280 && innerHeight === 720);
+}
 const ticksPerSecond = Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8" }).trim());
 const pageKiB = Number(execFileSync("getconf", ["PAGESIZE"], { encoding: "utf8" }).trim()) / 1024;
 function processes() {
@@ -183,65 +217,76 @@ execFileSync(
   ],
   { env: { ...process.env, DISPLAY: hostDisplay } },
 );
-await host.evaluate((encode) => {
-  const bits = new Function(`return (${encode})`)() as typeof markerBits;
-  const canvas = document.querySelector("canvas")!;
-  const ctx = canvas.getContext("2d")!;
-  const state = {
-    paints: [] as number[],
-    input: 0,
-    motion: false,
-    keys: [] as unknown[],
-    inputPaints: [] as { input: number; at: number }[],
-  };
-  Object.assign(window, { bench: state });
-  let dirty = true;
-  window.addEventListener("keydown", (e) => {
-    state.keys.push({
-      at: performance.now(),
-      code: e.code,
-      key: e.key,
-      trusted: e.isTrusted,
-      repeat: e.repeat,
-    });
-    if (e.isTrusted && e.code === "Space" && !e.repeat) {
-      e.preventDefault();
-      state.input++;
-      dirty = true;
-    }
-  });
-  const render = () => {
-    if (state.motion || dirty) {
-      const seq = state.paints.length;
-      ctx.fillStyle = "#151515";
-      ctx.fillRect(0, 0, 1280, 720);
-      ctx.fillStyle = "cyan";
-      ctx.fillRect(0, 100, 80, 100);
-      ctx.fillStyle = "magenta";
-      ctx.fillRect(800, 100, 80, 100);
-      bits(seq, state.input).forEach((bit, i) => {
-        ctx.fillStyle = bit ? "white" : "black";
-        ctx.fillRect((i + 4) * 20, 100, 20, 100);
+if (qualityMode) {
+  await host.evaluate(() => document.documentElement.requestFullscreen());
+  await qualityWindow(host, hostWindow, hostDisplay);
+}
+await host.evaluate(
+  ({ encode, draw, workload }) => {
+    const bits = new Function(`return (${encode})`)() as typeof markerBits;
+    const content = new Function(`return (${draw})`)() as typeof drawWorkload;
+    const canvas = document.querySelector("canvas")!;
+    const ctx = canvas.getContext("2d")!;
+    const state = {
+      paints: [] as number[],
+      input: 0,
+      motion: false,
+      keys: [] as unknown[],
+      inputPaints: [] as { input: number; at: number }[],
+    };
+    Object.assign(window, { bench: state });
+    let dirty = true;
+    window.addEventListener("keydown", (e) => {
+      state.keys.push({
+        at: performance.now(),
+        code: e.code,
+        key: e.key,
+        trusted: e.isTrusted,
+        repeat: e.repeat,
       });
-      ctx.fillStyle = "white";
-      ctx.font = "36px sans-serif";
-      ctx.fillText(`frame ${seq} input ${state.input}`, 80, 300);
-      if (state.motion) {
-        ctx.fillStyle = "#38bdf8";
-        ctx.fillRect((seq * 7) % 1120, 400, 160, 160);
+      if (e.isTrusted && e.code === "Space" && !e.repeat) {
+        e.preventDefault();
+        state.input++;
+        dirty = true;
       }
-      state.paints.push(performance.now());
-      if (state.inputPaints.at(-1)?.input !== state.input)
-        state.inputPaints.push({ input: state.input, at: state.paints.at(-1)! });
-      dirty = false;
-    }
+    });
+    const render = () => {
+      if (state.motion || dirty) {
+        const seq = state.paints.length;
+        ctx.fillStyle = "#151515";
+        ctx.fillRect(0, 0, 1280, 720);
+        if (state.motion) content(ctx, seq, workload);
+        ctx.fillStyle = "cyan";
+        ctx.fillRect(0, 100, 80, 100);
+        ctx.fillStyle = "magenta";
+        ctx.fillRect(800, 100, 80, 100);
+        bits(seq, state.input).forEach((bit, i) => {
+          ctx.fillStyle = bit ? "white" : "black";
+          ctx.fillRect((i + 4) * 20, 100, 20, 100);
+        });
+        ctx.fillStyle = "white";
+        ctx.font = "36px sans-serif";
+        if (workload === "marker") ctx.fillText(`frame ${seq} input ${state.input}`, 80, 300);
+        if (state.motion && workload === "marker") {
+          ctx.fillStyle = "#38bdf8";
+          ctx.fillRect((seq * 7) % 1120, 400, 160, 160);
+        }
+        state.paints.push(performance.now());
+        if (state.inputPaints.at(-1)?.input !== state.input)
+          state.inputPaints.push({ input: state.input, at: state.paints.at(-1)! });
+        dirty = false;
+      }
+      requestAnimationFrame(render);
+    };
     requestAnimationFrame(render);
-  };
-  requestAnimationFrame(render);
-}, markerBits.toString());
+  },
+  { encode: markerBits.toString(), draw: drawWorkload.toString(), workload },
+);
 let viewerBrowser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 let viewer: Awaited<ReturnType<typeof hostBrowser.newPage>> | undefined;
 const stats: unknown[] = [];
+let websocketBytes = 0,
+  countWebsocket = false;
 let viewerClock = { offsetMs: 0, uncertaintyMs: Infinity };
 const viewerSelector = process.env.VIEWER_SELECTOR ?? "video";
 let clientWindow = process.env.BENCH_WINDOW;
@@ -279,6 +324,17 @@ if (process.env.VIEWER_URL) {
     });
   });
   viewer = await context.newPage();
+  if (qualityMode) {
+    const cdp = await context.newCDPSession(viewer);
+    await cdp.send("Network.enable");
+    cdp.on("Network.webSocketFrameReceived", (event) => {
+      if (countWebsocket)
+        websocketBytes +=
+          event.response.opcode === 2
+            ? Buffer.from(event.response.payloadData, "base64").length
+            : Buffer.byteLength(event.response.payloadData);
+    });
+  }
   await viewer.goto(process.env.VIEWER_URL);
   for (const selector of viewerSetupClicks) await viewer.locator(selector).click();
   await viewer.locator(viewerSelector).waitFor();
@@ -318,6 +374,9 @@ if (viewer) {
     { env: { ...process.env, DISPLAY: clientDisplay } },
   );
   await viewer.locator(viewerSelector).focus();
+  if (qualityMode)
+    await viewer.locator(viewerSelector).evaluate((element) => element.requestFullscreen());
+  if (qualityMode) await qualityWindow(viewer, clientWindow, clientDisplay);
 }
 await pause(4000);
 execFileSync("xdotool", ["mousemove", "--sync", "640", "360", "click", "1"], {
@@ -336,7 +395,7 @@ if (!idleRaw.split("\n").some((line) => /^S \S+ 0 0 /.test(line))) {
   );
 }
 phase = "idle";
-await pause(10_000);
+await pause(qualityMode ? 1000 : 10_000);
 phase = "warmup";
 let best = { offsetMs: 0, uncertaintyMs: Infinity };
 for (let i = 0; i < 20; i++) {
@@ -408,7 +467,42 @@ if (viewer && process.env.BENCH_ATTRIBUTION === "1") {
     { marker: readMarker.toString(), row: readMarkerRow.toString() },
   );
 }
-const duration = Math.ceil(2 + trials * 0.45 + 3);
+const duration = qualityMode ? 20 : Math.ceil(2 + trials * 0.45 + 3);
+let tcpdump: ReturnType<typeof spawn> | undefined;
+let tcpdumpLog = "";
+const pcap = join(output, `${product}.pcap`);
+if (qualityMode && process.env.BENCH_UDP_PORT) {
+  tcpdump = spawn(
+    "sudo",
+    [
+      "-n",
+      "tcpdump",
+      "-i",
+      "lo",
+      "-Q",
+      "in",
+      "-U",
+      "-s",
+      "96",
+      "-w",
+      pcap,
+      `udp src port ${Number(process.env.BENCH_UDP_PORT)}`,
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  tcpdump.stderr!.on("data", (chunk) => {
+    tcpdumpLog += chunk;
+  });
+  await new Promise<void>((resolve, reject) => {
+    tcpdump!.once("error", reject);
+    tcpdump!.once("exit", (code) => reject(new Error(`tcpdump exited: ${code}`)));
+    tcpdump!.stderr!.once("data", (chunk) =>
+      String(chunk).includes("listening on") ? resolve() : reject(new Error(String(chunk))),
+    );
+  });
+}
+const bitrateStarted = mono();
+countWebsocket = true;
 const capture = spawn(helper, [clientDisplay, String(duration), String(trials), "1729"], {
   stdio: ["ignore", "pipe", "inherit"],
   env: detectorEnv,
@@ -442,12 +536,65 @@ const code = await new Promise<number | null>((resolve, reject) => {
   capture.once("exit", resolve);
 });
 if (statsTimer) clearInterval(statsTimer);
+countWebsocket = false;
+const bitrateSeconds = (mono() - bitrateStarted) / 1000;
+let udp: ReturnType<typeof pcapPayloadBytes> | undefined;
+if (tcpdump) {
+  const children = execFileSync("pgrep", ["-P", String(tcpdump.pid)], { encoding: "utf8" })
+    .trim()
+    .split("\n");
+  const pid = [String(tcpdump.pid), ...children].find(
+    (pid) => readFileSync(`/proc/${pid}/comm`, "utf8").trim() === "tcpdump",
+  );
+  if (!pid) throw new Error("tcpdump process not found");
+  execFileSync("sudo", ["-n", "kill", "-INT", pid]);
+  await new Promise<void>((resolve) => tcpdump!.once("close", () => resolve()));
+  udp = pcapPayloadBytes(pcap, Number(process.env.BENCH_UDP_PORT));
+  if (!/\b0 packets dropped by kernel\b/.test(tcpdumpLog))
+    throw new Error(`tcpdump packet loss or incomplete capture: ${tcpdumpLog}`);
+}
 clearInterval(sampler);
 if (code !== 0) throw new Error(`Detector failed: ${code}`);
 const state = await host.evaluate(
   () =>
     (window as unknown as { bench: { paints: number[]; input: number; motion: boolean } }).bench,
 );
+let quality;
+if (qualityMode) {
+  const framesHelper = join(output, "frames");
+  execFileSync("cc", [
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    resolve("scripts/bench/frames.c"),
+    "-o",
+    framesHelper,
+    "-lX11",
+    "-lXext",
+  ]);
+  const prefix = join(output, `${product}.quality`);
+  const paired = execFileSync(framesHelper, [hostDisplay, clientDisplay, "10", prefix], {
+    encoding: "utf8",
+  });
+  await writeFile(`${prefix}.log`, paired);
+  quality = analyzeQuality(prefix, paired);
+}
+const decodedColorSpace =
+  qualityMode && viewer
+    ? await viewer.locator(viewerSelector).evaluate((element) => {
+        if (!(element instanceof HTMLVideoElement) || typeof VideoFrame === "undefined")
+          return null;
+        try {
+          const frame = new VideoFrame(element);
+          const space = frame.colorSpace.toJSON();
+          frame.close();
+          return space;
+        } catch (error) {
+          return { error: String(error) };
+        }
+      })
+    : undefined;
 await host.evaluate(() => {
   (window as unknown as { bench: { motion: boolean } }).bench.motion = false;
 });
@@ -466,6 +613,22 @@ const receivedMediaMbps = streams.map((ssrc) => {
       ((last.bytesReceived - first.bytesReceived) * 8) / (last.timestamp - first.timestamp) / 1000,
   };
 });
+const bitrateMeasurement = udp
+  ? {
+      mbps: (udp.bytes * 8) / bitrateSeconds / 1e6,
+      source:
+        "Sunshine video-port UDP payload, including transport/FEC headers; loopback incoming packets only",
+    }
+  : receivedMediaMbps.length
+    ? {
+        mbps: receivedMediaMbps.reduce((sum, stream) => sum + stream.mbps, 0),
+        source: "WebRTC inbound-rtp video bytesReceived counter deltas",
+      }
+    : {
+        mbps: (websocketBytes * 8) / bitrateSeconds / 1e6,
+        source:
+          "CDP Network received WebSocket decoded payload bytes, including protocol/control messages",
+      };
 function resourceSummary(label: string) {
   const rows = resources.filter((r) => r.phase === label);
   const elapsed = rows.reduce((sum, r) => sum + r.ms, 0);
@@ -494,6 +657,7 @@ const result = {
     chrome: hostBrowser.version(),
     viewerSelector,
     viewerSetupClicks,
+    workload,
   },
   source: {
     frames: state.paints.length,
@@ -503,6 +667,17 @@ const result = {
   },
   ...metrics,
   receivedMediaMbps,
+  quality,
+  decodedColorSpace,
+  bitrateMeasurement,
+  transport: {
+    seconds: bitrateSeconds,
+    websocketBytes,
+    websocketMbps: (websocketBytes * 8) / bitrateSeconds / 1e6,
+    udp,
+    tcpdumpLog,
+    udpMbps: udp ? (udp.bytes * 8) / bitrateSeconds / 1e6 : null,
+  },
   resources: { idle: resourceSummary("idle"), motion: resourceSummary("motion") },
   runtime: {
     paths,
@@ -527,7 +702,12 @@ const result = {
       : null,
   },
   valid:
-    metrics.inputMs.count >= 100 &&
+    (qualityMode
+      ? quality !== undefined &&
+        quality.pairs.length >= 10 &&
+        Number.isFinite(bitrateMeasurement.mbps) &&
+        bitrateMeasurement.mbps > 0
+      : metrics.inputMs.count >= 100) &&
     metrics.missingInputs.length === 0 &&
     metrics.detector.hz >= 200 &&
     state.input === trials &&

@@ -241,6 +241,81 @@ heap allocation. On glibc Linux, session teardown now returns free heap pages vi
 It runs on a blocking worker, never in capture/encode or Tokio's async executor.
 Other allocators/platforms are unchanged.
 
+### Real content and picture quality
+
+`BENCH_WORKLOAD=text|drag|gradient` selects deterministic code editing/scrolling,
+large editor-window motion, or an animated color-gradient scene. The default
+`marker` workload remains unchanged. All retain the same checksummed source IDs.
+
+```sh
+BENCH_QUALITY=1 BENCH_WORKLOAD=text VIEWER_URL=http://127.0.0.1:7338 \
+  bun scripts/bench/run.ts content-nanoctl-text :97 :94 AGENT_PID \
+    "$HOME/bench-results/content" --repeat 3
+
+BENCH_QUALITY=1 BENCH_WORKLOAD=text VIEWER_URL=http://127.0.0.1:8088 \
+  VIEWER_SELECTOR='#screen' \
+  VIEWER_SETUP_CLICKS='["#toolbar-toggle","[data-action=control]"]' \
+  bun scripts/bench/run.ts content-screen-relay-text :93 :94 ENGINE_HOST_PID \
+    "$HOME/bench-results/content" --repeat 3
+
+# Start the native Moonlight viewer separately, as in the baseline setup.
+# Sunshine's video port is base port + 9; change this for your configuration.
+BENCH_QUALITY=1 BENCH_WORKLOAD=text BENCH_UDP_PORT=49009 \
+  bun scripts/bench/run.ts content-moonlight-text :96 :95 SUNSHINE_PID \
+    "$HOME/bench-results/content" --repeat 3
+```
+
+Repeat for `drag` and `gradient`. Run products sequentially, closing native
+streaming clients before measuring another product. Quality mode has no input
+trials: it measures a 20-second motion phase after four seconds settling and one
+second idle, followed by a separate ten-second matched-frame phase. Performance
+and host CPU/RSS do **not** include full-frame capture, PPM writes or FFmpeg work.
+Ordinary input benchmarks are unchanged. Quality validity requires >=10 matched
+pairs, a nonzero measured bitrate and the usual video/polling validity gates.
+
+Both browser viewports must be 1280x720 at device scale 1. Without a window
+manager, Chromium's fullscreen API alone does not resize the X window. Quality
+mode compensates the outer window's browser-chrome height and moves that chrome
+above the Xvfb screen. The visible canvas/video is native-size; the paired reader
+rejects scaled viewers (allowing two pixels of color-guard edge uncertainty).
+Native Moonlight must likewise display the source 1:1.
+
+`frames.c` attaches persistent XShm readers to **both** X servers. Full-frame
+reads are verified by a second marker decode, so changing frames are discarded.
+Eight source frames sampled every 15 IDs are retained; a client frame is saved
+only when its checksummed ID matches a retained source. Source/client XShm images
+are independently captured, not reconstructed from canvas commands. These are
+**dummy-data-only benchmark displays**: XShm segments use mode 0666 so an X server
+running as root inside the host-IPC Docker container can attach. Segments are
+marked for deletion immediately after attachment. Do not use sensitive desktops.
+
+The shared ROI is 1120x360, starting 120 pixels below the marker top and at its
+first data cell; marker, browser UI and toolbars are excluded. FFmpeg converts
+both RGB PPMs to gray luma, computes 8x8 SSIM and peak-255 PSNR on identical
+geometry, and saves a 640x180 text crop from the middle matched pair. JSON stores
+every pair's source ID, paths, scale, SSIM and PSNR, their distributions and the
+lossless-pair count (`inf` PSNR is explicit, not fabricated as a finite score).
+`PRODUCT.quality-text-{source,client}.png` are legibility evidence; all paired PPMs
+are retained. Repeat summaries use the median of per-run quality medians and
+min–max spread, not pooled frames or confidence intervals.
+
+Received bitrate scopes are deliberately explicit and are **not interchangeable**:
+
+- Nanoctl: browser inbound-video RTP `bytesReceived` counter deltas, excluding
+  transport headers.
+- Screen-relay: CDP Network received WebSocket payload bytes, decoding binary
+  frames from base64, including protocol/control messages but not WS/TCP headers.
+- Sunshine: IPv4 video-port UDP payload lengths from a header-only Ethernet PCAP
+  on loopback (`tcpdump -Q in`, so loopback traffic is counted once), including
+  Sunshine packet headers/FEC but excluding UDP/IP headers. This requires
+  passwordless `sudo -n tcpdump` and `sudo -n kill`; capture stops at motion end,
+  and nonzero kernel drops fail the run. Raw PCAP and tcpdump counters are kept.
+
+The source is generated canvas content, not a real editor/window manager or
+prerecorded video. Luma scores exclude chroma fidelity and are limited to this
+ROI. The paired phase follows the timing phase to avoid observer overhead, so
+quality and throughput are not computed from the same individual frames.
+
 ### Common measurements
 
 - The source reuses `tests/browser/latency-marker.ts` encoding (16-bit source

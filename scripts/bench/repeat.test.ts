@@ -61,3 +61,36 @@ test("runtime spread uses per-run MiB and leaves unavailable sizes explicit", ()
     summarizeRuns("invalid size", [{ ...run(10), runtime: { bytes: NaN } }], 1).runtimeMiB.count,
   ).toBe(0);
 });
+
+test("quality repeats require matched pairs and measured bitrate, not input trials", () => {
+  const sample: BenchRun = {
+    ...run(20),
+    inputMs: { count: 0, p50: null, p95: null },
+    quality: {
+      pairs: Array(10).fill({}),
+      ssim: { p50: 0.99 },
+      psnrY: { p50: 40 },
+      losslessPairs: 0,
+    },
+    bitrateMeasurement: { mbps: 5 },
+  };
+  const summary = summarizeRuns("quality", [sample], 1);
+  expect(summary.complete).toBe(true);
+  expect(summary.ssim.median).toBe(0.99);
+  expect(summaryMarkdown(summary)).toContain("0.99000");
+  expect(
+    summarizeRuns("missing bitrate", [{ ...sample, bitrateMeasurement: undefined }], 1).complete,
+  ).toBe(false);
+  expect(
+    summarizeRuns("missing frames", [{ ...sample, quality: { ...sample.quality!, pairs: [] } }], 1)
+      .complete,
+  ).toBe(false);
+  expect(summarizeRuns("mixed", [sample, run(20)], 2).complete).toBe(false);
+  expect(
+    summarizeRuns(
+      "lossless",
+      [{ ...sample, quality: { ...sample.quality!, psnrY: { p50: null }, losslessPairs: 10 } }],
+      1,
+    ).complete,
+  ).toBe(true);
+});
