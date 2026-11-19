@@ -2,6 +2,7 @@ import { test, expect, type Page } from "@playwright/test";
 import type { ControlMessage } from "../../packages/protocol/src/index";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { closePanel, openPanel } from "./panel";
 
 type SpyWindow = Window & { injected: string[] };
 async function controls(page: Page): Promise<ControlMessage[]> {
@@ -41,11 +42,12 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
     });
   }
   await page.goto("/");
+  await openPanel(page);
   await expect(page.getByRole("button", { name: "Input on", exact: true })).toBeEnabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
-  const buttons = page.locator(".toolbar button");
+  const buttons = page.locator(".session-panel button");
   for (const button of await buttons.all()) {
     await button.scrollIntoViewIfNeeded();
     const box = await button.boundingBox();
@@ -68,6 +70,7 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
   await screenshot(page, "pixel7-keyboard-ctrl.png");
   await page.getByRole("button", { name: "Hide special keys" }).click();
   await keyboard.click();
+  await openPanel(page);
   await page.getByRole("button", { name: "Trackpad", exact: true }).click();
   await expect(page.getByRole("button", { name: "Direct", exact: true })).toBeVisible();
   await page.reload();
@@ -77,7 +80,9 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
   await expect(page.getByRole("button", { name: "Trackpad", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Input on", exact: true })).toBeEnabled();
   if (process.env.NANOCTL_BROWSER_MEDIA === "1") {
-    await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+    await expect(page.getByTestId("connection-state")).toHaveText("Live", {
+      timeout: 30_000,
+    });
   }
   await page.setViewportSize({ width: 844, height: 390 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
@@ -100,7 +105,9 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
     };
   });
   await page.goto("/");
-  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", {
+    timeout: 30_000,
+  });
   await expect(page.locator(".touch-cursor")).toBeVisible();
   const box = (await page.locator("video").boundingBox())!;
   const x = box.x + box.width / 2;
@@ -144,6 +151,7 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
       ),
     )
     .toBe(true);
+  await openPanel(page);
   await page.getByRole("button", { name: "Keyboard", exact: true }).click();
   const field = page.getByRole("textbox", { name: "Remote keyboard" });
   await expect(field).toBeFocused();
@@ -157,8 +165,22 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
     })
     .toEqual([
       { type: "text", text },
-      { type: "key", key: "Enter", code: "Enter", action: "down", modifiers: 0, repeat: false },
-      { type: "key", key: "Enter", code: "Enter", action: "up", modifiers: 0, repeat: false },
+      {
+        type: "key",
+        key: "Enter",
+        code: "Enter",
+        action: "down",
+        modifiers: 0,
+        repeat: false,
+      },
+      {
+        type: "key",
+        key: "Enter",
+        code: "Enter",
+        action: "up",
+        modifiers: 0,
+        repeat: false,
+      },
     ]);
   await page.getByRole("button", { name: "Ctrl", exact: true }).click();
   await expect(field).toBeFocused();
@@ -166,8 +188,10 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
   await page.setViewportSize({ width: 844, height: 390 });
   await screenshot(page, "iphone-landscape-live-keyboard-ctrl.png");
   await page.getByRole("button", { name: "Hide special keys" }).click();
+  await openPanel(page);
   await page.getByRole("button", { name: "Input on", exact: true }).click();
   await expect(page.getByRole("button", { name: "Keyboard", exact: true })).toBeDisabled();
+  await closePanel(page);
   await page.setViewportSize({ width: 393, height: 851 });
   await clearControls(page);
   await tap();

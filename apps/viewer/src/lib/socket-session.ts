@@ -11,7 +11,13 @@ import {
   type RemoteSessionOptions,
 } from "./remote-session";
 
-export type SocketStatus = "connecting" | "online" | "reconnecting" | "replaced" | "error";
+export type SocketStatus =
+  | "connecting"
+  | "online"
+  | "reconnecting"
+  | "replaced"
+  | "disconnected"
+  | "error";
 export const reconnectDelay = (attempt: number): number | null =>
   attempt >= 5 ? null : Math.min(500 * 2 ** attempt, 8_000);
 
@@ -138,7 +144,10 @@ export class SocketSession {
                 preferences: this.preferences,
                 operations: {
                   sendSignal: async ({ envelope }) =>
-                    this.send(socket, { type: "signal", envelope: JSON.parse(envelope) }),
+                    this.send(socket, {
+                      type: "signal",
+                      envelope: JSON.parse(envelope),
+                    }),
                   endSession: async ({ reason }) => {
                     if (current()) {
                       localFailure = reason;
@@ -165,7 +174,10 @@ export class SocketSession {
             } else {
               if (!welcomed || !this.controller) throw new Error("Signal arrived before hello");
               this.controller.ingestHostSignals([
-                { sequence: message.envelope.sequence, envelope: JSON.stringify(message.envelope) },
+                {
+                  sequence: message.envelope.sequence,
+                  envelope: JSON.stringify(message.envelope),
+                },
               ]);
             }
           } catch {
@@ -212,6 +224,10 @@ export class SocketSession {
   private terminal(status: SocketStatus, detail: string): void {
     this.clear();
     this.options.onStatus(status, detail);
+  }
+
+  disconnect(): void {
+    this.terminal("disconnected", "You ended the session.");
   }
 
   dispose(): void {
