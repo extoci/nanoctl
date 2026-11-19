@@ -29,8 +29,7 @@ pub fn available() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        use cpal::traits::HostTrait;
-        cpal::default_host().default_output_device().is_some()
+        windows_worker().is_some_and(|worker| worker.available)
     }
     #[cfg(target_os = "macos")]
     {
@@ -130,56 +129,128 @@ fn capture() -> Result<(Capture, mpsc::Receiver<Vec<i16>>)> {
 }
 
 #[cfg(target_os = "windows")]
-struct Capture(std::sync::mpsc::Sender<()>);
+struct Capture {
+    commands: std::sync::mpsc::Sender<WindowsCommand>,
+    id: u64,
+}
 
 #[cfg(target_os = "windows")]
 impl Drop for Capture {
     fn drop(&mut self) {
-        let _ = self.0.send(());
+        let _ = self.commands.send(WindowsCommand::Stop(self.id));
     }
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
+enum WindowsCommand {
+    Start {
+        pcm: mpsc::Sender<Vec<i16>>,
+        ready: std::sync::mpsc::SyncSender<std::result::Result<u64, String>>,
+    },
+    Stop(u64),
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsWorker {
+    commands: std::sync::mpsc::Sender<WindowsCommand>,
+    available: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_worker() -> Option<&'static WindowsWorker> {
+    use cpal::traits::HostTrait;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+
+    static WORKER: std::sync::OnceLock<Option<WindowsWorker>> = std::sync::OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (commands, requests) = std::sync::mpsc::channel();
+            let (ready, started) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("audio-loopback".into())
+                .spawn(move || {
+                    // SAFETY: this thread owns its MTA and all CPAL objects created below.
+                    if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
+                        return;
+                    }
+                    struct Apartment;
+                    impl Drop for Apartment {
+                        fn drop(&mut self) {
+                            // SAFETY: paired with successful initialization on this thread.
+                            unsafe { CoUninitialize() };
+                        }
+                    }
+                    let _apartment = Apartment;
+                    let available = cpal::default_host().default_output_device().is_some();
+                    if ready.send(available).is_err() {
+                        return;
+                    }
+                    let mut streams = std::collections::HashMap::new();
+                    let mut next_id = 0_u64;
+                    while let Ok(command) = requests.recv() {
+                        match command {
+                            WindowsCommand::Start { pcm, ready } => {
+                                let result = windows_capture(pcm).map(|stream| {
+                                    let id = next_id;
+                                    next_id += 1;
+                                    streams.insert(id, stream);
+                                    id
+                                });
+                                if let Err(error) =
+                                    ready.send(result.map_err(|error| error.to_string()))
+                                    && let Ok(id) = error.0
+                                {
+                                    streams.remove(&id);
+                                }
+                            }
+                            WindowsCommand::Stop(id) => {
+                                streams.remove(&id);
+                            }
+                        }
+                    }
+                })
+                .ok()?;
+            Some(WindowsWorker {
+                commands,
+                available: started.recv().ok()?,
+            })
+        })
+        .as_ref()
+}
+
+#[cfg(target_os = "windows")]
 fn capture() -> Result<(Capture, mpsc::Receiver<Vec<i16>>)> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let (sender, receiver) = mpsc::channel(3);
-    let (stop, stopped) = std::sync::mpsc::channel();
+    let worker = windows_worker().context("cannot initialize audio worker")?;
+    anyhow::ensure!(worker.available, "no output device");
+    let (pcm, receiver) = mpsc::channel(3);
     let (ready, started) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("audio-loopback".into())
-        .spawn(move || {
-            let start = || -> Result<cpal::Stream> {
-                let device = cpal::default_host()
-                    .default_output_device()
-                    .context("no output device")?;
-                let config = device.default_output_config()?;
-                let stream = match config.sample_format() {
-                    cpal::SampleFormat::F32 => {
-                        windows_stream::<f32>(&device, &config.into(), sender)
-                    }
-                    cpal::SampleFormat::I16 => {
-                        windows_stream::<i16>(&device, &config.into(), sender)
-                    }
-                    cpal::SampleFormat::U16 => {
-                        windows_stream::<u16>(&device, &config.into(), sender)
-                    }
-                    format => anyhow::bail!("unsupported loopback format {format:?}"),
-                }?;
-                stream.play()?;
-                Ok(stream)
-            };
-            match start() {
-                Ok(_stream) => {
-                    let _ = ready.send(Ok(()));
-                    let _ = stopped.recv();
-                }
-                Err(error) => {
-                    let _ = ready.send(Err(error.to_string()));
-                }
-            }
-        })?;
-    started.recv()?.map_err(anyhow::Error::msg)?;
-    Ok((Capture(stop), receiver))
+    worker.commands.send(WindowsCommand::Start { pcm, ready })?;
+    let id = started.recv()?.map_err(anyhow::Error::msg)?;
+    Ok((
+        Capture {
+            commands: worker.commands.clone(),
+            id,
+        },
+        receiver,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_capture(sender: mpsc::Sender<Vec<i16>>) -> Result<cpal::Stream> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let device = cpal::default_host()
+        .default_output_device()
+        .context("no output device")?;
+    let config = device.default_output_config()?;
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => windows_stream::<f32>(&device, &config.into(), sender),
+        cpal::SampleFormat::I16 => windows_stream::<i16>(&device, &config.into(), sender),
+        cpal::SampleFormat::U16 => windows_stream::<u16>(&device, &config.into(), sender),
+        format => anyhow::bail!("unsupported loopback format {format:?}"),
+    }?;
+    stream.play()?;
+    Ok(stream)
 }
 
 #[cfg(target_os = "windows")]
@@ -289,6 +360,25 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_probe_is_cached_across_calling_threads() {
+        let worker = windows_worker().expect("audio worker initializes COM");
+        let expected = available();
+        assert_eq!(worker.available, expected);
+        let probes: Vec<_> = (0..16).map(|_| std::thread::spawn(available)).collect();
+        for probe in probes {
+            assert_eq!(probe.join().unwrap(), expected);
+        }
+        worker
+            .commands
+            .send(WindowsCommand::Stop(u64::MAX))
+            .unwrap();
+        if !expected {
+            assert!(capture().is_err());
+        }
+    }
 
     #[test]
     fn frames_arbitrary_pcm_chunks_without_losing_bytes() {
