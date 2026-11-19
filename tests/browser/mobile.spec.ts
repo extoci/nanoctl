@@ -8,7 +8,10 @@ async function controls(page: Page): Promise<ControlMessage[]> {
   return page.evaluate(() =>
     (window as unknown as SpyWindow).injected
       .map((data) => JSON.parse(data))
-      .filter((message) => message.type === "pointer" || message.type === "key"),
+      .filter(
+        (message) =>
+          message.type === "pointer" || message.type === "key" || message.type === "text",
+      ),
   );
 }
 async function clearControls(page: Page) {
@@ -149,24 +152,14 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
   await page.keyboard.insertText(text);
   await page.keyboard.press("Enter");
   await expect
-    .poll(
-      async () =>
-        (await controls(page))
-          .filter((m) => m.type === "key")
-          .map((m) => (m.type === "key" ? [m.key, m.action] : null)),
-      { timeout: 15_000 },
-    )
-    .toEqual(
-      [...text]
-        .flatMap((key) => [
-          [key, "down"],
-          [key, "up"],
-        ])
-        .concat([
-          ["Enter", "down"],
-          ["Enter", "up"],
-        ]),
-    );
+    .poll(async () => (await controls(page)).filter((m) => m.type === "key" || m.type === "text"), {
+      timeout: 15_000,
+    })
+    .toEqual([
+      { type: "text", text },
+      { type: "key", key: "Enter", code: "Enter", action: "down", modifiers: 0, repeat: false },
+      { type: "key", key: "Enter", code: "Enter", action: "up", modifiers: 0, repeat: false },
+    ]);
   await page.getByRole("button", { name: "Ctrl", exact: true }).click();
   await expect(field).toBeFocused();
   await screenshot(page, "pixel7-live-keyboard-ctrl.png");

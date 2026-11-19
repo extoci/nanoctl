@@ -1,7 +1,25 @@
-import type { ControlMessage } from "@nanoctl/protocol";
+import { MAX_CONTROL_MESSAGE_BYTES, type ControlMessage } from "@nanoctl/protocol";
 
 export const SENTINEL = "\u200b";
-export const MAX_INPUT_CHARACTERS = 256;
+export function textMessages(text: string): ControlMessage[] {
+  const messages: ControlMessage[] = [];
+  const encoder = new TextEncoder();
+  const overhead = encoder.encode(JSON.stringify({ type: "text", text: "" })).length;
+  let chunk = "";
+  let bytes = overhead;
+  for (const character of text) {
+    const size = encoder.encode(JSON.stringify(character)).length - 2;
+    if (bytes + size > MAX_CONTROL_MESSAGE_BYTES) {
+      messages.push({ type: "text", text: chunk });
+      chunk = "";
+      bytes = overhead;
+    }
+    chunk += character;
+    bytes += size;
+  }
+  if (chunk) messages.push({ type: "text", text: chunk });
+  return messages;
+}
 export const namedKeys: Record<string, string> = {
   Backspace: "Backspace",
   Enter: "Enter",
@@ -42,12 +60,14 @@ export function inputMessages(
       "insertReplacementText",
       "insertCompositionText",
       "insertFromComposition",
+      "insertFromPaste",
     ].includes(inputType)
   )
     return [];
-  return [...(data ?? "")]
-    .slice(0, MAX_INPUT_CHARACTERS)
-    .flatMap((key) => keyMessages(key, "", modifiers));
+  const text = data ?? "";
+  if (!modifiers || !text) return textMessages(text);
+  const first = String.fromCodePoint(text.codePointAt(0)!);
+  return [...keyMessages(first, "", modifiers), ...textMessages(text.slice(first.length))];
 }
 
 export const modifierKeys = {

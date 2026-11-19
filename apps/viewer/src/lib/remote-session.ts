@@ -11,7 +11,6 @@ import {
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { videoRates, type VideoSample } from "./video-rates";
 import { normalizedPosition, videoGeometry } from "./touch-input";
-import { KeySendQueue } from "./key-send-queue";
 
 export type RemoteSessionPhase =
   | "negotiating"
@@ -141,14 +140,6 @@ export class RemoteSessionController {
   private readonly offerPublicationGates = new Map<number, Promise<boolean>>();
   private readonly offerCompletionWaiters = new Map<number, () => void>();
   private metrics: RemoteSessionMetrics | null = null;
-  private readonly keyQueue = new KeySendQueue({
-    send: (message) => this.sendImmediate(message),
-    release: (message) => this.sendImmediate(message, true),
-    ready: () =>
-      this.inputEnabled &&
-      this.controlChannel?.readyState === "open" &&
-      this.controlChannel.bufferedAmount === 0,
-  });
 
   private readonly onWindowBlur = () => this.releaseInput();
   private readonly onVisibilityChange = () => {
@@ -293,25 +284,7 @@ export class RemoteSessionController {
     return true;
   }
 
-  resetControlKeys(): void {
-    this.keyQueue.reset();
-  }
-
   sendControl(payload: ControlMessage): boolean {
-    if (payload.type === "key") {
-      if (!this.inputEnabled || !this.isControlOpen()) return false;
-      if (!this.keyQueue.enqueue(payload)) {
-        this.inputEnabled = false;
-        this.releaseInput();
-        this.publishSnapshot();
-        return false;
-      }
-      return true;
-    }
-    return this.sendImmediate(payload);
-  }
-
-  private sendImmediate(payload: ControlMessage, releasing = false): boolean {
     const channel =
       payload.type === "pointer" && payload.action === "move"
         ? this.pointerChannel
@@ -319,8 +292,7 @@ export class RemoteSessionController {
     if (!channel || channel.readyState !== "open") return false;
     if (
       !this.inputEnabled &&
-      !releasing &&
-      (payload.type === "pointer" || payload.type === "key")
+      (payload.type === "pointer" || payload.type === "key" || payload.type === "text")
     ) {
       return false;
     }
@@ -1013,7 +985,6 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
-    this.keyQueue.reset();
     const channel = this.controlChannel;
     if (channel?.readyState === "open") {
       try {
