@@ -25,6 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use webrtc::media::Sample;
+use webrtc::rtp::extension::{HeaderExtension, playout_delay_extension::PlayoutDelayExtension};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 #[cfg(target_os = "linux")]
@@ -37,6 +38,17 @@ use crate::config::{EncoderPreference, LatencyMode};
 
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn video_playout_delay(mode: LatencyMode) -> HeaderExtension {
+    HeaderExtension::PlayoutDelay(PlayoutDelayExtension {
+        min_delay: 0,
+        max_delay: if matches!(mode, LatencyMode::Quality) {
+            10
+        } else {
+            0
+        },
+    })
+}
 
 #[derive(Default)]
 struct SendRateWindow {
@@ -1690,6 +1702,7 @@ pub fn spawn_video(
         });
         let mut stop_rx = stop_rx;
         let mut previous_written = None;
+        let extensions = [video_playout_delay(quality.latency_mode)];
         let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
         stats_tick.tick().await;
         let mut delivery_interrupted_since: Option<Instant> = None;
@@ -1720,7 +1733,7 @@ pub fn spawn_video(
                     let result = await_video_delivery(
                         async {
                             track
-                                .write_sample(&sample)
+                                .write_sample_with_extensions(&sample, &extensions)
                                 .await
                                 .map_err(anyhow::Error::from)
                         },
@@ -1894,6 +1907,23 @@ mod tests {
             super::sample_duration(Some(now), now - Duration::from_secs(1), 60),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn desktop_playout_is_immediate_except_when_quality_buffering_is_requested() {
+        for (mode, max_delay) in [
+            (LatencyMode::Responsiveness, 0),
+            (LatencyMode::Balanced, 0),
+            (LatencyMode::Quality, 10),
+        ] {
+            let webrtc::rtp::extension::HeaderExtension::PlayoutDelay(delay) =
+                super::video_playout_delay(mode)
+            else {
+                panic!("Expected playout delay")
+            };
+            assert_eq!(delay.min_delay, 0);
+            assert_eq!(delay.max_delay, max_delay);
+        }
     }
 
     #[test]

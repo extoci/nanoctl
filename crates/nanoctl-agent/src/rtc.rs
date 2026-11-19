@@ -31,7 +31,9 @@ use webrtc::rtcp::reception_report::ReceptionReport;
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use webrtc::rtp::extension::abs_send_time_extension::unix2ntp;
 use webrtc::rtp_transceiver::RTCPFeedback;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpHeaderExtensionCapability, RTPCodecType,
+};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::adaptive::LinkSample;
@@ -435,6 +437,13 @@ impl HostPeer {
         }
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
+        media_engine.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".to_owned(),
+            },
+            RTPCodecType::Video,
+            None,
+        )?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
         let mut settings = SettingEngine::default();
         let dev_loopback = crate::server::dev_user().is_some();
