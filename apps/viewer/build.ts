@@ -21,7 +21,7 @@ const asset = (path: string) => "/" + relative(outdir, path).replaceAll("\\", "/
 await writeFile(
   resolve(outdir, "index.html"),
   `<!doctype html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover">
 <meta name="color-scheme" content="dark"><meta name="theme-color" content="#0c111a">
 <title>nanoctl · Remote desktop</title><link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="${asset(style.path)}"><script type="module" src="${asset(script.path)}"></script></head>
