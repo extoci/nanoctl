@@ -65,17 +65,27 @@ pub fn capabilities(
 ) -> Capabilities {
     let displays = display_capabilities();
     let input = input_available();
-    let encoder_ready = {
+    let encoder_backends = {
         #[cfg(feature = "media")]
         {
-            crate::media::probe_encoder(encoder_preference).is_ok()
+            match crate::media::probe_encoder(encoder_preference) {
+                Ok((id, _))
+                    if id != "software-openh264"
+                        && matches!(encoder_preference, EncoderPreference::Auto) =>
+                {
+                    vec![id, "software-openh264"]
+                }
+                Ok((id, _)) => vec![id],
+                Err(_) => Vec::new(),
+            }
         }
         #[cfg(not(feature = "media"))]
         {
             let _ = encoder_preference;
-            false
+            Vec::new()
         }
     };
+    let encoder_ready = !encoder_backends.is_empty();
     let readiness = if !cfg!(feature = "media") {
         "encoder-unavailable"
     } else if displays.is_empty() {
@@ -96,13 +106,7 @@ pub fn capabilities(
         } else {
             Vec::new()
         },
-        encoder_backends: if cfg!(all(feature = "media", target_os = "macos")) {
-            vec!["videotoolbox", "software-openh264"]
-        } else if cfg!(feature = "media") {
-            vec!["software-openh264"]
-        } else {
-            Vec::new()
-        },
+        encoder_backends,
         ready: cfg!(feature = "media")
             && !displays.is_empty()
             && encoder_ready
@@ -288,7 +292,7 @@ fn encoder_check(_preference: crate::config::EncoderPreference) -> DoctorCheck {
             name: "encoder",
             ok: result.is_ok(),
             detail: match result {
-                Ok(backend) => format!("{backend} real-time H.264 encoder available"),
+                Ok((_, backend)) => format!("{backend} real-time H.264 encoder available"),
                 Err(error) => format!("{error:#}"),
             },
         }
