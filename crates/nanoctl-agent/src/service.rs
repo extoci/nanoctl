@@ -73,7 +73,7 @@ pub(crate) fn spawn_media(
     crate::media::spawn_video(
         peer.video_track(),
         peer.keyframe_requests(),
-        peer.bitrate_estimate_kbps(),
+        peer.link_feedback(),
         peer.display_selection(),
         peer.display_selection_feedback_sender(),
         crate::media::VideoQuality {

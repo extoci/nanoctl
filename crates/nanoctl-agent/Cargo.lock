@@ -2525,6 +2525,7 @@ dependencies = [
  "interceptor",
  "nanoctl-update",
  "openh264",
+ "openh264-sys2",
  "proptest",
  "rcgen",
  "reqwest",

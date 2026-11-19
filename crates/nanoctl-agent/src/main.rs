@@ -1,3 +1,5 @@
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
+mod adaptive;
 mod config;
 #[cfg(feature = "media")]
 mod input;

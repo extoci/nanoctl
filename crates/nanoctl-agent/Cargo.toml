@@ -12,6 +12,7 @@ capture = [
   "dep:cros-codecs",
   "dep:cros-libva",
   "dep:openh264",
+  "dep:openh264-sys2",
   "dep:videotoolbox",
   "dep:windows",
   "dep:xcap",
@@ -62,6 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
+openh264-sys2 = { version = "0.9.7", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
