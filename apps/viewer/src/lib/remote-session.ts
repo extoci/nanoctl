@@ -400,6 +400,9 @@ export class RemoteSessionController {
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
+      if ("jitterBufferTarget" in receiver) {
+        (receiver as RTCRtpReceiver & { jitterBufferTarget?: number }).jitterBufferTarget = 0;
+      }
       if ("playoutDelayHint" in receiver) {
         (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
       }

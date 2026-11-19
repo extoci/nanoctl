@@ -13,6 +13,32 @@ afterEach(() => {
 });
 
 describe("remote session lifecycle", () => {
+  test("requests zero receiver buffering only through supported browser APIs", async () => {
+    installBrowserGlobals();
+    for (const receiver of [
+      { jitterBufferTarget: 100, playoutDelayHint: 0.1 },
+      { playoutDelayHint: 0.1 },
+      {},
+    ]) {
+      const peer = new FakePeer();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: new FakeVideo() as unknown as HTMLVideoElement,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      const supported = Object.keys(receiver);
+      await controller.start();
+      peer.ontrack?.({ receiver, streams: [], track: {} } as unknown as RTCTrackEvent);
+      for (const property of supported) expect(Reflect.get(receiver, property)).toBe(0);
+      expect(Object.keys(receiver)).toEqual(supported);
+      await controller.stop();
+    }
+  });
   test("normal pointer capture loss preserves keyboard focus; cancellation still releases input", async () => {
     installBrowserGlobals();
     const peer = new FakePeer();
@@ -394,6 +420,8 @@ class FakeVideo extends EventTarget {
   videoHeight = 1080;
 
   focused = false;
+
+  async play(): Promise<void> {}
 
   focus(): void {
     this.focused = true;
