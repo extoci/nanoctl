@@ -100,12 +100,13 @@ export class SocketSession {
           try {
             const message = parseAgentMessage(JSON.parse(event.data));
             if (message.type === "end") {
-              this.terminal(
-                message.reason === "replaced" ? "replaced" : "error",
-                message.reason === "replaced"
-                  ? "Another viewer took over"
-                  : (localFailure ?? message.reason),
-              );
+              if (message.reason === "replaced") {
+                this.terminal("replaced", "Another viewer took over");
+              } else if (message.reason === "ended by controller") {
+                this.terminal("error", message.reason);
+              } else {
+                this.retry(localFailure ?? message.reason);
+              }
               return;
             }
             if (message.type === "hello") {
@@ -134,7 +135,10 @@ export class SocketSession {
                       localFailure = reason;
                       this.send(socket, { type: "end", reason });
                       this.timer = setTimeout(() => {
-                        if (current()) this.terminal("error", reason);
+                        if (current()) {
+                          if (reason === "ended by controller") this.terminal("error", reason);
+                          else this.retry(reason);
+                        }
                       }, 5_000);
                     }
                   },

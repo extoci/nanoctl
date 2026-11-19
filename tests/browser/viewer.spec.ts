@@ -1,4 +1,49 @@
 import { test, expect } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+
+test("disabled input stays off across repeated video clicks", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
+  await page.addInitScript(() => {
+    const send = RTCDataChannel.prototype.send;
+    (window as unknown as { injected: string[] }).injected = [];
+    RTCDataChannel.prototype.send = function (data: unknown) {
+      (window as unknown as { injected: string[] }).injected.push(String(data));
+      return Reflect.apply(send, this, [data]);
+    };
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  await page.getByRole("button", { name: "Input on", exact: true }).click();
+  await page.evaluate(() => {
+    (window as unknown as { injected: string[] }).injected = [];
+  });
+  await page.locator("video").click();
+  await page.locator("video").click();
+  await expect(page.getByRole("button", { name: "Input off", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+  expect(
+    await page.evaluate(() =>
+      (window as unknown as { injected: string[] }).injected.filter((data) =>
+        /"type":"(?:pointer|key)"/.test(data),
+      ),
+    ),
+  ).toEqual([]);
+});
+
+test("graceful host shutdown and restart recovers automatically", async ({ page }) => {
+  test.skip(
+    process.env.NANOCTL_BROWSER_MEDIA !== "1" || process.platform === "win32",
+    "Requires live video and POSIX signals",
+  );
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  const pid = Number(await readFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE!, "utf8"));
+  process.kill(pid, "SIGUSR2");
+  await expect(page.getByTestId("connection-state")).toHaveText("Reconnecting");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+});
 
 test("embedded viewer authenticates and negotiates under its CSP", async ({
   page,

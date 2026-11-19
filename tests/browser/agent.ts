@@ -31,21 +31,30 @@ const env = {
   XDG_CONFIG_HOME: directory,
   ...(process.platform === "linux" && !process.env.CC ? { CC: "gcc" } : {}),
 };
-const child = spawn(
-  "cargo",
-  [
-    "run",
-    "--features",
-    process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
-    "--manifest-path",
-    "crates/nanoctl-agent/Cargo.toml",
-    "--",
-    "--config",
-    config,
-    "run",
-  ],
-  { env, stdio: "inherit" },
-);
+const start = () =>
+  spawn(
+    "cargo",
+    [
+      "run",
+      "--features",
+      process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
+      "--manifest-path",
+      "crates/nanoctl-agent/Cargo.toml",
+      "--",
+      "--config",
+      config,
+      "run",
+    ],
+    { env, stdio: "inherit" },
+  );
+let child = start();
+if (process.env.NANOCTL_BROWSER_AGENT_PID_FILE)
+  await writeFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE, String(process.pid));
+let restarting = false;
+process.on("SIGUSR2", () => {
+  restarting = true;
+  child.kill("SIGINT");
+});
 let stopping = false;
 const stop = () => {
   stopping = true;
@@ -54,10 +63,18 @@ const stop = () => {
 process.on("SIGTERM", stop);
 process.on("SIGINT", stop);
 try {
-  const code = await new Promise<number>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code) => resolve(code ?? (stopping ? 0 : 1)));
-  });
+  let code: number;
+  do {
+    restarting = false;
+    code = await new Promise<number>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => resolve(code ?? (stopping ? 0 : 1)));
+    });
+    if (restarting && !stopping) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      child = start();
+    } else break;
+  } while (!stopping);
   process.exitCode = code;
 } finally {
   await rm(directory, { recursive: true, force: true });

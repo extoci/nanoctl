@@ -155,9 +155,6 @@ function Viewer() {
           muted
           tabIndex={0}
           aria-label="Remote desktop video"
-          onClick={() => {
-            if (info?.remoteInput) transport.current?.controller?.setInputEnabled(true);
-          }}
         />
         {!live && (
           <div className="overlay" role={terminal ? "alert" : "status"}>

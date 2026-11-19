@@ -1,5 +1,13 @@
 import { defineConfig, devices } from "@playwright/test";
 import { createServer } from "node:net";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+process.env.NANOCTL_BROWSER_AGENT_PID_FILE ??= join(
+  homedir(),
+  ".cache",
+  `nanoctl-browser-agent-${process.pid}.pid`,
+);
 
 if (!process.env.NANOCTL_BROWSER_PORT) {
   const server = createServer();

@@ -218,6 +218,16 @@ test("malformed messages fail closed, and disposal ignores late callbacks", asyn
   expect(state.controllers).toEqual([]);
 });
 
+test.each(["host shutdown", "control channel unavailable"])("%s is transient", async (reason) => {
+  const state = fixture();
+  const first = await socket();
+  first.receive({ type: "hello", sessionId: "one", host: info });
+  first.receive({ type: "end", reason });
+  expect(state.statuses.at(-1)).toBe("reconnecting");
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  expect(FakeSocket.instances).toHaveLength(2);
+});
+
 test("reconnect backoff is exponential, bounded and exhausts", () => {
   expect(Array.from({ length: 7 }, (_, attempt) => reconnectDelay(attempt))).toEqual([
     500,

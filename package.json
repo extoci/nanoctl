@@ -36,5 +36,8 @@
     "oxlint": "1.75.0",
     "typescript": "5.9.3"
   },
+  "overrides": {
+    "tinypool": "2.2.0"
+  },
   "packageManager": "bun@1.3.14"
 }
