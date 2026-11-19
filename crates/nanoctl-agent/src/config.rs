@@ -4,20 +4,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use url::Url;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AgentConfig {
-    pub control_plane_url: Url,
-    pub device_id: Option<String>,
+    pub tailnet: TailnetConfig,
     pub quality: QualityConfig,
-    pub network: NetworkConfig,
     pub features: FeatureConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct QualityConfig {
     pub codec: CodecPreference,
     pub encoder: EncoderPreference,
@@ -29,16 +26,17 @@ pub struct QualityConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct NetworkConfig {
-    pub ice_transport: IceTransport,
-    pub stun_urls: Vec<String>,
-    pub heartbeat_seconds: u64,
-    pub poll_milliseconds: u64,
+#[serde(default)]
+pub struct TailnetConfig {
+    pub port: u16,
+    pub allow_users: Vec<String>,
+    pub allow_tags: Vec<String>,
+    pub serve_loopback: bool,
+    pub tailscale_cli: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct FeatureConfig {
     pub system_audio: bool,
     pub clipboard: bool,
@@ -73,27 +71,6 @@ pub enum LatencyMode {
     Quality,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IceTransport {
-    #[default]
-    All,
-    Relay,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            control_plane_url: Url::parse("https://nanoctl.vercel.app")
-                .expect("static URL is valid"),
-            device_id: None,
-            quality: QualityConfig::default(),
-            network: NetworkConfig::default(),
-            features: FeatureConfig::default(),
-        }
-    }
-}
-
 impl Default for QualityConfig {
     fn default() -> Self {
         Self {
@@ -108,13 +85,14 @@ impl Default for QualityConfig {
     }
 }
 
-impl Default for NetworkConfig {
+impl Default for TailnetConfig {
     fn default() -> Self {
         Self {
-            ice_transport: IceTransport::All,
-            stun_urls: vec!["stun:stun.cloudflare.com:3478".into()],
-            heartbeat_seconds: 30,
-            poll_milliseconds: 2_000,
+            port: 7337,
+            allow_users: Vec::new(),
+            allow_tags: Vec::new(),
+            serve_loopback: true,
+            tailscale_cli: None,
         }
     }
 }
@@ -139,7 +117,11 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let value = fs::read_to_string(path)
             .with_context(|| format!("cannot read configuration at {}", path.display()))?;
-        let config: Self = toml::from_str(&value).context("configuration is invalid")?;
+        let raw: toml::Value = toml::from_str(&value).context("configuration is invalid")?;
+        let mut known = Self::default();
+        known.tailnet.tailscale_cli = Some(PathBuf::new());
+        warn_unknown(&raw, &toml::Value::try_from(known)?, "");
+        let config: Self = raw.try_into().context("configuration is invalid")?;
         config.validate()?;
         Ok(config)
     }
@@ -152,31 +134,9 @@ impl AgentConfig {
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
-        let parent = path.parent().context("configuration path has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-        let temporary = path.with_extension("toml.tmp");
-        fs::write(&temporary, toml::to_string_pretty(self)?)
-            .with_context(|| format!("cannot write {}", temporary.display()))?;
-        set_owner_only(&temporary)?;
-        fs::rename(&temporary, path)
-            .with_context(|| format!("cannot replace {}", path.display()))?;
-        Ok(())
-    }
-
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.control_plane_url.scheme(), "https" | "http") {
-            bail!("control_plane_url must use https");
-        }
-        if self.control_plane_url.scheme() == "http"
-            && !matches!(
-                self.control_plane_url.host_str(),
-                Some("127.0.0.1" | "localhost")
-            )
-        {
-            bail!("plain HTTP is allowed only for localhost development");
+        if self.tailnet.port == 0 {
+            bail!("tailnet.port must not be zero");
         }
         if !matches!(self.quality.max_fps, 30 | 60 | 90 | 120) {
             bail!("quality.max_fps must be 30, 60, 90, or 120");
@@ -189,22 +149,6 @@ impl AgentConfig {
         {
             bail!("quality resolution limits are outside the supported range");
         }
-        if !(5..=300).contains(&self.network.heartbeat_seconds) {
-            bail!("network.heartbeat_seconds must be between 5 and 300");
-        }
-        if !(250..=10_000).contains(&self.network.poll_milliseconds) {
-            bail!("network.poll_milliseconds must be between 250 and 10000");
-        }
-        if self.network.stun_urls.len() > 8 {
-            bail!("network.stun_urls cannot contain more than 8 endpoints");
-        }
-        for endpoint in &self.network.stun_urls {
-            if endpoint.len() > 512
-                || !(endpoint.starts_with("stun:") || endpoint.starts_with("stuns:"))
-            {
-                bail!("network.stun_urls entries must use stun: or stuns:");
-            }
-        }
         if self.features.system_audio || self.features.clipboard {
             bail!("system audio and clipboard are reserved and unavailable in protocol v2");
         }
@@ -216,27 +160,18 @@ impl AgentConfig {
         }
         Ok(())
     }
+}
 
-    pub fn validate_enrolled(&self) -> Result<()> {
-        self.validate()?;
-        if self.device_id.as_deref().is_none_or(str::is_empty) {
-            bail!("agent is not enrolled; run `nanoctl enroll CODE` first");
+fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
+    if let Some(table) = value.as_table() {
+        for (key, value) in table {
+            let path = format!("{prefix}{key}");
+            match known.get(key) {
+                Some(known) => warn_unknown(value, known, &format!("{path}.")),
+                None => tracing::warn!(key = path, "ignoring unknown or legacy configuration key"),
+            }
         }
-        Ok(())
     }
-}
-
-#[cfg(unix)]
-fn set_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_only(_path: &Path) -> Result<()> {
-    // Windows installer applies an explicit service/user ACL to the configuration directory.
-    Ok(())
 }
 
 #[cfg(test)]
@@ -244,24 +179,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_unknown_configuration_keys() {
-        let error = toml::from_str::<AgentConfig>(
-            r#"
-            control_plane_url = "https://example.com"
-            unsafe_shell = true
-            "#,
-        )
-        .expect_err("unknown key must fail");
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn rejects_insecure_remote_control_plane() {
-        let config = AgentConfig {
-            control_plane_url: Url::parse("http://example.com").unwrap(),
-            ..AgentConfig::default()
-        };
-        assert!(config.validate().is_err());
+    fn legacy_configuration_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "device_id = 'old'\ncontrol_plane_url = 'https://old.example'\n[network]\nheartbeat_seconds = 30\n").unwrap();
+        assert_eq!(AgentConfig::load(&path).unwrap().tailnet.port, 7337);
     }
 
     #[test]
@@ -272,18 +194,6 @@ mod tests {
         config.features.clipboard = false;
         config.features.system_audio = true;
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn validates_stun_endpoints_and_supported_codec() {
-        let mut config = AgentConfig::default();
-        config.network.stun_urls = vec!["https://not-an-ice-server.example".into()];
-        assert!(config.validate().is_err());
-        config.network.stun_urls = vec!["stuns:turn.example.test:5349".into()];
-        config.quality.codec = CodecPreference::Av1;
-        assert!(config.validate().is_err());
-        config.quality.codec = CodecPreference::H264;
-        assert!(config.validate().is_ok());
     }
 
     #[test]

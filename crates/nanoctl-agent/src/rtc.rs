@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::setting_engine::SettingEngine;
 #[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
 #[cfg(feature = "media")]
@@ -31,9 +32,6 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use zeroize::Zeroizing;
-
-use crate::control_plane::ControlPlane;
 
 const PROTOCOL_VERSION: u8 = 2;
 const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
@@ -112,10 +110,7 @@ struct SignalPublisher {
 
 #[derive(Clone)]
 enum SignalPublisherInner {
-    ControlPlane {
-        client: ControlPlane,
-        token: Arc<Zeroizing<String>>,
-    },
+    WebSocket(tokio::sync::mpsc::Sender<serde_json::Value>),
     #[cfg(test)]
     Test(tokio::sync::mpsc::UnboundedSender<TestSignal>),
     #[cfg(test)]
@@ -134,9 +129,9 @@ struct TestSignal {
 }
 
 impl SignalPublisher {
-    fn control_plane(client: ControlPlane, token: Arc<Zeroizing<String>>) -> Self {
+    fn websocket(sender: tokio::sync::mpsc::Sender<serde_json::Value>) -> Self {
         Self {
-            inner: SignalPublisherInner::ControlPlane { client, token },
+            inner: SignalPublisherInner::WebSocket(sender),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(AtomicBool::new(false)),
         }
@@ -232,10 +227,10 @@ impl SignalPublisher {
 
     async fn send_once(&self, session_id: &str, sequence: u64, envelope: &str) -> Result<()> {
         match &self.inner {
-            SignalPublisherInner::ControlPlane { client, token } => {
-                client
-                    .send_signal(token, session_id, sequence, envelope)
-                    .await
+            SignalPublisherInner::WebSocket(sender) => {
+                let _ = (session_id, sequence);
+                sender.send(serde_json::json!({"type":"signal","envelope":serde_json::from_str::<serde_json::Value>(envelope)?})).await
+                    .map_err(|_| anyhow::anyhow!("WebSocket receiver closed"))
             }
             #[cfg(test)]
             SignalPublisherInner::Test(sender) => sender
@@ -349,8 +344,7 @@ enum OutgoingPayload {
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
-        control_plane: ControlPlane,
-        token: Arc<Zeroizing<String>>,
+        sender: tokio::sync::mpsc::Sender<serde_json::Value>,
         session_id: String,
         serialized_offer: &str,
         ice_servers: Vec<RTCIceServer>,
@@ -359,7 +353,7 @@ impl HostPeer {
         allow_remote_input: bool,
     ) -> Result<Self> {
         Self::answer_with_publisher(
-            SignalPublisher::control_plane(control_plane, token),
+            SignalPublisher::websocket(sender),
             session_id,
             serialized_offer,
             ice_servers,
@@ -391,7 +385,17 @@ impl HostPeer {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+        let mut settings = SettingEngine::default();
+        let dev_loopback = crate::server::dev_user().is_some();
+        if matches!(publisher.inner, SignalPublisherInner::WebSocket(_)) {
+            settings.set_include_loopback_candidate(dev_loopback);
+            settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+            settings.set_ip_filter(Box::new(move |ip| {
+                crate::tailnet::is_tailnet_ip(ip) || (dev_loopback && ip.is_loopback())
+            }));
+        }
         let api = APIBuilder::new()
+            .with_setting_engine(settings)
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .build();
@@ -1085,6 +1089,7 @@ pub fn is_offer_for_session(serialized: &str, expected_session: &str) -> bool {
     parse_offer(serialized, expected_session).is_ok()
 }
 
+#[cfg(test)]
 pub fn offer_generation_and_epoch(
     serialized: &str,
     expected_session: &str,
@@ -1103,10 +1108,7 @@ pub(crate) fn host_epoch_seed() -> String {
 }
 
 fn host_sequence_seed() -> u64 {
-    // Convex transports sequences as JSON numbers, so use 53 random bits. Unlike a timestamp/PID
-    // recipe this remains fresh across rapid process restarts and PID reuse; the chance of
-    // colliding with retained signals is negligible. Database insertion time, not this seed,
-    // determines replay order across process epochs.
+    // Keep sequence numbers exactly representable by JavaScript clients.
     let random = (uuid::Uuid::new_v4().as_u128() & ((1_u128 << 53) - 1)) as u64;
     random.clamp(1, 9_007_199_254_740_991_u64 - 4_096)
 }
@@ -1154,32 +1156,6 @@ async fn remember_ice_ufrag(
 
 fn supported_version(version: u8) -> bool {
     (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
-}
-
-pub async fn report_negotiation_failure(
-    control_plane: &ControlPlane,
-    token: &Arc<Zeroizing<String>>,
-    session_id: &str,
-    controller_epoch: &str,
-    host_epoch: &str,
-    generation: u64,
-    reason: &str,
-) -> Result<()> {
-    // A terminal signal gets its own fresh host epoch. Sequence zero has no semantic meaning and
-    // must not be required for an offer because ICE callbacks can race local-description setup.
-    let reason = reason.chars().take(256).collect::<String>();
-    let sequence = host_sequence_seed();
-    let envelope = serialize_with_generation(
-        session_id,
-        controller_epoch,
-        host_epoch,
-        generation,
-        sequence,
-        OutgoingPayload::End { reason },
-    )?;
-    SignalPublisher::control_plane(control_plane.clone(), Arc::clone(token))
-        .send_terminal(session_id, sequence, &envelope)
-        .await
 }
 
 #[cfg(test)]

@@ -1,4 +1,3 @@
-use anyhow::Context;
 use serde::Serialize;
 
 use crate::config::{AgentConfig, EncoderPreference};
@@ -156,14 +155,6 @@ fn display_capabilities() -> Vec<DisplayCapability> {
     }
 }
 
-pub fn default_device_name() -> String {
-    hostname::get()
-        .ok()
-        .and_then(|value| value.into_string().ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("{} computer", PLATFORM))
-}
-
 pub async fn doctor(config: &AgentConfig) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(DoctorCheck {
@@ -175,54 +166,35 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
             "invalid; run nanoctl config and inspect service logs".into()
         },
     });
-    let credential = config
-        .device_id
-        .as_deref()
-        .and_then(|id| crate::credential::load(id).ok());
-    let credential_ok = credential.is_some();
+    let found = crate::tailnet::CliTailnet::discover(&config.tailnet);
     checks.push(DoctorCheck {
-        name: "credential",
-        ok: credential_ok,
-        detail: if credential_ok {
-            "available in operating-system credential store".into()
-        } else {
-            "missing; enroll this device".into()
+        name: "tailscale CLI",
+        ok: found.is_ok(),
+        detail: match &found {
+            Ok(_) => "found".into(),
+            Err(error) => error.to_string(),
         },
     });
-    checks.push(control_plane_check(config, credential.as_ref()).await);
+    let status = crate::tailnet::real(&config.tailnet).status().await;
+    checks.push(DoctorCheck {
+        name: "tailnet",
+        ok: status.is_ok(),
+        detail: match status {
+            Ok(node) => format!(
+                "running; IPs={:?}; MagicDNS={}; open {}",
+                node.ips,
+                node.dns_name,
+                crate::tailnet::urls(&node, config.tailnet.port).join(" ")
+            ),
+            Err(error) => error.to_string(),
+        },
+    });
     checks.push(capture_check());
     checks.push(encoder_check(config.quality.encoder));
     checks.push(input_check());
     DoctorReport {
         ready: checks.iter().all(|check| check.ok),
         checks,
-    }
-}
-
-async fn control_plane_check(
-    config: &AgentConfig,
-    credential: Option<&zeroize::Zeroizing<String>>,
-) -> DoctorCheck {
-    let result = async {
-        let credential = credential.context("device credential is unavailable")?;
-        let client = crate::control_plane::ControlPlane::new(config.control_plane_url.clone())?;
-        client
-            .heartbeat(
-                credential,
-                config.network.heartbeat_seconds,
-                config.features.remote_input,
-                config.quality.encoder,
-            )
-            .await
-    }
-    .await;
-    DoctorCheck {
-        name: "control plane",
-        ok: result.is_ok(),
-        detail: match result {
-            Ok(()) => "authenticated heartbeat accepted".into(),
-            Err(error) => format!("{error:#}"),
-        },
     }
 }
 
