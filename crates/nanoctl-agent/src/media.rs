@@ -7,8 +7,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
-    UsageType,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, MatrixCoefficients,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSource;
 use openh264_sys2::{
@@ -953,6 +953,11 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
         .usage_type(UsageType::ScreenContentRealTime)
+        .vui(
+            VuiConfig::srgb()
+                .full_range(false)
+                .matrix_coefficients(MatrixCoefficients::Smpte170M),
+        )
         .rate_control_mode(RateControlMode::Bitrate)
         .complexity(complexity)
         .skip_frames(skip_frames);
@@ -2345,6 +2350,36 @@ mod tests {
         assert_eq!((frame.width, frame.height), (1920, 1080));
         assert!(!frame.bytes.is_empty());
         assert!(annex_b_nal_types(&frame.bytes).is_ok());
+    }
+
+    #[test]
+    fn software_encoder_signals_the_limited_bt601_matrix_of_its_srgb_input() {
+        for mode in [
+            LatencyMode::Responsiveness,
+            LatencyMode::Balanced,
+            LatencyMode::Quality,
+        ] {
+            let mut encoder = super::create_encoder(4_000, 60, mode).unwrap();
+            let mut frame = super::I420Frame::new(16, 16).unwrap();
+            frame.read_rgba(&[128; 16 * 16 * 4]).unwrap();
+            encoder.encode(&frame).unwrap();
+            let mut params = openh264_sys2::SEncParamExt::default();
+            // SAFETY: GetOption synchronously writes the matching initialized parameter structure.
+            let result = unsafe {
+                encoder.raw_api().get_option(
+                    openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                    std::ptr::from_mut(&mut params).cast(),
+                )
+            };
+            assert_eq!(result, 0);
+            let layer = &params.sSpatialLayers[0];
+            assert!(layer.bVideoSignalTypePresent);
+            assert!(layer.bColorDescriptionPresent);
+            assert!(!layer.bFullRange);
+            assert_eq!(layer.uiColorPrimaries, 1);
+            assert_eq!(layer.uiTransferCharacteristics, 13);
+            assert_eq!(layer.uiColorMatrix, 6);
+        }
     }
 
     #[test]

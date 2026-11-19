@@ -643,3 +643,103 @@ bytes, +10,800 bytes (+0.067%) for cleanup support; pacing alone did not grow it
   import error was fixed before the final passing checks and production run.
 - `scripts/bench/reconnect.ts` and README document reproducing the cycle probe.
   No new picture-quality or separate visual review was performed.
+
+## Real-content quality and received bitrate
+
+Completed 27 baseline runs (three products × text/drag/gradient × three repeats),
+then nine nanoctl runs with **only software H.264 color metadata corrected**.
+All 36 were valid, with 1,428 matched quality pairs (38–40 per run).
+Sequential blocks: Moonlight, nanoctl baseline, screen-relay, nanoctl correction.
+Moonlight was closed before measuring the other products. No builds, tests,
+competing streams or full-frame quality readers ran during timed motion phases.
+Defaults otherwise match the preceding setup: 720p/60, software H.264; Moonlight
+logged a 10,000-kbps request, nanoctl's configured ceiling is 24 Mbps, screen-relay
+retains its default 1/8/40-Mbps policy. Targets are not received byte rates.
+
+Cells below are medians across three runs: per-run median frame SSIM/PSNR and
+video latency, unique FPS, measured received bitrate and average motion CPU.
+CPU is one core = 100%. Min–max spreads and raw per-run data are preserved in
+`~/bench-results/content/content-*.repeat.{json,md}`. These are not confidence
+intervals; blocks were sequential, not randomized.
+
+| Workload | Product           | SSIM Y  | PSNR Y dB | Received Mbps | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ----------------- | ------- | --------- | ------------- | ----- | ------------ | ------------ |
+| Text     | nanoctl before    | 0.99513 | 39.09     | 0.89          | 59.62 | 35.68        | 52.87        |
+| Text     | screen-relay      | 0.99958 | 52.22     | 3.36          | 59.70 | 52.78        | 34.17        |
+| Text     | Moonlight         | 0.99934 | 48.42     | 5.30          | 59.84 | 40.33        | 62.80        |
+| Text     | nanoctl corrected | 0.99522 | 39.67     | 0.89          | 59.53 | 19.80        | 51.23        |
+| Drag     | nanoctl before    | 0.99382 | 39.19     | 0.74          | 59.84 | 19.52        | 36.40        |
+| Drag     | screen-relay      | 0.99957 | 52.39     | 7.53          | 59.70 | 57.49        | 35.78        |
+| Drag     | Moonlight         | 0.99916 | 48.57     | 7.70          | 59.75 | 29.38        | 60.16        |
+| Drag     | nanoctl corrected | 0.99510 | 40.99     | 0.73          | 59.70 | 36.38        | 40.55        |
+| Gradient | nanoctl before    | 0.98548 | 27.67     | 3.26          | 59.53 | 36.40        | 50.92        |
+| Gradient | screen-relay      | 0.99404 | 47.66     | 16.57         | 59.70 | 62.13        | 48.23        |
+| Gradient | Moonlight         | 0.99293 | 46.49     | 7.39          | 58.10 | 22.06        | 70.02        |
+| Gradient | nanoctl corrected | 0.99107 | 42.65     | 3.26          | 59.11 | 36.32        | 49.16        |
+
+### What the quality fix corrects
+
+This is a reached software-encoder color-description bug, not evidence of a
+0.2-Mbps real-content REMB cap. The actual configured software backend calls
+`I420Frame::read_rgba`, whose integer coefficients produce limited-range BT.601
+YUV. `create_encoder` previously omitted VUI. Actual Chrome VideoFrame metadata
+in `content-nanoctl-text-run-1.json` reported limited-range **BT.709** matrix and
+transfer. The controller/quantizer were deliberately left unchanged to challenge
+the alternative explanation that the whole deficit was insufficient bitrate.
+
+The sole change signals BT.601/SMPTE-170M matrix, limited range, BT.709/sRGB
+primaries and sRGB transfer. Actual corrected VideoFrame metadata reports
+`matrix=smpte170m`, `fullRange=false`, `primaries=bt709`,
+`transfer=iec61966-2-1`. The initialized OpenH264 parameters are regression-tested
+for all three latency modes. No capture, rate-control, QP, pacing or thread
+setting changed. Software encoding on Linux was measured; hardware paths are
+untouched and were not evaluated here.
+
+The gradient gain is **27.67 → 42.65 dB (+14.98 dB)** at unchanged 3.26 Mbps.
+Drag improves 1.80 dB and text 0.58 dB. Text SSIM ranges overlap; its tiny SSIM
+gain alone is not persuasive. The correction is retained for correct color
+description and repeatable PSNR/gradient improvement, not claimed as latency or
+CPU optimization. Drag's after-block latency and CPU are **worse**; text's latency
+is better. Refresh-sized timing shifts remain and no causal performance claim
+is made from these blocks. Both release binaries are exactly 16,172,120 bytes;
+copies are `~/bench-candidates/nanoctl-quality-{before,vui}`.
+
+Nanoctl still loses quality to both competitors and text CPU to screen-relay.
+No QP hard cap, forced padding, rate-control change or optional SIMD/CPU
+optimization was retained or attempted after the color correction. Further
+quality/CPU tuning remains unfinished; the table must not be read as parity.
+
+### Measurement scope and evidence
+
+- The source workloads are deterministic canvas simulations, not native editor
+  automation or prerecorded video. Every frame retains checksummed IDs.
+- Timing/CPU use a 20-second motion phase. A separate ten-second paired phase
+  captures both displays through persistent XShm, verifies IDs after full reads,
+  and scores a native 1120x360 ROI excluding markers/browser chrome. This avoids
+  charging frame capture, PPM writes or FFmpeg analysis to host motion CPU.
+- Scores are FFmpeg gray-luma 8x8 SSIM and peak-255 PSNR; no chroma score or
+  perceptual-model claim. An identical-source self-check printed
+  `SSIM Y:1.000000 ... All:1.000000` and `PSNR y:inf average:inf`.
+- Browser viewports are normalized to 1280x720 at scale 1, including compensating
+  Chromium chrome on WM-less Xvfb. Scaled viewers are rejected. Preliminary
+  `probe-*` outputs at scale 0.688/0.879 were geometry-contaminated and are
+  excluded. A preliminary Moonlight tcpdump shutdown probe also ran too long;
+  only the named `content-*` runs are used above.
+- Container Xvfb's different UID required dummy-data XShm segments accessible
+  across UIDs. README documents permissions and the host-IPC trust boundary.
+- Nanoctl bitrate is video inbound-RTP payload counters. Screen-relay uses CDP
+  received WebSocket payload bytes including protocol/control messages, excluding
+  WS/TCP headers. Moonlight uses video-port 49009 incoming loopback UDP payload
+  lengths, including Sunshine/FEC headers but excluding UDP/IP. Its raw PCAPs and
+  zero-kernel-drop counters are retained. These scopes are not wire-equivalent.
+- Per-run JSON, source timelines, pixel logs, matched PPMs, quality logs and PNGs
+  are under `~/bench-results/content/`. Prefixes are
+  `content-{nanoctl,screen-relay,moonlight}-{text,drag,gradient}-run-{1,2,3}`;
+  corrected prefixes are `content-nanoctl-vui-{text,drag,gradient}-run-{1,2,3}`.
+  Text crops append `.quality-text-source.png` / `.quality-text-client.png`.
+  Crops have been inspected; Japanese glyph fallback boxes occur in the source
+  too and are not evidence of an encoder defect.
+- Checks: 98 Bun tests; focused oxlint/types; strict C compilation and unavailable
+  display failure; clippy all-targets RTC/media; 69 RTC tests; 118 media tests,
+  one preexisting X11 test ignored; release build. No new impaired-link,
+  hardware-encoder or reconnect-RSS campaign was performed.
