@@ -54,3 +54,25 @@ exact captured RGBA equality with the preceding successful output. These are
 source-pixel classifications, not decoded-picture validation. Raw received-marker
 FPS includes redundant images in the fixed-timer baseline, so it is not by itself
 a measure of unique motion updates.
+
+On Linux X11, `damage_enabled` reports XDamage gating and `capture_parked` reports
+its final state. `damage_resumes` includes nonvisual repaints; identical pixels
+return to parked immediately. `first_change_samples` counts successful changed
+encodes after parking. `first_change_last_ms` / `first_change_max_ms` measure from
+the local receipt of DamageNotify to completion of that encode, including capture
+and pacing. They are session-wide gauges (including warmup), not network/display
+latency. Other event/counter fields are measurement-window deltas.
+`first_change_capture_ready_ms` isolates the last event→captured-frame-ready part;
+`first_change_encode_ms` is that frame's color conversion and encoder duration.
+
+The X11 gate uses xcap's one-shot capture primitive rather than its continuous
+recorder: in xcap 0.9.7 `stop()` can race with the worker's running check and end
+the worker permanently, so stop/start cannot reliably resume it. Gating before
+creating that worker avoids both the race and an abandoned sleeping worker. The
+500 ms active grace is based on actual pixel changes, not redundant repaint
+notifications. Missing XDamage or Wayland retains the continuous recorder;
+runtime damage-connection errors revert to continuous one-shot captures. Cached
+keepalive and forced-keyframe encoding do not interact with the capture gate.
+
+The direct Linux dependency is xcb 1.7 (MIT), already used by xcap; its `damage`
+feature also enables xfixes. libc (MIT OR Apache-2.0) supplies descriptor polling.

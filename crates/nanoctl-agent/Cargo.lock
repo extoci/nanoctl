@@ -2523,6 +2523,7 @@ dependencies = [
  "futures-util",
  "hostname",
  "interceptor",
+ "libc",
  "nanoctl-update",
  "openh264",
  "openh264-sys2",
@@ -2548,6 +2549,7 @@ dependencies = [
  "windows 0.62.2",
  "x509-parser",
  "xcap",
+ "xcb",
 ]
 
 [[package]]

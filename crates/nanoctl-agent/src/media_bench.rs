@@ -81,6 +81,14 @@ fn pipeline_stats(pipeline: &VideoPipeline) -> Value {
     let stats = &pipeline.stats;
     json!({
         "frames_captured": stats.frames_captured.load(Ordering::Relaxed),
+        "damage_enabled": stats.damage_enabled.load(Ordering::Relaxed),
+        "capture_parked": stats.capture_parked.load(Ordering::Relaxed),
+        "damage_resumes": stats.damage_resumes.load(Ordering::Relaxed),
+        "first_change_samples": stats.first_change_samples.load(Ordering::Relaxed),
+        "first_change_last_ms": stats.first_change_last_ns.load(Ordering::Relaxed) as f64 / 1e6,
+        "first_change_max_ms": stats.first_change_max_ns.load(Ordering::Relaxed) as f64 / 1e6,
+        "first_change_capture_ready_ms": stats.first_change_capture_ready_ns.load(Ordering::Relaxed) as f64 / 1e6,
+        "first_change_encode_ms": stats.first_change_encode_ns.load(Ordering::Relaxed) as f64 / 1e6,
         "frames_encoded": stats.frames_encoded.load(Ordering::Relaxed),
         "changed_encodes": stats.changed_encodes.load(Ordering::Relaxed),
         "unchanged_encodes": stats.unchanged_encodes.load(Ordering::Relaxed),
@@ -325,6 +333,8 @@ pub async fn run(seconds: u64) -> Result<Value> {
     let mut delta = final_stats.clone();
     for key in [
         "frames_captured",
+        "damage_resumes",
+        "first_change_samples",
         "frames_encoded",
         "changed_encodes",
         "unchanged_encodes",

@@ -16,6 +16,8 @@ capture = [
   "dep:videotoolbox",
   "dep:windows",
   "dep:xcap",
+  "dep:xcb",
+  "dep:libc",
 ]
 media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
 rtc = ["dep:interceptor", "dep:webrtc"]
@@ -69,6 +71,8 @@ xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1.7", features = ["damage"], optional = true }
+libc = { version = "0.2", optional = true }
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
 cros-libva = { version = "0.0.12", optional = true }
 

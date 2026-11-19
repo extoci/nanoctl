@@ -26,6 +26,10 @@ use std::time::{Duration, Instant};
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+#[cfg(target_os = "linux")]
+#[path = "linux_damage.rs"]
+mod linux_damage;
+
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
@@ -35,6 +39,24 @@ const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct PipelineStats {
+    #[cfg(target_os = "linux")]
+    pub capture_parked: AtomicBool,
+    #[cfg(target_os = "linux")]
+    pub damage_enabled: AtomicBool,
+    #[cfg(target_os = "linux")]
+    pub damage_resumes: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_samples: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_last_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_max_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_capture_ready_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_encode_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    damage_started: Mutex<Option<Instant>>,
     pub frames_captured: AtomicU64,
     pub frames_encoded: AtomicU64,
     pub changed_encodes: AtomicU64,
@@ -420,7 +442,7 @@ impl CaptureEncoder {
             .to_string();
         let (recorder, latest_frame, forwarder) = start_capture(&monitor, stats)?;
         Ok(Self {
-            recorder: Some(recorder),
+            recorder,
             forwarder: Some(forwarder),
             latest_frame,
             display_id,
@@ -450,7 +472,7 @@ impl CaptureEncoder {
         if let Some(old_forwarder) = self.forwarder.take() {
             let _ = old_forwarder.join();
         }
-        self.recorder = Some(recorder);
+        self.recorder = recorder;
         self.forwarder = Some(forwarder);
         self.latest_frame = latest_frame;
         self.display_id = display_id.to_owned();
@@ -810,10 +832,20 @@ fn start_capture(
     monitor: &Monitor,
     stats: Arc<PipelineStats>,
 ) -> Result<(
-    xcap::VideoRecorder,
+    Option<xcap::VideoRecorder>,
     Arc<LatestFrame>,
     std::thread::JoinHandle<()>,
 )> {
+    #[cfg(target_os = "linux")]
+    match linux_damage::start(monitor, stats.clone()) {
+        Ok((latest, thread)) => return Ok((None, latest, thread)),
+        Err(error) => tracing::debug!(%error, "XDamage unavailable; retaining continuous capture"),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stats.damage_enabled.store(false, Ordering::Relaxed);
+        stats.capture_parked.store(false, Ordering::Relaxed);
+    }
     let (recorder, native_frames) = monitor
         .video_recorder()
         .context("continuous display capture is unavailable")?;
@@ -851,7 +883,7 @@ fn start_capture(
         let _ = forwarder.join();
         return Err(error).context("continuous display capture could not start");
     }
-    Ok((recorder, latest_frame, forwarder))
+    Ok((Some(recorder), latest_frame, forwarder))
 }
 
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
@@ -1551,7 +1583,7 @@ pub fn spawn_video(
                     }
                     let (max_width, max_height) =
                         scale.limits(quality.max_width, quality.max_height);
-                    let (frame, _) =
+                    let (frame, _timing) =
                         encoder.encode_captured_frame(captured, max_width, max_height)?;
                     if frame.bytes.is_empty() {
                         continue;
@@ -1560,6 +1592,30 @@ pub fn spawn_video(
                         .as_ref()
                         .is_none_or(|previous| captured.differs_from(previous));
                     if changed_output {
+                        #[cfg(target_os = "linux")]
+                        if let Some(started) = producer_stats.damage_started.lock().unwrap().take()
+                        {
+                            let elapsed = started.elapsed().as_nanos() as u64;
+                            producer_stats.first_change_capture_ready_ns.store(
+                                captured
+                                    .captured_at
+                                    .saturating_duration_since(started)
+                                    .as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                            producer_stats
+                                .first_change_encode_ns
+                                .store(_timing.encode.as_nanos() as u64, Ordering::Relaxed);
+                            producer_stats
+                                .first_change_samples
+                                .fetch_add(1, Ordering::Relaxed);
+                            producer_stats
+                                .first_change_last_ns
+                                .store(elapsed, Ordering::Relaxed);
+                            producer_stats
+                                .first_change_max_ns
+                                .fetch_max(elapsed, Ordering::Relaxed);
+                        }
                         producer_stats
                             .changed_encodes
                             .fetch_add(1, Ordering::Relaxed);
@@ -1958,6 +2014,17 @@ mod tests {
         };
         let (frame, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
         assert!(!frame.bytes.is_empty());
+        encoder.encoder.force_keyframe();
+        let (forced, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
+        assert!(!forced.bytes.is_empty());
+        assert_eq!(
+            encoder
+                .latest_frame
+                .stats
+                .frames_captured
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         captured.frame.raw.clear();
         assert!(encoder.encode_captured_frame(&captured, 64, 64).is_err());
     }
