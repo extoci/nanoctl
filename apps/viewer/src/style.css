@@ -131,11 +131,24 @@ select:focus-visible {
   background: radial-gradient(ellipse at 50% 45%, #14202c, #090d14 65%);
 }
 video {
+  touch-action: none;
   width: 100%;
   height: 100%;
   object-fit: contain;
   display: block;
   outline: none;
+}
+.touch-cursor {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border: 2px solid white;
+  border-radius: 50%;
+  background: #10182299;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
 .overlay {
   position: absolute;
@@ -285,6 +298,36 @@ kbd {
   bottom: 16px;
   left: 16px;
 }
+.soft-keyboard-field {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  font-size: 16px;
+  pointer-events: none;
+}
+.special-keys {
+  position: fixed;
+  z-index: 10;
+  left: 0;
+  right: 0;
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 6px max(8px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom))
+    max(8px, env(safe-area-inset-left));
+  background: #101721;
+  border-top: 1px solid #34455b;
+}
+.special-keys button {
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 44px;
+}
 @media (max-width: 900px) {
   .escape-hint {
     display: none;
@@ -327,5 +370,100 @@ kbd {
   }
   .status-card {
     padding: 28px 20px;
+  }
+}
+@media (max-width: 720px), (pointer: coarse) {
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  .viewer {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  .bar {
+    flex: 0 0 auto;
+    min-height: 44px;
+    gap: 10px;
+    padding: max(4px, env(safe-area-inset-top)) 10px 4px;
+  }
+  .brand {
+    font-size: 26px;
+  }
+  .brand span,
+  .identity,
+  .escape-hint,
+  .health,
+  .display-picker span {
+    display: none;
+  }
+  .host {
+    padding-left: 10px;
+    gap: 2px;
+  }
+  .host strong {
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .host span {
+    font-size: 10px;
+  }
+  .stage {
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+  .toolbar {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    min-height: 54px;
+    padding: 4px 8px max(4px, env(safe-area-inset-bottom));
+    gap: 6px;
+  }
+  .actions {
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    margin: 0;
+    gap: 6px;
+  }
+  .actions > * {
+    flex-shrink: 0;
+  }
+  button,
+  select {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 8px;
+    font-size: 12px;
+    white-space: nowrap;
+    touch-action: manipulation;
+  }
+  .display-picker select {
+    max-width: 140px;
+  }
+  .stats {
+    top: 8px;
+    right: 8px;
+    width: min(200px, 55%);
+    max-height: 60%;
+    overflow-y: auto;
+    gap: 5px;
+    padding: 8px;
+    font-size: 10px;
+  }
+  .overlay {
+    padding: 12px;
+  }
+  .status-card {
+    padding: 16px;
+    max-height: 100%;
+    overflow-y: auto;
+  }
+  .spinner {
+    margin-bottom: 10px;
   }
 }
