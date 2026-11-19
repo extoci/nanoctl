@@ -131,6 +131,31 @@ damage-to-source association can be coalesced; this is a diagnostic side channel
 not the product-neutral headline measurement. Instrumented runs include tracing
 and one-row video readback overhead; compare with uninstrumented runs too.
 
+### Reconnect memory probe
+
+On Linux, start a fresh agent on the host display, then run:
+
+```sh
+HOST_DISPLAY=:97 CLIENT_DISPLAY=:94 \
+  bun scripts/bench/reconnect.ts AGENT_PID "$HOME/bench-results/reconnect.json"
+```
+
+This opens the real viewer in a fresh headed-browser context for each of 20
+sessions against a shared 720p/60 Hz marker source. Each cycle verifies decoded
+video, runs ten seconds of motion, closes the context/WebSocket, waits three
+seconds for teardown, and samples agent-only `/proc/PID/status` RSS, thread count
+and open FDs. Connected samples and frame counts are also saved after every cycle;
+partial artifacts survive errors. Existing output files are refused. Browser
+processes persist across cycles but peer connections and contexts do not.
+
+`VIEWER_URL`, `CYCLES`, `MOTION_MS` (at least 1000), and `SETTLE_MS` override the
+defaults. Use fresh agents for before/after comparisons; keep the same PID only
+when explicitly extending a series. RSS measures physical residency, not live
+heap allocation. On glibc Linux, session teardown now returns free heap pages via
+`malloc_trim(0)` after media workers have joined and the closed peer is dropped.
+It runs on a blocking worker, never in capture/encode or Tokio's async executor.
+Other allocators/platforms are unchanged.
+
 ### Common measurements
 
 - The source reuses `tests/browser/latency-marker.ts` encoding (16-bit source

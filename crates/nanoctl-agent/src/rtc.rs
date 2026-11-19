@@ -1824,7 +1824,17 @@ mod tests {
         .await
         .expect("controller did not reconnect after ICE restart");
 
+        let weak_peer = Arc::downgrade(&host.peer);
+        let weak_video = Arc::downgrade(&host.video);
         host.close().await.unwrap();
         controller.close().await.unwrap();
+        drop(host);
+        timeout(Duration::from_secs(2), async {
+            while weak_peer.strong_count() != 0 || weak_video.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed host peer and video track must be released");
     }
 }

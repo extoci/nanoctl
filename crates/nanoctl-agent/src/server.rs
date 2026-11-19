@@ -410,6 +410,9 @@ async fn session(
             let _ = peer.fail(&reason).await;
         }
         let _ = peer.close().await;
+        drop(peer);
+        #[cfg(feature = "media")]
+        crate::media::release_session_memory().await;
     }
     let _ = send(&mut socket, json!({"type":"end","reason":reason})).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;

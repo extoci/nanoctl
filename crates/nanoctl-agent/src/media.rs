@@ -1463,6 +1463,24 @@ impl VideoPipeline {
     }
 }
 
+pub(crate) async fn release_session_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Err(error) = tokio::task::spawn_blocking(|| {
+        let started = Instant::now();
+        // glibc releases only free pages; live allocations in other sessions remain valid.
+        let trimmed = unsafe { libc::malloc_trim(0) };
+        tracing::debug!(
+            trim_us = started.elapsed().as_micros(),
+            trimmed,
+            "session allocator trimmed"
+        );
+    })
+    .await
+    {
+        tracing::warn!(%error, "session allocator cleanup failed");
+    }
+}
+
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
@@ -1877,6 +1895,16 @@ mod tests {
         pipeline.stop().await;
 
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn session_memory_cleanup_preserves_live_buffers_and_is_repeatable() {
+        super::release_session_memory().await;
+        let pixels = vec![37_u8; 4 * 1024 * 1024];
+        super::release_session_memory().await;
+        assert!(pixels.iter().all(|byte| *byte == 37));
+        drop(pixels);
+        super::release_session_memory().await;
     }
 
     #[test]

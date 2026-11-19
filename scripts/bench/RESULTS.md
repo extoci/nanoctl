@@ -339,8 +339,9 @@ the first three also have `.attribution.{json,md}`. Tooling commit: `c9e1341`.
 
 ## Five-run pacer comparison
 
-**Decision: retain the current pacer. Neither candidate meets every retention
-gate.** This comparison uses five fresh trials per group, not the preceding
+**Initial decision under the strict CPU gate: retain the current pacer.** This
+decision was superseded by the user-approved tradeoff below. This comparison
+uses five fresh trials per group, not the preceding
 single-run experiments. All **20/20 runs were valid**, matching **600/600 inputs
 per group, 2400/2400 total**. No outlier was excluded and no run was retried.
 
@@ -443,3 +444,104 @@ adaptive.rs was restored byte-for-byte; the prior passing unchanged-code Rust
 clippy/RTC/media matrix (68 RTC tests, 115 media tests, one ignored) was reused
 rather than rerun without changed inputs. The release artifact was rebuilt to
 replace the experimental binary. No native product-code diff remains.
+
+## User-approved half-frame pacing and reconnect RSS
+
+The user explicitly accepted the half-interval candidate's CPU tradeoff.
+**Half-frame minimum pacing is now retained**, commit `67fd0da`, with pending
+damage, exact deadline, forced-keyframe, empty-input and zero-FPS coverage.
+This is the same policy/binary used in the five-run half-interval comparison:
+input p50/p95 32.05/40.27 ms, video p50/p95 20.35/23.90 ms, motion CPU 41.13%.
+The approximately +2.53 CPU percentage points versus the old pacer are accepted;
+CPU remains below the same-session Moonlight median of 48.43%. These latency
+figures are the prior five-run measurements, not a new post-trim latency study.
+
+### Reconnect experiment
+
+Before and final-after runs each use a fresh agent, the retained half-frame
+policy, the same moving 720p/60 Hz marker source and real headed Chromium viewer.
+Each of 20 cycles creates a fresh viewer context, verifies video, runs ten
+seconds of motion, closes the context/WebSocket, waits three seconds, then reads
+agent-only VmRSS. Browser processes persist within a run. Initial agent RSS was
+10.27 MiB for both runs. All 20 cycles completed in each run; minimum video frame
+counts were 547 before and 600 after.
+
+**RSS after disconnect and settling, MiB:**
+
+| Cycle | Before trimming | Final build with trimming |
+| ---: | ---: | ---: |
+| 1 | 40.36 | 18.02 |
+| 2 | 67.59 | 18.89 |
+| 3 | 91.12 | 29.55 |
+| 4 | 97.18 | 19.59 |
+| 5 | 106.63 | 21.66 |
+| 6 | 115.74 | 22.64 |
+| 7 | 118.53 | 23.59 |
+| 8 | 121.38 | 25.69 |
+| 9 | 123.40 | 28.64 |
+| 10 | 123.40 | 28.67 |
+| 11 | 123.40 | 28.66 |
+| 12 | 124.59 | 28.91 |
+| 13 | 124.63 | 29.16 |
+| 14 | 124.66 | 29.16 |
+| 15 | 125.89 | 30.16 |
+| 16 | 126.76 | 31.04 |
+| 17 | 123.25 | 31.06 |
+| 18 | 124.11 | 31.07 |
+| 19 | 147.26 | 41.67 |
+| 20 | 161.20 | 32.11 |
+
+Connected RSS at the end of cycle 20 also fell, 161.20 → 70.14 MiB. Open FDs
+remained 12 throughout both runs. Post-disconnect threads were 12–13, consistent
+with a small runtime worker pool rather than one surviving thread per session.
+
+### Attribution and fix
+
+The large increase is **predominantly freed glibc arena residency**, not evidence
+of approximately 100 MiB of live encoders/frames per reconnect. Evidence:
+
+- The reached WebSocket cleanup path awaits `VideoPipeline::stop()`, including
+  its blocking capture/encoder worker, then closes and drops `HostPeer` before
+  allocator cleanup. The existing worker-join regression remains covered.
+- The real WebRTC controller/host regression now checks weak references after
+  close/drop: both peer connection and video track are actually released.
+- A diagnostic build sampled `mallinfo2` around each trim for 40 cycles. At
+  cycle 40, glibc reported **182.21 MiB free arena bytes** versus **1.86 MiB
+  in-use plus mmap bytes**. In-use accounting includes thread caches; it is
+  not a precise live-object census. `malloc_trim` cannot free live allocations.
+- That diagnostic process's post-disconnect RSS ended at **32.95 MiB** after
+  40 cycles. Cycles 36–40 were **32.88, 32.90, 32.94, 32.95, 32.95 MiB**.
+  This is a practical plateau over the observed window, not proof that every
+  smaller or longer-running leak is absent. The final clean run also retains
+  transient RSS variation, including cycle 19's 41.67 MiB.
+
+The retained fix calls **glibc `malloc_trim(0)` once after peer/media teardown**,
+on a blocking worker rather than the async executor or frame loop. It returns
+free pages to the OS without changing live buffers or imposing a heap policy
+on active encoding. The 40 diagnostic calls took **2.02 ms median, 4.13 ms max**.
+Other platforms/allocators are unchanged. Tests cover repeated cleanup with no
+buffers, live buffers and freed buffers, in addition to actual peer/track release.
+
+Temporary `mallinfo2` probes were removed before the final 20-cycle run. The
+final binary imports `malloc_trim@GLIBC_2.2.5`, not `mallinfo2@GLIBC_2.33`, avoiding
+a new glibc 2.33 minimum just for diagnostics. Final runtime size is 16,172,120
+bytes, +10,800 bytes (+0.067%) for cleanup support; pacing alone did not grow it.
+
+### Artifacts and verification
+
+- Baseline: `~/bench-results/rss-before.json`, logs
+  `~/bench-candidates/rss-before{,.agent}.log`.
+- Final production build: `~/bench-results/rss-final-clean.json`, logs
+  `~/bench-candidates/rss-final-clean{,.agent}.log`.
+- Diagnostic cycles 1–20 and 21–40: `~/bench-results/rss-after.json` and
+  `rss-after-continuation.json`; allocator counters in
+  `~/bench-candidates/rss-after.agent.log`, diagnostic source diff in
+  `rss-instrumentation.patch`. One interim run (`rss-final.json`) was stopped
+  after one cycle when a test-import error prevented the final rebuild; it is
+  preserved but excluded from these comparisons.
+- Final checks: clippy all-targets for both RTC and media, 69 RTC tests,
+  117 media tests (one ignored), 87 Bun tests, focused reconnect lint/typecheck,
+  release build and clean diff-whitespace check. An initial media-clippy test
+  import error was fixed before the final passing checks and production run.
+- `scripts/bench/reconnect.ts` and README document reproducing the cycle probe.
+  No new picture-quality or separate visual review was performed.
