@@ -4,7 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { markerBits } from "../../tests/browser/latency-marker";
+import { markerBits, readMarker, readMarkerRow } from "../../tests/browser/latency-marker";
 import { analyze } from "./metrics";
 
 const [product, hostDisplay, clientDisplay, pidText, outputText] = process.argv.slice(2);
@@ -147,11 +147,23 @@ await host.evaluate((encode) => {
   const bits = new Function(`return (${encode})`)() as typeof markerBits;
   const canvas = document.querySelector("canvas")!;
   const ctx = canvas.getContext("2d")!;
-  const state = { paints: [] as number[], input: 0, motion: false, keys: [] as unknown[] };
+  const state = {
+    paints: [] as number[],
+    input: 0,
+    motion: false,
+    keys: [] as unknown[],
+    inputPaints: [] as { input: number; at: number }[],
+  };
   Object.assign(window, { bench: state });
   let dirty = true;
   window.addEventListener("keydown", (e) => {
-    state.keys.push({ code: e.code, key: e.key, trusted: e.isTrusted, repeat: e.repeat });
+    state.keys.push({
+      at: performance.now(),
+      code: e.code,
+      key: e.key,
+      trusted: e.isTrusted,
+      repeat: e.repeat,
+    });
     if (e.isTrusted && e.code === "Space" && !e.repeat) {
       e.preventDefault();
       state.input++;
@@ -179,6 +191,8 @@ await host.evaluate((encode) => {
         ctx.fillRect((seq * 7) % 1120, 400, 160, 160);
       }
       state.paints.push(performance.now());
+      if (state.inputPaints.at(-1)?.input !== state.input)
+        state.inputPaints.push({ input: state.input, at: state.paints.at(-1)! });
       dirty = false;
     }
     requestAnimationFrame(render);
@@ -188,6 +202,7 @@ await host.evaluate((encode) => {
 let viewerBrowser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 let viewer: Awaited<ReturnType<typeof hostBrowser.newPage>> | undefined;
 const stats: unknown[] = [];
+let viewerClock = { offsetMs: 0, uncertaintyMs: Infinity };
 const viewerSelector = process.env.VIEWER_SELECTOR ?? "video";
 let clientWindow = process.env.BENCH_WINDOW;
 if (process.env.VIEWER_URL) {
@@ -205,7 +220,14 @@ if (process.env.VIEWER_URL) {
     Object.assign(window, { benchKeys: keys });
     window.addEventListener(
       "keydown",
-      (e) => keys.push({ code: e.code, key: e.key, trusted: e.isTrusted, repeat: e.repeat }),
+      (e) =>
+        keys.push({
+          at: performance.now(),
+          code: e.code,
+          key: e.key,
+          trusted: e.isTrusted,
+          repeat: e.repeat,
+        }),
       true,
     );
     window.RTCPeerConnection = new Proxy(Original, {
@@ -287,6 +309,64 @@ await host.evaluate(() => {
   (window as unknown as { bench: { motion: boolean } }).bench.motion = true;
 });
 phase = "motion";
+if (viewer && process.env.BENCH_ATTRIBUTION === "1") {
+  for (let i = 0; i < 20; i++) {
+    const t0 = mono(),
+      at = await viewer.evaluate(() => performance.now()),
+      t1 = mono();
+    if ((t1 - t0) / 2 < viewerClock.uncertaintyMs)
+      viewerClock = { offsetMs: (t0 + t1) / 2 - at, uncertaintyMs: (t1 - t0) / 2 };
+  }
+  await viewer.evaluate(
+    ({ marker, row }) => {
+      const decode = new Function("readMarker", `return (${row})`)(
+        new Function(`return (${marker})`)(),
+      ) as typeof readMarkerRow;
+      const state = { frames: [] as object[], sends: [] as object[] };
+      Object.assign(window, { benchAttribution: state });
+      const original = RTCDataChannel.prototype.send;
+      RTCDataChannel.prototype.send = new Proxy(original, {
+        apply(target, self, args) {
+          if (typeof args[0] === "string") {
+            try {
+              const m = JSON.parse(args[0]);
+              if (m.type === "key" && m.action === "down" && m.code === "Space")
+                state.sends.push({ at: performance.now() });
+            } catch {
+              /* Not a JSON control message. */
+            }
+          }
+          return Reflect.apply(target, self, args);
+        },
+      });
+      const video = document.querySelector("video")!;
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = 1;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+      let markerY: number | undefined;
+      const sample: VideoFrameRequestCallback = (at, metadata) => {
+        let id;
+        if (markerY === undefined) {
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0);
+          for (let y = 0; y < canvas.height && !id; y += 4) {
+            id = decode(ctx.getImageData(0, y, canvas.width, 1).data);
+            if (id) markerY = y;
+          }
+          canvas.height = 1;
+        } else {
+          ctx.drawImage(video, 0, markerY, video.videoWidth, 1, 0, 0, canvas.width, 1);
+          id = decode(ctx.getImageData(0, 0, canvas.width, 1).data);
+        }
+        if (id && state.frames.length < 30_000) state.frames.push({ ...id, at, ...metadata });
+        video.requestVideoFrameCallback(sample);
+      };
+      video.requestVideoFrameCallback(sample);
+    },
+    { marker: readMarker.toString(), row: readMarkerRow.toString() },
+  );
+}
 const duration = Math.ceil(2 + trials * 0.45 + 3);
 const capture = spawn(helper, [clientDisplay, String(duration), String(trials), "1729"], {
   stdio: ["ignore", "pipe", "inherit"],
@@ -397,6 +477,15 @@ const result = {
     excludes: "build caches and system shared libraries",
   },
   raw: {
+    attribution:
+      viewer && process.env.BENCH_ATTRIBUTION === "1"
+        ? {
+            clock: viewerClock,
+            ...(await viewer.evaluate(
+              () => (window as unknown as { benchAttribution: object }).benchAttribution,
+            )),
+          }
+        : null,
     paints: state.paints,
     resources,
     webRtcStats: stats,

@@ -69,6 +69,45 @@ Do not run these trials on a display with sensitive applications.
 
 ## Method and outputs
 
+### Optional nanoctl stage attribution
+
+Restart the Linux agent with `NANOCTL_BENCH_TRACE=1` and redirect its output to
+a fresh persistent log. Then run the browser benchmark with
+`BENCH_ATTRIBUTION=1`. For example, using the displays/config above:
+
+```sh
+DISPLAY=:97 NANOCTL_DEV_LOOPBACK_USER=dev@example.com NANOCTL_BENCH_TRACE=1 \
+  crates/nanoctl-agent/target/release/nanoctl --config "$HOME/nanoctl-bench.toml" run \
+  > "$HOME/bench-results/trace.agent.log" 2>&1 &
+HOST_PID=$!
+BENCH_ATTRIBUTION=1 VIEWER_URL=http://127.0.0.1:7338 \
+  bun scripts/bench/run.ts trace :97 :94 "$HOST_PID" "$HOME/bench-results"
+bun scripts/bench/attribution.ts "$HOME/bench-results/trace" \
+  "$HOME/bench-results/trace.agent.log"
+```
+
+This opt-in diagnostic decodes the benchmark marker in captured/native and
+viewer frames, joins capture/encode/write records to source IDs, and records
+Space down receive/injection ordinals without recording arbitrary key contents.
+It is disabled by default. Native timestamps use CLOCK_MONOTONIC; source and
+viewer performance clocks are aligned independently through shortest-round-trip
+samples. The native marker row and viewer crop are discovered rather than
+assuming a browser-chrome offset. Restart between runs to reset input ordinals;
+do not inject extra Space presses. The encoded-frame lookup and viewer frame
+collection are bounded.
+
+The analyzer writes `.attribution.json` and `.attribution.md`, with individual
+segment counts and p50/p95. Missing native/receiver metadata is not fabricated.
+Negative deltas are retained and counted: browser clock uncertainty and
+`expectedDisplayTime` prediction errors must not be interpreted as physical
+negative latency. `processingDuration` is decoder work, not an independently
+observed decode-end timestamp. Capture is sampled after XDamage receipt, so
+damage-to-source association can be coalesced; this is a diagnostic side channel,
+not the product-neutral headline measurement. Instrumented runs include tracing
+and one-row video readback overhead; compare with uninstrumented runs too.
+
+### Common measurements
+
 - The source reuses `tests/browser/latency-marker.ts` encoding (16-bit source
   frame, 8-bit input counter, checksum, color guards). Animation follows host
   requestAnimationFrame, approximately 60 Hz. Space increments only on a trusted

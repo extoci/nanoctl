@@ -32,6 +32,10 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 #[path = "linux_damage.rs"]
 mod linux_damage;
 
+#[cfg(target_os = "linux")]
+#[path = "media_trace.rs"]
+pub(crate) mod trace;
+
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
@@ -557,6 +561,8 @@ impl CaptureEncoder {
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let CapturedFrame { frame, captured_at } = captured;
+        #[cfg(target_os = "linux")]
+        let trace_started = trace::now();
         let preprocess_started = Instant::now();
         let source = rgba_view(frame)?;
         let (source_width, source_height) = source.dimensions();
@@ -595,6 +601,8 @@ impl CaptureEncoder {
         let color_before = self.encoder.color_convert_ns();
         let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
+        #[cfg(target_os = "linux")]
+        trace::encoded(frame, &encoded.bytes, trace_started, trace::now());
         self.latest_frame.stats.backend_ns.fetch_add(
             encoded_at.duration_since(encode_started).as_nanos() as u64,
             Ordering::Relaxed,
@@ -1722,6 +1730,8 @@ pub fn spawn_video(
                     // A replaced encoded frame is a local latency policy, not RTP packet loss.
                     // Passing that count as prev_dropped_packets corrupts packet sequencing.
                     let written_at = Instant::now();
+                    #[cfg(target_os = "linux")]
+                    let trace_started = trace::now();
                     let sample = Sample {
                         data: frame.bytes.into(),
                         duration: sample_duration(previous_written, written_at, writer_stats.target_fps.load(Ordering::Relaxed)),
@@ -1743,6 +1753,8 @@ pub fn spawn_video(
                     writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
                     if result.is_ok() {
+                        #[cfg(target_os = "linux")]
+                        trace::sent(&sample.data, trace_started, trace::now());
                         previous_written = Some(written_at);
                         writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
                         writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));

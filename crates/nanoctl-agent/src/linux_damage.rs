@@ -237,9 +237,11 @@ pub(super) fn start(
         while let Some(latest) = weak.upgrade() {
             if latest.stopped.load(Ordering::Acquire) { break; }
             let mut damaged = false;
+            let mut damage_at = 0.0;
             if let Some(events) = watch.as_ref() {
                 match events.drain() {
                     Ok(Some(received)) => {
+                        damage_at = super::trace::now() - received.elapsed().as_secs_f64() * 1000.0;
                         damaged = true;
                         if gate.parked { stats.damage_resumes.fetch_add(1, Ordering::Relaxed); }
                         gate.damage(received);
@@ -255,6 +257,7 @@ pub(super) fn start(
             }
             if gate.should_capture(Instant::now(), damaged, initial, watch.is_none()) {
                 let started = Instant::now();
+                let trace_started = super::trace::now();
                 let image = if let Some(events) = watch.as_mut().filter(|events| events.fast_capture) {
                     match events.capture(monitor_id) {
                         Ok(image) => Ok(image),
@@ -267,6 +270,7 @@ pub(super) fn start(
                 } else { monitor.capture_image().map_err(anyhow::Error::from) };
                 match image {
                     Ok(image) => {
+                        super::trace::capture(&image, damage_at, trace_started, super::trace::now());
                         initial = false;
                         stats.capture_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let changed = latest.last.lock().unwrap().as_ref().is_none_or(|old| {

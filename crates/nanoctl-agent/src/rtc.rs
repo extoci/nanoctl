@@ -551,6 +551,8 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
+                    #[cfg(target_os = "linux")]
+                    crate::media::trace::input(0, &message.data);
                     let sender = sender.clone();
                     let input = message_input.clone();
                     let weak_channel = weak_channel.clone();
@@ -1140,7 +1142,12 @@ fn spawn_input_worker(
                         if input_revoked.load(Ordering::Acquire) {
                             return Ok(None);
                         }
-                        input.dispatch(&bytes, lane)
+                        #[cfg(target_os = "linux")]
+                        crate::media::trace::input(1, &bytes);
+                        let result = input.dispatch(&bytes, lane);
+                        #[cfg(target_os = "linux")]
+                        crate::media::trace::input(2, &bytes);
+                        result
                     })
                     .await;
                     match result {
