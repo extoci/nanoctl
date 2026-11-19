@@ -784,7 +784,7 @@ substitute for the reached encoder target or received RTP bytes.
 | Text diagnostic                   | Native QP min/median/max | Encoder target min/median/max kbps | Chrome availableIncomingBitrate min/median/max Mbps |
 | --------------------------------- | ------------------------ | ---------------------------------- | --------------------------------------------------- |
 | Before, 1,911 attempts            | 26 / 26 / 30             | 4000 / 24000 / 24000               | 0.576 / 0.676 / 0.939                               |
-| QP 20–51, 1,932 nonempty attempts | 20 / 20 / 30             | 4000 / 24000 / 24000               | 0.676 / 1.170 / 1.633                               |
+| QP 20–51, 1,932 nonempty attempts | 20 / 20 / 30             | 4000 / 21926 / 21926               | 0.676 / 1.170 / 1.633                               |
 
 Chrome exposed incoming estimates in 19 samples per probe, not as a guaranteed
 link-capacity measurement. It reported more than one nominated pair; the added
@@ -813,3 +813,66 @@ and disabled for the comparisons. Browser probes now retain nominated candidate
 pairs and transports, including optional `availableIncomingBitrate`; received
 media Mbps remains strictly inbound-video RTP deltas. Tests prevent candidate
 pair or audio counters being counted as video and reject invalid/reset counters.
+
+### Separately evaluated: nearest-code I420 rounding, rejected
+
+After retaining QP 20–51, an encoder-free round-trip of a captured text ROI
+implicated the truncating fixed-point RGB→I420 transform as another fidelity
+limit: FFmpeg round-trip PSNR was 38.89 dB with existing truncation, 42.36 dB
+with nearest-code rounding. This is a diagnostic proxy, not a Chrome quality
+score. A four-addition rounding variant was then measured in the real viewer,
+without changing quantizer bounds, pacing, rate control or VUI.
+
+Its first sequential nine-run block was:
+
+| Workload | SSIM Y  | PSNR Y dB | Received Mbps | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ------- | --------- | ------------- | ----- | ------------ | ------------ |
+| Text     | 0.99893 | 47.00     | 1.11          | 59.05 | 36.75        | 54.97        |
+| Drag     | 0.99879 | 47.69     | 1.89          | 59.36 | 20.05        | 43.79        |
+| Gradient | 0.99396 | 47.03     | 5.18          | 59.46 | 36.39        | 49.34        |
+
+This initially missed both text p50 and drag CPU budgets relative to the older
+QP-20 block. Before attributing the 16.67-ms text shift to rounding, a fresh,
+unchanged QP-20 control was run three times: **36.58 ms [19.58–36.68]**, CPU
+**51.14% [46.22–52.62]**, PSNR **41.72 dB**. This disproves treating a 20→36-ms
+block shift alone as proof of a rounding-induced delay. It does not identify
+the cause of the presentation-phase variation.
+
+A further comparison was declared **before running it**: three pairs per
+workload, fresh agents each run, order control/rounding, rounding/control,
+control/rounding. No builds, competing streams or code changes during the
+18-run comparison. All 18 runs were valid. Medians of per-run metrics:
+
+| Workload | Variant           | SSIM Y  | PSNR Y dB | Received Mbps | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ----------------- | ------- | --------- | ------------- | ----- | ------------ | ------------ |
+| Text     | QP-20 control     | 0.99715 | 41.73     | 1.10          | 59.37 | 36.38        | 52.05        |
+| Text     | Rounded, rejected | 0.99883 | 47.00     | 1.11          | 59.26 | 19.94        | 52.52        |
+| Drag     | QP-20 control     | 0.99723 | 42.85     | 1.89          | 59.84 | 20.46        | 36.06        |
+| Drag     | Rounded, rejected | 0.99871 | 47.71     | 1.90          | 59.42 | 20.04        | 49.37        |
+| Gradient | QP-20 control     | 0.99345 | 44.81     | 5.17          | 58.71 | 36.44        | 53.92        |
+| Gradient | Rounded, rejected | 0.99395 | 47.04     | 5.18          | 58.80 | 36.30        | 53.37        |
+
+The quality gains reproduce, and paired median video p50 does not regress.
+However, drag CPU rises **13.31 points**, versus the approximately five-point
+budget (first block: +6.74 points). Therefore **rounding is rejected**, not
+quietly retained for its attractive quality numbers. These measurements do
+not isolate the cause of the extra CPU between generated conversion code,
+content-dependent encoder work and other per-run effects. No such cause is
+claimed confirmed. No outlier was removed; the initial block, unchanged control
+and paired block are all preserved under `quality-gap-round-*`,
+`quality-gap-qp20-control-text*` and `quality-gap-paired-*`.
+
+There were **57 valid comparison/control runs**, plus two separate diagnostic
+probes. Native-pixel source/client text crops were inspected; examples include
+`quality-gap-qp20-text-run-2.quality-text-client.png` and the rejected variant's
+`quality-gap-round-text-run-2.quality-text-{source,client}.png` in the content
+artifact directory. The rejected rounding patch and executable are preserved
+under `~/bench-candidates/quality-gap-round{.patch,}` for investigation.
+
+Final product source and executable are restored exactly to the retained
+QP-20 variant. Idle-only refinement, SDP bitrate hints and transport-CC changes
+were **not implemented**; the remaining quality gap is explicitly unfinished.
+No new input-latency study, impaired-link or hardware-encoder run is claimed.
+The original QP-20 comparison meets its median gates, but unchanged later
+controls still show refresh-sized timing variation: this is not a universal
+latency guarantee or an attributable latency improvement.
