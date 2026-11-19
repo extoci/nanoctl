@@ -251,7 +251,8 @@ cargo test --release --features media --manifest-path crates/nanoctl-agent/Cargo
   benchmark_rgba_conversion_720p -- --ignored --nocapture --test-threads=1
 ```
 
-It rotates three kernels over nine batches of 50 frames: current truncation,
+It rotates three kernels over nine batches of 50 frames: current production
+`I420Frame::read_rgba` truncation,
 the previously rejected signed rounding, and a test-only unsigned-16-bit rounded
 candidate. Output is median/min/max ns/frame, with reusable input/output and
 `black_box`. Candidate kernels are checked byte-for-byte against the reference;

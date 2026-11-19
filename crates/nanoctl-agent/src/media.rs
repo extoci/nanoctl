@@ -2252,7 +2252,7 @@ mod tests {
                     let frame = black_box(&mut frame);
                     let rgba = black_box(&rgba);
                     match variant {
-                        0 => reference_rgba::<0>(frame, rgba),
+                        0 => frame.read_rgba(rgba).unwrap(),
                         1 => reference_rgba::<128>(frame, rgba),
                         _ => frame.read_rgba_rounded_candidate(rgba).unwrap(),
                     }
@@ -2271,6 +2271,16 @@ mod tests {
                 samples[4], samples[0], samples[8]
             );
         }
+    }
+
+    #[test]
+    fn rounded_candidate_rejects_empty_and_short_buffers_without_mutation() {
+        let mut frame = super::I420Frame::new(2, 2).unwrap();
+        frame.read_rgba_rounded_candidate(&[255; 16]).unwrap();
+        let before = frame.bytes.clone();
+        assert!(frame.read_rgba_rounded_candidate(&[]).is_err());
+        assert!(frame.read_rgba_rounded_candidate(&[0; 15]).is_err());
+        assert_eq!(frame.bytes, before);
     }
 
     #[test]

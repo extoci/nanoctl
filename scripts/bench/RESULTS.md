@@ -1,4 +1,48 @@
-# screen-relay Docker versus current nanoctl, five runs each
+# Latest retained-product summary
+
+**Text workload, 720p software H.264; not a contemporaneous head-to-head.**
+Nanoctl uses the latest three unsigned-rounding campaign **controls**, since
+the treatment failed the CPU gate. Competitor rows use their latest unchanged
+three-run real-content campaigns below. These are moving-text quality/latency
+measurements, **not settled static-text scores**. CPU is one core = 100%; RSS is
+the host engine process tree, excluding source/client browsers.
+
+| Product                | Video p50 ms | FPS   | Motion CPU % | Motion RSS MiB | Host runtime MiB | SSIM Y  | PSNR Y dB |
+| ---------------------- | ------------ | ----- | ------------ | -------------- | ---------------- | ------- | --------- |
+| nanoctl, retained QP20 | 53.21        | 58.42 | 66.71        | 54.49          | 23.47            | 0.99719 | 41.71     |
+| Sunshine/Moonlight     | 40.33        | 59.84 | 62.80        | 199.82         | 124.98           | 0.99934 | 48.42     |
+| screen-relay           | 52.78        | 59.70 | 34.17        | 48.39          | 139.59           | 0.99958 | 52.22     |
+
+Cells are medians of per-run metrics, not pooled percentiles. Nanoctl's latest
+controls are substantially slower/more CPU-intensive than earlier campaigns;
+these cross-session rows **do not establish a new causal performance ranking**.
+The complete paired control/treatment results and gate decision appear at the
+end of this document. QP20 remains retained, without rounded conversion.
+
+Runtime is logical installed bytes for the **host side**, including transitive
+ELF libraries: nanoctl release binary; Sunshine binary and `/usr/share/sunshine`;
+screen-relay npm package/engine, Node and listed helpers. Xvfb, browsers, Moonlight
+client, build tools/caches and other OS files are excluded. Fresh nanoctl/Sunshine
+snapshots are `~/bench-runtime/{nanoctl,sunshine}-final-quality{,.json}`:
+24,605,552 / 131,051,595 bytes. Screen-relay's unchanged snapshot is 146,374,952
+bytes. This replaces Sunshine's earlier **app-only** 30,349,491-byte figure with
+a library-inclusive one; it is not a runtime-size regression.
+
+Idle refinement and settled-text capture are **not implemented yet**. The
+current OpenH264 `EncodeFrame(SSourcePicture*, SFrameBSInfo*)` is synchronous,
+has no cancellation/per-picture-QP argument, and its reached encode path updates
+the reference list (`encoder_ext.cpp::WelsEncoderEncodeExt`, `UpdateRefList`).
+Changing context QP bounds between calls is possible, but encoding a refinement
+on the current context cannot guarantee that newly arriving damage preempts it;
+discarding an already encoded P frame would also invalidate the following P
+frame's decoder references. Before implementing a weaker guarantee, the proposed
+alternative is a **private background encoder**, a low-QP IDR admitted only while
+still idle and within current controller credit, and context adoption only on
+acceptance. Cancellation would leave the normal encoder available. This needs a
+decision on the extra encoder working-memory cost versus accepting preemption
+only before refinement starts. No motion/settled-quality improvement is claimed.
+
+## screen-relay Docker versus current nanoctl, five runs each
 
 Measured sequentially on 2026-11-19: screen-relay 0.1.2 x5, then the current
 nanoctl release (retained half-frame pacer and teardown trimming) x5. Both use the
@@ -888,11 +932,11 @@ reference; the rounded candidate is checked byte-for-byte against the earlier
 signed rounded transform over black, white and pseudorandom frames and several
 even dimensions. Production remains the original truncating kernel.
 
-| Kernel                   | First microbench ns/frame median [min–max] | Final reproducible test-only microbench ns/frame median [min–max] |
-| ------------------------ | ------------------------------------------ | ----------------------------------------------------------------- |
-| Current truncation       | 1449076 [1272133–2226845]                  | 1658832 [1339703–2526008]                                         |
-| Earlier signed rounding  | 1398815 [1281993–1924919]                  | 1526683 [1358205–2521179]                                         |
-| Unsigned 16-bit rounding | 1574649 [1276694–1767070]                  | 1561154 [1356024–2727492]                                         |
+| Kernel                   | First microbench ns/frame median [min–max] | Final production-control microbench ns/frame median [min–max] |
+| ------------------------ | ------------------------------------------ | ------------------------------------------------------------- |
+| Current truncation       | 1449076 [1272133–2226845]                  | 1364967 [1279732–2451640]                                     |
+| Earlier signed rounding  | 1398815 [1281993–1924919]                  | 1379793 [1298477–2056445]                                     |
+| Unsigned 16-bit rounding | 1574649 [1276694–1767070]                  | 1408994 [1299948–2128354]                                     |
 
 The candidate uses bounded unsigned 16-bit sums, folds offsets into 4224/32896,
 and explicitly averages chroma with `(sum + 2) >> 2`. Maximal intermediates are
@@ -900,7 +944,8 @@ and explicitly averages chroma with `(sum + 2) >> 2`. Maximal intermediates are
 Actual release assembly mapped to the conversion source contains 52 packed-word
 SIMD operations (`pmullw`, `paddw`, `psllw`, `psrlw`, `psubw`); scalar cleanup
 remains. Assembly evidence: `~/bench-candidates/final-quality-conversion.asm.txt`.
-The first microbench is +8.67% versus control; the final test-only copy is −5.89%.
+The first microbench is +8.67% versus control; the final benchmark calls the
+production `read_rgba` method directly for control and measures +3.23%.
 Both meet the approximately 10% microbench gate. Crucially, the earlier signed
 rounding also does **not** reproduce a 13-point conversion cost in isolation.
 This disproves simply blaming floating-point math or scalar conversion overhead;
