@@ -2724,8 +2724,10 @@ dependencies = [
  "videotoolbox",
  "webrtc",
  "windows 0.62.2",
+ "x11rb",
  "x509-parser",
  "xcap",
+ "xkeysym",
 ]
 
 [[package]]
