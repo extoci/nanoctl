@@ -77,6 +77,7 @@ pub struct PipelineStats {
     pub encode_attempts: AtomicU64,
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
+    #[cfg(target_os = "linux")]
     pub producer_tid: AtomicU32,
 }
 
