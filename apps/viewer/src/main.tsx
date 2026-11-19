@@ -233,7 +233,7 @@ function Viewer() {
   const inputReady = snapshot.inputEnabled && status === "online";
 
   return (
-    <main className={`viewer ${panelOpen ? "panel-open" : ""}`}>
+    <main className={`viewer scale-${scale} ${panelOpen ? "panel-open" : ""}`}>
       <section className={`stage scale-${scale}`} aria-label="Remote desktop">
         <audio ref={audioRef} autoPlay muted={!soundEnabled} />
         <video
