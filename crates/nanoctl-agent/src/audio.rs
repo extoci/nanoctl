@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use anyhow::Context;
+use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
