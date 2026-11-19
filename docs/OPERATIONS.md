@@ -1,78 +1,59 @@
 # Operations
 
-## Production services
+There is no hosted nanoctl service, database, signaling queue, TURN credential or
+enrollment endpoint to operate. Each host serves its own embedded viewer over Tailscale.
 
-Deploy the Next.js app behind TLS with HSTS and a nonce-based CSP. Deploy Convex production
-separately from development and set `APP_ORIGIN` exactly to the canonical HTTPS origin. Configure
-Shoo for that origin implicitly through its pairwise audience behavior. Deploy at least two TURN
-regions and advertise UDP 3478, TCP 3478, TLS 5349, and TLS/TCP 443 where infrastructure allows.
+## Routine checks
 
-Use short-lived TURN REST credentials derived from a rotated shared secret. Monitor allocation
-failures, relay bandwidth, authentication failures, and region saturation. Capacity planning must
-assume a relayed 1080p60 session can consume tens of megabits per second in both ingress and egress.
+```sh
+tailscale status
+nanoctl doctor
+nanoctl url
+nanoctl paths
+nanoctl config
+```
 
-## Retention
+Doctor checks config, CLI discovery, Tailscale state, addresses, MagicDNS, TLS URL,
+capture, encoder and input. Missing Tailscale does not prevent installation or the
+background agent waiting for it; doctor correctly reports that the host is not ready.
+The URL command may fail until Tailscale is running.
 
-- pairing codes: delete within 24 hours of expiry/consumption;
-- signals: delete within one hour of session expiry;
-- session metadata: 30 days by default;
-- audit events: 90 days by default;
-- device heartbeat/status: retained with the device;
-- application logs: 14 days, redacted;
-- media and clipboard: never stored by control-plane services.
+Enable HTTPS in the Tailscale admin console's DNS settings. With `tls="auto"`,
+`tailscale cert` issues a private native-HTTPS certificate, checked daily and renewed
+within 14 days of expiry. A failed renewal retains a valid certificate. If issuance
+fails and no valid certificate exists, inspect the warning, grant certificate permission
+to the agent user, and fix HTTPS configuration; the agent falls back to HTTP meanwhile.
 
-## Observability
+## Service and upgrades
 
-Metrics use pseudonymous device/session identifiers and include endpoint success/latency, enrollment
-failure category, active sessions, signaling delay, candidate type, connection setup, relay usage,
-and agent readiness/version. Do not label metrics with owner IDs, tokens, SDP, candidates, IP
-addresses, device names, or clipboard data.
+- Linux: `systemctl --user status nanoctl.service`;
+  logs: `journalctl --user -u nanoctl.service`.
+- macOS: `launchctl print gui/$(id -u)/dev.nanoctl.agent`;
+  registration: `~/Library/LaunchAgents/dev.nanoctl.agent.plist`.
+- Windows: `Get-ScheduledTask -TaskName "nanoctl Agent"`;
+  logs: `%LOCALAPPDATA%\nanoctl\agent.log`.
 
-Structured logs contain event type, coarse platform/version, request id, result category, and
-redacted pseudonymous ids. Debug mode remains locally enabled for a bounded duration and still
-redacts secrets and content.
+Run the release installer again as the same desktop user. Download checksums,
+atomic binary activation, service registration and startup rollback remain enforced.
+Windows uses PID/version/token ready-file validation and a stability window; Unix
+one-command installs verify that the same service PID survives startup.
+Low-level packaging helpers retain signed-manifest stage/activate/commit/rollback.
+Config stays in place; v2 credentials are removed best-effort only after success.
+No keyring or setup-code interaction is required.
 
-## Incident priorities
+## Troubleshooting
 
-1. Credential/signing compromise: freeze enrollment/updates, rotate secrets, revoke affected
-   credentials, publish owner guidance.
-2. Cross-account authorization: disable affected functions immediately, preserve redacted audit
-   evidence, patch and independently review.
-3. TURN abuse: rotate TURN secret, rate-limit allocations, block abusive sources without exposing
-   static credentials in clients.
-4. Availability: existing P2P sessions may continue; communicate which control-plane operations fail.
+| Symptom                   | Check                                                                                                         |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| No URL / no listener      | Tailscale installed, running and signed in; `tailscale status --json`; agent CLI path                         |
+| 403                       | Identity in response; node owner, `allow_users`, allowed source tags, capability grant; [policy](SECURITY.md) |
+| WebSocket rejected        | Same-origin page; correct Host, listener scheme and port; avoid arbitrary proxies                             |
+| Negotiates but no video   | Host capture permissions, available display, UDP firewall/policy and encoder diagnostic                       |
+| Keyboard lock unavailable | Use native HTTPS, a supporting browser and fullscreen                                                         |
+| Another viewer took over  | Expected single-session behavior; reconnect deliberately                                                      |
+| Very low FPS/kbps         | Compare multiple stats samples while changing the desktop; idle capture can be sparse                         |
 
-## Deployment order
-
-Apply backward-compatible Convex schema/functions first, then web, then agent. Never deploy an agent
-requiring a protocol version the control plane does not accept. Destructive schema migrations use a
-backfill plus dual-read/write window. Rollback must not re-enable revoked credentials.
-
-The hosted web application is a native Vercel Next.js deployment. Set the production
-`NEXT_PUBLIC_CONVEX_URL` and canonical HTTPS `NEXT_PUBLIC_APP_ORIGIN` in the Vercel project, run
-`bun run build:vercel`, and deploy the reviewed commit with `vercel deploy --prod`. The fail-closed
-preflight rejects loopback, non-HTTPS, credential-bearing, and non-origin values. `APP_ORIGIN`,
-`TURN_URLS`, `TURN_AUTH_SECRET`, and an independent `RATE_LIMIT_SECRET` belong to the Convex
-deployment rather than the Vercel runtime. Because both browser-visible variables are compiled into
-the Next.js bundle, changing either requires a new deployment.
-
-Tagged releases are produced by `.github/workflows/release.yml` for Linux, macOS, and Windows on
-x64 and arm64. Public releases contain only the six platform executables, their individual SHA-256
-files, and the Unix and Windows installers. Platform signing, macOS notarization, and the physical
-acceptance matrix remain mandatory production gates.
-
-The native updater verifies an exact-byte Ed25519 envelope before parsing it, rejects downgrade and
-expired manifests, streams into a bounded private staging file, and checks the signed length and
-SHA-256 digest. Unix package scripts stop the service before an atomic activation and retain the
-previous executable until the restarted agent passes `doctor`. Failed health checks roll back.
-Windows uses the same verifier and staging format; the administrator bootstrap serializes updates
-with an exclusive lock, stops the interactive Scheduled Task, rewrites it to the hidden runner,
-retains a transaction-specific previous executable, and commits only after `doctor` plus a startup
-stability window. Failed health checks restore the old binary and leave a failed artifact for
-diagnostics. The agent deliberately refuses in-process Windows activation.
-
-## Readiness
-
-A production launch is blocked until canonical domains, private security contact, signing
-identities, TURN regions, rate limiting, retention jobs, backups, restore test, physical-machine
-matrix, and on-call ownership are documented with real values.
+The stats route is the WebRTC candidate type, not proof that Tailscale itself is using
+a direct path instead of DERP. Use Tailscale diagnostics for the underlying route.
+Never set `NANOCTL_DEV_LOOPBACK_USER` in a deployed service. Keep loopback serving off
+unless deliberately accepting the single-user `tailscale serve` trust tradeoff.

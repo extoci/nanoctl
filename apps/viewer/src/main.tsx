@@ -29,6 +29,10 @@ function Viewer() {
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
+    if (info?.hostName) document.title = `${info.hostName} · nanoctl`;
+  }, [info?.hostName]);
+
+  useEffect(() => {
     if (!videoRef.current) return;
     if (typeof window.RTCPeerConnection !== "function" || typeof window.WebSocket !== "function") {
       setStatus("error");
@@ -186,10 +190,11 @@ function Viewer() {
               Resolution <b>{metrics?.resolution ?? "—"}</b>
             </span>
             <span>
-              Frame rate <b>{metrics?.fps ?? "—"} fps</b>
+              Frame rate <b>{metrics?.fps == null ? "—" : metrics.fps.toFixed(1)} fps</b>
             </span>
             <span>
-              Bitrate <b>{metrics ? `${metrics.bitrateKbps} kbps` : "—"}</b>
+              Bitrate{" "}
+              <b>{metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}</b>
             </span>
             <span>
               RTT <b>{metrics ? `${metrics.rttMs} ms` : "—"}</b>

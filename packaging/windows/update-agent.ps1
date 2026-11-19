@@ -19,6 +19,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\..\tailnet.ps1"
 $taskName = "nanoctl Agent"
 $resolvedBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -48,8 +49,8 @@ function Test-CurrentUserAdministrator {
 if ($configOwnerSid.Value -ne $currentIdentity.User.Value -and
     -not ($configOwnerSid.Value -eq "S-1-5-32-544" -and (Test-CurrentUserAdministrator))) {
   throw (
-    "The elevated identity '$($currentIdentity.Name)' does not own the enrolled configuration. " +
-    "Elevate the same account that enrolled nanoctl; do not supply another administrator."
+    "The elevated identity '$($currentIdentity.Name)' does not own the configuration. " +
+    "Elevate the same account that installed nanoctl; do not supply another administrator."
   )
 }
 $resolvedManifest = (Resolve-Path -LiteralPath $ManifestPath).Path
@@ -115,7 +116,7 @@ function Assert-TaskOwner {
   if ($taskSid -ne $currentIdentity.User.Value) {
     throw (
       "The nanoctl task belongs to '$taskUser', but the update is running as " +
-      "'$($currentIdentity.Name)'. Elevate the same account that enrolled nanoctl."
+      "'$($currentIdentity.Name)'. Elevate the same account that installed nanoctl."
     )
   }
 }
@@ -370,7 +371,7 @@ try {
   Start-ScheduledTask -TaskName $taskName
   Wait-AgentReady -BinaryPath $resolvedBinary -ReadyVersion $candidateVersion
 
-  & $resolvedBinary --config $resolvedConfig doctor
+  & $resolvedBinary --config $resolvedConfig config | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "Updated nanoctl failed its health check."
   }
@@ -387,6 +388,8 @@ try {
   Remove-Item -LiteralPath $stagedPath -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $previousTaskXml -Force -ErrorAction SilentlyContinue
   Write-Host "nanoctl update activated and committed."
+  Remove-LegacyCredential -ConfigPath $resolvedConfig
+  Show-TailnetUrl -BinaryPath $resolvedBinary -ConfigPath $resolvedConfig
 }
 finally {
   if (-not $completed -and $lockAcquired) {

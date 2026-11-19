@@ -1,120 +1,75 @@
-# Security and privacy
+# Security
 
-## Security goals
+## Trust and threats
 
-- Only the authenticated owner can enumerate or initiate access to a device.
-- Enrollment is explicit, short-lived, single-use, and resistant to guessing.
-- A database disclosure does not reveal usable device credentials.
-- Media and control are confidential and integrity-protected in transit.
-- The agent exposes no inbound TCP listener and accepts input only inside an authorized live session.
-- Disconnect, expiry, revocation, and parse failure fail closed.
-- Logs and telemetry cannot reconstruct desktop content, clipboard content, auth tokens, or SDP.
+nanoctl 3 has no hosted nanoctl control plane, enrollment endpoint, device secret or
+hosted signaling database. A host serves its own viewer and signaling only on Tailscale
+addresses. Tailscale's identity/network infrastructure and the host OS remain trusted.
+WebRTC DTLS-SRTP/SCTP runs inside WireGuard; a DERP relay does not decrypt that traffic.
 
-## Threat model
+Threats include unauthorized tailnet users, malicious browser origins, DNS rebinding,
+untrusted local users, compromised clients/hosts, and stale signals after replacement.
+A permitted control session has the interactive user's desktop privileges. nanoctl
+does not isolate applications or protect an already compromised endpoint.
 
-We defend against internet scanners, guessed enrollment codes, replayed signals, malicious browser
-content outside the nanoctl origin, another nanoctl user, a passive network observer, a compromised
-TURN relay, and accidental over-broad service permissions.
+## Authorization
 
-We do not claim to defend a machine from its local administrator/root, a compromised OS or browser,
-a malicious owner controlling their own enrolled machine, screen observation at either endpoint, or
-Shoo/Convex account takeover. Account MFA is inherited from the Google account brokered by Shoo.
+The agent obtains the connecting peer through `tailscale whois --json <ip:port>`.
+Tagged callers must first match `tailnet.allow_tags`, even if they have a capability.
+Then policy is:
 
-## Authentication and authorization
+1. Capability `extoci.lol/cap/nanoctl`: any `{"control":true}` entry grants control;
+   otherwise a present capability (`[{}]` or `[{"control":false}]`) is view-only.
+2. An allowed tag grants control for a tagged caller without a capability.
+3. A login in `tailnet.allow_users` grants control. If that list is empty, only
+   the owner of the host's Tailscale node is allowed by default.
+4. Otherwise deny (403).
 
-Shoo tokens are accepted only after ES256 signature, exact issuer, exact origin audience, expiry, and
-subject validation by Convex. Client-side identity fields never make authorization decisions.
-Because Shoo labels itself “super early WIP,” all Shoo-specific code stays behind one adapter. A
-production deployment must monitor issuer/JWKS availability and have a documented migration path.
+Network grants/ACLs must independently allow the connection. Example to merge into
+your tailnet policy (replace the destination with the host's Tailscale IP):
 
-Enrollment codes contain 100 bits of random entropy, expire after ten minutes, and are consumed
-atomically. The endpoint is additionally rate-limited by requester and code. Requester identity
-comes from Convex's authoritative request metadata rather than caller-controlled forwarding
-headers, and addresses are HMAC-pseudonymized with `RATE_LIMIT_SECRET`. With no secret, requesters
-deliberately share one conservative bucket rather than persisting a reversible address-derived
-value. The resulting agent token is 256 random bits, returned once over TLS, stored in the OS
-credential facility, and represented in Convex only by SHA-256. Revocation changes the indexed
-hash, ends active session records in the same transaction, closes the browser peer reactively, and
-causes the agent to close all peers and stop when its next bounded session poll is rejected.
+```json
+{
+  "grants": [
+    {
+      "src": ["alice@example.com"],
+      "dst": ["100.100.1.2"],
+      "ip": ["tcp:7337", "udp:*"],
+      "app": {
+        "extoci.lol/cap/nanoctl": [{ "control": true }]
+      }
+    }
+  ]
+}
+```
 
-Session authorization is `(owner subject, device id, session id, expiry, role)`. IDs alone are never
-capabilities. Signal sequence numbers are scoped by sender. Replays are ignored. SDP, candidates,
-clipboard, names, and reasons have explicit size limits.
+Use `{"control":false}` for view-only. TCP carries the viewer and signaling; UDP
+allows dynamic WebRTC host ports. Add allowed source tags to the host config when
+using tagged controller nodes. Capabilities come from whois, not browser headers.
 
-Persistent agent logs use allowlisted error categories rather than raw error strings. They never
-write bearer tokens, SDP, ICE candidates, TURN credentials, or controller-provided end reasons;
-terminal events retain only a bounded byte count and pseudonymous session/device identifiers.
+## HTTPS and browser boundary
 
-## Transport
+Enable HTTPS certificates in the Tailscale admin console. Default `tls="auto"` uses
+`tailscale cert`, owner-only certificate/key storage, daily renewal checks and renewal
+within 14 days of expiry. Failed renewal retains an existing valid cert; without one
+the agent warns and falls back to HTTP. HTTP is still WireGuard-encrypted on the
+tailnet but does not provide a normal browser secure context.
 
-Browser-to-control-plane traffic requires TLS. WebRTC uses ICE + DTLS, SRTP for media, and SCTP over
-DTLS for data. TURN relays encrypted packets and receives ephemeral credentials. Production enables
-TLS 1.3 where supported, HSTS at the web edge, no mixed content, and a restrictive CSP.
+Host must identify this node (tailnet IP, MagicDNS FQDN or host name). WebSocket
+Origin must match that Host and actual HTTP/HTTPS listener scheme. The viewer uses
+only same-origin assets/connections, a restrictive CSP without unsafe-eval or remote
+script origins, no-store API responses, nosniff and anti-framing headers.
 
-WebRTC encryption does not independently authenticate the remote machine’s human-readable name.
-The authenticated signaling channel binds the session and SDP fingerprints. A future high-assurance
-mode may add device identity signatures over fingerprints.
+## Loopback is not an identity boundary
 
-## Agent hardening
+`serve_loopback=false` by default. **Only enable it on single-user machines fronted
+by tailscale serve.** Local OS users can forge `Tailscale-User-Login`; Host/Origin
+checks do not stop a malicious local process. Opt-in serve traffic accepts HTTP or
+HTTPS Origin for the same Host without trusting X-Forwarded-Proto.
 
-- Run as a dedicated service identity where platform capture permits; split privileged input helper
-  from network process when required.
-- Store config read-only to the service account/administrators and secrets in Keychain, Credential
-  Manager/DPAPI, or Secret Service/kernel keyring.
-- Never put tokens or pairing codes in process lists after enrollment. Installer input is passed by
-  protected pipe or UI field.
-- Bind diagnostics IPC to a local protected socket/pipe. Do not listen publicly.
-- Use signed, reproducible packages and a signed update manifest. Updates are HTTPS, signature
-  verified, atomic, and rollback-capable.
-- Drop frames and messages at bounded queues; reject decompression bombs and oversized JSON before
-  allocation.
-- Validate advanced config against a deny-by-default schema.
+`NANOCTL_DEV_LOOPBACK_USER` is an explicitly insecure test-only bypass, including
+loopback ICE. Never set it for production.
 
-## OS-specific boundaries
-
-Windows input must not bypass the secure desktop. macOS capture and input require Screen Recording
-and Accessibility TCC grants. Linux Wayland uses PipeWire/xdg-desktop-portal and compositor-approved
-input mechanisms; unsupported compositors are view-only. X11 input is inherently broad and the UI
-warns accordingly. Locked-session behavior follows OS policy and is surfaced to the controller.
-
-## Web hardening
-
-The app sets no-sniff, frame denial, referrer, and permissions headers. Production adds a nonce-based
-CSP permitting only the application, Convex, and Shoo endpoints. Remote video is rendered directly
-to a media element, never injected HTML. Clipboard is unavailable in protocol v2. Browser key
-handling is active only while the video owns focus. `Ctrl+Alt+Shift+Escape` is intercepted locally
-before the video handler, releases remote key/button state, disables injection, and exits
-fullscreen.
-
-## Abuse controls
-
-Rate-limit enrollment by IP, code digest, and account; session creation by account/device; agent
-authentication failures by IP; and signaling by session/role. Alert on repeated code failures,
-geographically implausible session requests, new device enrollment, credential revocation, and
-unusual relay volume. Never silently auto-enroll.
-
-## Secret inventory
-
-| Secret              | Location                            | Rotation                   |
-| ------------------- | ----------------------------------- | -------------------------- |
-| Agent token         | OS credential store; hash in Convex | revoke/re-enroll           |
-| Shoo signing key    | Shoo; public JWKS cached by Convex  | issuer-managed             |
-| TURN auth secret    | Convex/edge secret + coturn         | quarterly / incident       |
-| Rate-limit secret   | Convex environment                  | quarterly / incident       |
-| Convex deploy key   | CI secret store                     | least privilege / incident |
-| Package signing key | offline or managed signing service  | documented ceremony        |
-
-## Audited dependency exceptions
-
-`RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` apply to `quick-xml 0.30`, which is pulled in solely as
-an `xcb` build dependency. It parses protocol XML shipped inside the reviewed `xcb` crate while
-compiling the Linux X11 bindings; it is not linked into the nanoctl agent and never processes
-network, owner, device, signaling, clipboard, or local runtime input. CI keeps the two advisory IDs
-as explicit exceptions until `xcb` adopts the patched parser, while continuing to fail on every
-other RustSec vulnerability.
-
-## Reporting
-
-Do not open public issues containing tokens, SDP, ICE candidates, private IPs, crash dumps, or
-screenshots. Security reports should include affected version, platform, reproducibility, and impact.
-Until a private reporting channel is configured, deployment owners must publish one before launch.
+Installers preserve legacy config but ignore removed keys; deletion of old platform
+keyring credentials is best-effort, not remote revocation. Keep OS and Tailscale
+patches current and restrict who can change the binary, config and service.

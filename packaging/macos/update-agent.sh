@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
+# shellcheck source=packaging/tailnet.sh
+. "$(dirname "$0")/../tailnet.sh"
 
 manifest_path=${1:?usage: update-agent.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
 public_key=${2:?usage: update-agent.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
 [ "$(id -u)" -ne 0 ] || {
-  printf '%s\n' "Update nanoctl as the enrolled desktop user, not root." >&2
+  printf '%s\n' "Update nanoctl as the desktop user, not root." >&2
   exit 1
 }
 install_root="$HOME/Library/Application Support/nanoctl"
@@ -37,11 +39,14 @@ activated=1
 launchctl bootstrap "gui/$(id -u)" "$agent_path"
 launchctl kickstart -k "$service_target"
 
-if "$binary_path" doctor; then
+if "$binary_path" config >/dev/null; then
   "$binary_path" commit-update
   completed=1
   trap - EXIT HUP INT TERM
   printf '%s\n' "nanoctl update activated and committed."
+  remove_legacy_credential "$binary_path"
+  check_tailnet
+  print_tailnet_url "$binary_path"
   exit 0
 fi
 

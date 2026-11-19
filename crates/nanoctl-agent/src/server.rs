@@ -71,7 +71,9 @@ impl ServerState {
         ))
         .unwrap();
         json!({
-            "hostName":node.host_name, "platform":crate::platform::PLATFORM,
+            "hostName": if node.host_name.is_empty() {
+                hostname::get().ok().and_then(|name| name.into_string().ok()).unwrap_or_else(|| "nanoctl host".into())
+            } else { node.host_name.clone() }, "platform":crate::platform::PLATFORM,
             "version":env!("CARGO_PKG_VERSION"), "displays":capabilities["displays"],
             "remoteInput": capabilities["remoteInput"], "capabilities":capabilities,
             "viewer":{"identity":identity,"mayControl":control}

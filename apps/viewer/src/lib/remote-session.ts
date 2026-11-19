@@ -9,6 +9,7 @@ import {
   type SignalPayload,
 } from "@nanoctl/protocol";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
+import { videoRates, type VideoSample } from "./video-rates";
 
 export type RemoteSessionPhase =
   | "negotiating"
@@ -20,8 +21,8 @@ export type RemoteSessionPhase =
 
 export type RemoteSessionMetrics = {
   resolution: string;
-  fps: number;
-  bitrateKbps: number;
+  fps: number | null;
+  bitrateKbps: number | null;
   rttMs: number;
   packetsLost: number;
   framesDropped: number;
@@ -131,7 +132,7 @@ export class RemoteSessionController {
   private recoveryRetryRequested = false;
   private notifiedEnd = false;
   private statsInFlight = false;
-  private previousBytes: { value: number; timestamp: number } | null = null;
+  private previousVideoSample: VideoSample | null = null;
   private readonly localUfragGenerations = new Map<string, number>();
   private readonly offerPublicationGates = new Map<number, Promise<boolean>>();
   private readonly offerCompletionWaiters = new Map<number, () => void>();
@@ -1061,14 +1062,18 @@ export class RemoteSessionController {
         }
       });
       if (!inbound) return;
-      const bytes = statNumber(inbound, "bytesReceived") ?? 0;
-      const timestamp = inbound.timestamp;
-      const elapsed = this.previousBytes ? timestamp - this.previousBytes.timestamp : 0;
-      const bitrateKbps =
-        this.previousBytes && elapsed > 0
-          ? Math.max(0, Math.round(((bytes - this.previousBytes.value) * 8) / elapsed))
-          : 0;
-      this.previousBytes = { value: bytes, timestamp };
+      const sample: VideoSample = {
+        id: inbound.id,
+        bytes: statNumber(inbound, "bytesReceived") ?? 0,
+        frames: statNumber(inbound, "framesDecoded"),
+        timestamp: inbound.timestamp,
+      };
+      const rates = videoRates(
+        sample,
+        this.previousVideoSample,
+        statNumber(inbound, "framesPerSecond"),
+      );
+      this.previousVideoSample = sample;
       const remoteCandidateId = candidatePair
         ? statString(candidatePair, "remoteCandidateId")
         : undefined;
@@ -1085,8 +1090,7 @@ export class RemoteSessionController {
           (statNumber(inbound, "frameHeight") ?? 0) > 0
             ? `${statNumber(inbound, "frameWidth")}×${statNumber(inbound, "frameHeight")}`
             : "—",
-        fps: Math.round(statNumber(inbound, "framesPerSecond") ?? 0),
-        bitrateKbps,
+        ...rates,
         rttMs: Math.round((statNumber(candidatePair, "currentRoundTripTime") ?? 0) * 1_000),
         packetsLost: Math.max(0, Math.round(statNumber(inbound, "packetsLost") ?? 0)),
         framesDropped: Math.max(0, Math.round(statNumber(inbound, "framesDropped") ?? 0)),

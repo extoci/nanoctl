@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
+# shellcheck source=packaging/tailnet.sh
+. "$(dirname "$0")/../tailnet.sh"
 
 manifest_path=${1:?usage: update-user-service.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
 public_key=${2:?usage: update-user-service.sh /path/to/manifest.json PUBLIC_KEY_BASE64}
 [ "$(id -u)" -ne 0 ] || {
-  printf '%s\n' "Update nanoctl as the enrolled graphical user, not root." >&2
+  printf '%s\n' "Update nanoctl as the graphical user, not root." >&2
   exit 1
 }
 binary_path="$HOME/.local/bin/nanoctl"
@@ -32,11 +34,14 @@ systemctl --user stop nanoctl.service
 activated=1
 systemctl --user start nanoctl.service
 
-if "$binary_path" doctor; then
+if "$binary_path" config >/dev/null; then
   "$binary_path" commit-update
   completed=1
   trap - EXIT HUP INT TERM
   printf '%s\n' "nanoctl update activated and committed."
+  remove_legacy_credential "$binary_path"
+  check_tailnet
+  print_tailnet_url "$binary_path"
   exit 0
 fi
 

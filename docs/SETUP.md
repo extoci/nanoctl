@@ -1,117 +1,65 @@
-# Host setup
+# Setup
 
-Create a setup code in the nanoctl dashboard, then run the installer as the desktop user that will
-share this computer.
+1. [Install Tailscale](https://tailscale.com/download) on the host and browser device.
+   Sign into your tailnet and make sure Tailscale is running.
+2. Run the [installer](../README.md#get-started) as the interactive desktop user,
+   not root, LocalSystem, or a different Windows administrator.
+3. Open the printed URL from your tailnet browser. The viewer auto-connects.
 
-Linux and macOS:
+No nanoctl account, setup code, enrollment or keyring unlock is needed. Installers warn
+but still install if Tailscale is missing/stopped; the agent waits for it to become
+available. Run `nanoctl url` once Tailscale is running.
 
-```sh
-curl -fsSL https://extoci.lol/nanoctl/install | sh
+The Linux installer uses a systemd user service, macOS a LaunchAgent, and Windows
+a hidden per-user Scheduled Task. Allow Screen Recording and Accessibility on macOS.
+The desktop user must be signed in. See [platform constraints](PLATFORMS.md).
+
+## HTTPS
+
+Enable **DNS → HTTPS Certificates** in the Tailscale admin console and use MagicDNS.
+Default `tailnet.tls="auto"` invokes `tailscale cert` for the node's validated FQDN.
+Grant the desktop user certificate-issuance permission if tailscaled requires it.
+Certificates and keys are stored privately; renewal is automatic within 14 days of expiry.
+
+The normal URL is `https://<host>.<tailnet>.ts.net:7337/`. Failed issuance without a
+valid existing certificate warns and falls back to `http://<host>.<tailnet>.ts.net:7337/`.
+WireGuard still encrypts HTTP over the tailnet, but keyboard lock and other browser
+secure-context features need HTTPS. Use `nanoctl doctor` to see the fallback reason
+and `nanoctl url` for the URL to open. `tls="off"` explicitly disables native TLS.
+
+## Configuration and access
+
+Defaults require no config file. `nanoctl paths` prints the platform config path;
+`nanoctl config` prints the effective config. Example optional configuration:
+
+```toml
+[tailnet]
+port = 7337
+tls = "auto"
+allow_users = ["alice@example.com"]
+allow_tags = []
+# Only enable on single-user machines when fronted by tailscale serve.
+serve_loopback = false
+# tailscale_cli = "/custom/path/to/tailscale"
+
+[features]
+remote_input = true
 ```
 
-Windows PowerShell:
+An empty `allow_users` allows the host node's owner by default. A nonempty list
+replaces that default. Grants can authorize control or view-only through
+`extoci.lol/cap/nanoctl`; tagged callers additionally require `allow_tags`.
+See [security](SECURITY.md#authorization) for a sample tailnet `grants` policy.
+Permit TCP 7337 and dynamic WebRTC UDP traffic through tailnet policy and host firewalls.
+Restart the agent after config changes.
 
-```powershell
-irm https://extoci.lol/nanoctl/install | iex
-```
+Native HTTPS does not require `tailscale serve`. If you choose serve instead,
+explicitly opt into loopback only on a single-user host: local users can forge its
+identity header. Do not expose the listener through a public reverse proxy or Funnel.
 
-The installer selects the correct x64 or arm64 executable, verifies its SHA-256 checksum, asks for
-the setup code on first install, and starts the background agent. Run the same command again to
-update to the latest release without enrolling again. It also adds `nanoctl` to the current user's
-PATH for new terminals.
+## Upgrading from v2
 
-Windows prints the resolved release and target before downloading, for example
-`Downloading nanoctl 2.0.0-alpha.1 for windows-x64...`, verifies that the executable reports that exact
-version, and prints the installed command path when the upgrade completes. A failed health-gated
-upgrade restores the previous task and executable rather than claiming that the new version is
-installed.
-
-If automatic platform selection is undesirable, use
-`https://extoci.lol/nanoctl/install.sh` or
-`https://extoci.lol/nanoctl/install.ps1` explicitly.
-
-Linux uses a systemd user service, macOS uses a per-user LaunchAgent, and Windows uses a hidden,
-non-elevated Scheduled Task launched through the windowless Windows Script Host (`wscript.exe`).
-The agent must run in the enrolled interactive user's session so it can access that user's
-credential store, screen, and input APIs. It does not open an inbound port. The registration starts
-at login and restarts after failures. While idle, the agent does not capture the screen or initialize
-a media session; it only performs lightweight control-plane checks while waiting for an authorized
-session. Windows runtime
-output is written to `%LOCALAPPDATA%\nanoctl\agent.log`; no console window is opened by the task.
-
-On Linux and macOS, the installer checks that the candidate can run and report its configuration
-path before stopping the old service. If the candidate fails to start or exits during the startup
-check, the installer restores the previous executable and service registration and brings back
-the service if it was running before the upgrade. On macOS, a previously stopped LaunchAgent
-remains stopped and is loaded again at the next login.
-
-On Windows, an upgrade preserves the existing configuration and enrollment, migrates an older
-explicit `--config` task path when needed, and retains the previous executable until the new task
-passes its health checks. A failed upgrade restores the previous binary and task automatically.
-
-Configurations created by an older elevated setup may be owned by `BUILTIN\Administrators`. The
-installer detects that legacy ACL before changing the installation. If the same Windows account is
-an administrator but is running with a filtered token, it automatically requests UAC approval once,
-reruns the exact resolved release, and grants the enrolled user explicit access. It still rejects a
-task or configuration belonging to another Windows user.
-
-macOS may ask for Screen Recording and Accessibility. Wayland may ask through its desktop portal.
-Complete those prompts as the user who ran the installer.
-
-## Verification
-
-Run:
-
-```sh
-nanoctl doctor
-nanoctl media-smoke --require-hardware --seconds 30
-```
-
-Then confirm the dashboard reports the device online and test a connection from another network.
-Use `--json` when collecting a machine-readable acceptance record.
-
-To stop the installed background agent without opening Task Scheduler, launchd, or systemd tools,
-run:
-
-```sh
-nanoctl stop
-```
-
-The command asks the running per-user agent to close active sessions, waits for native capture and
-encoder resources to be released, and succeeds if the agent is already stopped. The normal
-login-triggered registration remains installed, so it starts again at the next login or reinstall.
-
-Nanoctl 2.0 requires a protocol-v2 agent for new sessions. An older enrolled agent remains visible
-while it is being upgraded, and the dashboard explains why Connect is unavailable.
-
-## Advanced and development setup
-
-The installer supports these environment overrides:
-
-- `NANOCTL_VERSION=v2.0.0-alpha.1` installs a specific release instead of `latest`.
-- `NANOCTL_REPOSITORY=owner/repository` downloads from another GitHub repository.
-- `NANOCTL_CONTROL_PLANE=https://example.convex.site` enrolls against another deployment.
-- `NANOCTL_ENROLL_CODE=...` supplies the setup code without an interactive prompt.
-- `NANOCTL_BINARY=/path/to/nanoctl` uses a local Unix executable instead of downloading.
-
-## Alpha testing
-
-The first nanoctl 2.0 alpha is a prerelease and must be selected explicitly; stable `latest`
-continues to resolve to the latest stable release.
-
-Linux and macOS:
-
-```sh
-curl -fsSL https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.sh \
-  | NANOCTL_VERSION=v2.0.0-alpha.1 sh
-```
-
-Windows PowerShell:
-
-```powershell
-$env:NANOCTL_VERSION = "v2.0.0-alpha.1"
-irm https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.ps1 | iex
-```
-
-The scripts under `packaging/` remain low-level development and removal helpers. Normal
-installation and updates should use the one-command installer.
+Re-run the installer. It preserves the existing config, ignores removed legacy keys
+with warnings, and best-effort deletes the old platform credential after a successful
+upgrade. Do not delete config to work around a Tailscale warning. Checksum validation,
+transactional activation/rollback and service startup health gates remain in place.

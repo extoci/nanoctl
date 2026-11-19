@@ -11,6 +11,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\..\tailnet.ps1"
 $taskName = "nanoctl Agent"
 $sourceBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -62,14 +63,13 @@ function Resolve-AccountSid {
   ).Value
 }
 
-function Test-ConfigEnrolled {
+function Test-ConfigFile {
   param([string]$Path)
 
   if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     return $false
   }
-  $contents = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
-  return [bool]($contents -match '(?m)^\s*device_id\s*=\s*["''][^"'']+["'']\s*$')
+  return $true
 }
 
 function Get-TaskConfigPath {
@@ -146,7 +146,7 @@ function Assert-ExistingTaskOwner {
 if ($existingTask) {
   Assert-ExistingTaskOwner -Task $existingTask
   $taskConfigPath = Get-TaskConfigPath -Task $existingTask
-  if ($taskConfigPath -and (Test-ConfigEnrolled -Path $taskConfigPath)) {
+  if ($taskConfigPath -and (Test-ConfigFile -Path $taskConfigPath)) {
     $resolvedConfig = (Resolve-Path -LiteralPath $taskConfigPath).Path
     Write-Host "Preserving the existing configuration at $resolvedConfig."
   }
@@ -156,12 +156,12 @@ $configOwner = (Get-Acl -LiteralPath $resolvedConfig).Owner
 try {
   $configOwnerSid = Resolve-AccountSid -Account $configOwner
 } catch {
-  throw "Could not resolve the enrolled configuration owner '$configOwner'."
+  throw "Could not resolve the configuration owner '$configOwner'."
 }
 if ($configOwnerSid -ne $currentIdentity.User.Value -and
     -not ($configOwnerSid -eq "S-1-5-32-544" -and (Test-CurrentUserAdministrator))) {
   throw (
-    "The elevated identity '$currentUser' does not own the enrolled configuration. " +
+    "The elevated identity '$currentUser' does not own the configuration. " +
     "Sign in as '$configOwner' and elevate that same account; do not supply another administrator."
   )
 }
@@ -329,7 +329,7 @@ function Wait-AgentProcessExit {
 }
 
 # Capture and input must execute in the interactive user's session. A LocalSystem service runs in
-# Session 0 and cannot safely use that desktop or the enrolling user's Credential Manager entry.
+# Session 0 and cannot safely use that desktop.
 try {
   New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
   $lockStream = [IO.File]::Open(
@@ -391,7 +391,7 @@ try {
     throw "The nanoctl executable is incompatible with the headless service runner."
   }
   $installedVersion = $Matches[1]
-  & $installedBinary --config $resolvedConfig doctor
+  & $installedBinary --config $resolvedConfig config | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "nanoctl failed its pre-install health check."
   }
@@ -478,3 +478,5 @@ Remove-Item -LiteralPath $previousRunner -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $previousTaskXml -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "nanoctl background agent installed at $installedBinary and started for $currentUser."
+Remove-LegacyCredential -ConfigPath $resolvedConfig
+Show-TailnetUrl -BinaryPath $installedBinary -ConfigPath $resolvedConfig

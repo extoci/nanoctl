@@ -25,7 +25,8 @@ test("embedded viewer authenticates and negotiates under its CSP", async ({
   const response = await page.goto("/");
   expect(response?.headers()["content-security-policy"]).toContain("script-src 'self'");
   expect(response?.headers()["content-security-policy"]).not.toContain("unsafe-eval");
-  await expect(page).toHaveTitle("nanoctl · Remote desktop");
+  await expect(page).toHaveTitle(`${info.hostName} · nanoctl`);
+  await expect(page.getByText(info.hostName, { exact: true })).toBeVisible();
   await expect(page.getByText("dev@example.com", { exact: true })).toBeVisible();
   await expect
     .poll(() =>
@@ -52,6 +53,17 @@ test("embedded viewer authenticates and negotiates under its CSP", async ({
   }
   await page.getByRole("button", { name: "Stats", exact: true }).click();
   await expect(page.getByLabel("Connection statistics")).toContainText("RTT");
+  if (process.env.NANOCTL_BROWSER_MEDIA === "1") {
+    await expect
+      .poll(
+        async () => {
+          const stats = await page.getByLabel("Connection statistics").innerText();
+          return /Bitrate\s+(?!0\.00)[\d.]+ kbps/.test(stats);
+        },
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+  }
   await page.screenshot({ path: testInfo.outputPath("viewer.png") });
   expect(remoteRequests).toEqual([]);
   expect(errors).toEqual([]);
