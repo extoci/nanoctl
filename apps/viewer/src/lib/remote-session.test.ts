@@ -13,6 +13,54 @@ afterEach(() => {
 });
 
 describe("remote session lifecycle", () => {
+  test("normal pointer capture loss preserves keyboard focus; cancellation still releases input", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    const channel = peer.channels[1]!;
+    channel.sent = [];
+    video.focus();
+    video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
+    expect(video.focused).toBe(true);
+    expect(channel.sent).toEqual([]);
+    video.dispatchEvent(
+      Object.assign(new Event("keydown"), { code: "Space", key: " ", repeat: false }),
+    );
+    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+      type: "key",
+      action: "down",
+      code: "Space",
+    });
+    for (const [type, buttons] of [
+      ["lostpointercapture", 1],
+      ["pointercancel", 0],
+    ] as const) {
+      video.focus();
+      video.dispatchEvent(Object.assign(new Event(type), { buttons }));
+      expect(video.focused).toBe(false);
+      expect(JSON.parse(channel.sent.at(-1)!)).toEqual({ type: "release" });
+    }
+    controller.setInputEnabled(false);
+    channel.sent = [];
+    video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
+    video.dispatchEvent(Object.assign(new Event("keydown"), { code: "Space", key: " " }));
+    expect(channel.sent).toEqual([]);
+    channel.readyState = "closed";
+    video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 1 }));
+    expect(channel.sent).toEqual([]);
+    await controller.stop();
+  });
   test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
     installBrowserGlobals();
     const preferences = { inputEnabled: true, displayId: "secondary" };
@@ -340,18 +388,20 @@ function defineGlobal(name: string, value: unknown): void {
   });
 }
 
-class FakeVideo {
+class FakeVideo extends EventTarget {
   srcObject: unknown = null;
   videoWidth = 1920;
   videoHeight = 1080;
 
-  addEventListener(): void {}
+  focused = false;
 
-  removeEventListener(): void {}
+  focus(): void {
+    this.focused = true;
+  }
 
-  focus(): void {}
-
-  blur(): void {}
+  blur(): void {
+    this.focused = false;
+  }
 }
 
 class FakeMediaStream {
