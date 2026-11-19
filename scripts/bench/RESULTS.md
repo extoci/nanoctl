@@ -877,3 +877,61 @@ No new input-latency study, impaired-link or hardware-encoder run is claimed.
 The original QP-20 comparison meets its median gates, but unchanged later
 controls still show refresh-sized timing variation: this is not a universal
 latency guarantee or an attributable latency improvement.
+
+## Last quality round, part 1: isolated conversion and unsigned rounding
+
+No floats or data-dependent per-pixel branches were present in the rejected
+four-addition rounding implementation. A new ignored release microbench isolates
+conversion from capture/encoding, with reusable 720p buffers and nine rotated
+50-frame batches. The original kernel is checked against the packed-RGB library
+reference; the rounded candidate is checked byte-for-byte against the earlier
+signed rounded transform over black, white and pseudorandom frames and several
+even dimensions. Production remains the original truncating kernel.
+
+| Kernel                   | First microbench ns/frame median [min–max] | Final reproducible test-only microbench ns/frame median [min–max] |
+| ------------------------ | ------------------------------------------ | ----------------------------------------------------------------- |
+| Current truncation       | 1449076 [1272133–2226845]                  | 1658832 [1339703–2526008]                                         |
+| Earlier signed rounding  | 1398815 [1281993–1924919]                  | 1526683 [1358205–2521179]                                         |
+| Unsigned 16-bit rounding | 1574649 [1276694–1767070]                  | 1561154 [1356024–2727492]                                         |
+
+The candidate uses bounded unsigned 16-bit sums, folds offsets into 4224/32896,
+and explicitly averages chroma with `(sum + 2) >> 2`. Maximal intermediates are
+60324 for Y and 61456 for U/V, so neither wrapping nor saturation is needed.
+Actual release assembly mapped to the conversion source contains 52 packed-word
+SIMD operations (`pmullw`, `paddw`, `psllw`, `psrlw`, `psubw`); scalar cleanup
+remains. Assembly evidence: `~/bench-candidates/final-quality-conversion.asm.txt`.
+The first microbench is +8.67% versus control; the final test-only copy is −5.89%.
+Both meet the approximately 10% microbench gate. Crucially, the earlier signed
+rounding also does **not** reproduce a 13-point conversion cost in isolation.
+This disproves simply blaming floating-point math or scalar conversion overhead;
+it does not establish the cause of the whole-agent CPU differences.
+
+The actual unsigned candidate was still evaluated with three fresh-agent pairs
+per workload, order control/treatment, treatment/control, control/treatment.
+All 18 runs were valid. No builds or competing streams ran during measurement.
+Values are medians of per-run metrics; spreads remain in
+`~/bench-results/content/final-quality-paired-*.repeat.json`.
+
+| Workload | Variant          | SSIM Y  | PSNR Y dB | Mbps | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ---------------- | ------- | --------- | ---- | ----- | ------------ | ------------ |
+| Text     | QP-20 control    | 0.99719 | 41.71     | 1.10 | 58.42 | 53.21        | 66.71        |
+| Text     | Unsigned rounded | 0.99884 | 46.93     | 1.09 | 57.84 | 37.66        | 68.53        |
+| Drag     | QP-20 control    | 0.99728 | 42.90     | 1.89 | 58.31 | 37.49        | 53.99        |
+| Drag     | Unsigned rounded | 0.99870 | 47.66     | 1.87 | 57.15 | 37.72        | 63.46        |
+| Gradient | QP-20 control    | 0.99346 | 44.81     | 5.15 | 57.17 | 53.08        | 80.70        |
+| Gradient | Unsigned rounded | 0.99393 | 47.02     | 5.11 | 56.63 | 54.18        | 78.43        |
+
+**Rejected:** drag CPU +9.47 points exceeds the approximately five-point gate,
+despite the microbench and median latency gates passing. All control/treatment
+results are retained. Absolute control CPU/latency also deteriorated versus
+earlier sessions; these are not new competitor comparisons. A subsequent VM
+sample showed no cgroup throttling and 100% idle in its one-second sample; that
+does not establish conditions during the runs. Cumulative native timing logs
+cover moving-quality capture as well as the motion phase and do not isolate a
+cause for the motion-only CPU difference. No claim of a confirmed codec,
+compiler or host-scheduling root cause is made.
+
+The candidate executable/patch and raw logs are preserved under
+`~/bench-candidates/final-quality-rounded-u16`, `final-quality-u16.patch` and
+`final-quality-*`. Only the ignored microbench, reference checks and documentation
+are retained; unsigned rounding is **not enabled** in the production encoder.

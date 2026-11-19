@@ -243,6 +243,20 @@ Other allocators/platforms are unchanged.
 
 ### Real content and picture quality
 
+Isolated 720p conversion comparison (no capture, codec, allocation or network in
+the timed loop):
+
+```sh
+cargo test --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml \
+  benchmark_rgba_conversion_720p -- --ignored --nocapture --test-threads=1
+```
+
+It rotates three kernels over nine batches of 50 frames: current truncation,
+the previously rejected signed rounding, and a test-only unsigned-16-bit rounded
+candidate. Output is median/min/max ns/frame, with reusable input/output and
+`black_box`. Candidate kernels are checked byte-for-byte against the reference;
+they are not enabled in the product merely because the microbench passes.
+
 For software-encoder diagnosis, start the agent with
 `RUST_LOG=info,nanoctl::encoder=debug`. Each encode attempt logs its input-frame
 count, last encoded frame's average macroblock QP, current target kbps, and output

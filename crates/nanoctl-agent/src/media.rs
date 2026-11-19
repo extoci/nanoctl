@@ -434,6 +434,49 @@ impl I420Frame {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn read_rgba_rounded_candidate(&mut self, rgba: &[u8]) -> Result<()> {
+        let pixels = self.width * self.height;
+        if Some(rgba.len()) != pixels.checked_mul(4) {
+            bail!("RGBA pixel buffer does not match I420 dimensions");
+        }
+        let (y, uv) = self.bytes.split_at_mut(pixels);
+        let (u, v) = uv.split_at_mut(pixels / 4);
+        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
+            *y = ((66 * u16::from(pixel[0])
+                + 129 * u16::from(pixel[1])
+                + 25 * u16::from(pixel[2])
+                + 4224)
+                >> 8) as u8;
+        }
+        for ((rows, u), v) in rgba
+            .chunks_exact(self.width * 8)
+            .zip(u.chunks_exact_mut(self.width / 2))
+            .zip(v.chunks_exact_mut(self.width / 2))
+        {
+            let (top, bottom) = rows.split_at(self.width * 4);
+            for (((top, bottom), u), v) in top
+                .chunks_exact(8)
+                .zip(bottom.chunks_exact(8))
+                .zip(u)
+                .zip(v)
+            {
+                let average = |channel| {
+                    (u16::from(top[channel])
+                        + u16::from(top[channel + 4])
+                        + u16::from(bottom[channel])
+                        + u16::from(bottom[channel + 4])
+                        + 2)
+                        >> 2
+                };
+                let (r, g, b) = (average(0), average(1), average(2));
+                *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
+                *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl YUVSource for I420Frame {
@@ -2153,8 +2196,85 @@ mod tests {
         assert!(!next.differs_from(&next));
     }
 
+    fn reference_rgba<const ROUND: u32>(frame: &mut super::I420Frame, rgba: &[u8]) {
+        let pixels = frame.width * frame.height;
+        let (y, uv) = frame.bytes.split_at_mut(pixels);
+        let (u, v) = uv.split_at_mut(pixels / 4);
+        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
+            *y = (((66 * u32::from(pixel[0])
+                + 129 * u32::from(pixel[1])
+                + 25 * u32::from(pixel[2])
+                + ROUND)
+                >> 8)
+                + 16) as u8;
+        }
+        for ((rows, u), v) in rgba
+            .chunks_exact(frame.width * 8)
+            .zip(u.chunks_exact_mut(frame.width / 2))
+            .zip(v.chunks_exact_mut(frame.width / 2))
+        {
+            let (top, bottom) = rows.split_at(frame.width * 4);
+            for (((top, bottom), u), v) in top
+                .chunks_exact(8)
+                .zip(bottom.chunks_exact(8))
+                .zip(u)
+                .zip(v)
+            {
+                let average = |channel| {
+                    (i16::from(top[channel])
+                        + i16::from(top[channel + 4])
+                        + i16::from(bottom[channel])
+                        + i16::from(bottom[channel + 4])
+                        + 2)
+                        / 4
+                };
+                let (r, g, b) = (average(0), average(1), average(2));
+                *u = (((-38 * r + 112 * b - 74 * g + ROUND as i16) >> 8) + 128) as u8;
+                *v = (((112 * r - 18 * b - 94 * g + ROUND as i16) >> 8) + 128) as u8;
+            }
+        }
+    }
+
     #[test]
-    fn direct_rgba_conversion_matches_packed_rgb_reference() {
+    #[ignore = "isolated 720p conversion timing; run release, single test thread"]
+    fn benchmark_rgba_conversion_720p() {
+        use std::hint::black_box;
+        let rgba: Vec<_> = (0..1280 * 720 * 4)
+            .map(|i| (i * 71 + i / 997) as u8)
+            .collect();
+        let mut frame = super::I420Frame::new(1280, 720).unwrap();
+        let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+        for batch in 0..9 {
+            for position in 0..3 {
+                let variant = (batch + position) % 3;
+                let started = Instant::now();
+                for _ in 0..50 {
+                    let frame = black_box(&mut frame);
+                    let rgba = black_box(&rgba);
+                    match variant {
+                        0 => reference_rgba::<0>(frame, rgba),
+                        1 => reference_rgba::<128>(frame, rgba),
+                        _ => frame.read_rgba_rounded_candidate(rgba).unwrap(),
+                    }
+                    black_box(&frame.bytes);
+                }
+                samples[variant].push(started.elapsed().as_nanos() / 50);
+            }
+        }
+        for (name, mut samples) in ["control", "rejected", "rounded-u16"]
+            .into_iter()
+            .zip(samples)
+        {
+            samples.sort_unstable();
+            println!(
+                "{name}: ns/frame median={} min={} max={}",
+                samples[4], samples[0], samples[8]
+            );
+        }
+    }
+
+    #[test]
+    fn direct_rgba_conversion_checks_truncated_and_rounded_kernels() {
         let mut seed = 0x12345678_u32;
         for (width, height) in [(2, 2), (4, 6), (32, 18), (64, 64)] {
             let mut converted = super::I420Frame::new(width, height).unwrap();
@@ -2172,12 +2292,19 @@ mod tests {
                     .collect();
                 let reference =
                     YUVBuffer::from_rgb8_source(RgbSliceU8::new(&packed, (width, height)));
+                let mut expected = super::I420Frame::new(width, height).unwrap();
+                reference_rgba::<0>(&mut expected, &rgba);
+                assert_eq!(expected.y(), reference.y());
+                assert_eq!(expected.u(), reference.u());
+                assert_eq!(expected.v(), reference.v());
                 converted.read_rgba(&rgba).unwrap();
                 assert_eq!(converted.bytes.as_ptr(), allocation);
                 assert_eq!(converted.strides(), reference.strides());
-                assert_eq!(converted.y(), reference.y());
-                assert_eq!(converted.u(), reference.u());
-                assert_eq!(converted.v(), reference.v());
+                assert_eq!(converted.bytes, expected.bytes);
+                reference_rgba::<128>(&mut expected, &rgba);
+                converted.read_rgba_rounded_candidate(&rgba).unwrap();
+                assert_eq!(converted.bytes.as_ptr(), allocation);
+                assert_eq!(converted.bytes, expected.bytes);
             }
         }
     }
