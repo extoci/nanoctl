@@ -42,4 +42,7 @@ test("empty, invalid and missing runs never fabricate successful comparisons", (
   expect(summary.observed).toBe(2);
   expect(summary.validRuns).toBe(1);
   expect(summary.inputP50.median).toBe(10);
+  const incomplete = run(10);
+  incomplete.videoMs.p95 = null;
+  expect(summarizeRuns("missing metric", [incomplete], 1).complete).toBe(false);
 });

@@ -36,7 +36,19 @@ export function spread(values: number[]): {
 }
 
 export function summarizeRuns(product: string, runs: BenchRun[], requested: number) {
-  const valid = runs.filter((run) => run.valid);
+  const valid = runs.filter(
+    (run) =>
+      run.valid &&
+      [
+        run.inputMs.p50,
+        run.inputMs.p95,
+        run.videoMs.p50,
+        run.videoMs.p95,
+        run.uniqueFps,
+        run.resources.motion.cpuPercent,
+        run.resources.motion.rssMiB,
+      ].every((value) => typeof value === "number" && Number.isFinite(value)),
+  );
   const metric = (select: (run: BenchRun) => number | null) =>
     spread(valid.map(select).filter((v): v is number => v !== null));
   return {

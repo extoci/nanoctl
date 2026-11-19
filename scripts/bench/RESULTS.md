@@ -336,3 +336,110 @@ row. That incomplete run is not used for the frame table.
 Artifacts: `~/bench-results/{attribution-full,phase-stable,burst-credit,`
 `final-attribution-step}.{json,md,pixels.log,source.json,agent.log}`;
 the first three also have `.attribution.{json,md}`. Tooling commit: `c9e1341`.
+
+## Five-run pacer comparison
+
+**Decision: retain the current pacer. Neither candidate meets every retention
+gate.** This comparison uses five fresh trials per group, not the preceding
+single-run experiments. All **20/20 runs were valid**, matching **600/600 inputs
+per group, 2400/2400 total**. No outlier was excluded and no run was retried.
+
+### Protocol
+
+- Sequential blocks in this order: current ×5, token bucket ×5, half interval
+  ×5, Sunshine/Moonlight ×5. No competing stream or build ran during measurement.
+- 1280×720, software H.264, existing defaults, 120 randomized input trials per
+  run, fixed seed 1729, ten-second static phase and approximately one-minute
+  motion phase. Chromium 151.0.7922.34 was used throughout.
+- Source/viewer browsers are recreated between trials; each host persists within
+  its five-run group. Nanoctl was restarted between candidate groups. The
+  Moonlight stream was restarted for the reference; Sunshine remained listening
+  while inactive during nanoctl trials. The native Moonlight client persists
+  across its five trials. All attribution tracing was disabled.
+- Candidate binaries were built before measurements using the same release
+  media build wrapper and unchanged viewer assets. No runtime policy flag or
+  candidate implementation remains in the product.
+- Gate declared before results: lower median input **and** video p50 than current,
+  with no higher median input/video p95 or motion CPU. These are point-estimate
+  comparisons; no significance test or noninferiority margin is implied.
+
+Policies:
+
+1. **Current:** previous encode start + full frame interval (16.667 ms at 60 fps).
+2. **Token bucket:** refill at configured FPS, capacity two frames; encode fresh
+   damage immediately when a token is available, otherwise wait until refill.
+   Idle/refresh and forced-keyframe behavior is otherwise preserved. Unit tests
+   cover jitter, bounded bursts, sustained rate, idle refill and zero-FPS clamping.
+3. **Half interval:** replace the minimum wait with half the configured frame
+   interval (8.333 ms at 60 fps). This is not an average-rate token bucket: on a
+   higher-rate damage source it can permit twice the configured rate. It is only
+   an experimental candidate here, not a retained change.
+
+### Results
+
+Every cell is **median of per-run metrics [minimum–maximum across five runs]**,
+not a pooled percentile or confidence interval. CPU is host motion-phase mean,
+with one core = 100%.
+
+| Policy / product | Input p50 ms | Input p95 ms | Video p50 ms | Video p95 ms | Motion CPU % |
+| --- | --- | --- | --- | --- | --- |
+| Current | 36.01 [32.36–44.03] | 48.35 [44.36–76.46] | 23.96 [22.46–50.75] | 36.07 [31.11–63.15] | 38.59 [36.18–44.86] |
+| Token bucket | 32.14 [28.37–44.70] | 44.09 [36.37–56.16] | 21.13 [19.95–35.45] | 38.11 [22.04–38.55] | 37.03 [34.35–39.81] |
+| Half interval | 32.05 [28.38–40.10] | 40.27 [40.09–56.07] | 20.35 [20.09–35.80] | 23.90 [22.63–39.43] | 41.13 [39.34–42.18] |
+| Sunshine/Moonlight, fresh reference | 36.05 [28.07–48.05] | 44.06 [36.30–64.41] | 23.72 [18.08–46.53] | 37.05 [23.51–50.94] | 48.43 [44.82–52.62] |
+
+| Policy / product | Unique FPS | Motion RSS MiB | Runtime bytes |
+| --- | --- | --- | ---: |
+| Current | 59.39 [59.21–59.48] | 92.95 [55.41–102.67] | 16,161,320 |
+| Token bucket | 59.98 [59.88–60.00] | 102.25 [54.67–138.14] | 16,161,832 |
+| Half interval | 59.93 [59.76–60.00] | 103.27 [54.86–137.73] | 16,161,320 |
+| Sunshine/Moonlight | 59.67 [56.88–59.93] | 283.53 [282.30–283.53] | 30,349,491 |
+
+- **Token bucket rejected:** median video p95 is **+2.03 ms** versus current,
+  despite lower input/video p50 and CPU. Its input p95 also improved.
+- **Half interval rejected:** latency medians improve, but median motion CPU is
+  **+2.53 percentage points (+6.57%)** versus current. It still uses less CPU than
+  Moonlight here, but that is not the declared retention condition.
+- Ranges overlap substantially. These gates do not establish that either
+  regression is statistically significant; they prevent retaining a candidate
+  without satisfying the requested no-regression rule on the reported medians.
+- Fresh Moonlight medians are 36.05/23.72 ms input/video, not the earlier single
+  run's 28.05/16.44 ms. Neither that old point estimate nor the approximately
+  8 ms gap should be treated as stable across these runs. Sequential blocks
+  also leave order/time drift as a limitation; this is not a paired crossover.
+- RSS grew across reconnects for all nanoctl policies. Current motion RSS by run
+  was 55.41, 79.90, 92.95, 101.42, 102.67 MiB; token and half reached approximately
+  138 MiB. Allocator high-water behavior versus retained allocations was not
+  investigated, so these are not claimed as proven memory leaks or policy causes.
+
+All runs had zero >100 ms stalls. Detector frequency ranged 248.52–249.90 Hz,
+poll interval p99 4.54–6.73 ms, and source clock uncertainty ±0.22–0.40 ms.
+Approximately 4 ms polling quantization remains significant. Nanoctl received
+approximately 0.20 Mbps on this sparse marker workload. No picture-quality or
+separate visual review was performed.
+
+### Artifacts and checks
+
+`run.ts --repeat N` preserves each trial as `PRODUCT-run-I.{json,md,pixels.log,source.json}`
+and writes `PRODUCT.repeat.{json,md}`. Existing run JSON is refused, and missing,
+invalid or non-finite required metrics make the aggregate incomplete. Per-run
+results and failure descriptions are never replaced with synthetic successes.
+
+Artifacts: `~/bench-results/stats-{current,token,half,moonlight}-run-{1..5}.*`
+and `~/bench-results/stats-{current,token,half,moonlight}.repeat.{json,md}`.
+Experiment binaries, source patches, agent logs and run logs remain under
+`~/bench-candidates/`. Binary SHA-256 identities:
+
+```text
+current 14bb47df41db744438b914b2edf5d5cf99c6895e798d414668abc00ff37abd01
+token   8fe3c5dba39d4df8174377722fed91b723aa2be65bc71d1b6c38d99b4e12cd13
+half    c17ac757458751b488b9b43805e2b42a88bfa3f001c02e8da3533d6041f15754
+```
+
+Repeat harness commit: `45b4bd0`. Full Bun tests: 85 passed, zero failed;
+focused changed-file lint and TypeScript checking passed. Candidate adaptive
+tests: 30 passed for token bucket, 29 for half interval. After rejection,
+adaptive.rs was restored byte-for-byte; the prior passing unchanged-code Rust
+clippy/RTC/media matrix (68 RTC tests, 115 media tests, one ignored) was reused
+rather than rerun without changed inputs. The release artifact was rebuilt to
+replace the experimental binary. No native product-code diff remains.
