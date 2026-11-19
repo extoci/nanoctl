@@ -1,16 +1,18 @@
 import { chromium } from "@playwright/test";
 import { dlopen, ptr } from "bun:ffi";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { markerBits, readMarker, readMarkerRow } from "../../tests/browser/latency-marker";
 import { analyze } from "./metrics";
+import { repeatArgs, summarizeRuns, summaryMarkdown, type BenchRun } from "./repeat";
 
-const [product, hostDisplay, clientDisplay, pidText, outputText] = process.argv.slice(2);
+const options = repeatArgs(process.argv.slice(2));
+const [product, hostDisplay, clientDisplay, pidText, outputText] = options.args;
 if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
   throw new Error(
-    "Usage: bun scripts/bench/run.ts PRODUCT HOST_DISPLAY CLIENT_DISPLAY HOST_PID OUTPUT_DIR; VIEWER_URL for browser viewers, otherwise attach to an existing native viewer. RUNTIME_PATHS is a colon-separated runtime file/directory list.",
+    "Usage: bun scripts/bench/run.ts PRODUCT HOST_DISPLAY CLIENT_DISPLAY HOST_PID OUTPUT_DIR [--repeat N]; VIEWER_URL for browser viewers, otherwise attach to an existing native viewer. RUNTIME_PATHS is a colon-separated runtime file/directory list.",
   );
 }
 const rootPid = Number(pidText),
@@ -25,6 +27,41 @@ if (
   throw new Error("Invalid PID or trials (100..250)");
 const output = resolve(outputText);
 await mkdir(output, { recursive: true });
+if (options.repeat !== null) {
+  for (let i = 1; i <= options.repeat; i++) {
+    const file = join(output, `${product}-run-${i}.json`);
+    if (existsSync(file)) throw new Error(`Refusing to overwrite repeat artifact: ${file}`);
+  }
+  const runs: BenchRun[] = [];
+  const files: string[] = [];
+  const failures: string[] = [];
+  for (let i = 1; i <= options.repeat; i++) {
+    const name = `${product}-run-${i}`;
+    const child = spawnSync(
+      process.execPath,
+      [import.meta.path, name, hostDisplay, clientDisplay, pidText, output],
+      { stdio: "inherit", env: process.env },
+    );
+    const file = join(output, `${name}.json`);
+    files.push(file);
+    try {
+      runs.push(JSON.parse(readFileSync(file, "utf8")) as BenchRun);
+    } catch (error) {
+      failures.push(`${file}: ${String(error)}`);
+    }
+    if (child.status !== 0)
+      failures.push(
+        `${name}: exit ${child.status}, signal ${child.signal}, error ${child.error ?? "none"}`,
+      );
+  }
+  const summary = { ...summarizeRuns(product, runs, options.repeat), files, failures };
+  summary.complete &&= failures.length === 0;
+  await writeFile(join(output, `${product}.repeat.json`), JSON.stringify(summary, null, 2));
+  const markdown = summaryMarkdown(summary);
+  await writeFile(join(output, `${product}.repeat.md`), markdown);
+  console.log(markdown);
+  process.exit(summary.complete ? 0 : 1);
+}
 const helper = join(output, "pixels");
 execFileSync("cc", [
   "-O2",

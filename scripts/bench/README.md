@@ -69,6 +69,31 @@ Do not run these trials on a display with sensitive applications.
 
 ## Method and outputs
 
+### Repeated comparisons
+
+Append `--repeat N` (1–100) to the usual command. For example:
+
+```sh
+VIEWER_URL=http://127.0.0.1:7338 RUNTIME_PATHS="$PWD/crates/nanoctl-agent/target/release/nanoctl" \
+  bun scripts/bench/run.ts current :97 :94 "$HOST_PID" "$HOME/bench-results" --repeat 5
+```
+
+Each trial creates fresh source/viewer browsers and performs the full idle and
+motion phases with 120 input trials. The host process persists across repeats.
+Raw artifacts use `PRODUCT-run-1` through `PRODUCT-run-N`; existing run JSON is
+refused to prevent overwrites or reuse of stale results after a failed child.
+`PRODUCT.repeat.json` and `.repeat.md` report the median of **per-run** p50/p95,
+CPU, RSS and FPS, with **min–max** spread. These are not pooled percentiles or
+confidence intervals. Every run must be valid before a comparison is complete;
+failed/missing runs remain explicit and the repeat command exits nonzero.
+
+Use distinct product labels/output directories for each candidate. Run each
+candidate's repeats sequentially, without other active streams or builds, and
+record candidate order and binary identity. Keep settings and input seed fixed.
+For five-run selection, require lower median input and video p50, with no higher
+median input/video p95 or motion CPU than the current pacer. Overlapping ranges
+still limit the strength of any conclusion from only five trials.
+
 ### Optional nanoctl stage attribution
 
 Restart the Linux agent with `NANOCTL_BENCH_TRACE=1` and redirect its output to
