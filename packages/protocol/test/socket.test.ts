@@ -16,6 +16,12 @@ test("accepts hello with an empty display list and identity", () => {
   expect(parseAgentMessage(message)).toEqual(message);
   expect(() => assertHostInfo(host)).not.toThrow();
 });
+test("audio capability is independent of viewer control permission", () => {
+  const audioHost = { ...host, capabilities: { ...host.capabilities, systemAudio: true } };
+  const message = { type: "hello", sessionId: "audio", host: audioHost };
+  expect(parseAgentMessage(message)).toEqual(message);
+  expect(audioHost.viewer.mayControl).toBe(false);
+});
 test("accepts signal objects and end reasons", () => {
   const message = {
     type: "signal",

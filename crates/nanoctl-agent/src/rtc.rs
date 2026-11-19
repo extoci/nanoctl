@@ -380,6 +380,7 @@ impl HostPeer {
         host_epoch: String,
         allow_remote_input: bool,
         allow_clipboard: bool,
+        allow_audio: bool,
     ) -> Result<Self> {
         Self::answer_with_publisher(
             SignalPublisher::websocket(sender),
@@ -390,6 +391,7 @@ impl HostPeer {
             host_epoch,
             allow_remote_input,
             allow_clipboard,
+            allow_audio,
         )
         .await
     }
@@ -404,6 +406,7 @@ impl HostPeer {
         host_epoch: String,
         allow_remote_input: bool,
         allow_clipboard: bool,
+        allow_audio: bool,
     ) -> Result<Self> {
         let (offer, initial_generation, controller_epoch) =
             parse_offer(serialized_offer, &session_id)?;
@@ -432,7 +435,7 @@ impl HostPeer {
             .with_interceptor_registry(registry)
             .build();
         #[cfg(not(feature = "media"))]
-        let _ = (allow_remote_input, allow_clipboard);
+        let _ = (allow_remote_input, allow_clipboard, allow_audio);
         let peer = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
@@ -603,6 +606,35 @@ impl HostPeer {
                     })
                 }));
                 Box::pin(async {})
+            }));
+        }
+        #[cfg(feature = "media")]
+        if allow_audio && crate::audio::available() {
+            let audio = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".into(),
+                    ..Default::default()
+                },
+                "system-audio".into(),
+                "nanoctl-audio".into(),
+            ));
+            let sender = peer.add_track(audio.clone()).await?;
+            input_tasks.push(tokio::spawn(crate::audio::run(
+                audio,
+                peer.clone(),
+                input_shutdown.subscribe(),
+            )));
+            let mut shutdown = input_shutdown.subscribe();
+            input_tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        result = sender.read_rtcp() => { if result.is_err() { break; } }
+                    }
+                }
             }));
         }
         let video = Arc::new(TrackLocalStaticSample::new(
@@ -1403,6 +1435,7 @@ mod tests {
             "host-test".to_owned(),
             false,
             false,
+            false,
         )
         .await;
 
@@ -1468,6 +1501,7 @@ mod tests {
             Vec::new(),
             RTCIceTransportPolicy::All,
             "host-test".to_owned(),
+            false,
             false,
             false,
         )

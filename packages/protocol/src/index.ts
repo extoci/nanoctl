@@ -112,6 +112,7 @@ export type DeviceCapabilities = {
   readonly codecs: readonly VideoCodec[];
   readonly input: boolean;
   readonly clipboard: boolean;
+  /** One-way host output audio; independent of permission to control the host. */
   readonly systemAudio: boolean;
   /** Whether the agent can accept remote input in this capability state. */
   readonly remoteInput?: boolean;

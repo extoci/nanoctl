@@ -36,8 +36,8 @@ Types and validators live in `packages/protocol`.
       "readiness": "ready",
       "input": true,
       "remoteInput": true,
-      "clipboard": false,
-      "systemAudio": false,
+      "clipboard": true,
+      "systemAudio": true,
       "displays": []
     },
     "viewer": {
@@ -94,7 +94,23 @@ WebRTC uses empty ICE servers, tailnet host candidates, H.264 RTP, DTLS-SRTP vid
 SCTP data channels. No application-level TURN/STUN is used; Tailscale may relay its
 underlying encrypted transport through DERP. Reliable control carries discrete commands;
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
-host input or clipboard access. Audio is not implemented.
+host input or clipboard access. System audio is available to view-only sessions too.
+
+### System audio
+
+When `capabilities.systemAudio` is true, the viewer offers an additional recvonly audio
+transceiver. The agent sends a separate Opus RTP track: 48 kHz stereo, 20 ms frames,
+128 kbps restricted-lowdelay encoding, fmtp `minptime=10;useinbandfec=1;stereo=1`.
+RTCP is drained independently, and bounded audio queues drop stale work rather than
+blocking video. Capture starts after the peer connects and stops with the session.
+
+`features.system_audio` defaults to true. Linux requires `parec` and a reachable
+PulseAudio/PipeWire-pulse server; capture reads `@DEFAULT_MONITOR@`, not the microphone.
+Windows uses WASAPI output-device loopback. macOS system audio is unsupported and
+advertised false. Opus is bundled statically, so no runtime libopus installation is needed.
+The browser starts muted; **Enable sound** opts in for the session, and **Mute sound**
+disables playback again. Autoplay rejection leaves playback muted. Audio is host-to-viewer
+only and does not require permission to control the host.
 
 ### Clipboard
 

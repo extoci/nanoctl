@@ -15,6 +15,52 @@ afterEach(() => {
 });
 
 describe("remote session lifecycle", () => {
+  test("audio is recvonly when advertised, even for view-only sessions", async () => {
+    installBrowserGlobals();
+    for (const enabled of [false, true]) {
+      const peer = new FakePeer();
+      const video = new FakeVideo();
+      const audio = {
+        srcObject: null as unknown,
+        muted: true,
+        play: async () => {},
+        pause: () => {},
+      };
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: video as unknown as HTMLVideoElement,
+        audio: audio as unknown as HTMLAudioElement,
+        systemAudioEnabled: enabled,
+        remoteInputPolicy: false,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(peer.transceivers).toEqual(
+        enabled
+          ? [
+              ["video", "recvonly"],
+              ["audio", "recvonly"],
+            ]
+          : [["video", "recvonly"]],
+      );
+      peer.ontrack?.({
+        receiver: { playoutDelayHint: 1, jitterBufferTarget: 100 },
+        streams: [],
+        track: { kind: "audio" },
+      } as unknown as RTCTrackEvent);
+      expect(audio.srcObject instanceof FakeMediaStream).toBe(enabled);
+      expect(video.srcObject).toBeNull();
+      expect(audio.muted).toBe(true);
+      await controller.stop();
+      expect(audio.srcObject).toBeNull();
+    }
+  });
+
   test("clipboard is control-only and sends text before a remote paste key", async () => {
     installBrowserGlobals();
     Object.assign(document, { hasFocus: () => true });
@@ -338,6 +384,7 @@ class FakeDataChannel {
 }
 
 class FakePeer {
+  transceivers: [string, RTCRtpTransceiverDirection | undefined][] = [];
   channels = new Map<string, FakeDataChannel>();
   sent: [string, string][] = [];
   connectionState: RTCPeerConnectionState = "new";
@@ -354,7 +401,9 @@ class FakePeer {
     return channel;
   }
 
-  addTransceiver(): void {}
+  addTransceiver(kind: string, init: RTCRtpTransceiverInit): void {
+    this.transceivers.push([kind, init.direction]);
+  }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
     return { type: "offer", sdp: "v=0\r\na=ice-ufrag:fake" };

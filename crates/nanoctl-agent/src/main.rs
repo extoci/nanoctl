@@ -1,4 +1,6 @@
 #[cfg(feature = "media")]
+mod audio;
+#[cfg(feature = "media")]
 mod clipboard;
 mod config;
 #[cfg(feature = "media")]

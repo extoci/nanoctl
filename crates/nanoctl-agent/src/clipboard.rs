@@ -71,8 +71,12 @@ fn start() -> Option<Backend> {
                 let _ = ready.send(false);
                 return;
             };
-            let _ = ready.send(true);
             let mut state = State::default();
+            if let Ok(text) = clipboard.get_text() {
+                current.send_replace(encode(&text));
+                changes.send_replace(state.changed(text));
+            }
+            let _ = ready.send(true);
             loop {
                 match requests.recv_timeout(Duration::from_millis(350)) {
                     Ok(text) => {

@@ -60,6 +60,8 @@ export type RemoteSessionOptions = {
   displays: readonly DisplayInfo[];
   iceServers: readonly RTCIceServer[];
   video: HTMLVideoElement;
+  audio?: HTMLAudioElement;
+  systemAudioEnabled?: boolean;
   remoteInputEnabled?: boolean;
   clipboardEnabled?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
@@ -359,6 +361,10 @@ export class RemoteSessionController {
         this.clipboardChannel?.close();
         this.clipboardChannel = null;
         this.clipboard = null;
+        if (this.options.audio) {
+          this.options.audio.pause();
+          this.options.audio.srcObject = null;
+        }
         this.pointerChannel = null;
         this.controlChannel = null;
         peer.close();
@@ -424,10 +430,21 @@ export class RemoteSessionController {
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
     peer.addTransceiver("video", { direction: "recvonly" });
+    if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
       if ("playoutDelayHint" in receiver) {
         (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
+      }
+      if ("jitterBufferTarget" in receiver) {
+        (receiver as RTCRtpReceiver & { jitterBufferTarget?: number }).jitterBufferTarget = 0;
+      }
+      if (track.kind === "audio") {
+        if (this.options.audio && this.options.systemAudioEnabled) {
+          this.options.audio.srcObject = new MediaStream([track]);
+          void this.options.audio.play().catch(() => {});
+        }
+        return;
       }
       const stream = streams[0] ?? new MediaStream([track]);
       this.options.video.srcObject = stream;
