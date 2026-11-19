@@ -43,6 +43,19 @@ impl Gate {
             None
         }
     }
+
+    fn should_capture(
+        &mut self,
+        now: Instant,
+        damaged: bool,
+        initial: bool,
+        fallback: bool,
+    ) -> bool {
+        if !damaged && now.duration_since(self.last_change) >= PARK_AFTER {
+            self.parked = true;
+        }
+        initial || damaged || fallback
+    }
 }
 
 struct DamageWatch {
@@ -111,7 +124,7 @@ impl DamageWatch {
             revents: 0,
         };
         // The connection owns this descriptor for the entire poll call.
-        let result = unsafe { libc::poll(&mut fd, 1, if parked { 100 } else { 1 }) };
+        let result = unsafe { libc::poll(&mut fd, 1, if parked { 100 } else { 16 }) };
         if result < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
@@ -142,11 +155,14 @@ pub(super) fn start(
     let thread = std::thread::Builder::new().name("nanoctl-xdamage".to_owned()).spawn(move || {
         let mut watch = Some(watch);
         let mut gate = Gate::new(Instant::now());
+        let mut initial = true;
         while let Some(latest) = weak.upgrade() {
             if latest.stopped.load(Ordering::Acquire) { break; }
+            let mut damaged = false;
             if let Some(events) = watch.as_ref() {
                 match events.drain() {
                     Ok(Some(received)) => {
+                        damaged = true;
                         if gate.parked { stats.damage_resumes.fetch_add(1, Ordering::Relaxed); }
                         gate.damage(received);
                     }
@@ -159,10 +175,11 @@ pub(super) fn start(
                     }
                 }
             }
-            if !gate.parked {
+            if gate.should_capture(Instant::now(), damaged, initial, watch.is_none()) {
                 let started = Instant::now();
                 match monitor.capture_image() {
                     Ok(image) => {
+                        initial = false;
                         stats.capture_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let changed = latest.last.lock().unwrap().as_ref().is_none_or(|old| {
                             old.frame.width != image.width() || old.frame.height != image.height()
@@ -226,6 +243,21 @@ mod tests {
         gate.damage(event + Duration::from_secs(2));
         assert_eq!(gate.frame(event + Duration::from_secs(2), false), None);
         assert!(gate.parked);
+    }
+
+    #[test]
+    fn capture_requires_damage_except_startup_and_fallback() {
+        let now = Instant::now();
+        let mut gate = Gate::new(now);
+        assert!(gate.should_capture(now, false, true, false));
+        assert!(!gate.should_capture(now, false, false, false));
+        assert!(gate.should_capture(now, true, false, false));
+        assert!(!gate.should_capture(now + PARK_AFTER, false, false, false));
+        assert!(gate.parked);
+        assert!(gate.should_capture(now + PARK_AFTER, false, false, true));
+        gate.damage(now + PARK_AFTER);
+        assert!(!gate.parked);
+        assert!(gate.should_capture(now + PARK_AFTER, true, false, false));
     }
 
     #[test]
