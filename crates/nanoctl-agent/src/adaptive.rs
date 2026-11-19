@@ -11,6 +11,7 @@ pub struct LinkSample {
     pub rtt: Option<Duration>,
     pub remb_kbps: Option<u32>,
     pub at: Instant,
+    pub receiver_report_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +37,8 @@ pub struct RateController {
     app_limited: bool,
     active_since: Option<Instant>,
     last_remb: Option<u32>,
+    last_loss_report: Option<Instant>,
+    high_loss_reports: u8,
 }
 
 impl RateController {
@@ -65,6 +68,8 @@ impl RateController {
             app_limited: false,
             active_since: None,
             last_remb: None,
+            last_loss_report: None,
+            high_loss_reports: 0,
         }
     }
 
@@ -79,6 +84,7 @@ impl RateController {
         self.send_kbps = (kbps.is_finite() && kbps >= 0.0).then_some(kbps);
         if app_limited {
             self.active_since = None;
+            self.high_loss_reports = 0;
         } else {
             self.active_since.get_or_insert(at);
         }
@@ -112,6 +118,25 @@ impl RateController {
             .filter(|remb| Some(*remb) != self.last_remb);
         self.last_remb = sample.remb_kbps.or(self.last_remb);
         let loss = sample.fraction_lost.clamp(0.0, 1.0);
+        let fresh_report = sample
+            .receiver_report_at
+            .is_some_and(|at| self.last_loss_report.is_none_or(|last| at > last));
+        if fresh_report {
+            self.last_loss_report = sample.receiver_report_at;
+            self.high_loss_reports = if loss > 0.1 && !self.app_limited {
+                self.high_loss_reports.saturating_add(1)
+            } else {
+                0
+            };
+        }
+        let sustained_loss = self.high_loss_reports >= 2;
+        let loss_cut = loss > 0.1 && sustained_loss && fresh_report;
+        let previous_rate = self.rate;
+        let mut baseline_ms = None;
+        let mut trend_ms_per_s = None;
+        let mut trend_rising = false;
+        let mut remb_cut = false;
+        let mut queued = false;
         let mut delay_congested = false;
         let mut delay_cut = false;
         while self
@@ -132,7 +157,11 @@ impl RateController {
                 .iter()
                 .map(|(_, rtt)| rtt.as_secs_f64())
                 .fold(f64::INFINITY, f64::min);
-            let rising = trend.is_some_and(|slope| slope > 0.015);
+            queued = rtt.as_secs_f64() - baseline >= 0.015;
+            let rising = queued && trend.is_some_and(|slope| slope > 0.015);
+            baseline_ms = Some(baseline * 1000.0);
+            trend_ms_per_s = trend.map(|slope| slope * 1000.0);
+            trend_rising = rising;
             let draining = trend.is_some_and(|slope| slope < -0.005);
             delay_congested = rtt.as_secs_f64() > baseline + (baseline * 0.25).max(0.03) || rising;
             if delay_congested
@@ -162,16 +191,24 @@ impl RateController {
             self.last_congestion = None;
             self.congestion_rate = None;
         }
-        if loss > 0.1 || delay_cut {
+        if loss_cut || delay_cut {
             self.last_congestion = Some(sample.at);
             self.congestion_rate = Some(self.rate);
         }
-        if loss > 0.1 {
+        if loss_cut {
             self.rate *= 1.0 - 0.5 * loss;
         } else if loss < 0.02 && !delay_congested {
             if let Some(last) = self.last_congestion {
                 if clean_for >= Duration::from_secs(3) {
-                    self.rate *= Self::probe_gain(sample.rtt).powf(elapsed.min(2.0));
+                    let gain = if sample
+                        .rtt
+                        .is_some_and(|rtt| rtt <= Duration::from_millis(10))
+                    {
+                        2.0_f64
+                    } else {
+                        Self::probe_gain(sample.rtt)
+                    };
+                    self.rate *= gain.powf(elapsed.min(2.0));
                 } else if sample.at.duration_since(last) >= Duration::from_secs(3) {
                     let near_congestion = self
                         .congestion_rate
@@ -199,6 +236,7 @@ impl RateController {
             self.rate *= 0.85;
         }
         if let Some(remb) = new_remb
+            && (sample.rtt.is_none() || queued || sustained_loss)
             && self
                 .send_kbps
                 .is_some_and(|sent| f64::from(remb) < sent * 0.95)
@@ -208,6 +246,7 @@ impl RateController {
         {
             let cap = f64::from(remb) * 0.95;
             if cap < self.rate {
+                remb_cut = true;
                 self.last_congestion = Some(sample.at);
                 self.congestion_rate = Some(self.rate);
                 self.clean_since = None;
@@ -233,9 +272,43 @@ impl RateController {
         }
         let decision = self.decision();
         let delta = decision.bitrate_kbps.abs_diff(self.reported.bitrate_kbps) as f64;
-        if decision.fps != self.reported.fps
-            || delta >= (self.reported.bitrate_kbps as f64 * 0.1).max(1.0)
-        {
+        let changed = decision.fps != self.reported.fps
+            || delta >= (self.reported.bitrate_kbps as f64 * 0.1).max(1.0);
+        if changed || loss_cut || delay_cut || remb_cut {
+            let reason = if remb_cut {
+                "remb"
+            } else if loss_cut {
+                "loss"
+            } else if delay_cut && trend_rising {
+                "trend"
+            } else if delay_cut {
+                "rtt"
+            } else if decision.fps != self.reported.fps && self.rate == previous_rate {
+                "fps"
+            } else {
+                "probe"
+            };
+            tracing::info!(
+                reason,
+                previous_kbps = previous_rate,
+                target_kbps = decision.bitrate_kbps,
+                target_fps = decision.fps,
+                applied = changed,
+                loss,
+                loss_cut,
+                high_loss_reports = self.high_loss_reports,
+                delay_cut,
+                remb_cut,
+                remb_corroborated = sample.rtt.is_none() || queued || sustained_loss,
+                rtt_ms = sample.rtt.map(|rtt| rtt.as_secs_f64() * 1000.0),
+                baseline_ms,
+                trend_ms_per_s,
+                remb_kbps = sample.remb_kbps,
+                send_kbps = self.send_kbps,
+                "video rate decision"
+            );
+        }
+        if changed {
             self.reported = decision;
             Some(decision)
         } else {
@@ -344,6 +417,7 @@ mod tests {
             rtt: None,
             remb_kbps: None,
             at,
+            receiver_report_at: Some(at),
         }
     }
 
@@ -372,6 +446,10 @@ mod tests {
         let now = Instant::now();
         let mut controller = RateController::new(8_000, 60);
         assert_eq!(
+            controller.observe(sample(now - Duration::from_secs(1), 0.2)),
+            None
+        );
+        assert_eq!(
             controller.observe(sample(now, 0.2)).unwrap().bitrate_kbps,
             1_800
         );
@@ -387,6 +465,7 @@ mod tests {
         let now = Instant::now();
         let mut clean = RateController::new(8_000, 60);
         let mut cut = RateController::new(8_000, 60);
+        cut.observe(sample(now - Duration::from_secs(1), 0.2));
         cut.observe(sample(now, 0.2));
         for seconds in 0..=7 {
             let mut input = sample(now + Duration::from_secs(seconds), 0.0);
@@ -591,6 +670,8 @@ mod tests {
         }
         assert_eq!(controller.decision().bitrate_kbps, 8_000);
         input.remb_kbps = Some(1_500);
+        input.at += Duration::from_secs(1);
+        input.rtt = Some(Duration::from_millis(25));
         assert_eq!(controller.observe(input).unwrap().bitrate_kbps, 1_425);
     }
 
@@ -600,12 +681,12 @@ mod tests {
         let mut controller = RateController::new(8_000, 60);
         controller.update_sender(2_000.0, false, now - Duration::from_secs(3));
         let mut input = sample(now, 0.0);
-        input.rtt = Some(Duration::from_millis(1));
         input.remb_kbps = Some(100);
         controller.observe(input);
         assert_eq!(controller.decision().bitrate_kbps, 250);
         for second in 1..=11 {
             input.at = now + Duration::from_secs(second);
+            input.rtt = Some(Duration::from_millis(1));
             let sent = f64::from(controller.decision().bitrate_kbps) * 0.7;
             controller.update_sender(sent, false, input.at);
             input.remb_kbps = Some((1.5 * sent + 10.0) as u32);
@@ -618,6 +699,87 @@ mod tests {
         }
         assert!(controller.last_congestion.is_none());
         assert!(controller.congestion_rate.is_none());
+    }
+
+    #[test]
+    fn clean_loopback_rejects_chrome_remb_collapse_despite_sending_above_estimate() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        controller.update_sender(4_000.0, false, now - Duration::from_secs(3));
+        for second in 0..=20 {
+            let mut input = sample(now + Duration::from_secs(second), 0.0);
+            input.rtt = Some(Duration::from_micros(500 + second % 5 * 200));
+            input.remb_kbps = Some(740_u32.saturating_sub(second as u32 * 40).max(21));
+            controller.observe(input);
+            assert!(controller.decision().bitrate_kbps >= 2_000);
+        }
+        assert_eq!(controller.decision().bitrate_kbps, 8_000);
+        assert_eq!(controller.decision().fps, 60);
+    }
+
+    #[test]
+    fn loss_requires_two_fresh_receiver_reports_not_remb_copies() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        let mut input = sample(now, 0.2);
+        assert_eq!(controller.observe(input), None);
+        input.at += Duration::from_millis(500);
+        input.remb_kbps = Some(3_000);
+        assert_eq!(controller.observe(input), None);
+        assert_eq!(controller.high_loss_reports, 1);
+        assert_eq!(
+            controller
+                .observe(sample(now + Duration::from_secs(1), 0.2))
+                .unwrap()
+                .bitrate_kbps,
+            1_800
+        );
+        controller.observe(sample(now + Duration::from_secs(2), 0.0));
+        controller.observe(sample(now + Duration::from_secs(3), 0.2));
+        assert_eq!(controller.decision().bitrate_kbps, 1_800);
+        let mut no_report = sample(now + Duration::from_secs(4), 0.2);
+        no_report.receiver_report_at = None;
+        controller.observe(no_report);
+        assert_eq!(controller.decision().bitrate_kbps, 1_800);
+    }
+
+    #[test]
+    fn low_rtt_trend_noise_has_an_absolute_queue_floor() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        for tick in 0..30 {
+            let mut input = sample(now + Duration::from_millis(tick * 100), 0.0);
+            input.rtt = Some(Duration::from_millis(if tick % 2 == 0 { 1 } else { 3 }));
+            controller.observe(input);
+        }
+        assert!(controller.decision().bitrate_kbps >= 2_000);
+        assert!(controller.last_delay_cut.is_none());
+    }
+
+    #[test]
+    fn idle_breaks_loss_report_streak() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        controller.observe(sample(now, 0.2));
+        controller.update_sender(1.0, true, now + Duration::from_secs(1));
+        controller.update_sender(2_000.0, false, now + Duration::from_secs(10));
+        controller.observe(sample(now + Duration::from_secs(10), 0.2));
+        assert_eq!(controller.decision().bitrate_kbps, 2_000);
+        assert_eq!(controller.high_loss_reports, 1);
+    }
+
+    #[test]
+    fn genuine_queue_growth_corroborates_remb() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        controller.update_sender(1_800.0, false, now - Duration::from_secs(3));
+        let mut input = sample(now, 0.0);
+        input.rtt = Some(Duration::from_millis(1));
+        controller.observe(input);
+        input.at += Duration::from_secs(1);
+        input.rtt = Some(Duration::from_millis(25));
+        input.remb_kbps = Some(1_000);
+        assert_eq!(controller.observe(input).unwrap().bitrate_kbps, 950);
     }
 
     #[test]
@@ -671,6 +833,7 @@ mod tests {
     fn recovery_holds_then_approaches_congestion_rate_cautiously_without_rtt() {
         let now = Instant::now();
         let mut controller = RateController::new(8_000, 60);
+        controller.observe(sample(now - Duration::from_secs(1), 0.2));
         controller.observe(sample(now, 0.2));
         for second in 1..=2 {
             controller.observe(sample(now + Duration::from_secs(second), 0.0));

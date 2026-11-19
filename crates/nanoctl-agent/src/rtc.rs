@@ -28,6 +28,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtcp::reception_report::ReceptionReport;
+use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use webrtc::rtp::extension::abs_send_time_extension::unix2ntp;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -55,6 +56,7 @@ fn reception_report_sample(
         rtt,
         remb_kbps,
         at,
+        receiver_report_at: Some(at),
     })
 }
 
@@ -643,6 +645,14 @@ impl HostPeer {
                 }
                 let previous_remb = remb_kbps;
                 for packet in &packets {
+                    if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
+                        tracing::info!(
+                            video_ssrc,
+                            media_ssrc = nack.media_ssrc,
+                            nack_pairs = nack.nacks.len(),
+                            "video NACK"
+                        );
+                    }
                     if let Some(estimate) = packet
                         .as_any()
                         .downcast_ref::<ReceiverEstimatedMaximumBitrate>()
@@ -650,6 +660,7 @@ impl HostPeer {
                         && estimate.bitrate > 0.0
                     {
                         let kbps = (estimate.bitrate / 1_000.0).min(u32::MAX as f32) as u32;
+                        tracing::info!(video_ssrc, remb_kbps = kbps, "video REMB");
                         remb_kbps = Some(kbps.max(1));
                     }
                 }
@@ -667,6 +678,8 @@ impl HostPeer {
                             lsr = report.last_sender_report,
                             dlsr = report.delay,
                             compact_ntp,
+                            fraction_lost = sample.fraction_lost,
+                            total_lost = report.total_lost,
                             rtt_ms = sample.rtt.map(|rtt| rtt.as_secs_f64() * 1000.0),
                             "video receiver report"
                         );
@@ -681,6 +694,7 @@ impl HostPeer {
                         rtt: None,
                         remb_kbps,
                         at,
+                        receiver_report_at: None,
                     });
                     sample.at = at;
                     sample.remb_kbps = remb_kbps;

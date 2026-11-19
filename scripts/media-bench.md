@@ -98,12 +98,23 @@ upstream AIMD uses the 1.5x+10 expression as an increase ceiling, not an
 unconditional idle-time decrease. No actual browser runs in this harness.
 
 `send_kbps` measures successful writer payloads over two seconds. New REMB values
-bind only below 95% of that rate; an old value carried by later Receiver Reports
-cannot recap a new probe. Idle damage pacing freezes the target/FPS; the first two
+bind only below 95% of that rate. When RTT is available, they also require
+corroboration: at least 15 ms RTT growth over the baseline or two consecutive
+high-loss Receiver Reports (over 10% loss). Without RTT, the send-rate rule remains
+the fallback. An old REMB carried by later Receiver Reports cannot recap a new
+probe. Idle damage pacing freezes the target/FPS; the first two
 seconds of resumed motion ignore stale idle REMB while loss/RTT remain active.
+Loss cuts require two fresh high-loss reports; REMB updates carrying the same
+report do not count again, and idle resets the streak. RTT-trend cuts also require
+at least 15 ms absolute growth over baseline, so tiny loopback fluctuations cannot
+trigger them.
 After three clean measured seconds, recovery probes multiplicatively with an
-RTT-weighted gain (up to 1.5x/s on low RTT); congestion memory expires after ten
+RTT-weighted gain (2x/s at RTT <=10 ms); congestion memory expires after ten
 clean seconds. Resolution hysteresis restores full size at 1800 kbps.
+Controller decisions and congestion attempts log at info with their reason
+(`loss`, `rtt`, `trend`, `remb`, `probe` or `fps`), feedback values and an `applied`
+flag distinguishing emitted decisions from changes below output hysteresis.
+Raw REMB/NACK events log at info; Receiver Report loss and timing log at debug.
 Targets, FPS and sizes are absolute gauges, not measurement-window deltas.
 Time to target >=4000 kbps can be read from `target_series` at one-second
 resolution, relative to second 10 (idle-motion) or 20 (recovery). Idle never
