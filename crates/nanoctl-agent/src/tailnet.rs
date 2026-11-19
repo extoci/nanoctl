@@ -39,6 +39,9 @@ pub struct Identity {
 pub trait Tailnet: Send + Sync {
     async fn status(&self) -> Result<Node>;
     async fn whois(&self, peer: SocketAddr) -> Result<Identity>;
+    async fn cert(&self, _: &str, _: &std::path::Path, _: &std::path::Path) -> Result<()> {
+        bail!("certificate issuance is unavailable");
+    }
 }
 
 pub struct CliTailnet {
@@ -99,6 +102,27 @@ impl CliTailnet {
 
 #[async_trait]
 impl Tailnet for CliTailnet {
+    async fn cert(&self, dns: &str, cert: &std::path::Path, key: &std::path::Path) -> Result<()> {
+        crate::tls::validate_dns_name(dns)?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(&self.path)
+                .arg("cert")
+                .arg("--cert-file")
+                .arg(cert)
+                .arg("--key-file")
+                .arg(key)
+                .arg(dns)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .context("tailscale cert timed out")??;
+        if !output.status.success() {
+            bail!("tailscale cert failed; {}", crate::tls::CERT_HINT);
+        }
+        Ok(())
+    }
     async fn status(&self) -> Result<Node> {
         parse_status(self.command(&["status", "--json"]).await?)
     }
@@ -273,6 +297,9 @@ impl LazyTailnet {
 
 #[async_trait]
 impl Tailnet for LazyTailnet {
+    async fn cert(&self, dns: &str, cert: &std::path::Path, key: &std::path::Path) -> Result<()> {
+        self.cli().await?.cert(dns, cert, key).await
+    }
     async fn status(&self) -> Result<Node> {
         self.cli().await?.status().await
     }

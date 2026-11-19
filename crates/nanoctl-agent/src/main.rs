@@ -14,6 +14,7 @@ mod server;
 mod service;
 mod service_control;
 mod tailnet;
+mod tls;
 mod update;
 #[cfg(all(feature = "media", target_os = "windows"))]
 mod windows_encoder;
@@ -197,6 +198,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Config => {
             let config = AgentConfig::load_or_default(&config_path)?;
+            println!(
+                "# tailnet.serve_loopback: only enable on single-user machines when fronted by tailscale serve"
+            );
             println!("{}", toml::to_string_pretty(&config)?);
         }
         Command::Paths => {
@@ -205,7 +209,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Url => {
             let config = AgentConfig::load_or_default(&config_path)?;
             let node = tailnet::real(&config.tailnet).status().await?;
-            for url in tailnet::urls(&node, config.tailnet.port) {
+            let tls = tls::inspect(&config.tailnet, &node);
+            if tls.config.is_none() && config.tailnet.tls == config::TlsMode::Auto {
+                eprintln!("{}", tls.detail);
+            }
+            for url in tls::urls(&node, config.tailnet.port, tls.config.is_some()) {
                 println!("{url}");
             }
         }

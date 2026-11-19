@@ -176,6 +176,14 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
         },
     });
     let status = crate::tailnet::real(&config.tailnet).status().await;
+    if let Ok(node) = &status {
+        let tls = crate::tls::inspect(&config.tailnet, node);
+        checks.push(DoctorCheck {
+            name: "TLS",
+            ok: true,
+            detail: tls.detail,
+        });
+    }
     checks.push(DoctorCheck {
         name: "tailnet",
         ok: status.is_ok(),
@@ -184,7 +192,12 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
                 "running; IPs={:?}; MagicDNS={}; open {}",
                 node.ips,
                 node.dns_name,
-                crate::tailnet::urls(&node, config.tailnet.port).join(" ")
+                crate::tls::urls(
+                    &node,
+                    config.tailnet.port,
+                    crate::tls::inspect(&config.tailnet, &node).config.is_some()
+                )
+                .join(" ")
             ),
             Err(error) => error.to_string(),
         },

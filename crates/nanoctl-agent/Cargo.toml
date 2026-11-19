@@ -26,6 +26,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
@@ -56,6 +57,7 @@ uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
+x509-parser = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
@@ -77,6 +79,7 @@ windows = { version = "0.62.2", features = [
 
 [dev-dependencies]
 proptest = "1.11.0"
+rcgen = "0.13"
 tempfile = "3.24"
 tokio-tungstenite = "0.29"
 

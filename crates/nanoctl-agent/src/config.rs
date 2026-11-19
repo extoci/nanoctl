@@ -31,7 +31,9 @@ pub struct TailnetConfig {
     pub port: u16,
     pub allow_users: Vec<String>,
     pub allow_tags: Vec<String>,
+    /// Only enable on single-user machines when fronted by tailscale serve.
     pub serve_loopback: bool,
+    pub tls: TlsMode,
     pub tailscale_cli: Option<PathBuf>,
 }
 
@@ -41,6 +43,14 @@ pub struct FeatureConfig {
     pub system_audio: bool,
     pub clipboard: bool,
     pub remote_input: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Auto,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -91,7 +101,8 @@ impl Default for TailnetConfig {
             port: 7337,
             allow_users: Vec::new(),
             allow_tags: Vec::new(),
-            serve_loopback: true,
+            serve_loopback: false,
+            tls: TlsMode::Auto,
             tailscale_cli: None,
         }
     }

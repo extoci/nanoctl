@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use axum::{
-    Router,
+    Extension, Router,
     extract::{
         ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -83,6 +83,7 @@ impl ServerState {
         peer: SocketAddr,
         headers: &HeaderMap,
         ws: bool,
+        tls: bool,
     ) -> Result<(Identity, bool)> {
         let node = self.node.read().await.clone();
         let identity = if peer.ip().is_loopback() {
@@ -115,7 +116,10 @@ impl ServerState {
         if !valid_host(headers, &node, peer.ip().is_loopback()) {
             bail!("{label}: invalid Host");
         }
-        if ws && !valid_origin(headers, peer.ip().is_loopback()) {
+        let serve = peer.ip().is_loopback()
+            && self.config.tailnet.serve_loopback
+            && headers.get("Tailscale-User-Login").is_some();
+        if ws && !valid_origin(headers, tls, serve) {
             bail!("{label}: invalid WebSocket Origin");
         }
         let control = tailnet::authorize(&self.config.tailnet, &node, &identity)
@@ -163,7 +167,7 @@ pub fn valid_host(headers: &HeaderMap, node: &Node, loopback: bool) -> bool {
         || (loopback && name.eq_ignore_ascii_case("localhost"))
 }
 
-pub fn valid_origin(headers: &HeaderMap, loopback: bool) -> bool {
+pub fn valid_origin(headers: &HeaderMap, tls: bool, serve: bool) -> bool {
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -176,25 +180,18 @@ pub fn valid_origin(headers: &HeaderMap, loopback: bool) -> bool {
     else {
         return false;
     };
-    let scheme = if loopback
-        && headers
-            .get("X-Forwarded-Proto")
-            .and_then(|v| v.to_str().ok())
-            == Some("https")
-    {
-        "https"
-    } else {
-        "http"
-    };
+    let scheme = if tls { "https" } else { "http" };
     origin == format!("{scheme}://{host}")
+        || (serve && (origin == format!("https://{host}") || origin == format!("http://{host}")))
 }
 
-pub fn router(state: Arc<ServerState>) -> Router {
+pub fn router(state: Arc<ServerState>, tls: bool) -> Router {
     Router::new()
         .route("/v1/info", get(info))
         .route("/v1/connect", get(connect))
         .fallback(get(asset))
         .with_state(state)
+        .layer(Extension(tls))
         .layer(middleware::from_fn(security_headers))
 }
 
@@ -216,9 +213,10 @@ fn forbidden(error: anyhow::Error) -> Response {
 async fn info(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(tls): Extension<bool>,
     headers: HeaderMap,
 ) -> Response {
-    match state.authenticate(peer, &headers, false).await {
+    match state.authenticate(peer, &headers, false, tls).await {
         Ok((identity, control)) => axum::Json(state.info(&identity, control).await).into_response(),
         Err(error) => forbidden(error),
     }
@@ -227,10 +225,11 @@ async fn info(
 async fn asset(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(tls): Extension<bool>,
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
-    if let Err(error) = state.authenticate(peer, &headers, false).await {
+    if let Err(error) = state.authenticate(peer, &headers, false, tls).await {
         return forbidden(error);
     }
     let path = if uri.path() == "/" {
@@ -261,10 +260,11 @@ async fn asset(
 async fn connect(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(tls): Extension<bool>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let (identity, control) = match state.authenticate(peer, &headers, true).await {
+    let (identity, control) = match state.authenticate(peer, &headers, true, tls).await {
         Ok(result) => result,
         Err(error) => return forbidden(error),
     };
@@ -415,7 +415,10 @@ async fn session(
 
 pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let mut listeners =
-        HashMap::<IpAddr, (watch::Sender<bool>, tokio::task::JoinHandle<()>)>::new();
+        HashMap::<IpAddr, (axum_server::Handle<SocketAddr>, tokio::task::JoinHandle<()>)>::new();
+    let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
+    let mut cert_node = String::new();
+    let mut cert_checked = None::<tokio::time::Instant>;
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
@@ -426,6 +429,37 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
         match state.tailnet.status().await {
             Ok(node) => {
                 wanted.extend(node.ips.iter().copied());
+                if cert_node != node.dns_name
+                    || cert_checked.is_none_or(|checked| {
+                        checked.elapsed() >= Duration::from_secs(24 * 60 * 60)
+                    })
+                {
+                    let result = tokio::select! {
+                        result = crate::tls::prepare(&state.config.tailnet, &node, state.tailnet.as_ref()) => result,
+                        _ = shutdown.changed() => break,
+                    };
+                    if result.config.is_none()
+                        && state.config.tailnet.tls != crate::config::TlsMode::Off
+                    {
+                        tracing::warn!("{}", result.detail);
+                    }
+                    match (&tls_config, result.config) {
+                        (Some(current), Some(config)) => current.reload_from_config(config),
+                        (_, next) => {
+                            let changed = tls_config.is_some() != next.is_some();
+                            tls_config =
+                                next.map(axum_server::tls_rustls::RustlsConfig::from_config);
+                            if changed {
+                                for (_, (stop, task)) in listeners.drain() {
+                                    stop.graceful_shutdown(Some(Duration::from_secs(5)));
+                                    let _ = task.await;
+                                }
+                            }
+                        }
+                    }
+                    cert_node = node.dns_name.clone();
+                    cert_checked = Some(tokio::time::Instant::now());
+                }
                 *state.node.write().await = node;
             }
             Err(error) => {
@@ -444,7 +478,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
             .collect::<Vec<_>>();
         for ip in old {
             if let Some((stop, task)) = listeners.remove(&ip) {
-                stop.send_replace(true);
+                stop.graceful_shutdown(Some(Duration::from_secs(5)));
                 let _ = task.await;
             }
         }
@@ -455,18 +489,35 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
             let addr = SocketAddr::new(ip, state.config.tailnet.port);
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
-                    tracing::info!(%addr, "tailnet HTTP listener ready");
-                    let (stop, mut receiver) = watch::channel(false);
-                    let app = router(state.clone());
+                    let tls = if ip.is_loopback() {
+                        None
+                    } else {
+                        tls_config.clone()
+                    };
+                    tracing::info!(%addr, tls = tls.is_some(), "tailnet listener ready");
+                    let app = router(state.clone(), tls.is_some());
+                    let stop = axum_server::Handle::new();
+                    let handle = stop.clone();
+                    let listener = listener.into_std()?;
                     let task = tokio::spawn(async move {
-                        let _ = axum::serve(
-                            listener,
-                            app.into_make_service_with_connect_info::<SocketAddr>(),
-                        )
-                        .with_graceful_shutdown(async move {
-                            let _ = receiver.changed().await;
-                        })
+                        let service = app.into_make_service_with_connect_info::<SocketAddr>();
+                        let result: std::io::Result<()> = async {
+                            if let Some(tls) = tls {
+                                axum_server::from_tcp_rustls(listener, tls)?
+                                    .handle(handle)
+                                    .serve(service)
+                                    .await
+                            } else {
+                                axum_server::from_tcp(listener)?
+                                    .handle(handle)
+                                    .serve(service)
+                                    .await
+                            }
+                        }
                         .await;
+                        if let Err(error) = result {
+                            tracing::warn!(%addr, %error, "listener stopped");
+                        }
                     });
                     listeners.insert(ip, (stop, task));
                 }
@@ -477,7 +528,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
         }
     }
     for (_, (stop, task)) in listeners {
-        stop.send_replace(true);
+        stop.graceful_shutdown(Some(Duration::from_secs(5)));
         let _ = task.await;
     }
     Ok(())
@@ -512,11 +563,13 @@ mod tests {
                 ..Default::default()
             },
         });
-        let state = ServerState::new(AgentConfig::default(), fake);
+        let mut config = AgentConfig::default();
+        config.tailnet.serve_loopback = true;
+        let state = ServerState::new(config, fake);
         *state.node.write().await = state.tailnet.status().await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(state.clone());
+        let app = router(state.clone(), false);
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -654,10 +707,10 @@ mod tests {
             headers.insert(header::HOST, host.parse().unwrap());
             headers.insert(header::ORIGIN, format!("http://{host}").parse().unwrap());
             assert!(valid_host(&headers, &node, false));
-            assert!(valid_origin(&headers, false));
+            assert!(valid_origin(&headers, false, false));
         }
         headers.insert(header::ORIGIN, "http://evil.test".parse().unwrap());
-        assert!(!valid_origin(&headers, false));
+        assert!(!valid_origin(&headers, false, false));
         headers.insert(header::HOST, "evil.test:7337".parse().unwrap());
         assert!(!valid_host(&headers, &node, false));
         headers.insert(header::HOST, "127.0.0.1:7337".parse().unwrap());
@@ -665,7 +718,31 @@ mod tests {
         assert!(valid_host(&headers, &node, true));
         headers.insert(header::ORIGIN, "https://127.0.0.1:7337".parse().unwrap());
         headers.insert("X-Forwarded-Proto", "https".parse().unwrap());
-        assert!(valid_origin(&headers, true));
-        assert!(!valid_origin(&headers, false));
+        assert!(valid_origin(&headers, true, false));
+        assert!(!valid_origin(&headers, false, false));
+        assert!(valid_origin(&headers, false, true));
+        headers.insert(header::ORIGIN, "http://127.0.0.1:7337".parse().unwrap());
+        assert!(valid_origin(&headers, false, true));
+        assert!(!valid_origin(&headers, true, false));
+        headers.insert(header::ORIGIN, "https://evil.test".parse().unwrap());
+        assert!(!valid_origin(&headers, true, true));
+    }
+
+    #[tokio::test]
+    async fn default_rejects_forged_loopback_header() {
+        assert!(!AgentConfig::default().tailnet.serve_loopback);
+        let fake = Arc::new(crate::tailnet::FakeTailnet {
+            node: Node::default(),
+            identity: Identity::default(),
+        });
+        let state = ServerState::new(AgentConfig::default(), fake);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "localhost:7337".parse().unwrap());
+        headers.insert("Tailscale-User-Login", "owner@example.com".parse().unwrap());
+        let error = state
+            .authenticate("127.0.0.1:12345".parse().unwrap(), &headers, false, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("loopback requires"));
     }
 }
