@@ -86,6 +86,8 @@ jobs:
           echo "Timed out waiting for a successful CI run for $GITHUB_SHA." >&2
           exit 1
 
+      # CI builds the static viewer before each agent binary. Promote those embedded artifacts;
+      # do not rebuild either the viewer or the agent during tag publication.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           run-id: ${{ steps.locate.outputs.run_id }}

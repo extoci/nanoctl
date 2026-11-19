@@ -1,0 +1,19 @@
+{
+  "name": "@nanoctl/viewer",
+  "version": "3.0.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build.ts",
+    "typecheck": "tsc --build"
+  },
+  "dependencies": {
+    "@nanoctl/protocol": "workspace:*",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0"
+  }
+}

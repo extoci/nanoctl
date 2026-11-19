@@ -1,7 +1,7 @@
 import { rm } from "node:fs/promises";
 
 const generatedPaths = [
-  "apps/web/.next",
+  "apps/viewer/dist",
   "packages/protocol/dist",
   "target",
   "coverage",
