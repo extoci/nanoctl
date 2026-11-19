@@ -42,14 +42,46 @@ test("an unpaced 200-character key burst reaches native input in order", async (
       }
     }, text);
     await expect(target.getByRole("textbox")).toHaveValue(text, { timeout: 5000 });
-    await page.evaluate(() => {
-      (window as unknown as { control: RTCDataChannel }).control.send(
-        JSON.stringify({ type: "text", text: "-paste-and-ime-commit" }),
-      );
-    });
-    await expect(target.getByRole("textbox")).toHaveValue(text + "-paste-and-ime-commit", {
-      timeout: 3000,
-    });
+    let expected = text;
+    const commitText = async (label: string, commit: string, timeout: number) => {
+      const started = performance.now();
+      await page.evaluate((text) => {
+        (window as unknown as { control: RTCDataChannel }).control.send(
+          JSON.stringify({ type: "text", text }),
+        );
+      }, commit);
+      expected += commit;
+      await target
+        .waitForFunction(
+          (expected) => document.querySelector("input")?.value === expected,
+          expected,
+          { timeout },
+        )
+        .catch(async (error: unknown) => {
+          console.log(
+            `${label} received: ${JSON.stringify(await target.getByRole("textbox").inputValue())}`,
+          );
+          throw error;
+        });
+      const elapsed = performance.now() - started;
+      console.log(`${label}: ${elapsed.toFixed(1)} ms`);
+      expect(elapsed).toBeLessThan(timeout);
+    };
+    await commitText(
+      "200-character ASCII/Latin commit",
+      "AbC xyz 123!? ".repeat(20).slice(0, 200),
+      1000,
+    );
+    await commitText(
+      "200-character mixed Unicode commit",
+      Array.from("Hello 日本語 café 🙂! ".repeat(20)).slice(0, 200).join(""),
+      1000,
+    );
+    const distinct = Array.from({ length: 200 }, (_, index) =>
+      String.fromCodePoint(0x4e00 + index),
+    ).join("");
+    for (let attempt = 1; attempt <= 3; attempt++)
+      await commitText(`200-distinct-CJK commit ${attempt}`, distinct, 3000);
   } finally {
     await targetBrowser.close();
   }
