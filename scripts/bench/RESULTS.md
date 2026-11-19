@@ -8,20 +8,20 @@ matched 120/120 trusted XTest inputs: **5/5 valid runs and 600/600 inputs per
 product**. No outlier was removed. Cells below are **median of per-run metrics
 [minimum–maximum]**, not pooled percentiles or confidence intervals.
 
-| Product | Input p50 ms | Input p95 ms | Input p99 ms | Video p50 ms | Video p95 ms | Video p99 ms |
-| --- | --- | --- | --- | --- | --- | --- |
+| Product      | Input p50 ms        | Input p95 ms         | Input p99 ms         | Video p50 ms        | Video p95 ms        | Video p99 ms        |
+| ------------ | ------------------- | -------------------- | -------------------- | ------------------- | ------------------- | ------------------- |
 | screen-relay | 64.23 [56.05–96.09] | 72.25 [72.22–108.05] | 76.05 [73.83–108.46] | 55.06 [46.27–88.15] | 57.48 [57.39–91.03] | 62.47 [61.75–98.10] |
-| nanoctl | 32.16 [31.94–40.37] | 40.33 [36.42–52.38] | 44.23 [40.40–64.04] | 21.09 [19.94–35.77] | 37.77 [22.31–38.88] | 38.79 [27.28–43.72] |
+| nanoctl      | 32.16 [31.94–40.37] | 40.33 [36.42–52.38]  | 44.23 [40.40–64.04]  | 21.09 [19.94–35.77] | 37.77 [22.31–38.88] | 38.79 [27.28–43.72] |
 
-| Product | Unique FPS | Frame interval p50 ms | Frame interval p95 ms | Frame interval p99 ms | Stalls >100 ms |
-| --- | --- | --- | --- | --- | --- |
-| screen-relay | 59.74 [59.45–59.89] | 16.01 [16.01–16.02] | 20.26 [20.15–20.34] | 28.00 [24.19–28.18] | 0 [0–0] |
-| nanoctl | 59.96 [59.85–59.99] | 16.03 [16.03–16.04] | 20.23 [20.20–20.25] | 23.97 [20.45–24.30] | 0 [0–0] |
+| Product      | Unique FPS          | Frame interval p50 ms | Frame interval p95 ms | Frame interval p99 ms | Stalls >100 ms |
+| ------------ | ------------------- | --------------------- | --------------------- | --------------------- | -------------- |
+| screen-relay | 59.74 [59.45–59.89] | 16.01 [16.01–16.02]   | 20.26 [20.15–20.34]   | 28.00 [24.19–28.18]   | 0 [0–0]        |
+| nanoctl      | 59.96 [59.85–59.99] | 16.03 [16.03–16.04]   | 20.23 [20.20–20.25]   | 23.97 [20.45–24.30]   | 0 [0–0]        |
 
-| Product | Idle CPU % | Motion CPU % | Idle RSS MiB | Motion RSS MiB | Runtime MiB |
-| --- | --- | --- | --- | --- | --- |
+| Product      | Idle CPU %       | Motion CPU %        | Idle RSS MiB        | Motion RSS MiB      | Runtime MiB            |
+| ------------ | ---------------- | ------------------- | ------------------- | ------------------- | ---------------------- |
 | screen-relay | 0.88 [0.49–0.99] | 26.53 [25.97–27.73] | 48.27 [48.27–48.27] | 48.27 [48.27–48.27] | 139.59 [139.59–139.59] |
-| nanoctl | 0.60 [0.50–0.88] | 36.15 [33.55–36.79] | 49.55 [43.53–57.63] | 56.57 [53.45–61.97] | 23.46 [23.46–23.46] |
+| nanoctl      | 0.60 [0.50–0.88] | 36.15 [33.55–36.79] | 49.55 [43.53–57.63] | 56.57 [53.45–61.97] | 23.46 [23.46–23.46]    |
 
 Nanoctl is faster and smaller in this workload; screen-relay uses less motion
 CPU and engine RSS. Screen-relay's between-run latency spread is substantial.
@@ -79,10 +79,10 @@ do not infer one from its target or compare that target to nanoctl's RTP rate.
 
 ## Detector and artifacts
 
-| Product | Poll Hz | Poll interval p99 ms | Capture p99 ms | Reader CPU % | Clock uncertainty ±ms |
-| --- | --- | --- | --- | --- | --- |
-| screen-relay | 249.35 [248.76–249.38] | 4.66 [4.62–5.42] | 0.52 [0.50–0.53] | 1.35 [1.33–1.42] | 0.23 [0.21–0.29] |
-| nanoctl | 249.43 [249.16–249.76] | 4.63 [4.47–4.67] | 0.59 [0.54–0.63] | 1.60 [1.53–1.65] | 0.27 [0.23–0.52] |
+| Product      | Poll Hz                | Poll interval p99 ms | Capture p99 ms   | Reader CPU %     | Clock uncertainty ±ms |
+| ------------ | ---------------------- | -------------------- | ---------------- | ---------------- | --------------------- |
+| screen-relay | 249.35 [248.76–249.38] | 4.66 [4.62–5.42]     | 0.52 [0.50–0.53] | 1.35 [1.33–1.42] | 0.23 [0.21–0.29]      |
+| nanoctl      | 249.43 [249.16–249.76] | 4.63 [4.47–4.67]     | 0.59 [0.54–0.63] | 1.60 [1.53–1.65] | 0.27 [0.23–0.52]      |
 
 The roughly 4-ms polling quantization remains significant. Reader CPU excludes
 the client X server's capture-serving work. Total screen-relay/nanoctl detector
@@ -226,14 +226,14 @@ These are elapsed-time means, not CPU samples or a distribution. Capture and
 encoding run on separate workers, so the columns must not be summed into an
 end-to-end latency estimate.
 
-| Stage, mean ms/operation | Profile baseline | Persistent capture | Final, playout delay |
-| --- | ---: | ---: | ---: |
-| X11 capture | 5.120 | 2.168 | 2.003 |
-| Frame comparison, per capture | 0.131 | 0.115 | 0.102 |
-| Resize/preprocess, per encode attempt | 0.0003 | 0.0007 | 0.0003 |
-| RGBA to I420 | 1.598 | 1.522 | 1.394 |
-| OpenH264/backend excluding conversion | 3.996 | 3.702 | 3.445 |
-| Packetize/send sample | 0.061 | 0.058 | 0.055 |
+| Stage, mean ms/operation              | Profile baseline | Persistent capture | Final, playout delay |
+| ------------------------------------- | ---------------: | -----------------: | -------------------: |
+| X11 capture                           |            5.120 |              2.168 |                2.003 |
+| Frame comparison, per capture         |            0.131 |              0.115 |                0.102 |
+| Resize/preprocess, per encode attempt |           0.0003 |             0.0007 |               0.0003 |
+| RGBA to I420                          |            1.598 |              1.522 |                1.394 |
+| OpenH264/backend excluding conversion |            3.996 |              3.702 |                3.445 |
+| Packetize/send sample                 |            0.061 |              0.058 |                0.055 |
 
 The baseline window captured **8,802** frames for **3,145** encode attempts
 (2.80 captures/attempt). Final: **3,229** captures for **3,197** attempts
@@ -251,13 +251,13 @@ processing means use the decoded-frame delta. Processing includes decode and
 jitter buffering: these columns are not additive. QP is delta(qpSum) divided by
 decoded frames; it is not a picture-quality score.
 
-| Run | Emitted/decoded delta | Buffer ms/frame | Decode ms/frame | Processing ms/frame | Dropped delta | QP/frame | Received media Mbps |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Profile baseline | 3390/3390 | 20.013 | 0.635 | 20.719 | 0 | 26.0 | 0.197 |
-| Receiver target zero | 3437/3437 | 19.698 | 0.521 | 20.278 | 0 | 26.0 | 0.199 |
-| Damage-driven | 3430/3430 | 11.887 | 0.565 | 12.524 | 0 | 26.0 | 0.199 |
-| Persistent capture | 3434/3434 | 11.826 | 0.600 | 12.510 | 0 | 26.0 | 0.199 |
-| Final, playout delay | 3387/3387 | 0.331 | 0.535 | 0.963 | 0 | 26.0 | 0.200 |
+| Run                  | Emitted/decoded delta | Buffer ms/frame | Decode ms/frame | Processing ms/frame | Dropped delta | QP/frame | Received media Mbps |
+| -------------------- | --------------------: | --------------: | --------------: | ------------------: | ------------: | -------: | ------------------: |
+| Profile baseline     |             3390/3390 |          20.013 |           0.635 |              20.719 |             0 |     26.0 |               0.197 |
+| Receiver target zero |             3437/3437 |          19.698 |           0.521 |              20.278 |             0 |     26.0 |               0.199 |
+| Damage-driven        |             3430/3430 |          11.887 |           0.565 |              12.524 |             0 |     26.0 |               0.199 |
+| Persistent capture   |             3434/3434 |          11.826 |           0.600 |              12.510 |             0 |     26.0 |               0.199 |
+| Final, playout delay |             3387/3387 |           0.331 |           0.535 |               0.963 |             0 |     26.0 |               0.200 |
 
 Setting `jitterBufferTarget = 0` alongside the existing `playoutDelayHint = 0`
 was insufficient by itself. Chrome's offer advertises the RTP `playout-delay`
@@ -280,21 +280,21 @@ Accepted rows are cumulative, except that the two explicitly discarded
 experiments below were each based on persistent capture and were removed
 before the final playout-delay change.
 
-| Run | Inputs | Input p50/p95/p99 ms | Video p50/p95/p99 ms | Unique fps | Frame interval p50/p95/p99 ms | Stalls >100ms | CPU idle/motion % | RSS idle/motion MiB | Runtime MiB |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Profile baseline | 120/120 | 48.07 / 64.12 / 80.41 | 38.13 / 55.81 / 62.68 | 56.11 | 16.02 / 31.99 / 36.08 | 0 | 0.59 / 116.14 | 53.74 / 59.73 | 15.40 |
-| Receiver target zero | 120/120 | 44.28 / 56.04 / 64.22 | 37.13 / 54.00 / 55.82 | 56.88 | 16.02 / 31.69 / 35.99 | 0 | 0.78 / 108.96 | 53.82 / 61.22 | 15.40 |
-| Damage-driven capture | 120/120 | 44.32 / 56.16 / 64.04 | 37.17 / 40.75 / 54.71 | 56.72 | 16.02 / 31.53 / 36.02 | 0 | 0.60 / 59.71 | 43.52 / 55.51 | 15.40 |
-| Persistent capture | 120/120 | 47.76 / 58.45 / 75.89 | 36.85 / 40.69 / 52.62 | 57.17 | 16.03 / 27.57 / 36.02 | 0 | 0.70 / 45.63 | 43.46 / 55.74 | 15.40 |
-| Final, playout delay | 120/120 | 36.03 / 52.13 / 53.70 | 23.89 / 37.28 / 39.82 | 59.36 | 16.04 / 20.33 / 25.63 | 0 | 0.58 / 41.97 | 43.79 / 55.47 | 15.40 |
-| Sunshine/Moonlight, earlier reference | 120/120 | 28.05 / 40.44 / 58.18 | 16.44 / 24.51 / 38.20 | 58.62 | 16.19 / 24.00 / 33.68 | 0 | 45.35 / 46.27 | 260.29 / 269.81 | 28.94 |
+| Run                                   | Inputs  | Input p50/p95/p99 ms  | Video p50/p95/p99 ms  | Unique fps | Frame interval p50/p95/p99 ms | Stalls >100ms | CPU idle/motion % | RSS idle/motion MiB | Runtime MiB |
+| ------------------------------------- | ------- | --------------------- | --------------------- | ---------- | ----------------------------- | ------------- | ----------------- | ------------------- | ----------- |
+| Profile baseline                      | 120/120 | 48.07 / 64.12 / 80.41 | 38.13 / 55.81 / 62.68 | 56.11      | 16.02 / 31.99 / 36.08         | 0             | 0.59 / 116.14     | 53.74 / 59.73       | 15.40       |
+| Receiver target zero                  | 120/120 | 44.28 / 56.04 / 64.22 | 37.13 / 54.00 / 55.82 | 56.88      | 16.02 / 31.69 / 35.99         | 0             | 0.78 / 108.96     | 53.82 / 61.22       | 15.40       |
+| Damage-driven capture                 | 120/120 | 44.32 / 56.16 / 64.04 | 37.17 / 40.75 / 54.71 | 56.72      | 16.02 / 31.53 / 36.02         | 0             | 0.60 / 59.71      | 43.52 / 55.51       | 15.40       |
+| Persistent capture                    | 120/120 | 47.76 / 58.45 / 75.89 | 36.85 / 40.69 / 52.62 | 57.17      | 16.03 / 27.57 / 36.02         | 0             | 0.70 / 45.63      | 43.46 / 55.74       | 15.40       |
+| Final, playout delay                  | 120/120 | 36.03 / 52.13 / 53.70 | 23.89 / 37.28 / 39.82 | 59.36      | 16.04 / 20.33 / 25.63         | 0             | 0.58 / 41.97      | 43.79 / 55.47       | 15.40       |
+| Sunshine/Moonlight, earlier reference | 120/120 | 28.05 / 40.44 / 58.18 | 16.44 / 24.51 / 38.20 | 58.62      | 16.19 / 24.00 / 33.68         | 0             | 45.35 / 46.27     | 260.29 / 269.81     | 28.94       |
 
 Discarded experiments, not included in the final code:
 
-| Experiment | Inputs | Input p50/p95/p99 ms | Video p50/p95/p99 ms | Unique fps | Frame interval p50/p95/p99 ms | Stalls >100ms | CPU idle/motion % | RSS idle/motion MiB | Runtime MiB |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Direct RTP elapsed timestamps | 120/120 | 56.03 / 76.44 / 84.37 | 52.26 / 68.83 / 72.10 | 55.73 | 16.05 / 31.99 / 36.05 | 0 | 0.59 / 40.32 | 43.30 / 55.12 | 15.41 |
-| OpenH264 single thread | 120/120 | 44.05 / 56.08 / 56.29 | 36.69 / 39.82 / 45.81 | 57.15 | 16.03 / 28.01 / 35.99 | 0 | 1.09 / 43.03 | 43.36 / 55.03 | 15.40 |
+| Experiment                    | Inputs  | Input p50/p95/p99 ms  | Video p50/p95/p99 ms  | Unique fps | Frame interval p50/p95/p99 ms | Stalls >100ms | CPU idle/motion % | RSS idle/motion MiB | Runtime MiB |
+| ----------------------------- | ------- | --------------------- | --------------------- | ---------- | ----------------------------- | ------------- | ----------------- | ------------------- | ----------- |
+| Direct RTP elapsed timestamps | 120/120 | 56.03 / 76.44 / 84.37 | 52.26 / 68.83 / 72.10 | 55.73      | 16.05 / 31.99 / 36.05         | 0             | 0.59 / 40.32      | 43.30 / 55.12       | 15.41       |
+| OpenH264 single thread        | 120/120 | 44.05 / 56.08 / 56.29 | 36.69 / 39.82 / 45.81 | 57.15      | 16.03 / 28.01 / 35.99         | 0             | 1.09 / 43.03      | 43.36 / 55.03       | 15.40       |
 
 Direct RTP timestamps lowered receiver buffering but worsened pixel latency,
 disproving the predicted end-to-end benefit in that run. Single-thread encoding
@@ -344,30 +344,30 @@ write_sample_with_extensions, not a packet sniffer observation. Segment medians
 are not additive, and decoder processingDuration is a duration, not a separately
 observed decode-end timestamp.
 
-| Segment | p50 ms | p95 ms |
-| --- | ---: | ---: |
-| Source draw → damage received | 1.737 | 2.447 |
-| Damage received → capture start | 0.036 | 0.253 |
-| Capture start → end | 1.682 | 2.605 |
-| Capture end → encode start | 8.744 | 15.533 |
-| Encode start → end | 4.345 | 6.489 |
-| Encode end → RTP write start | 0.137 | 0.391 |
-| RTP write start → end | 0.042 | 0.064 |
-| RTP write end → rVFC receiveTime | 0.230 | 0.644 |
-| receiveTime → presentationTime | 0.700 | 3.600 |
-| Decode processingDuration | 0.400 | 0.700 |
-| presentationTime → expectedDisplayTime | 19.200 | 31.100 |
-| expectedDisplayTime → first client pixel | -9.917 | 9.360 |
-| presentationTime → first client pixel | 5.267 | 13.275 |
-| Source draw → first client pixel | 25.033 | 32.803 |
-| Client XTest → viewer DOM keydown | 0.729 | 3.811 |
-| Viewer DOM → datachannel send | 0.100 | 0.200 |
-| Datachannel send → agent receive | 0.205 | 0.672 |
-| Agent receive → inject start | 0.052 | 0.336 |
-| Inject start → end | 0.165 | 0.693 |
-| Inject end → source DOM | 0.270 | 0.773 |
-| Source DOM → repaint | 7.900 | 16.100 |
-| XTest → source repaint | 9.469 | 17.958 |
+| Segment                                  | p50 ms | p95 ms |
+| ---------------------------------------- | -----: | -----: |
+| Source draw → damage received            |  1.737 |  2.447 |
+| Damage received → capture start          |  0.036 |  0.253 |
+| Capture start → end                      |  1.682 |  2.605 |
+| Capture end → encode start               |  8.744 | 15.533 |
+| Encode start → end                       |  4.345 |  6.489 |
+| Encode end → RTP write start             |  0.137 |  0.391 |
+| RTP write start → end                    |  0.042 |  0.064 |
+| RTP write end → rVFC receiveTime         |  0.230 |  0.644 |
+| receiveTime → presentationTime           |  0.700 |  3.600 |
+| Decode processingDuration                |  0.400 |  0.700 |
+| presentationTime → expectedDisplayTime   | 19.200 | 31.100 |
+| expectedDisplayTime → first client pixel | -9.917 |  9.360 |
+| presentationTime → first client pixel    |  5.267 | 13.275 |
+| Source draw → first client pixel         | 25.033 | 32.803 |
+| Client XTest → viewer DOM keydown        |  0.729 |  3.811 |
+| Viewer DOM → datachannel send            |  0.100 |  0.200 |
+| Datachannel send → agent receive         |  0.205 |  0.672 |
+| Agent receive → inject start             |  0.052 |  0.336 |
+| Inject start → end                       |  0.165 |  0.693 |
+| Inject end → source DOM                  |  0.270 |  0.773 |
+| Source DOM → repaint                     |  7.900 | 16.100 |
+| XTest → source repaint                   |  9.469 | 17.958 |
 
 **Browser prediction caveat:** expectedDisplayTime was later than already-visible
 pixels in 2852/3324 observations; presentation→expected also had 93 negative
@@ -398,13 +398,13 @@ display measured 0.005533/0.013622 ms p50/p95 versus Enigo dispatch's
 0.165/0.693 ms. The direct test excludes server execution/DOM repaint, so it is
 not an end-to-end comparison. No input backend/channel change was made.
 
-| Run / disposition | Input p50/p95/p99 ms | Video p50/p95/p99 ms | FPS | CPU idle/motion % | RSS idle/motion MiB | Stalls >100ms |
-| --- | --- | --- | ---: | --- | --- | ---: |
-| Instrumented baseline | 35.89 / 44.29 / 48.07 | 24.98 / 33.16 / 46.00 | 59.51 | 0.68 / 40.46 | 43.38 / 54.90 | 0 |
-| Phase-stable deadlines; discarded | 44.05 / 76.19 / 88.22 | 56.20 / 64.51 / 76.24 | 59.67 | 0.50 / 41.86 | 43.23 / 54.49 | 1 |
-| Bounded one-frame credit; discarded | 40.08 / 60.25 / 64.71 | 38.94 / 44.26 / 49.45 | 59.76 | 0.60 / 42.56 | 43.67 / 54.93 | 0 |
-| Final, original pacer, tracing off | 32.24 / 48.05 / 55.12 | 22.93 / 31.11 / 37.39 | 59.52 | 0.60 / 39.21 | 43.42 / 55.03 | 0 |
-| Earlier Moonlight reference | 28.05 / 40.44 / 58.18 | 16.44 / 24.51 / 38.20 | 58.62 | 45.35 / 46.27 | 260.29 / 269.81 | 0 |
+| Run / disposition                   | Input p50/p95/p99 ms  | Video p50/p95/p99 ms  |   FPS | CPU idle/motion % | RSS idle/motion MiB | Stalls >100ms |
+| ----------------------------------- | --------------------- | --------------------- | ----: | ----------------- | ------------------- | ------------: |
+| Instrumented baseline               | 35.89 / 44.29 / 48.07 | 24.98 / 33.16 / 46.00 | 59.51 | 0.68 / 40.46      | 43.38 / 54.90       |             0 |
+| Phase-stable deadlines; discarded   | 44.05 / 76.19 / 88.22 | 56.20 / 64.51 / 76.24 | 59.67 | 0.50 / 41.86      | 43.23 / 54.49       |             1 |
+| Bounded one-frame credit; discarded | 40.08 / 60.25 / 64.71 | 38.94 / 44.26 / 49.45 | 59.76 | 0.60 / 42.56      | 43.67 / 54.93       |             0 |
+| Final, original pacer, tracing off  | 32.24 / 48.05 / 55.12 | 22.93 / 31.11 / 37.39 | 59.52 | 0.60 / 39.21      | 43.42 / 55.03       |             0 |
+| Earlier Moonlight reference         | 28.05 / 40.44 / 58.18 | 16.44 / 24.51 / 38.20 | 58.62 | 45.35 / 46.27     | 260.29 / 269.81     |             0 |
 
 The first candidate preserved timer phase across small overshoots but still had
 7.922/9.642 ms capture→encode wait. Source draw→damage shifted to
@@ -480,19 +480,19 @@ Every cell is **median of per-run metrics [minimum–maximum across five runs]**
 not a pooled percentile or confidence interval. CPU is host motion-phase mean,
 with one core = 100%.
 
-| Policy / product | Input p50 ms | Input p95 ms | Video p50 ms | Video p95 ms | Motion CPU % |
-| --- | --- | --- | --- | --- | --- |
-| Current | 36.01 [32.36–44.03] | 48.35 [44.36–76.46] | 23.96 [22.46–50.75] | 36.07 [31.11–63.15] | 38.59 [36.18–44.86] |
-| Token bucket | 32.14 [28.37–44.70] | 44.09 [36.37–56.16] | 21.13 [19.95–35.45] | 38.11 [22.04–38.55] | 37.03 [34.35–39.81] |
-| Half interval | 32.05 [28.38–40.10] | 40.27 [40.09–56.07] | 20.35 [20.09–35.80] | 23.90 [22.63–39.43] | 41.13 [39.34–42.18] |
+| Policy / product                    | Input p50 ms        | Input p95 ms        | Video p50 ms        | Video p95 ms        | Motion CPU %        |
+| ----------------------------------- | ------------------- | ------------------- | ------------------- | ------------------- | ------------------- |
+| Current                             | 36.01 [32.36–44.03] | 48.35 [44.36–76.46] | 23.96 [22.46–50.75] | 36.07 [31.11–63.15] | 38.59 [36.18–44.86] |
+| Token bucket                        | 32.14 [28.37–44.70] | 44.09 [36.37–56.16] | 21.13 [19.95–35.45] | 38.11 [22.04–38.55] | 37.03 [34.35–39.81] |
+| Half interval                       | 32.05 [28.38–40.10] | 40.27 [40.09–56.07] | 20.35 [20.09–35.80] | 23.90 [22.63–39.43] | 41.13 [39.34–42.18] |
 | Sunshine/Moonlight, fresh reference | 36.05 [28.07–48.05] | 44.06 [36.30–64.41] | 23.72 [18.08–46.53] | 37.05 [23.51–50.94] | 48.43 [44.82–52.62] |
 
-| Policy / product | Unique FPS | Motion RSS MiB | Runtime bytes |
-| --- | --- | --- | ---: |
-| Current | 59.39 [59.21–59.48] | 92.95 [55.41–102.67] | 16,161,320 |
-| Token bucket | 59.98 [59.88–60.00] | 102.25 [54.67–138.14] | 16,161,832 |
-| Half interval | 59.93 [59.76–60.00] | 103.27 [54.86–137.73] | 16,161,320 |
-| Sunshine/Moonlight | 59.67 [56.88–59.93] | 283.53 [282.30–283.53] | 30,349,491 |
+| Policy / product   | Unique FPS          | Motion RSS MiB         | Runtime bytes |
+| ------------------ | ------------------- | ---------------------- | ------------: |
+| Current            | 59.39 [59.21–59.48] | 92.95 [55.41–102.67]   |    16,161,320 |
+| Token bucket       | 59.98 [59.88–60.00] | 102.25 [54.67–138.14]  |    16,161,832 |
+| Half interval      | 59.93 [59.76–60.00] | 103.27 [54.86–137.73]  |    16,161,320 |
+| Sunshine/Moonlight | 59.67 [56.88–59.93] | 283.53 [282.30–283.53] |    30,349,491 |
 
 - **Token bucket rejected:** median video p95 is **+2.03 ms** versus current,
   despite lower input/video p50 and CPU. Its input p95 also improved.
@@ -567,27 +567,27 @@ counts were 547 before and 600 after.
 **RSS after disconnect and settling, MiB:**
 
 | Cycle | Before trimming | Final build with trimming |
-| ---: | ---: | ---: |
-| 1 | 40.36 | 18.02 |
-| 2 | 67.59 | 18.89 |
-| 3 | 91.12 | 29.55 |
-| 4 | 97.18 | 19.59 |
-| 5 | 106.63 | 21.66 |
-| 6 | 115.74 | 22.64 |
-| 7 | 118.53 | 23.59 |
-| 8 | 121.38 | 25.69 |
-| 9 | 123.40 | 28.64 |
-| 10 | 123.40 | 28.67 |
-| 11 | 123.40 | 28.66 |
-| 12 | 124.59 | 28.91 |
-| 13 | 124.63 | 29.16 |
-| 14 | 124.66 | 29.16 |
-| 15 | 125.89 | 30.16 |
-| 16 | 126.76 | 31.04 |
-| 17 | 123.25 | 31.06 |
-| 18 | 124.11 | 31.07 |
-| 19 | 147.26 | 41.67 |
-| 20 | 161.20 | 32.11 |
+| ----: | --------------: | ------------------------: |
+|     1 |           40.36 |                     18.02 |
+|     2 |           67.59 |                     18.89 |
+|     3 |           91.12 |                     29.55 |
+|     4 |           97.18 |                     19.59 |
+|     5 |          106.63 |                     21.66 |
+|     6 |          115.74 |                     22.64 |
+|     7 |          118.53 |                     23.59 |
+|     8 |          121.38 |                     25.69 |
+|     9 |          123.40 |                     28.64 |
+|    10 |          123.40 |                     28.67 |
+|    11 |          123.40 |                     28.66 |
+|    12 |          124.59 |                     28.91 |
+|    13 |          124.63 |                     29.16 |
+|    14 |          124.66 |                     29.16 |
+|    15 |          125.89 |                     30.16 |
+|    16 |          126.76 |                     31.04 |
+|    17 |          123.25 |                     31.06 |
+|    18 |          124.11 |                     31.07 |
+|    19 |          147.26 |                     41.67 |
+|    20 |          161.20 |                     32.11 |
 
 Connected RSS at the end of cycle 20 also fell, 161.20 → 70.14 MiB. Open FDs
 remained 12 throughout both runs. Post-disconnect threads were 12–13, consistent
