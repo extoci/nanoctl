@@ -800,7 +800,8 @@ large baseline spread (45.54–64.94%), so its reduction is not attributed to th
 patch. Likewise, refresh-sized latency swings are not claimed as optimizations.
 The retained setting **does not close the remaining competitor quality gap**.
 
-Maximum QP remains 51 so allocation cuts can sacrifice fidelity/frame output;
+The explicit maximum is 51 (the effective sentinel default was 35), so
+allocation cuts can sacrifice fidelity/frame output;
 the adaptive controller, starting bitrate, bitrate bounds, feedback negotiation,
 frame pacing, VUI and encoder complexity are unchanged. Regression tests read
 back effective QP bounds and bitrate mode for every latency mode and exercise
