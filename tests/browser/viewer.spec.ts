@@ -1,5 +1,60 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { copyFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+test("host picker lists tailnet machines and supports keyboard", async ({ page }, testInfo) => {
+  await page.route("**/v1/hosts", (route) =>
+    route.fulfill({
+      json: {
+        self: {
+          hostName: "Current desktop",
+          dnsName: "current.ts.net",
+          url: "https://current.ts.net:7337/",
+        },
+        hosts: [
+          {
+            hostName: "Build server",
+            dnsName: "build.ts.net",
+            os: "linux",
+            online: true,
+            url: "https://build.ts.net:7337/",
+          },
+          {
+            hostName: "Studio Mac",
+            dnsName: "studio.ts.net",
+            os: "macOS",
+            online: true,
+            url: "https://studio.ts.net:7337/",
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto("/");
+  const picker = page.getByRole("button", { name: "Choose host" });
+  await expect(picker).toContainText("(3)");
+  const directory = join(homedir(), "picker-shots");
+  await mkdir(directory, { recursive: true });
+  const closed = testInfo.outputPath("picker-closed.png");
+  await page.screenshot({ path: closed });
+  await copyFile(closed, join(directory, "picker-closed.png"));
+  await picker.click();
+  const hosts = page.getByRole("group", { name: "Tailnet hosts" });
+  await expect(hosts).toContainText("Current desktop");
+  await expect(hosts).toContainText("Build server");
+  await expect(hosts).toContainText("Studio Mac");
+  await expect(hosts).toContainText("macOS");
+  const opened = testInfo.outputPath("picker-open.png");
+  await page.screenshot({ path: opened });
+  await copyFile(opened, join(directory, "picker-open.png"));
+  await picker.press("ArrowDown");
+  await expect(hosts.getByRole("button").first()).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(picker).toBeFocused();
+  await expect(hosts).toBeHidden();
+});
 
 test("disabled input stays off across repeated video clicks", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");

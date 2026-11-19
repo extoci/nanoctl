@@ -1,3 +1,41 @@
+export type HostLocation = { hostName: string; dnsName: string; url: string };
+export type HostsResponse = {
+  self: HostLocation;
+  hosts: (HostLocation & { os: string; online: boolean })[];
+};
+
+export function assertHostsResponse(value: unknown): asserts value is HostsResponse {
+  const location = (v: unknown): v is HostLocation => {
+    if (!v || typeof v !== "object") return false;
+    const h = v as Record<string, unknown>;
+    if (
+      typeof h.hostName !== "string" ||
+      typeof h.dnsName !== "string" ||
+      typeof h.url !== "string"
+    )
+      return false;
+    try {
+      const url = new URL(h.url);
+      return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password;
+    } catch {
+      return false;
+    }
+  };
+  if (!value || typeof value !== "object") throw new Error("invalid hosts response");
+  const response = value as Record<string, unknown>;
+  if (
+    !location(response.self) ||
+    !Array.isArray(response.hosts) ||
+    !response.hosts.every(
+      (h: unknown) =>
+        location(h) &&
+        typeof (h as Record<string, unknown>).os === "string" &&
+        typeof (h as Record<string, unknown>).online === "boolean",
+    )
+  )
+    throw new Error("invalid hosts response");
+}
+
 /** The wire contract shared by the tailnet viewer and native agent. */
 export const PROTOCOL_VERSION = 2 as const;
 export const MIN_SUPPORTED_PROTOCOL_VERSION = 1 as const;
