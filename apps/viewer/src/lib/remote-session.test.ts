@@ -67,7 +67,12 @@ describe("remote session lifecycle", () => {
     defineGlobal("navigator", {
       clipboard: { readText: async () => "local paste", writeText: async () => {} },
     });
-    for (const mayControl of [false, true]) {
+    for (const [mayControl, remoteInput] of [
+      [false, true],
+      [true, false],
+      [false, false],
+      [true, true],
+    ]) {
       const peer = new FakePeer();
       const video = new FakeVideo();
       const controller = new RemoteSessionController({
@@ -78,13 +83,14 @@ describe("remote session lifecycle", () => {
         video: video as unknown as HTMLVideoElement,
         clipboardEnabled: true,
         remoteInputPolicy: mayControl,
+        remoteInputEnabled: remoteInput,
         operations: { sendSignal: async () => null, endSession: async () => null },
         peerFactory: () => peer as unknown as RTCPeerConnection,
         onSnapshot: () => {},
       });
       await controller.start();
-      expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(mayControl);
-      if (mayControl) {
+      expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(!!mayControl && !!remoteInput);
+      if (mayControl && remoteInput) {
         video.listeners.get("keydown")?.({
           type: "keydown",
           code: "KeyV",

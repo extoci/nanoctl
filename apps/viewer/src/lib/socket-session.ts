@@ -132,7 +132,9 @@ export class SocketSession {
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
                 clipboardEnabled:
-                  message.host.capabilities.clipboard && message.host.viewer.mayControl,
+                  message.host.capabilities.clipboard &&
+                  message.host.remoteInput &&
+                  message.host.viewer.mayControl,
                 preferences: this.preferences,
                 operations: {
                   sendSignal: async ({ envelope }) =>

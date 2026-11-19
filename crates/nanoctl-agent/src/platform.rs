@@ -112,7 +112,7 @@ pub fn capabilities(
         readiness,
         input: remote_input_enabled && input,
         remote_input: remote_input_enabled && input,
-        clipboard: clipboard_available(clipboard_enabled),
+        clipboard: clipboard_available(clipboard_enabled && remote_input_enabled && input),
         system_audio: system_audio_available(system_audio_enabled),
         displays,
     }

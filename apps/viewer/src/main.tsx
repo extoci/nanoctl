@@ -146,7 +146,9 @@ function Viewer() {
           <span>
             {info?.platform ?? "Tailnet connection"} <i>·</i>{" "}
             {info?.remoteInput ? "Control" : "View only"}
-            {info?.capabilities.clipboard && info.viewer.mayControl ? " · Clipboard sync on" : ""}
+            {info?.capabilities.clipboard && info.remoteInput && info.viewer.mayControl
+              ? " · Clipboard sync on"
+              : ""}
           </span>
         </div>
         <div className="identity">

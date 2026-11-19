@@ -399,7 +399,7 @@ export class RemoteSessionController {
   }
 
   private attachPeer(peer: RTCPeerConnection, lifecycle: number): void {
-    if (this.options.clipboardEnabled && this.remoteInputPolicy) {
+    if (this.options.clipboardEnabled && this.remoteInputAllowed) {
       const channel = peer.createDataChannel("nanoctl.clipboard.v1", { ordered: true });
       this.clipboardChannel = channel;
       this.clipboard = new ClipboardSync({

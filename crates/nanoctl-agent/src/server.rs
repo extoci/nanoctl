@@ -67,7 +67,7 @@ impl ServerState {
         let node = self.node.read().await;
         let capabilities = serde_json::to_value(crate::platform::capabilities(
             self.config.features.remote_input && control,
-            self.config.features.clipboard && control,
+            self.config.features.clipboard && self.config.features.remote_input && control,
             self.config.features.system_audio,
             self.config.quality.encoder,
         ))
@@ -543,6 +543,25 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn view_only_info_never_advertises_clipboard() {
+        for (remote_input, control) in [(false, true), (true, false), (false, false)] {
+            let mut config = AgentConfig::default();
+            config.features.remote_input = remote_input;
+            assert!(config.features.clipboard);
+            let state = ServerState::new(
+                config,
+                Arc::new(crate::tailnet::FakeTailnet {
+                    node: Node::default(),
+                    identity: Identity::default(),
+                }),
+            );
+            let info = state.info(&Identity::default(), control).await;
+            assert_eq!(info["capabilities"]["clipboard"], false);
+            assert_eq!(info["remoteInput"], false);
+        }
+    }
 
     #[cfg(feature = "rtc")]
     #[tokio::test]
