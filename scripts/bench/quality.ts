@@ -34,6 +34,60 @@ export function receivedVideoRates(samples: unknown[]) {
   });
 }
 
+export function idleVideoBursts(samples: { at: number; reports: unknown[] }[], paints: number[]) {
+  if (paints.some((at, i) => !Number.isFinite(at) || (i > 0 && at <= paints[i - 1])))
+    throw new Error("Invalid source paint times");
+  const windows = {
+    interactive: { bytes: 0, seconds: 0, intervals: 0 },
+    refinement: { bytes: 0, seconds: 0, intervals: 0 },
+    quiet: { bytes: 0, seconds: 0, intervals: 0 },
+  };
+  const intervals = [];
+  let paint = -1;
+  for (let i = 0; i < samples.length; i++) {
+    const current = samples[i],
+      previous = samples[i - 1];
+    if (!Number.isFinite(current.at) || (previous && current.at <= previous.at))
+      throw new Error("Invalid receiver sample times");
+    if (!previous) continue;
+    const rates = receivedVideoRates(
+      [previous, current].flatMap((s) =>
+        s.reports.map((value) =>
+          value && typeof value === "object" ? { ...value, timestamp: s.at } : value,
+        ),
+      ),
+    );
+    const middle = (previous.at + current.at) / 2;
+    while (paint + 1 < paints.length && paints[paint + 1] <= middle) paint++;
+    if (paint < 0 || current.at > (paints[paint + 1] ?? Infinity)) continue;
+    const age = middle - paints[paint];
+    const phase = age < 100 ? "interactive" : age < 400 ? "refinement" : age < 700 ? "quiet" : null;
+    if (!phase) continue;
+    const seconds = (current.at - previous.at) / 1000;
+    const mbps = rates.reduce((sum, rate) => sum + rate.mbps, 0);
+    const bytes = Math.round((mbps * seconds * 1e6) / 8);
+    windows[phase].bytes += bytes;
+    windows[phase].seconds += seconds;
+    windows[phase].intervals++;
+    intervals.push({ at: middle, age, phase, bytes, mbps });
+  }
+  return {
+    windows: Object.fromEntries(
+      Object.entries(windows).map(([phase, w]) => [
+        phase,
+        {
+          ...w,
+          mbps: w.seconds > 0 ? (w.bytes * 8) / w.seconds / 1e6 : 0,
+        },
+      ]),
+    ),
+    peakIntervalMbps: distribution(intervals.map((i) => i.mbps)),
+    intervals,
+    convention:
+      "Video RTP bytes; approximately 100-ms receiver intervals classified by midpoint after source paint: 0–100 ms interactive, 100–400 ms refinement, 400–700 ms quiet; intervals crossing the next source paint excluded",
+  };
+}
+
 export function qualityScores(log: string) {
   const ssim = Number(log.match(/SSIM[^\n]*All:([\d.]+)/)?.[1]);
   const value = log.match(/PSNR[^\n]*average:([\d.]+|inf)/)?.[1];

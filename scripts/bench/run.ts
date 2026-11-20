@@ -10,11 +10,14 @@ import { repeatArgs, summarizeRuns, summaryMarkdown, type BenchRun } from "./rep
 import { runtimeBytes } from "./runtime";
 import { setupClicks } from "./viewer";
 import { drawWorkload, workloadName } from "./workloads";
-import { analyzeQuality, pcapPayloadBytes, receivedVideoRates } from "./quality";
+import { analyzeQuality, pcapPayloadBytes, receivedVideoRates, idleVideoBursts } from "./quality";
 
 const options = repeatArgs(process.argv.slice(2));
 const viewerSetupClicks = setupClicks(process.env.VIEWER_SETUP_CLICKS);
 const qualityMode = process.env.BENCH_QUALITY === "1";
+const idleInputMode = process.env.BENCH_IDLE_INPUT === "1";
+if (qualityMode && idleInputMode)
+  throw new Error("Quality and idle-input modes are separate trials");
 const workload = workloadName(process.env.BENCH_WORKLOAD);
 const [product, hostDisplay, clientDisplay, pidText, outputText] = options.args;
 if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
@@ -222,7 +225,7 @@ if (qualityMode) {
   await qualityWindow(host, hostWindow, hostDisplay);
 }
 await host.evaluate(
-  ({ encode, draw, workload }) => {
+  ({ encode, draw, workload, idleInputMode }) => {
     const bits = new Function(`return (${encode})`)() as typeof markerBits;
     const content = new Function(`return (${draw})`)() as typeof drawWorkload;
     const canvas = document.querySelector("canvas")!;
@@ -231,6 +234,7 @@ await host.evaluate(
       paints: [] as number[],
       input: 0,
       motion: false,
+      settled: false,
       keys: [] as unknown[],
       inputPaints: [] as { input: number; at: number }[],
     };
@@ -250,12 +254,16 @@ await host.evaluate(
         dirty = true;
       }
     });
+    let lastSettled = 0;
+    let settledSequence = 0;
     const render = () => {
-      if (state.motion || dirty) {
+      const at = performance.now();
+      if (state.motion || dirty || (state.settled && at - lastSettled >= 750)) {
         const seq = state.paints.length;
         ctx.fillStyle = "#151515";
         ctx.fillRect(0, 0, 1280, 720);
-        if (state.motion) content(ctx, seq, workload);
+        if (state.motion || state.settled || idleInputMode)
+          content(ctx, state.settled ? settledSequence++ * 45 : seq, workload);
         ctx.fillStyle = "cyan";
         ctx.fillRect(0, 100, 80, 100);
         ctx.fillStyle = "magenta";
@@ -275,16 +283,18 @@ await host.evaluate(
         if (state.inputPaints.at(-1)?.input !== state.input)
           state.inputPaints.push({ input: state.input, at: state.paints.at(-1)! });
         dirty = false;
+        if (state.settled) lastSettled = at;
       }
       requestAnimationFrame(render);
     };
     requestAnimationFrame(render);
   },
-  { encode: markerBits.toString(), draw: drawWorkload.toString(), workload },
+  { encode: markerBits.toString(), draw: drawWorkload.toString(), workload, idleInputMode },
 );
 let viewerBrowser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 let viewer: Awaited<ReturnType<typeof hostBrowser.newPage>> | undefined;
 const stats: unknown[] = [];
+const receiverSamples: { at: number; reports: unknown[] }[] = [];
 let websocketBytes = 0,
   countWebsocket = false;
 let viewerClock = { offsetMs: 0, uncertaintyMs: Infinity };
@@ -382,6 +392,10 @@ await pause(4000);
 execFileSync("xdotool", ["mousemove", "--sync", "640", "360", "click", "1"], {
   env: { ...process.env, DISPLAY: clientDisplay },
 });
+for (const display of [clientDisplay, hostDisplay])
+  execFileSync("xdotool", ["mousemove", "--sync", "1270", "710"], {
+    env: { ...process.env, DISPLAY: display },
+  });
 const detectorEnv = { ...process.env, ...(clientWindow ? { BENCH_WINDOW: clientWindow } : {}) };
 const idleRaw = execFileSync(helper, [clientDisplay, "0.1", "0", "1"], {
   encoding: "utf8",
@@ -405,10 +419,10 @@ for (let i = 0; i < 20; i++) {
   if ((t1 - t0) / 2 < best.uncertaintyMs)
     best = { offsetMs: (t0 + t1) / 2 - browserMs, uncertaintyMs: (t1 - t0) / 2 };
 }
-await host.evaluate(() => {
-  (window as unknown as { bench: { motion: boolean } }).bench.motion = true;
-});
-phase = "motion";
+await host.evaluate((motion) => {
+  (window as unknown as { bench: { motion: boolean } }).bench.motion = motion;
+}, !idleInputMode);
+phase = idleInputMode ? "input-after-idle" : "motion";
 if (viewer && process.env.BENCH_ATTRIBUTION === "1") {
   for (let i = 0; i < 20; i++) {
     const t0 = mono(),
@@ -467,7 +481,7 @@ if (viewer && process.env.BENCH_ATTRIBUTION === "1") {
     { marker: readMarker.toString(), row: readMarkerRow.toString() },
   );
 }
-const duration = qualityMode ? 20 : Math.ceil(2 + trials * 0.45 + 3);
+const duration = qualityMode ? 20 : Math.ceil(2 + trials * (idleInputMode ? 0.85 : 0.45) + 3);
 let tcpdump: ReturnType<typeof spawn> | undefined;
 let tcpdumpLog = "";
 const pcap = join(output, `${product}.pcap`);
@@ -511,36 +525,47 @@ let raw = "";
 capture.stdout.on("data", (chunk) => {
   raw += chunk;
 });
-const statsTimer = viewer
-  ? setInterval(async () => {
-      try {
-        stats.push(
-          await viewer!.evaluate(async () => {
-            const peers = (window as unknown as { benchPeers: RTCPeerConnection[] }).benchPeers;
-            const entries = [];
-            for (const p of peers) {
-              const report = await p.getStats();
-              for (const value of report.values())
-                if (
-                  (value.type === "inbound-rtp" && value.kind === "video") ||
-                  (value.type === "candidate-pair" && value.nominated) ||
-                  value.type === "transport"
-                )
-                  entries.push(value);
-            }
-            return entries;
-          }),
-        );
-      } catch {
-        /* The browser may be closing. */
+let statsInFlight: Promise<void> | undefined;
+const collectStats = async () => {
+  try {
+    const reports = await viewer!.evaluate(async () => {
+      const peers = (window as unknown as { benchPeers: RTCPeerConnection[] }).benchPeers;
+      const entries = [];
+      for (const p of peers) {
+        const report = await p.getStats();
+        for (const value of report.values())
+          if (
+            (value.type === "inbound-rtp" && value.kind === "video") ||
+            (value.type === "candidate-pair" && value.nominated) ||
+            value.type === "transport"
+          )
+            entries.push(value);
       }
-    }, 1000)
+      return entries;
+    });
+    stats.push(reports);
+    if (idleInputMode) receiverSamples.push({ at: mono(), reports });
+  } catch {
+    /* The browser may be closing. */
+  }
+};
+const statsTimer = viewer
+  ? setInterval(
+      () => {
+        if (!statsInFlight)
+          statsInFlight = collectStats().finally(() => {
+            statsInFlight = undefined;
+          });
+      },
+      idleInputMode ? 100 : 1000,
+    )
   : undefined;
 const code = await new Promise<number | null>((resolve, reject) => {
   capture.once("error", reject);
   capture.once("exit", resolve);
 });
 if (statsTimer) clearInterval(statsTimer);
+await statsInFlight;
 countWebsocket = false;
 const bitrateSeconds = (mono() - bitrateStarted) / 1000;
 let udp: ReturnType<typeof pcapPayloadBytes> | undefined;
@@ -562,9 +587,19 @@ clearInterval(sampler);
 if (code !== 0) throw new Error(`Detector failed: ${code}`);
 const state = await host.evaluate(
   () =>
-    (window as unknown as { bench: { paints: number[]; input: number; motion: boolean } }).bench,
+    (
+      window as unknown as {
+        bench: {
+          paints: number[];
+          input: number;
+          motion: boolean;
+          inputPaints: { input: number; at: number }[];
+        };
+      }
+    ).bench,
 );
 let quality;
+let settledQuality;
 if (qualityMode) {
   const framesHelper = join(output, "frames");
   execFileSync("cc", [
@@ -584,6 +619,19 @@ if (qualityMode) {
   });
   await writeFile(`${prefix}.log`, paired);
   quality = analyzeQuality(prefix, paired);
+  if (workload === "text") {
+    await host.evaluate(() => {
+      const state = (window as unknown as { bench: { motion: boolean; settled: boolean } }).bench;
+      state.motion = false;
+      state.settled = true;
+    });
+    const prefix = join(output, `${product}.settled`);
+    const paired = execFileSync(framesHelper, [hostDisplay, clientDisplay, "10", prefix, "500"], {
+      encoding: "utf8",
+    });
+    await writeFile(`${prefix}.log`, paired);
+    settledQuality = analyzeQuality(prefix, paired);
+  }
 }
 const decodedColorSpace =
   qualityMode && viewer
@@ -650,6 +698,7 @@ const result = {
     viewerSelector,
     viewerSetupClicks,
     workload,
+    idleInputMode,
   },
   source: {
     frames: state.paints.length,
@@ -660,6 +709,21 @@ const result = {
   ...metrics,
   receivedMediaMbps,
   quality,
+  settledQuality,
+  inputAfterIdle: idleInputMode
+    ? {
+        latencyMs: metrics.inputMs,
+        minimumClientStableMs: 500,
+        stableMs: raw
+          .split("\n")
+          .filter((line) => line.startsWith("G "))
+          .map((line) => Number(line.split(" ")[2])),
+        bitrate: idleVideoBursts(
+          receiverSamples,
+          state.inputPaints.filter((p) => p.input > 0).map((p) => p.at + best.offsetMs),
+        ),
+      }
+    : undefined,
   decodedColorSpace,
   bitrateMeasurement,
   transport: {
@@ -670,7 +734,10 @@ const result = {
     tcpdumpLog,
     udpMbps: udp ? (udp.bytes * 8) / bitrateSeconds / 1e6 : null,
   },
-  resources: { idle: resourceSummary("idle"), motion: resourceSummary("motion") },
+  resources: {
+    idle: resourceSummary("idle"),
+    motion: resourceSummary(idleInputMode ? "input-after-idle" : "motion"),
+  },
   runtime: {
     paths,
     bytes: paths.length ? runtimeBytes(paths) : null,

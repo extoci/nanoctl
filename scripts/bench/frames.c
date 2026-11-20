@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 typedef struct { Display *d; XImage *im; XShmSegmentInfo shm; int row, left, right; } Reader;
 static int xerror = 0;
@@ -74,24 +75,29 @@ static void close_reader(Reader *r) {
 }
 int main(int argc, char **argv) {
   XSetErrorHandler(on_error);
-  if (argc != 5 || atof(argv[3]) <= 0) { fprintf(stderr, "usage: frames SOURCE_DISPLAY CLIENT_DISPLAY SECONDS OUTPUT_PREFIX\n"); return 2; }
+  if ((argc != 5 && argc != 6) || atof(argv[3]) <= 0) { fprintf(stderr, "usage: frames SOURCE_DISPLAY CLIENT_DISPLAY SECONDS OUTPUT_PREFIX [SETTLE_MS]\n"); return 2; }
+  char *end = NULL;
+  double settle = argc == 6 ? strtod(argv[5], &end) / 1000 : 0;
+  if (!isfinite(settle) || settle < 0 || settle > 10 || (argc == 6 && (end == argv[5] || *end))) { fprintf(stderr, "Invalid settle delay\n"); return 2; }
+  int stride = settle > 0 ? 1 : 15;
   Reader src = {0}, dst = {0};
   if (!open_reader(&src, argv[1]) || !open_reader(&dst, argv[2])) { fprintf(stderr, "XShm displays/markers unavailable\n"); return 2; }
   size_t size = (size_t)src.im->bytes_per_line * 720;
-  char *slots[8]; int ids[8];
+  char *slots[8]; int ids[8]; double ages[8] = {0};
   for (int i = 0; i < 8; i++) { slots[i] = malloc(size); ids[i] = -1; if (!slots[i]) return 2; }
-  int last_src = -1, last_dst = -1, pairs = 0; double started = now();
+  int last_src = -1, last_dst = -1, pairs = 0, seen = -1; double started = now(), stable_since = started;
   while (now() - started < atof(argv[3])) {
     int id = grab(&src, 0);
-    if (id >= 0 && id % 15 == 0 && id != last_src && grab(&src, 1) == id) {
-      int slot = (id / 15) % 8; memcpy(slots[slot], src.im->data, size); ids[slot] = id; last_src = id;
+    if (id >= 0 && id != seen) { seen = id; stable_since = now(); }
+    if (id >= 0 && id % stride == 0 && id != last_src && now() - stable_since >= settle && grab(&src, 1) == id) {
+      int slot = (id / stride) % 8; memcpy(slots[slot], src.im->data, size); ids[slot] = id; ages[slot] = now() - stable_since; last_src = id;
     }
     id = grab(&dst, 0);
-    if (id >= 0 && id % 15 == 0 && id != last_dst && ids[(id / 15) % 8] == id && grab(&dst, 1) == id) {
+    if (id >= 0 && id % stride == 0 && id != last_dst && ids[(id / stride) % 8] == id && grab(&dst, 1) == id) {
       double scale = (double)(dst.right - dst.left) / (src.right - src.left);
       if (scale > .997 && scale < 1.003) scale = 1;
       if (scale != 1) { fprintf(stderr, "Quality capture requires 1:1 viewer scale, got %.6f\n", scale); return 3; }
-      char file[4096]; char *original = src.im->data; src.im->data = slots[(id / 15) % 8]; src.im->height = 720;
+      char file[4096]; char *original = src.im->data; src.im->data = slots[(id / stride) % 8]; src.im->height = 720;
       snprintf(file, sizeof(file), "%s-%d-source.ppm", argv[4], id);
       int ok = save(&src, file, 1120, 360, src.left + 1, src.row + 120);
       src.im->data = original;
@@ -99,6 +105,7 @@ int main(int argc, char **argv) {
       ok = ok && save(&dst, file, (int)(1120 * scale + .5), (int)(360 * scale + .5), dst.left + 1, dst.row + (int)(120 * scale + .5));
       if (!ok) { fprintf(stderr, "Invalid ROI or frame write failed\n"); return 3; }
       printf("P %d %.6f\n", id, scale); fflush(stdout); pairs++; last_dst = id;
+      if (settle > 0) { printf("A %d %.6f\n", id, ages[(id / stride) % 8] * 1000); fflush(stdout); }
     }
     struct timespec delay = {0, 4000000}; nanosleep(&delay, NULL);
   }

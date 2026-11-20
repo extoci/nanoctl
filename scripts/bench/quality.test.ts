@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { qualityScores, analyzeQuality, pcapPayloadBytes, receivedVideoRates } from "./quality";
+import {
+  qualityScores,
+  analyzeQuality,
+  pcapPayloadBytes,
+  receivedVideoRates,
+  idleVideoBursts,
+} from "./quality";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +22,51 @@ test("video bitrate excludes candidate-pair and audio transport counters", () =>
   ).toEqual([{ ssrc: 123, mbps: 1 }]);
   expect(receivedVideoRates([])).toEqual([]);
   expect(receivedVideoRates([null, { ...video, bytesReceived: 10, timestamp: 1 }])).toEqual([]);
+});
+
+test("idle burst windows separate the refinement from interactive input and quiet", () => {
+  const rows = [0, 100, 200, 300, 500, 600].map((at, i) => ({
+    at,
+    reports: [
+      {
+        type: "inbound-rtp",
+        kind: "video",
+        ssrc: 1,
+        bytesReceived: [100, 1100, 5100, 5100, 5100, 5100][i],
+      },
+      { type: "inbound-rtp", kind: "audio", ssrc: 2, bytesReceived: 99999999 },
+    ],
+  }));
+  const result = idleVideoBursts(rows, [0]);
+  expect(result.windows.interactive.bytes).toBe(1000);
+  expect(result.windows.refinement.bytes).toBe(4000);
+  expect(result.windows.quiet.bytes).toBe(0);
+  expect(result.peakIntervalMbps.max).toBe(0.32);
+  expect(idleVideoBursts([], []).intervals).toEqual([]);
+});
+
+test("idle burst analysis rejects invalid clocks and counter resets", () => {
+  expect(() => idleVideoBursts([], [NaN])).toThrow("paint");
+  expect(() => idleVideoBursts([{ at: NaN, reports: [] }], [])).toThrow("sample");
+  expect(() =>
+    idleVideoBursts(
+      [
+        { at: 1, reports: [] },
+        { at: 1, reports: [] },
+      ],
+      [],
+    ),
+  ).toThrow("sample");
+  const report = { type: "inbound-rtp", kind: "video", ssrc: 1, bytesReceived: 100 };
+  expect(() =>
+    idleVideoBursts(
+      [
+        { at: 0, reports: [report] },
+        { at: 100, reports: [{ ...report, bytesReceived: 0 }] },
+      ],
+      [0],
+    ),
+  ).toThrow("monotonically");
 });
 
 test("video bitrate rejects invalid or reset counters", () => {

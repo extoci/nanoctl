@@ -90,16 +90,20 @@ int main(int argc, char **argv) {
   printf("M %d\n", row);
   double start = now(), deadline = start, next_input = start + 2000;
   int trials = atoi(argv[3]), sent = 0;
+  int idle_input = getenv("BENCH_IDLE_INPUT") && !strcmp(getenv("BENCH_IDLE_INPUT"), "1");
+  int seen_seq = -1, seen_input = -1;
+  double stable_since = start;
   srand((unsigned)strtoul(argv[4], NULL, 10));
   KeyCode space = XKeysymToKeycode(d, XK_space);
   while (now() - start < atof(argv[2]) * 1000) {
     double before = now();
-    if (sent < trials && before >= next_input) {
+    if (sent < trials && before >= next_input && (!idle_input || (seen_input == sent && before - stable_since >= 500))) {
+      if (idle_input) printf("G %.6f %.6f\n", before, before - stable_since);
       printf("I %.6f %d\n", before, ++sent);
       XTestFakeKeyEvent(d, space, True, CurrentTime);
       XTestFakeKeyEvent(d, space, False, CurrentTime);
       XSync(d, False);
-      next_input = before + 250 + rand() % 201;
+      next_input = before + (idle_input ? 700 + rand() % 101 : 250 + rand() % 201);
     }
     double read_start = now();
     if (!XShmGetImage(d, RootWindow(d, screen), im, 0, row, AllPlanes)) return 3;
@@ -123,6 +127,9 @@ int main(int argc, char **argv) {
       }
       int s = word >> 16, in = (word >> 8) & 255;
       if (valid && (word & 255) == (((s >> 8) ^ s ^ in ^ 0xa5) & 255)) { seq = s; input = in; }
+    }
+    if (seq >= 0 && (seq != seen_seq || input != seen_input)) {
+      stable_since = captured; seen_seq = seq; seen_input = input;
     }
     printf("S %.6f %d %d %.6f %.6f\n", captured, seq, input, captured - read_start, now() - before);
     deadline += 4;

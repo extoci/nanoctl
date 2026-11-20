@@ -1,46 +1,210 @@
-# Latest retained-product summary
+# Latest isolated-stack comparison
 
-**Text workload, 720p software H.264; not a contemporaneous head-to-head.**
-Nanoctl uses the latest three unsigned-rounding campaign **controls**, since
-the treatment failed the CPU gate. Competitor rows use their latest unchanged
-three-run real-content campaigns below. These are moving-text quality/latency
-measurements, **not settled static-text scores**. CPU is one core = 100%; RSS is
-the host engine process tree, excluding source/client browsers.
+Measured consecutively on 2026-11-20 UTC, 02:12–02:52, at 1280x720 on Xvfb,
+software H.264 and loopback, with default product settings otherwise. Each
+measurement had only its own streaming host/client stack: other engines,
+viewers, browsers and displays were stopped. Pre-run inventories enforce zero
+pre-existing live Chrome processes, exactly the expected streaming engine/client
+and two Xvfb servers before launching the benchmark browsers.
 
-| Product                | Video p50 ms | FPS   | Motion CPU % | Motion RSS MiB | Host runtime MiB | SSIM Y  | PSNR Y dB |
-| ---------------------- | ------------ | ----- | ------------ | -------------- | ---------------- | ------- | --------- |
-| nanoctl, retained QP20 | 53.21        | 58.42 | 66.71        | 54.49          | 23.47            | 0.99719 | 41.71     |
-| Sunshine/Moonlight     | 40.33        | 59.84 | 62.80        | 199.82         | 124.98           | 0.99934 | 48.42     |
-| screen-relay           | 52.78        | 59.70 | 34.17        | 48.39          | 139.59           | 0.99958 | 52.22     |
+This is input-to-captured-client-pixels, **not optical input-to-photon**. CPU is
+one core = 100%; host CPU/RSS excludes browsers, Xvfb, readers and native clients.
+The marker and moving-content rows are different workloads, not interchangeable
+resource numbers. Cells are medians of per-run metrics; brackets are min–max,
+not confidence intervals or pooled percentiles. The comparison below measures
+the retained QP20–51/truncating-conversion baseline, before the idle experiment.
 
-Cells are medians of per-run metrics, not pooled percentiles. Nanoctl's latest
-controls are substantially slower/more CPU-intensive than earlier campaigns;
-these cross-session rows **do not establish a new causal performance ranking**.
-The complete paired control/treatment results and gate decision appear at the
-end of this document. QP20 remains retained, without rounded conversion.
+## Marker: five valid runs per product
 
-Runtime is logical installed bytes for the **host side**, including transitive
-ELF libraries: nanoctl release binary; Sunshine binary and `/usr/share/sunshine`;
-screen-relay npm package/engine, Node and listed helpers. Xvfb, browsers, Moonlight
-client, build tools/caches and other OS files are excluded. Fresh nanoctl/Sunshine
-snapshots are `~/bench-runtime/{nanoctl,sunshine}-final-quality{,.json}`:
-24,605,552 / 131,051,595 bytes. Screen-relay's unchanged snapshot is 146,374,952
-bytes. This replaces Sunshine's earlier **app-only** 30,349,491-byte figure with
-a library-inclusive one; it is not a runtime-size regression.
+| Product            | Input p50 ms        | Input p95 ms          | Video p50 ms        | FPS                 | Motion CPU %        | Motion RSS MiB         | Host runtime MiB |
+| ------------------ | ------------------- | --------------------- | ------------------- | ------------------- | ------------------- | ---------------------- | ---------------- |
+| nanoctl QP20       | 36.07 [32.17–36.39] | 52.30 [40.32–76.81]   | 34.58 [20.15–52.44] | 59.86 [58.45–59.88] | 39.77 [38.14–53.31] | 54.74 [53.18–58.54]    | 23.47            |
+| Sunshine/Moonlight | 35.98 [28.04–64.06] | 48.19 [43.77–84.56]   | 24.81 [14.41–48.60] | 53.93 [52.22–59.93] | 51.41 [48.41–77.50] | 167.24 [167.01–171.96] | 124.98           |
+| screen-relay       | 80.33 [56.05–96.05] | 104.06 [68.18–124.02] | 86.64 [50.83–88.49] | 59.75 [59.71–59.94] | 27.41 [24.94–28.41] | 48.15 [47.98–48.34]    | 139.59           |
 
-Idle refinement and settled-text capture are **not implemented yet**. The
-current OpenH264 `EncodeFrame(SSourcePicture*, SFrameBSInfo*)` is synchronous,
-has no cancellation/per-picture-QP argument, and its reached encode path updates
-the reference list (`encoder_ext.cpp::WelsEncoderEncodeExt`, `UpdateRefList`).
-Changing context QP bounds between calls is possible, but encoding a refinement
-on the current context cannot guarantee that newly arriving damage preempts it;
-discarding an already encoded P frame would also invalidate the following P
-frame's decoder references. Before implementing a weaker guarantee, the proposed
-alternative is a **private background encoder**, a low-QP IDR admitted only while
-still idle and within current controller credit, and context adoption only on
-acceptance. Cancellation would leave the normal encoder available. This needs a
-decision on the extra encoder working-memory cost versus accepting preemption
-only before refinement starts. No motion/settled-quality improvement is claimed.
+All products matched **600/600 inputs; 15/15 marker runs were valid**. No run was
+excluded or replaced. Nanoctl and Moonlight input p50 differ by less than the
+approximately 4-ms detector quantization; this does not establish an input-latency
+winner between them. Moonlight's lower observed unique FPS is included, not
+filtered out. Idle CPU was 0.78 / 48.86 / 0.58%, respectively.
+
+Runtime is logical host-side installed bytes including transitive ELF libraries:
+nanoctl release binary; Sunshine binary and `/usr/share/sunshine`; screen-relay
+npm package/engine, Node and listed helpers. Browsers, Xvfb, Moonlight client,
+build tools/caches, Docker layers and unrelated OS files are excluded. The
+baseline snapshots contain 24,605,552 / 131,051,595 / 146,374,952 bytes.
+
+## Moving content: three valid runs per product/workload
+
+| Workload | Product            | SSIM Y  | PSNR Y dB | Received Mbps | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ------------------ | ------- | --------- | ------------- | ----- | ------------ | ------------ |
+| Text     | nanoctl QP20       | .997157 | 41.722    | 1.098         | 58.37 | 36.97        | 63.93        |
+| Text     | Sunshine/Moonlight | .999342 | 48.416    | 5.278         | 58.83 | 21.92        | 63.63        |
+| Text     | screen-relay       | .999577 | 52.209    | 3.361         | 59.92 | 40.55        | 28.18        |
+| Drag     | nanoctl QP20       | .997237 | 42.847    | 1.891         | 59.53 | 36.48        | 43.18        |
+| Drag     | Sunshine/Moonlight | .999161 | 48.569    | 7.750         | 59.84 | 25.32        | 61.00        |
+| Drag     | screen-relay       | .999562 | 52.379    | 7.527         | 59.85 | 52.56        | 31.35        |
+| Gradient | nanoctl QP20       | .993468 | 44.815    | 5.128         | 59.05 | 36.70        | 54.63        |
+| Gradient | Sunshine/Moonlight | .992758 | 46.046    | 7.301         | 59.82 | 43.19        | 71.56        |
+| Gradient | screen-relay       | .994075 | 47.688    | 16.562        | 59.71 | 68.69        | 47.77        |
+
+**27/27 quality runs were valid.** Bitrate scopes differ: nanoctl inbound-video
+RTP payload; screen-relay decoded WebSocket payload including protocol messages;
+Sunshine video-port UDP payload including framing/FEC. These are not equivalent
+wire rates or matched-bitrate quality measurements. Full-frame quality capture
+and FFmpeg processing followed the separate CPU/latency measurement.
+
+### Isolation evidence and historical limitations
+
+The requested initial `top -b -n1` and `ps aux --sort=-%cpu | head -30` found old
+Sunshine PID 21124, Moonlight 21958, screen-relay engine 137681, Chrome and Xvfb
+processes. They were stopped; Moonlight required SIGKILL after SIGTERM. The
+snapshot showed no zombies and approximately 100% idle CPU, so resident
+processes alone do not prove they were actively encoding or caused slow controls.
+
+A later audit caught **ten persistent managed-browser Chrome processes** on
+display `:0` that the first cleanup missed. PID 3426 used `.browser_data_dir` and
+remote-debugging port 29229. At this audit its targets were only the new-tab UI;
+the root/GPU processes reported lifetime CPU of approximately 0.3/0.2%. This is
+not evidence of a competing video stream, nor proof of its state during earlier
+runs. Nevertheless it violated strict browser isolation. It was stopped with
+SIGTERM, all Chrome/streaming/Xvfb processes were verified gone, and **the entire
+42-run headline cohort plus six rounding runs were repeated with the stronger
+zero-pre-existing-Chrome check**. No platform browser tools were used afterward.
+
+Earlier `clean-*`, `clean-parked-*`, `clean-round-*`, `refine-*` and partial
+`exact-*` artifacts are preserved but superseded for strict-isolation comparison.
+The older nanoctl marker attempt with 119/120 acknowledgements is not part of the
+headline cohort above. Older Moonlight quality captures with a client cursor
+inside the ROI have a demonstrated quality artifact: on a same-pair crop,
+excluding that cursor changed PSNR from approximately 39.76 to 48.17 dB. The
+runner now keeps its necessary focus click, then parks both pointers outside
+the scored ROI; the new headline uses that corrected setup throughout.
+
+Isolation does **not** guarantee an uncontended physical host. VM CPU steal and
+refresh-sized latency modes remain, with large run-to-run ranges. Sunshine's
+20:53:18 November 19 disconnect preceded the QP20 probe at 22:06 and rounding
+controls at 23:23; active Sunshine streaming is not established as their cause.
+Historical rows are marked **non-isolated/superseded**, not proven to have their
+entire CPU/latency deficit caused by contamination. The isolated nanoctl text CPU
+is still 63.93%, not consistently restored to the earlier approximately 37–50%.
+
+## Strict paired rounding recheck: rejected
+
+Three fresh-agent control/treatment drag pairs (CT, TC, CT), **six valid runs**,
+after the headline cohort. The same unsigned fixed-point candidate and prior
+conversion microbench apply: 1,364,967 versus 1,408,994 ns/frame, **+3.23%**, inside
+the approximately 10% conversion gate. The production patch replaces arithmetic
+inside the existing conversion, not an additional conversion call. The isolated
+kernel does not explain the whole-agent CPU delta.
+
+| Variant          | SSIM Y  | PSNR Y dB | Mbps  | FPS   | Video p50 ms | Motion CPU % |
+| ---------------- | ------- | --------- | ----- | ----- | ------------ | ------------ |
+| QP20 control     | .997262 | 42.770    | 1.896 | 59.69 | 19.89        | 40.65        |
+| Unsigned rounded | .998690 | 47.705    | 1.896 | 58.87 | 37.50        | 51.54        |
+
+Quality improves, but **CPU +10.89 points** and observed video p50 **+17.60 ms**
+exceed the approximately five-point/two-ms gates. Rounding is not retained.
+The experiment does not identify the cause of the whole-pipeline CPU increase.
+
+## Exact normal-context idle refinement
+
+Built and tested the requested one-shot **150-ms, QP14 P-frame** policy on the
+normal software OpenH264 context, with **no bitrate/clean-feedback admission
+condition**. It cancels only immediately before native encoding if newly captured
+damage is waiting; once encoding starts it finishes, then handles new damage.
+There is no second encoder, and cancellation never aborts a started native encode.
+
+The reached native non-reset update path does not apply global QP bounds alone.
+The prototype temporarily sets the layer QP, disables periodic intra for that
+call, selects `RC_OFF_MODE`, and restores parameters and rate-control function
+pointers afterward. Tests cover P/non-IDR output, decoder continuity through the
+next normal frame, cancellation/empty input, restoration on an injected encoding
+error, and a subsequent 4000→250-kbps allocation cut. Hardware encoders and an
+impaired-link refinement campaign were not tested.
+
+Three fresh-agent pairs (CT, TC, CT) for input and each moving workload: **24/24
+valid runs**. Both input variants matched **360/360 inputs**. The treatment logged
+**363 QP14 frames** across the three input sessions, including warmup, rather
+than skipping pauses through the earlier exploratory admission condition.
+Observed stable intervals before Space were at least 502.75 / 646.08 ms for
+control/treatment. The settled phase captures 13 deterministic scenes per run
+after at least 500 ms unchanged: **39/39 paired source-scene PPM hashes matched**.
+
+| Variant         | Input-after-idle p50 ms | p95 ms              | Settled SSIM Y            | Settled PSNR Y dB      |
+| --------------- | ----------------------- | ------------------- | ------------------------- | ---------------------- |
+| QP20 control    | 32.11 [28.35–40.74]     | 48.02 [40.12–82.47] | .997164 [.997017–.997236] | 41.729 [41.681–41.777] |
+| QP14 refinement | 32.27 [28.24–32.28]     | 44.31 [36.35–52.08] | .997653 [.997636–.997703] | 42.526 [42.524–42.528] |
+
+**The numeric input gate passes: p50 +0.17 ms, below the user's <=3-ms limit**
+and the approximately 4-ms detector quantization. The p95 difference is not
+claimed as a causal improvement. Settled quality improves reproducibly by
+**0.797 dB**, with non-overlapping PSNR/SSIM ranges on identical source scenes.
+
+**Not retained under the predeclared 1-dB interpretation of a "clear" settled
+quality gain.** That was an engineering judgment, **not a numerical threshold
+specified by the user**. The gain is real but small in the inspected native-pixel
+text crops, unlike the approximately five-dB rounded-conversion improvement.
+This is a quality-gain retention decision, not a claim that the exact policy
+failed its numeric input gate or moving-content guardrails.
+
+### Moving-content guardrails
+
+| Workload | Variant | SSIM Y  | PSNR Y dB | Mbps  | FPS   | Video p50 ms | Motion CPU % |
+| -------- | ------- | ------- | --------- | ----- | ----- | ------------ | ------------ |
+| Text     | Control | .997150 | 41.731    | 1.102 | 59.74 | 19.49        | 44.74        |
+| Text     | QP14    | .997150 | 41.725    | 1.102 | 59.69 | 19.37        | 46.19        |
+| Drag     | Control | .997205 | 42.828    | 1.892 | 59.85 | 36.21        | 37.97        |
+| Drag     | QP14    | .997262 | 42.770    | 1.892 | 59.66 | 19.57        | 37.66        |
+| Gradient | Control | .993457 | 44.822    | 5.183 | 59.48 | 35.60        | 47.96        |
+| Gradient | QP14    | .993474 | 44.818    | 5.149 | 59.43 | 21.66        | 47.41        |
+
+All three motion CPU deltas are within five points; none of the median video
+latencies rises by two ms. Refresh-sized latency modes and differing ranges mean
+the apparent reductions are not attributable performance wins. Even the unchanged
+strictly isolated text controls varied: headline CPU/video p50 63.93%/36.97 ms
+versus the later paired control's 44.74%/19.49 ms. Both used the same executable
+with no unrelated browser/stream. Guest cleanup did not eliminate VM/scheduling
+variation, so the later fast control is not substituted into the headline table.
+
+### Encode blocking and bitrate burst
+
+Across all 363 logged input-session refinements, including warmup, encode time
+including conversion was **p50 4.819, p95 11.782, max 49.559 ms**. One encode is
+the bound, **not a hard five-ms bound** on this shared VM. Payload was **p50
+2,079 B, p95 3,995 B, max 55,767 B**. The >=500-ms input trial does not deliberately
+collide with the 150-ms encode and is not a worst-case in-flight blocking test.
+
+Mean receiver video-RTP rate in approximate 100–400-ms post-paint windows was
+**0.0221→0.0754 Mbps**, and 400–700-ms quiet windows were **0→0 Mbps**. Whole
+idle-input-trial receive rate was **0.0417→0.0568 Mbps**. The median per-run maximum
+refinement-window bin was **4.70→4.03 Mbps**; these approximately 100-ms bins can
+include delayed interactive/IDR traffic, so they are not isolated refinement
+wire peaks. Encoded frame bytes above directly measure the one-frame burst.
+The existing two-second keepalive remains separate; there is no repeated idle
+quality loop.
+
+The earlier admitted QP14 prototype (`refine-*`) had an extra >=4-Mbps/clean-link
+condition and the unrelated managed browser still present. It is exploratory,
+not the exact requested policy or a strict-isolation retention result. The partial
+`exact-*` trial was stopped before this complete `strict-exact-*` campaign.
+
+The shipping software path remains **QP20–51, truncating conversion and the
+ordinary 250-ms refresh**. The unconditional prototype's executable and source
+patch are preserved as `~/bench-candidates/idle-refinement-always14{,.patch}`;
+no prototype Rust changes remain in the retained source.
+
+Artifacts: `~/bench-results/clean-final/strict-*`, summaries
+`strict-summary-corrected.json` and `strict-exact-idle-summary.json`, per-run
+`.inventory.log` / `.vmstat.log`, `strict-round-*` and `strict-exact-*`. Inspected
+native-pixel crops:
+
+- `strict-moonlight-text-run-2.quality-text-client.png`
+- `strict-exact-control-quality-text-run-2.settled-text-client.png`
+- `strict-exact-always14-quality-text-run-2.settled-text-client.png`
+- `strict-exact-always14-quality-text-run-2.settled-text-source.png`
+
+## Historical campaigns (superseded; original values retained)
 
 ## screen-relay Docker versus current nanoctl, five runs each
 

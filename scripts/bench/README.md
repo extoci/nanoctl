@@ -71,6 +71,42 @@ Browser and native clients must forward Space to the source. In particular,
 verify input permissions on Sunshine; video streaming alone is insufficient.
 Do not run these trials on a display with sensitive applications.
 
+After the focus click, the runner parks both display pointers at `(1270,710)`,
+outside the scored quality ROI. Keep the focus click: parking alone does not
+grant browser/native input focus. A visible client cursor absent from the source
+capture is a quality-measurement artifact, not encoder distortion.
+
+### Input after idle and settled text
+
+`BENCH_IDLE_INPUT=1 BENCH_QUALITY=0 BENCH_WORKLOAD=text` selects a separate
+input trial. The source is static except for trusted Space events. The detector
+waits for the previous input acknowledgement and at least 500 ms of unchanged
+client frame/input IDs before sending the next Space, with 700–800 ms injection
+spacing. It records each observed stable interval as a `G` line and under
+`inputAfterIdle.stableMs`. The default 120 inputs take approximately 107 seconds,
+including the measurement tail; ordinary randomized 250–450 ms motion trials
+are unchanged. Do not combine idle-input and quality modes.
+
+This mode samples inbound-video WebRTC counters at approximately 100 ms instead
+of one second. `inputAfterIdle.bitrate` retains the raw interval measurements and
+three windows relative to each source paint: 0–100 ms interactive, 100–400 ms
+refinement, and 400–700 ms quiet. Intervals are classified by midpoint; intervals
+crossing the next source paint are excluded. These are approximate receiver RTP
+payload windows, not exact wire peaks or per-frame packet attribution. Source
+paint times use the same measured monotonic-clock offset as input latency.
+
+Text quality mode also adds a separate ten-second **settled** phase after the
+ordinary moving-quality capture. It draws deterministic scenes 0,45,90,... at
+750-ms intervals, independent of the earlier motion phase's frame count. Both
+products/variants therefore receive the same settled scene sequence. The paired
+XShm reader waits at least 500 ms after a source ID changes, then captures matched
+source/client IDs without the moving phase's 15-frame decimation. `A` lines in
+`PRODUCT.settled.log` record the observed source-stable age. Scores and crops are
+under `settledQuality` and `PRODUCT.settled*`; moving `quality` remains separate.
+CPU/latency sampling finishes before either full-frame quality capture or FFmpeg
+analysis. Require at least ten settled pairs, inspect the crops, and preserve
+invalid runs rather than silently omitting them.
+
 ## screen-relay in Ubuntu 24.04 Docker
 
 The [upstream Docker guide](https://screen-relay.dev/docs/docker) builds its own
