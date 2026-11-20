@@ -1,4 +1,144 @@
-# Rounded conversion: encoder-path diagnosis and retained fix
+# Current isolated comparison: QP20 retained after quantizer sweep
+
+2026-11-20 UTC. **No lower QP floor retained.** QP18 and QP16 improved text
+quality within the CPU and bitrate budgets, but failed drag latency gates.
+QP14 was not attempted because QP16 did not pass. Production remains exactly
+`5ce62e5`: rounded integer conversion, `CameraVideoRealTime`, QP20–51, unchanged
+adaptive congestion control. The final rebuilt executable is byte-identical to
+the immutable QP20 control (SHA256
+`a40044d2b46af5424aca3a21aa32ffebebec88d4dc049edbefe2c6f0c42db210`).
+
+## Current three-product campaign
+
+**One fresh campaign, 05:26–06:05 UTC: 42/42 valid runs.** Marker ×5/product,
+plus moving text/drag/gradient ×3/product. Products alternate within each
+repetition: nanoctl, Sunshine/Moonlight, screen-relay. Every run starts a fresh
+stack, audits exactly two Xvfb servers and only the expected engine/client,
+and rejects pre-existing Chrome, agents, encoders and frame readers. All 42
+inventories passed. No builds, profiling or offline reports overlap measurements.
+Postflight: no live benchmark stacks; screen-relay container stopped.
+
+Scope: one shared Linux VM, 1280×720, software H.264, development-auth loopback,
+not an actual tailnet or impaired link. Input is **injection to captured client
+pixels**, not optical input-to-photon. Video is source canvas draw to captured
+client pixels. The approximately 250-Hz detector contributes up to roughly 4 ms
+polling quantization. CPU is one core = 100%; CPU/RSS include the host process
+tree, not clients, source browsers, Xvfb or the detector. Values are medians of
+per-run percentiles/averages, not pooled distributions or confidence intervals.
+
+### Marker: five repetitions per product
+
+All products matched **600/600 inputs**. Runtime is host application/assets plus
+transitive ELF libraries, not build directories, clients/browsers, Docker layers
+or a complete cross-platform installation footprint.
+
+| Product            | Input p50 / p95 ms | Video p50 / p95 ms |   FPS | Motion CPU % | RSS MiB | Host runtime MiB |
+| ------------------ | -----------------: | -----------------: | ----: | -----------: | ------: | ---------------: |
+| nanoctl QP20       |      32.16 / 40.22 |      20.14 / 22.40 | 59.96 |        24.65 |   43.92 |            23.47 |
+| Sunshine/Moonlight |      29.00 / 40.04 |      18.82 / 22.27 | 59.86 |        43.58 |  166.36 |           124.98 |
+| screen-relay       |      60.06 / 72.07 |      53.76 / 60.36 | 59.73 |        25.14 |   48.36 |           139.59 |
+
+Min–max across the five runs (not percentile confidence bounds):
+
+| Product      | Input p50 ms | Input p95 ms | Video p50 ms | Video p95 ms |         FPS |       CPU % |       RSS MiB |
+| ------------ | -----------: | -----------: | -----------: | -----------: | ----------: | ----------: | ------------: |
+| nanoctl      |  31.92–48.09 |  36.38–67.15 |  19.82–37.11 |  21.90–46.63 | 59.28–60.00 | 24.25–36.82 |   41.71–44.83 |
+| Moonlight    |  24.18–32.10 |  32.33–40.38 |  14.56–20.92 |  18.37–26.61 | 59.57–59.96 | 42.96–46.76 | 164.04–169.21 |
+| screen-relay |  36.17–80.08 |  52.33–88.35 |  27.65–71.72 |  55.18–87.88 | 59.32–59.93 | 23.64–27.33 |   48.19–48.66 |
+
+### Moving quality: three repetitions per workload and product
+
+SSIM/PSNR are luma-only, matched source/client frames in the content ROI;
+quality capture follows the 20-second timing phase. These are moving, not settled,
+text scores. Every quality run has at least ten matched pairs. Browser/native
+focus clicks and pointer parking are preserved. Nanoctl source/client text crops
+from repetition two were inspected at native pixels.
+
+| Workload | Product      |  SSIM Y | PSNR Y dB |   Mbps |   FPS | Video p50 ms | Motion CPU % |
+| -------- | ------------ | ------: | --------: | -----: | ----: | -----------: | -----------: |
+| Text     | nanoctl      | .998301 |    46.655 |  1.612 | 59.80 |        19.38 |        28.03 |
+| Text     | Moonlight    | .999342 |    48.415 |  5.318 | 59.90 |        27.17 |        59.64 |
+| Text     | screen-relay | .999577 |    52.214 |  3.364 | 59.75 |        44.28 |        30.64 |
+| Drag     | nanoctl      | .997812 |    47.146 |  1.948 | 59.94 |        19.28 |        28.84 |
+| Drag     | Moonlight    | .999160 |    48.567 |  7.756 | 59.74 |        18.70 |        52.80 |
+| Drag     | screen-relay | .999557 |    52.398 |  7.527 | 59.70 |        24.18 |        30.13 |
+| Gradient | nanoctl      | .993764 |    46.862 |  5.037 | 59.21 |        35.53 |        46.35 |
+| Gradient | Moonlight    | .992597 |    45.492 |  7.280 | 60.00 |        32.54 |        65.17 |
+| Gradient | screen-relay | .994044 |    47.684 | 16.568 | 59.68 |        25.19 |        39.38 |
+
+Bitrate scopes differ: nanoctl inbound video-RTP payload, screen-relay decoded
+WebSocket payload, Sunshine video-port UDP payload including framing/FEC. This
+is a defaults comparison, **not matched-bitrate quality**. Actual tailnet
+capacity, optical latency, hardware encoding, chroma quality and installation
+weight on other platforms are not measured.
+
+The every-axis goal is **not met**: nanoctl still trails text/drag fidelity,
+Moonlight marker p50 latency, and screen-relay gradient CPU/latency. Isolation
+does not remove VM scheduling variability: whole-run `vmstat` (excluding each
+first since-boot sample) reports mean steal **0.61%, maximum 32%**. No headline
+outliers were removed or replaced. Historical headline tables below are
+superseded by this contemporaneous campaign, not mixed into it.
+
+## QP floor sweep: strict paired text and drag
+
+Each candidate is compared to the immutable `5ce62e5` QP20 build, three fresh
+pairs per workload, CT/TC/CT order. **24/24 runs valid**, each matching 120/120
+inputs; all 24 isolation inventories passed. `BENCH_QUALITY_INPUT=1` extends
+motion to 59 seconds and measures input latency before matched quality capture.
+Both members use the same phase plan and parent-surface video fullscreen.
+The final campaign instead uses ordinary marker and 20-second quality phases;
+do not substitute its faster controls or different scene poses into these pairs.
+
+Gates were fixed before analysis: workload-median CPU ≤51% and ≤paired control
++5 points; input/video p50 ≤control +2 ms; drag bitrate ≤8 Mbps. Gates compare
+medians of three per-run metrics; all pair-level deltas remain in raw artifacts.
+There is no new subjective quality threshold. The effective max QP stays **51**
+for every candidate; no congestion-controller, bitrate or feedback changes.
+Existing effective-parameter and 4000→250-kbps congestion regressions remain.
+
+| Sweep | Workload | Min QP     |  SSIM Y | PSNR Y dB |  Mbps | Input p50 ms | Video p50 ms |  CPU % |
+| ----- | -------- | ---------- | ------: | --------: | ----: | -----------: | -----------: | -----: |
+| 18    | Text     | 20 control | .998260 |    46.528 | 1.617 |       44.170 |       35.015 | 28.057 |
+| 18    | Text     | 18         | .998716 |    47.961 | 1.786 |       28.217 |       18.625 | 27.653 |
+| 18    | Drag     | 20 control | .997019 |    46.921 | 1.956 |       28.405 |       18.690 | 29.345 |
+| 18    | Drag     | 18         | .996764 |    48.109 | 2.436 |       40.357 |       34.783 | 30.984 |
+| 16    | Text     | 20 control | .998277 |    46.583 | 1.610 |       28.176 |       18.592 | 28.399 |
+| 16    | Text     | 16         | .999091 |    50.027 | 2.149 |       28.185 |       18.800 | 29.082 |
+| 16    | Drag     | 20 control | .996749 |    46.922 | 1.959 |       28.605 |       18.669 | 29.109 |
+| 16    | Drag     | 16         | .996948 |    49.297 | 3.322 |       32.042 |       18.935 | 30.731 |
+
+| Candidate | Workload | Δ CPU points | Δ input p50 ms | Δ video p50 ms | Decision                             |
+| --------- | -------- | -----------: | -------------: | -------------: | ------------------------------------ |
+| QP18      | Text     |       −0.404 |        −15.953 |        −16.390 | Pass workload                        |
+| QP18      | Drag     |       +1.639 |        +11.952 |        +16.092 | Reject candidate: both latency gates |
+| QP16      | Text     |       +0.683 |         +0.010 |         +0.207 | Pass workload                        |
+| QP16      | Drag     |       +1.621 |         +3.437 |         +0.266 | Reject candidate: input gate         |
+
+QP16's drag input deltas by pair are **+0.004 / +3.661 / +3.437 ms**: the median
+paired delta also exceeds +2 ms. CPU and bitrate pass for both candidates, but
+the input limit was not loosened to one detector poll. Refresh-sized variability
+also exists in unchanged controls; these measurements do not isolate the exact
+cause of the latency differences. **Keep QP20; QP14 not attempted**, as conditioned
+on QP16 passing. The quality gap remains despite the promising 50.027-dB text
+result at QP16.
+
+One initial combined-mode preflight (`qp-sweep-18-control-text-run-1`) was invalid:
+92/120 matched inputs and stalled client presentation with direct video-element
+fullscreen. Its source registered all 120 inputs. It is preserved, excluded from
+both completed cohorts, and not reclassified as an encoder result. After changing
+the combined-mode fullscreen surface to the video parent, all 24 complete sweep
+runs matched 120/120 and approximately 60 FPS. Ordinary final-campaign phase
+behavior is unchanged.
+
+Artifacts: `~/bench-results/qp-floor/qp-sweep-v2-*`, `qp-final-*`,
+`sweep-{18,16}-summary.json`, `final-head-summary.json`; each run retains raw
+JSON/pixel/source traces, process inventory, logs, `vmstat`, quality pairs and
+crops (plus Sunshine PCAP/counters). Binaries/build logs and ordered drivers:
+`~/bench-candidates/{quality-gap-qpsweep-*,quality-gap-qp-final,qp-floor-*}`.
+Native crop evidence: `qp-final-nanoctl-text-run-2.quality-text-{source,client}.png`.
+Runtime snapshots: `~/bench-runtime/{qp-floor-final,sunshine-final-quality,screen-relay}`.
+
+## Prior retained change: rounded conversion and encoder-path diagnosis
 
 2026-11-20 UTC. **Retained:** nearest-code unsigned integer RGB→I420 conversion,
 with OpenH264's general-purpose `CameraVideoRealTime` usage instead of

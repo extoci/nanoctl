@@ -10,14 +10,20 @@ import { repeatArgs, summarizeRuns, summaryMarkdown, type BenchRun } from "./rep
 import { runtimeBytes } from "./runtime";
 import { setupClicks } from "./viewer";
 import { drawWorkload, workloadName } from "./workloads";
+import { trialPlan } from "./phases";
 import { analyzeQuality, pcapPayloadBytes, receivedVideoRates, idleVideoBursts } from "./quality";
 
 const options = repeatArgs(process.argv.slice(2));
 const viewerSetupClicks = setupClicks(process.env.VIEWER_SETUP_CLICKS);
 const qualityMode = process.env.BENCH_QUALITY === "1";
 const idleInputMode = process.env.BENCH_IDLE_INPUT === "1";
-if (qualityMode && idleInputMode)
-  throw new Error("Quality and idle-input modes are separate trials");
+const qualityInputMode = process.env.BENCH_QUALITY_INPUT === "1";
+const { trials, duration } = trialPlan(
+  qualityMode,
+  idleInputMode,
+  qualityInputMode,
+  process.env.TRIALS,
+);
 const workload = workloadName(process.env.BENCH_WORKLOAD);
 const [product, hostDisplay, clientDisplay, pidText, outputText] = options.args;
 if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
@@ -25,16 +31,8 @@ if (!product || !hostDisplay || !clientDisplay || !pidText || !outputText) {
     "Usage: bun scripts/bench/run.ts PRODUCT HOST_DISPLAY CLIENT_DISPLAY HOST_PID OUTPUT_DIR [--repeat N]; VIEWER_URL for browser viewers, otherwise attach to an existing native viewer. RUNTIME_PATHS is a colon-separated runtime file/directory list.",
   );
 }
-const rootPid = Number(pidText),
-  trials = qualityMode ? 0 : Number(process.env.TRIALS ?? 120);
-if (
-  !Number.isInteger(rootPid) ||
-  rootPid < 1 ||
-  !Number.isInteger(trials) ||
-  (trials < 100 && !qualityMode) ||
-  trials > 250
-)
-  throw new Error("Invalid PID or trials (100..250)");
+const rootPid = Number(pidText);
+if (!Number.isInteger(rootPid) || rootPid < 1) throw new Error("Invalid PID");
 const output = resolve(outputText);
 await mkdir(output, { recursive: true });
 if (options.repeat !== null) {
@@ -385,7 +383,11 @@ if (viewer) {
   );
   await viewer.locator(viewerSelector).focus();
   if (qualityMode)
-    await viewer.locator(viewerSelector).evaluate((element) => element.requestFullscreen());
+    await viewer.locator(viewerSelector).evaluate((element, input) => {
+      const surface =
+        input && element instanceof HTMLVideoElement ? element.parentElement! : element;
+      return surface.requestFullscreen();
+    }, qualityInputMode);
   if (qualityMode) await qualityWindow(viewer, clientWindow, clientDisplay);
 }
 await pause(4000);
@@ -481,7 +483,6 @@ if (viewer && process.env.BENCH_ATTRIBUTION === "1") {
     { marker: readMarker.toString(), row: readMarkerRow.toString() },
   );
 }
-const duration = qualityMode ? 20 : Math.ceil(2 + trials * (idleInputMode ? 0.85 : 0.45) + 3);
 let tcpdump: ReturnType<typeof spawn> | undefined;
 let tcpdumpLog = "";
 const pcap = join(output, `${product}.pcap`);
@@ -765,7 +766,8 @@ const result = {
       ? quality !== undefined &&
         quality.pairs.length >= 10 &&
         Number.isFinite(bitrateMeasurement.mbps) &&
-        bitrateMeasurement.mbps > 0
+        bitrateMeasurement.mbps > 0 &&
+        (!qualityInputMode || metrics.inputMs.count >= 100)
       : metrics.inputMs.count >= 100) &&
     metrics.missingInputs.length === 0 &&
     metrics.detector.hz >= 200 &&

@@ -76,6 +76,23 @@ outside the scored quality ROI. Keep the focus click: parking alone does not
 grant browser/native input focus. A visible client cursor absent from the source
 capture is a quality-measurement artifact, not encoder distortion.
 
+### Input during moving quality workloads
+
+Set `BENCH_QUALITY=1 BENCH_QUALITY_INPUT=1 BENCH_WORKLOAD=text` (or `drag`)
+to measure input latency, video latency, motion resources and bitrate before
+capturing matched quality frames. The default 120 Space trials extend motion
+to 59 seconds; `TRIALS` accepts 100–250. All inputs must match, as in marker
+trials. Use the same switches for both members of every pair. Ordinary quality
+mode still runs 20 seconds without input trials. Do not combine this mode with
+`BENCH_IDLE_INPUT`.
+
+For combined quality/input trials, a browser video uses its parent as the
+fullscreen surface, retaining the video's input focus without invoking native
+video-element fullscreen presentation. Canvas and native viewers are unchanged.
+Keep the 1280×720, device-pixel-ratio-one alignment checks and matched-frame
+validation; keyboard input must not pause presentation. Quality is captured
+after the timing phase, not from its individual latency samples.
+
 ### Input after idle and settled text
 
 `BENCH_IDLE_INPUT=1 BENCH_QUALITY=0 BENCH_WORKLOAD=text` selects a separate
