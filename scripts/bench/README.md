@@ -287,19 +287,36 @@ cargo test --release --features media --manifest-path crates/nanoctl-agent/Cargo
   benchmark_rgba_conversion_720p -- --ignored --nocapture --test-threads=1
 ```
 
-It rotates three kernels over nine batches of 50 frames: current production
-`I420Frame::read_rgba` truncation,
-the previously rejected signed rounding, and a test-only unsigned-16-bit rounded
-candidate. Output is median/min/max ns/frame, with reusable input/output and
-`black_box`. Candidate kernels are checked byte-for-byte against the reference;
-they are not enabled in the product merely because the microbench passes.
+It rotates three kernels over nine batches of 50 frames: the truncating reference,
+the signed rounded reference, and production unsigned-16-bit rounded conversion.
+Output is median/min/max ns/frame, with reusable input/output and `black_box`.
+Production output is checked byte-for-byte against the independent rounded
+reference. Conversion timing alone does not measure the codec's response to the
+changed pixel values; see the FME investigation in `RESULTS.md`.
 
 For software-encoder diagnosis, start the agent with
 `RUST_LOG=info,nanoctl::encoder=debug`. Each encode attempt logs its input-frame
-count, last encoded frame's average macroblock QP, current target kbps, and output
-bytes. Zero-byte attempts are skipped frames, not new QP observations. These
-queries and per-frame logs are disabled at the normal info level; disable them
-for resource comparisons.
+count, last encoded frame's average macroblock QP, current target kbps, output
+bytes, cumulative skipped/IDR counts, and conversion/native microseconds. The
+native interval includes output copying and the diagnostic statistics query.
+Pipeline counters include empty encodes and capture wait; their interval is one
+second with encoder debugging enabled, otherwise ten seconds. Zero-byte attempts
+are skipped frames, not new QP observations. These queries and per-frame logs are
+disabled at the normal info level; disable them for resource comparisons.
+
+For a motion-phase-only agent profile, attach at motion start and interrupt the
+actual `perf` process at motion end (not just its `sudo` wrapper):
+
+```sh
+sudo -n perf record -F 199 -e task-clock:u -g --call-graph dwarf,8192 \
+  -p "$AGENT_PID" -o "$OUTPUT/perf.data"
+sudo -n perf report -i "$OUTPUT/perf.data" --stdio --no-children --call-graph none
+```
+
+Use equal build flags and debug settings for control/treatment; keep profile
+processing and builds outside measured phases. This VM requires sudo because
+`perf_event_paranoid=4`; no system-wide profiling permission change is needed.
+Keep unprofiled paired runs separate from these instrumented diagnostic runs.
 
 Browser `raw.webRtcStats` includes nominated candidate pairs and transports as
 well as inbound video. Inspect `selectedCandidatePairId`, packet/byte activity,

@@ -140,6 +140,8 @@ impl PipelineStats {
             color_convert_ns = self.color_convert_ns.load(Ordering::Relaxed),
             backend_ns = self.backend_ns.load(Ordering::Relaxed),
             encode_attempts = self.encode_attempts.load(Ordering::Relaxed),
+            empty_encodes = self.empty_encodes.load(Ordering::Relaxed),
+            capture_wait_ns = self.capture_wait_ns.load(Ordering::Relaxed),
             send_ns = self.send_ns.load(Ordering::Relaxed),
             sample_writes = self.sample_writes.load(Ordering::Relaxed),
             fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
@@ -394,49 +396,6 @@ impl I420Frame {
     }
 
     fn read_rgba(&mut self, rgba: &[u8]) -> Result<()> {
-        let pixels = self.width * self.height;
-        if Some(rgba.len()) != pixels.checked_mul(4) {
-            bail!("RGBA pixel buffer does not match I420 dimensions");
-        }
-        let (y, uv) = self.bytes.split_at_mut(pixels);
-        let (u, v) = uv.split_at_mut(pixels / 4);
-        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
-            *y = (((66 * u32::from(pixel[0])
-                + 129 * u32::from(pixel[1])
-                + 25 * u32::from(pixel[2]))
-                >> 8)
-                + 16) as u8;
-        }
-        for ((rows, u), v) in rgba
-            .chunks_exact(self.width * 8)
-            .zip(u.chunks_exact_mut(self.width / 2))
-            .zip(v.chunks_exact_mut(self.width / 2))
-        {
-            let (top, bottom) = rows.split_at(self.width * 4);
-            for (((top, bottom), u), v) in top
-                .chunks_exact(8)
-                .zip(bottom.chunks_exact(8))
-                .zip(u)
-                .zip(v)
-            {
-                let average = |channel| {
-                    (i16::from(top[channel])
-                        + i16::from(top[channel + 4])
-                        + i16::from(bottom[channel])
-                        + i16::from(bottom[channel + 4])
-                        + 2)
-                        / 4
-                };
-                let (r, g, b) = (average(0), average(1), average(2));
-                *u = (((-38 * r + 112 * b - 74 * g) >> 8) + 128) as u8;
-                *v = (((112 * r - 18 * b - 94 * g) >> 8) + 128) as u8;
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn read_rgba_rounded_candidate(&mut self, rgba: &[u8]) -> Result<()> {
         let pixels = self.width * self.height;
         if Some(rgba.len()) != pixels.checked_mul(4) {
             bail!("RGBA pixel buffer does not match I420 dimensions");
@@ -910,7 +869,8 @@ impl SoftwareEncoder {
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
         yuv.read_rgba(image.as_raw())?;
-        self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
+        let color_elapsed = color_started.elapsed();
+        self.color_convert_ns += color_elapsed.as_nanos() as u64;
         let bytes = self
             .encoder
             .encode(yuv)
@@ -924,6 +884,10 @@ impl SoftwareEncoder {
                 qp = statistics.uiAverageFrameQP,
                 target_kbps = self.bitrate_kbps,
                 bytes = bytes.len(),
+                skipped = statistics.uiSkippedFrameCount,
+                idr = statistics.uiIDRSentNum,
+                convert_us = color_elapsed.as_micros(),
+                native_us = color_started.elapsed().saturating_sub(color_elapsed).as_micros(),
                 "software encoder frame"
             );
         }
@@ -1025,7 +989,7 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
-        .usage_type(UsageType::ScreenContentRealTime)
+        .usage_type(UsageType::CameraVideoRealTime)
         .vui(
             VuiConfig::srgb()
                 .full_range(false)
@@ -1809,7 +1773,15 @@ pub fn spawn_video(
         let mut stop_rx = stop_rx;
         let mut previous_written = None;
         let extensions = [video_playout_delay(quality.latency_mode)];
-        let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
+        let mut stats_tick = tokio::time::interval(Duration::from_secs(
+            if tracing::enabled!(
+                target: "nanoctl::encoder", tracing::Level::DEBUG
+            ) {
+                1
+            } else {
+                10
+            },
+        ));
         stats_tick.tick().await;
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
@@ -2252,18 +2224,22 @@ mod tests {
                     let frame = black_box(&mut frame);
                     let rgba = black_box(&rgba);
                     match variant {
-                        0 => frame.read_rgba(rgba).unwrap(),
+                        0 => reference_rgba::<0>(frame, rgba),
                         1 => reference_rgba::<128>(frame, rgba),
-                        _ => frame.read_rgba_rounded_candidate(rgba).unwrap(),
+                        _ => frame.read_rgba(rgba).unwrap(),
                     }
                     black_box(&frame.bytes);
                 }
                 samples[variant].push(started.elapsed().as_nanos() / 50);
             }
         }
-        for (name, mut samples) in ["control", "rejected", "rounded-u16"]
-            .into_iter()
-            .zip(samples)
+        for (name, mut samples) in [
+            "truncating-reference",
+            "rounded-reference",
+            "production-rounded",
+        ]
+        .into_iter()
+        .zip(samples)
         {
             samples.sort_unstable();
             println!(
@@ -2274,12 +2250,12 @@ mod tests {
     }
 
     #[test]
-    fn rounded_candidate_rejects_empty_and_short_buffers_without_mutation() {
+    fn direct_rgba_conversion_rejects_empty_and_short_buffers_without_mutation() {
         let mut frame = super::I420Frame::new(2, 2).unwrap();
-        frame.read_rgba_rounded_candidate(&[255; 16]).unwrap();
+        frame.read_rgba(&[255; 16]).unwrap();
         let before = frame.bytes.clone();
-        assert!(frame.read_rgba_rounded_candidate(&[]).is_err());
-        assert!(frame.read_rgba_rounded_candidate(&[0; 15]).is_err());
+        assert!(frame.read_rgba(&[]).is_err());
+        assert!(frame.read_rgba(&[0; 15]).is_err());
         assert_eq!(frame.bytes, before);
     }
 
@@ -2307,13 +2283,10 @@ mod tests {
                 assert_eq!(expected.y(), reference.y());
                 assert_eq!(expected.u(), reference.u());
                 assert_eq!(expected.v(), reference.v());
+                reference_rgba::<128>(&mut expected, &rgba);
                 converted.read_rgba(&rgba).unwrap();
                 assert_eq!(converted.bytes.as_ptr(), allocation);
                 assert_eq!(converted.strides(), reference.strides());
-                assert_eq!(converted.bytes, expected.bytes);
-                reference_rgba::<128>(&mut expected, &rgba);
-                converted.read_rgba_rounded_candidate(&rgba).unwrap();
-                assert_eq!(converted.bytes.as_ptr(), allocation);
                 assert_eq!(converted.bytes, expected.bytes);
             }
         }
@@ -2592,6 +2565,7 @@ mod tests {
             assert_eq!(result, 0);
             assert_eq!((params.iMinQp, params.iMaxQp), (20, 51));
             assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
+            assert_eq!(params.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
             let layer = &params.sSpatialLayers[0];
             assert!(layer.bVideoSignalTypePresent);
             assert!(layer.bColorDescriptionPresent);

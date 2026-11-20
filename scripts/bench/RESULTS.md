@@ -1,4 +1,144 @@
-# Latest isolated-stack comparison
+# Rounded conversion: encoder-path diagnosis and retained fix
+
+2026-11-20 UTC. **Retained:** nearest-code unsigned integer RGB→I420 conversion,
+with OpenH264's general-purpose `CameraVideoRealTime` usage instead of
+`ScreenContentRealTime`. This is still screen capture, software H.264, QP20–51,
+and the existing adaptive congestion controller. It is not a camera capture mode.
+The supported usage setting bypasses OpenH264's expensive screen-only feature
+motion estimation (FME) heuristic; no private ABI or dependency fork is used.
+Complexity, frame skipping, thread configuration, bitrate allocation, VUI and
+pacing settings are unchanged. Idle refinement is not part of this change.
+
+## Motion-phase profiling
+
+Control and rounded binaries have identical release/debug flags and diagnostics;
+only conversion arithmetic differs. `perf record -g`, 199 Hz, DWARF stack dumps,
+attaches to the agent PID during drag motion, not the browser or whole system.
+The requested event is `cycles:u`; the recorded data identifies `task-clock:uH`.
+These are recorded-event **self percentages, not hardware-cycle measurements or
+inclusive call-graph weights**. The reason for the event remapping was not isolated.
+Offline report processing and builds are excluded from the final paired trials.
+The table uses `round-profile-control-drag-run-3` and the first completed rounded
+and camera profiles. Earlier control artifacts are exploratory: the first had a
+sudo-child shutdown error; the second overlapped a stalled offline DWARF report.
+The clean control repeat, ablation, entry-counter runs and retention trials have
+no such background report. Only self reports are used, not stalled inclusive
+DWARF reports.
+
+| Self symbol                                                           | Screen/truncation | Screen/rounded | General-purpose/rounded |
+| --------------------------------------------------------------------- | ----------------: | -------------: | ----------------------: |
+| `CaptureEncoder::encode_captured_frame` (includes inlined conversion) |            21.41% |         16.83% |                  26.81% |
+| `WIDTH_LOOP_SSE4`                                                     |             1.53% |         13.07% |               0 samples |
+| `HASH_WIDTH_LOOP_SSE2`                                                |             1.46% |         11.77% |               0 samples |
+| `WelsVP::CheckLine`                                                   |            16.27% |         12.01% |               0 samples |
+| capture-thread Rust entry                                             |             9.29% |          7.36% |                  11.37% |
+| `WelsSampleSad16x16_sse2`                                             |             2.61% |          2.00% |                   1.08% |
+| `WelsSampleSad8x8_sse21.pixel_sad_8x8_nsplit`                         |             3.07% |          1.82% |                   2.89% |
+
+Per-stage wall counters below use the first and last one-second snapshots fully
+inside motion: 1,199 / 1,200 / 1,200 attempts over approximately 20 seconds. Native
+is backend minus conversion; it includes output copying and diagnostic overhead.
+Profile runs are diagnostic observations, not the retention gates.
+
+| Metric                               | Screen/truncation | Screen/rounded | General-purpose/rounded |
+| ------------------------------------ | ----------------: | -------------: | ----------------------: |
+| Capture ms/attempt                   |            1.6171 |         1.6409 |                  1.6249 |
+| Convert ms/attempt                   |            1.1948 |         1.1667 |                  1.2916 |
+| Backend ms/attempt                   |            4.5280 |         6.2928 |                  3.7363 |
+| Native ms/attempt                    |            3.3332 |         5.1261 |                  2.4447 |
+| Encode attempts/s                    |           59.9485 |        60.0015 |                 59.9994 |
+| Empty encodes / native skipped delta |             0 / 0 |          0 / 0 |                   0 / 0 |
+| Pacer skips / IDR delta              |            1 / 10 |         2 / 10 |                  2 / 10 |
+| Motion CPU %                         |            37.638 |         47.497 |                  32.954 |
+| Video p50 ms                         |            19.466 |         36.319 |                  19.361 |
+
+The original rounded kernel is effectively equal in this comparison; native
+encoding adds **1.7929 ms/frame**, approximately 10.76 CPU points at 60 FPS if
+CPU-bound, consistent with the observed +9.86 points. One additional encode and
+one additional pacer skip over 20 seconds cannot account for that CPU increase;
+native skipped and IDR counts are identical. The higher conversion wall time in the
+general-purpose diagnostic run is included, not discarded; retention uses the
+separate unprofiled trials below.
+
+### Verified costly path and causal ablation
+
+Bundled OpenH264 (`openh264-sys2` 0.9.7), in
+`encoder/core/src/encoder_ext.cpp::InitDqLayers`, allocates feature
+storage for screen-content usage. On screen-content P frames,
+`PreprocessSliceCoding` calls `CalcFMESwitchFlag`, then `PerformFMEPreprocess`
+when enabled and the reference features have not yet been calculated.
+`svc_motion_estimate.cpp::CalculateFeatureOfBlock` dispatches to the sum and
+feature-location routines containing the two hot assembly loops above.
+
+This path is observed, not inferred only from source: fresh motion-only entry
+uprobes on `WelsEnc::PerformFMEPreprocess`, counted with `perf stat -p`, recorded
+**78 calls / 20.2767 s for truncation versus 867 / 20.2873 s for rounding**,
+an 11.1× increase. Both binaries use the same native configuration and dimensions;
+only the YUV values differ. Thus the additional CPU is data-dependent **screen
+feature-search preprocessing**, not the integer conversion or extra frame count.
+
+The switch depends on detected scrolling or a positive FME-good-frame history
+with average macroblock SAD >30. Which operand/particular pixel values trigger
+the difference was **not instrumented**; an exact white-level explanation is not
+claimed. Source dispatch plus runtime entry counts verify the costly path.
+Low complexity does not directly gate this preprocessing block. Rather than
+blindly changing several encoder settings, the supported general-purpose usage
+is a causal ablation: the screen-only branch is unreachable, its three hot
+symbols disappear, native time falls and the CPU/latency penalty disappears.
+This usage also changes other screen-specific coding decisions; it is not
+claimed to be a one-heuristic-only switch. Drag PSNR in the ablation is about
+0.5 dB below screen-mode rounding, but still over 4 dB above shipping truncation.
+
+The near-equal pacer-skip counts do not establish a missed 8.3-ms pacing gate.
+The refresh-sized video delay could be a downstream presentation deadline;
+that exact latency mechanism remains unverified. No optical latency claim is made.
+
+## Strict unprofiled retention gates: drag and text, three pairs each
+
+Twelve fresh-agent runs, all valid, 1280×720, balanced software encoding and
+loopback; ordering is control/treatment, treatment/control, control/treatment for
+each workload. Control is the retained QP20/truncating executable. Treatment is
+rounded conversion plus the general-purpose usage setting. Encoder debugging,
+perf and builds are absent. Each inventory enforces zero pre-existing Chrome,
+the expected engine/client only, and two Xvfb instances. Medians are of per-run
+metrics, not pooled samples; CPU is one core =100%. Bitrate is inbound video RTP.
+
+| Workload | Variant  |  SSIM Y | PSNR Y dB |  Mbps |   FPS | Video p50 ms | Motion CPU % | RSS MiB |
+| -------- | -------- | ------: | --------: | ----: | ----: | -----------: | -----------: | ------: |
+| Drag     | Control  | .997237 |    42.813 | 1.892 | 60.00 |       35.937 |       34.692 |  56.890 |
+| Drag     | Retained | .997812 |    47.146 | 1.950 | 59.99 |       19.279 |       28.323 |  46.018 |
+| Text     | Control  | .997150 |    41.725 | 1.102 | 59.78 |       19.401 |       44.735 |  52.906 |
+| Text     | Retained | .998244 |    46.592 | 1.609 | 59.90 |       19.393 |       27.123 |  42.916 |
+
+Drag: **+4.333 dB, −6.369 CPU points, −16.659-ms video p50**.
+Text: **+4.867 dB, −17.612 CPU points, −0.008-ms video p50**.
+The last latency delta is indistinguishable from measurement noise, not an
+attributable improvement. Both workloads pass ≤approximately +3 CPU points and
+no median video-latency regression. Individual text-pair latency deltas are
++0.054 / +1.307 / −0.026 ms; one treatment run has a 21.390-ms video p50.
+All three drag pairs improve video p50 by 16.59–16.79 ms. No outlier is excluded.
+
+Per-run ranges: drag control/treatment CPU 34.396–36.193 / 27.995–29.140%,
+video p50 35.863–36.184 / 19.275–19.398 ms; text CPU 44.638–45.841 /
+26.735–33.412%, video p50 19.339–20.083 / 19.375–21.390 ms. Text bitrate rises
+approximately 46%, versus 3% for drag: this is not a matched-bitrate comparison.
+The adaptive controller still owns congestion; the existing real-encoder
+4000→250-kbps regression passes with the new usage setting. Effective QP20–51,
+bitrate rate control, general-purpose usage and color metadata are checked for
+all three latency modes. Other modes' performance, impaired links and hardware
+encoders were not benchmarked in this round.
+
+This closes the measured rounding CPU problem, **not the goal of beating both
+competitors on every axis**. The earlier competitor campaign below is retained
+as a baseline, not relabeled as a new contemporaneous comparison with this fix.
+
+Artifacts: `~/bench-results/clean-final/round-profile-*`, `round-count-*`, and
+`round-fixed-*` (raw JSON, inventories, logs, perf data, counter files, matching
+frames and crops). Native-pixel control/treatment text crops were inspected:
+`round-fixed-{control,fixed}-text-run-2.quality-text-client.png`. No new UI or
+input-after-idle trial was requested or performed.
+
+# Previous isolated-stack comparison (before the rounding fix)
 
 Measured consecutively on 2026-11-20 UTC, 02:12–02:52, at 1280x720 on Xvfb,
 software H.264 and loopback, with default product settings otherwise. Each
