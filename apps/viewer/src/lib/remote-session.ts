@@ -400,6 +400,9 @@ export class RemoteSessionController {
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
+      if ("jitterBufferTarget" in receiver) {
+        (receiver as RTCRtpReceiver & { jitterBufferTarget?: number }).jitterBufferTarget = 0;
+      }
       if ("playoutDelayHint" in receiver) {
         (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
       }
@@ -480,7 +483,7 @@ export class RemoteSessionController {
     video.addEventListener("pointerdown", this.onPointer);
     video.addEventListener("pointerup", this.onPointer);
     video.addEventListener("pointercancel", this.onPointerCancel);
-    video.addEventListener("lostpointercapture", this.onPointerCancel);
+    video.addEventListener("lostpointercapture", this.onLostPointerCapture);
     video.addEventListener("wheel", this.onWheel, { passive: false });
     video.addEventListener("contextmenu", this.onContextMenu);
     video.addEventListener("keydown", this.onKey);
@@ -498,7 +501,7 @@ export class RemoteSessionController {
     video.removeEventListener("pointerdown", this.onPointer);
     video.removeEventListener("pointerup", this.onPointer);
     video.removeEventListener("pointercancel", this.onPointerCancel);
-    video.removeEventListener("lostpointercapture", this.onPointerCancel);
+    video.removeEventListener("lostpointercapture", this.onLostPointerCapture);
     video.removeEventListener("wheel", this.onWheel);
     video.removeEventListener("contextmenu", this.onContextMenu);
     video.removeEventListener("keydown", this.onKey);
@@ -528,6 +531,10 @@ export class RemoteSessionController {
   };
 
   private readonly onPointerCancel = (): void => this.releaseInput();
+
+  private readonly onLostPointerCapture = (event: PointerEvent): void => {
+    if (event.buttons !== 0) this.releaseInput();
+  };
 
   private readonly onWheel = (event: WheelEvent): void => {
     if (!this.inputEnabled) return;
