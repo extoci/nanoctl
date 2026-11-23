@@ -155,16 +155,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
       - name: Refresh apt index
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native capture dependencies
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-x264-linux:
@@ -186,16 +182,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
       - name: Refresh apt index
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native dependencies including opt-in GPL encoder
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            libx264-dev cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev libx264-dev cmake nasm pkg-config
       - run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-x264-check:
@@ -217,16 +209,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
       - name: Refresh apt index
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native dependencies including opt-in GPL encoder
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            libx264-dev cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev libx264-dev cmake nasm pkg-config
       - run: cargo clippy --all-targets --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
 
   agent-x264-package:
@@ -250,16 +238,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
       - name: Refresh apt index
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native dependencies including opt-in GPL encoder
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            libx264-dev cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev libx264-dev cmake nasm pkg-config
       - run: cargo build --release --locked --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
@@ -327,17 +311,13 @@ jobs:
       - run: bun run build:viewer
       - name: Refresh apt index
         if: matrix.os == 'ubuntu-24.04'
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native capture dependencies
         if: matrix.os == 'ubuntu-24.04'
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
 
   agent-media-package:
@@ -379,17 +359,13 @@ jobs:
       - run: bun run build:viewer
       - name: Refresh apt index
         if: matrix.os == 'ubuntu-24.04'
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native capture dependencies
         if: matrix.os == 'ubuntu-24.04'
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
       - name: Build release media binary
         run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
@@ -453,17 +429,13 @@ jobs:
       - name: Refresh apt index
         if: matrix.platform == 'linux'
         shell: bash
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install Linux media dependencies
         if: matrix.platform == 'linux'
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            cmake nasm pkg-config
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'
