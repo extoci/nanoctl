@@ -9,6 +9,7 @@ import {
   type SignalPayload,
   type VideoCodec,
 } from "@nanoctl/protocol";
+import { recordDebugEvent } from "./debug-report";
 import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
@@ -593,6 +594,10 @@ export class RemoteSessionController {
     };
     peer.onconnectionstatechange = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
+      recordDebugEvent(
+        `peer ${peer.connectionState}`,
+        `ice ${peer.iceConnectionState}; generation ${this.iceGeneration}`,
+      );
       switch (peer.connectionState) {
         case "connected":
           this.reconnectAttempt = 0;
