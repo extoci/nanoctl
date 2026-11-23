@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import type { ControlMessage } from "../../packages/protocol/src/index";
+import type { AudioOutput, ControlMessage } from "../../packages/protocol/src/index";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { closePanel, openPanel } from "./panel";
@@ -90,6 +90,7 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
         if (process.env.NANOCTL_BROWSER_MEDIA !== "1") message.host.remoteInput = true;
         message.host.hostName = "A very long desktop host name for mobile layout";
         message.host.capabilities.systemAudio = true;
+        delete message.host.capabilities.audioOutputs;
         message.host.capabilities.clipboard = true;
       }
       socket.send(JSON.stringify(message));
@@ -167,7 +168,10 @@ test("the sound panel explains when the host has no available audio", async ({ p
     const server = socket.connectToServer();
     server.onMessage((data) => {
       const message = JSON.parse(String(data));
-      if (message.type === "hello") message.host.capabilities.systemAudio = false;
+      if (message.type === "hello") {
+        message.host.capabilities.systemAudio = false;
+        delete message.host.capabilities.audioOutputs;
+      }
       socket.send(JSON.stringify(message));
     });
   });
@@ -175,6 +179,60 @@ test("the sound panel explains when the host has no available audio", async ({ p
   await openPanel(page);
   await expect(page.getByText("Host audio unavailable")).toBeVisible();
   await expect(page.getByRole("button", { name: "Tap for sound" })).toHaveCount(0);
+});
+
+test("a view-only viewer selects Windows audio and sees outputs appear without reconnecting", async ({
+  page,
+}) => {
+  const speakers = { id: "1", name: "Speakers", isDefault: true };
+  const headphones = { id: "2", name: "Headphones", isDefault: false };
+  let outputs: AudioOutput[] = [];
+  let publish = (_selectedId: string | null) => {};
+  const selections: (string | null)[] = [];
+  await page.routeWebSocket("**/v1/connect", (socket) => {
+    const server = socket.connectToServer();
+    publish = (selectedId) =>
+      socket.send(JSON.stringify({ type: "audio-outputs", outputs, selectedId }));
+    socket.onMessage((data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "select-audio-output") {
+        selections.push(message.outputId);
+        publish(message.outputId);
+      } else {
+        server.send(data);
+      }
+    });
+    server.onMessage((data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "hello") {
+        message.host.platform = "windows";
+        message.host.remoteInput = false;
+        message.host.viewer.mayControl = false;
+        message.host.capabilities.systemAudio = false;
+        message.host.capabilities.audioOutputs = outputs;
+      }
+      socket.send(JSON.stringify(message));
+    });
+  });
+  await page.goto("/");
+  await openPanel(page);
+  await expect(page.getByText("Host audio unavailable")).toBeVisible();
+  await expect.poll(() => selections).toEqual([null]);
+
+  outputs = [speakers, headphones];
+  publish(null);
+  const picker = page.getByRole("combobox", { name: "Host audio output" });
+  await expect(picker.getByRole("option")).toHaveText([
+    "System default",
+    "Speakers (default)",
+    "Headphones",
+  ]);
+  await expect(picker).toHaveValue("");
+  await picker.selectOption(headphones.id);
+  await expect(picker).toHaveValue(headphones.id);
+  await screenshot(page, "host-audio-output-picker.png");
+  await picker.selectOption("");
+  await expect.poll(() => selections).toEqual([null, headphones.id, null]);
 });
 
 test("mobile live touch, scroll and keyboard control respect the input toggle", async ({

@@ -3,6 +3,7 @@ import {
   assertHostInfo,
   type HostInfo,
   type AgentClientMessage,
+  type AudioOutputState,
 } from "@nanoctl/protocol";
 import {
   RemoteSessionController,
@@ -39,6 +40,7 @@ export class SocketSession {
       video: HTMLVideoElement;
       audio?: HTMLAudioElement;
       onAudioTrackChange?: () => void;
+      onAudioOutputs?: (state: AudioOutputState) => void;
       onInfo: (info: HostInfo) => void;
       onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
       onStatus: (status: SocketStatus, detail?: string) => void;
@@ -125,6 +127,10 @@ export class SocketSession {
               this.timer = null;
               this.options.onInfo(message.host);
               this.options.onStatus("online");
+              const audioOutputs = message.host.capabilities.audioOutputs;
+              if (audioOutputs !== undefined) {
+                this.send(socket, { type: "select-audio-output", outputId: null });
+              }
               const createController =
                 this.options.createController ??
                 ((options) => new RemoteSessionController(options));
@@ -136,7 +142,8 @@ export class SocketSession {
                 video: this.options.video,
                 audio: this.options.audio,
                 onAudioTrackChange: this.options.onAudioTrackChange,
-                systemAudioEnabled: message.host.capabilities.systemAudio,
+                systemAudioEnabled:
+                  message.host.capabilities.systemAudio || audioOutputs !== undefined,
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
                 gamepadAvailable: message.host.capabilities.gamepad === true,
@@ -175,13 +182,17 @@ export class SocketSession {
                 if (current()) this.terminal("error", "WebRTC is unavailable in this browser");
               });
             } else {
-              if (!welcomed || !this.controller) throw new Error("Signal arrived before hello");
-              this.controller.ingestHostSignals([
-                {
-                  sequence: message.envelope.sequence,
-                  envelope: JSON.stringify(message.envelope),
-                },
-              ]);
+              if (!welcomed || !this.controller) throw new Error("Message arrived before hello");
+              if (message.type === "audio-outputs") {
+                this.options.onAudioOutputs?.(message);
+              } else {
+                this.controller.ingestHostSignals([
+                  {
+                    sequence: message.envelope.sequence,
+                    envelope: JSON.stringify(message.envelope),
+                  },
+                ]);
+              }
             }
           } catch {
             this.terminal("error", "The host sent an invalid signaling message");
@@ -197,6 +208,16 @@ export class SocketSession {
       .catch((error: unknown) => {
         if (current()) this.retry(error instanceof Error ? error.message : "Host unavailable");
       });
+  }
+
+  selectAudioOutput(outputId: string | null): boolean {
+    try {
+      if (!this.socket || !this.controller) return false;
+      this.send(this.socket, { type: "select-audio-output", outputId });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private send(socket: WebSocket, message: AgentClientMessage): void {
