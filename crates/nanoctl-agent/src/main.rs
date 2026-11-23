@@ -37,6 +37,7 @@ mod windows_encoder;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
@@ -86,9 +87,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the foreground service process.
+    /// Start the agent in this terminal, or show the viewer URL if it is already running.
     Run,
-    /// Stop the installed background agent gracefully.
+    /// Stop the running agent gracefully.
     Stop,
     /// Check configuration, Tailscale, capture, and input readiness.
     Doctor {
@@ -112,8 +113,12 @@ enum Command {
     Config,
     /// Print the configuration path used by this invocation.
     Paths,
-    /// Print this host's tailnet viewer URLs.
-    Url,
+    /// Print this host's preferred tailnet viewer URL.
+    Url {
+        /// Wait briefly for the running agent to open its tailnet listener.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Verify a signed update manifest and print the artifact for this executable.
     VerifyUpdate {
         manifest: PathBuf,
@@ -144,7 +149,7 @@ enum Command {
     CommitUpdate,
 }
 
-fn init_logging(log_file: Option<&Path>) -> Result<()> {
+fn init_logging(log_file: Option<&Path>, diagnostics_to_stderr: bool) -> Result<()> {
     let filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("nanoctl=info"));
     if let Some(path) = log_file {
@@ -164,12 +169,56 @@ fn init_logging(log_file: Option<&Path>) -> Result<()> {
             .compact()
             .init();
     } else {
-        tracing_subscriber::fmt()
+        let subscriber = tracing_subscriber::fmt()
             .with_env_filter(filter())
             .with_ansi(terminal::supports_styling())
-            .compact()
-            .init();
+            .compact();
+        if diagnostics_to_stderr {
+            subscriber.with_writer(std::io::stderr).init();
+        } else {
+            subscriber.init();
+        }
     }
+    Ok(())
+}
+
+async fn print_viewer_url(config: &config::TailnetConfig, wait: bool) -> Result<()> {
+    let node = tailnet::real(config)
+        .status()
+        .await
+        .context("Start Tailscale on this PC, sign in, then run nanoctl url again")?;
+    if wait {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut listening = false;
+            for ip in &node.ips {
+                let connect = tokio::net::TcpStream::connect((*ip, config.port));
+                if matches!(
+                    tokio::time::timeout(Duration::from_millis(250), connect).await,
+                    Ok(Ok(_))
+                ) {
+                    listening = true;
+                    break;
+                }
+            }
+            if listening {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Viewer is not listening yet. If nanoctl is starting, retry nanoctl url --wait shortly"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    let tls = tls::inspect(config, &node);
+    if tls.config.is_none() && config.tls == config::TlsMode::Auto {
+        eprintln!("{}", tls.detail);
+    }
+    let url = tls::viewer_url(&node, config.port, tls.config.is_some())
+        .context("Tailscale has no viewer address")?;
+    println!("{url}");
     Ok(())
 }
 
@@ -184,15 +233,30 @@ async fn run(cli: Cli) -> Result<()> {
             let config = AgentConfig::load_or_default(&config_path)?;
             config.validate()?;
             #[cfg(windows)]
-            {
-                if cli.supervised_worker {
-                    return service::run_worker(config).await;
+            if cli.supervised_worker {
+                return service::run_worker(config).await;
+            }
+            match service_control::ServiceControl::acquire()? {
+                service_control::StartOutcome::Acquired(control) => {
+                    #[cfg(windows)]
+                    if cli.ready_file.is_none() && cli.ready_token.is_none() {
+                        return supervisor::run(control).await;
+                    }
+                    service::run(config, control, cli.ready_file, cli.ready_token).await?;
                 }
-                if cli.ready_file.is_none() && cli.ready_token.is_none() {
-                    return supervisor::run().await;
+                service_control::StartOutcome::AlreadyRunning => {
+                    if cli.ready_file.is_some() {
+                        anyhow::bail!("the nanoctl background agent is already running");
+                    }
+                    println!("nanoctl is already running.");
+                    if let Err(error) = print_viewer_url(&config.tailnet, true).await {
+                        eprintln!("{error:#}");
+                    }
+                }
+                service_control::StartOutcome::Stopping => {
+                    println!("nanoctl is stopping. Retry nanoctl run when it has stopped.");
                 }
             }
-            service::run(config, cli.ready_file, cli.ready_token).await?;
         }
         Command::Stop => match service_control::request_stop().await? {
             service_control::StopOutcome::Stopped => {
@@ -254,16 +318,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Paths => {
             println!("config={}", config_path.display());
         }
-        Command::Url => {
+        Command::Url { wait } => {
             let config = AgentConfig::load_or_default(&config_path)?;
-            let node = tailnet::real(&config.tailnet).status().await?;
-            let tls = tls::inspect(&config.tailnet, &node);
-            if tls.config.is_none() && config.tailnet.tls == config::TlsMode::Auto {
-                eprintln!("{}", tls.detail);
-            }
-            for url in tls::urls(&node, config.tailnet.port, tls.config.is_some()) {
-                println!("{url}");
-            }
+            print_viewer_url(&config.tailnet, wait).await?;
         }
         Command::VerifyUpdate {
             manifest,
@@ -364,7 +421,10 @@ async fn main() -> Result<()> {
             previous_hook(panic);
         }));
     }
-    if let Err(error) = init_logging(log_file.as_deref()) {
+    if let Err(error) = init_logging(
+        log_file.as_deref(),
+        matches!(cli.command, Command::Url { .. }),
+    ) {
         append_diagnostic(
             log_file.as_deref(),
             format_args!("nanoctl command failed: {error:#}"),

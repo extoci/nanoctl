@@ -4,12 +4,10 @@ use std::{future::Future, path::PathBuf, time::Duration};
 
 pub async fn run(
     config: AgentConfig,
+    control: ServiceControl,
     ready_file: Option<PathBuf>,
     ready_token: Option<String>,
 ) -> Result<()> {
-    let Some(control) = ServiceControl::acquire()? else {
-        return Ok(());
-    };
     run_until(config, ready_file, ready_token, async {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.context("cannot listen for Ctrl+C").map(|()| "Ctrl+C"),

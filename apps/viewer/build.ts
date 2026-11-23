@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 
 const root = import.meta.dir;
@@ -23,12 +23,24 @@ await writeFile(
   `<!doctype html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover">
 <meta name="color-scheme" content="dark"><meta name="theme-color" content="#0c111a">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="nanoctl">
 <title>nanoctl · Remote desktop</title><link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/app-icon.png"><link rel="manifest" href="/manifest.webmanifest">
 <link rel="stylesheet" href="${asset(style.path)}"><script type="module" src="${asset(script.path)}"></script></head>
 <body><div id="root"></div><noscript>nanoctl needs JavaScript to connect to this desktop.</noscript></body></html>`,
 );
+await copyFile(resolve(root, "src/favicon.svg"), resolve(outdir, "favicon.svg"));
+await copyFile(resolve(root, "src/app-icon.png"), resolve(outdir, "app-icon.png"));
 await writeFile(
-  resolve(outdir, "favicon.svg"),
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#0c111a"/><path d="M8 24V8h5l6 10V8h5v16h-5L13 14v10z" fill="#8ef0cb"/></svg>',
+  resolve(outdir, "manifest.webmanifest"),
+  JSON.stringify({
+    name: "nanoctl Remote Desktop",
+    short_name: "nanoctl",
+    start_url: "/",
+    display: "standalone",
+    background_color: "#0c111a",
+    theme_color: "#0c111a",
+    icons: [{ src: "/app-icon.png", sizes: "192x192", type: "image/png" }],
+  }),
 );
 console.log(`Viewer built: index.html + ${result.outputs.length} hashed assets`);

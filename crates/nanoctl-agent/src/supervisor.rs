@@ -15,10 +15,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_CONTROL_C_EXIT: i32 = 0xc000_013a_u32 as i32;
 
 #[cfg(windows)]
-pub(crate) async fn run() -> Result<()> {
-    let Some(control) = crate::service_control::ServiceControl::acquire()? else {
-        return Ok(());
-    };
+pub(crate) async fn run(control: crate::service_control::ServiceControl) -> Result<()> {
     let mut interrupt = tokio::signal::windows::ctrl_c().context("cannot listen for Ctrl+C")?;
     let mut command = Command::new(std::env::current_exe().context("cannot locate the agent")?);
     command

@@ -33,7 +33,9 @@ WebRTC carries video and input between your browser and the host.
    ```
 
 3. Open the printed URL from a browser on your tailnet, normally
-   `https://<host>.<tailnet>.ts.net:7337/`.
+   `https://<host>.<tailnet>.ts.net:7337/`. On iPhone, use the full MagicDNS link
+   in Safari, not the PC’s IP. To find it again, run `nanoctl url` on the host;
+   you don’t need to stop or restart nanoctl.
 
 During prereleases, use the install script from the selected release and set
 `NANOCTL_VERSION=v3.0.0-alpha.1` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.1"`).
@@ -65,7 +67,8 @@ For a Windows host, install the official [ViGEmBus driver](https://github.com/ne
 and restart nanoctl. Pair a controller such as a DualSense with the viewer device (for example,
 an iPhone), open nanoctl in Safari over HTTPS, turn on **Gamepad**, and press a button on the
 controller so the browser can detect it. The browser must expose the controller through the
-standard Gamepad mapping. Windows games see up to four virtual Xbox 360 controllers.
+standard Gamepad mapping. Windows supports up to four virtual controllers: DualShock 4 for
+recognized PlayStation controllers and Xbox 360 for other controllers.
 
 Gamepad forwarding requires permission to control the desktop and only sends input from a
 focused viewer. It does not replace Tailscale or require a native iOS helper.

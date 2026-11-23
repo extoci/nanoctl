@@ -8,6 +8,7 @@ const KEEPALIVE_MS = 500;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
 type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
 type DualShock4Pad = NonNullable<GamepadMessage["dualShock4"]>[number];
+export type GamepadStatus = "waiting" | "connected" | "unsupported";
 
 function isPlayStation(id: string): boolean {
   return (
@@ -53,10 +54,13 @@ export class GamepadForwarder {
 
   constructor(private readonly send: (message: GamepadMessage) => boolean) {}
 
-  sample(pads: ArrayLike<InputPad | null>, now: number): void {
+  sample(pads: ArrayLike<InputPad | null>, now: number): GamepadStatus {
     const available = new Map<number, InputPad>();
+    let unsupported = false;
     for (const pad of Array.from(pads)) {
-      if (pad?.connected && pad.mapping === "standard") available.set(pad.index, pad);
+      if (!pad?.connected) continue;
+      if (pad.mapping === "standard") available.set(pad.index, pad);
+      else unsupported = true;
     }
     for (let slot = 0; slot < this.slots.length; slot++) {
       const index = this.slots[slot];
@@ -86,6 +90,7 @@ export class GamepadForwarder {
       }
     });
     this.flush({ type: "gamepad", pads: reports, ...(dualShock4.length && { dualShock4 }) }, now);
+    return available.size ? "connected" : unsupported ? "unsupported" : "waiting";
   }
 
   release(): void {

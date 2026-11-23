@@ -16,6 +16,13 @@ function pad(index: number, mapping: GamepadMappingType = "standard") {
   };
 }
 
+test("reports whether the browser sees a supported controller", () => {
+  const gamepad = new GamepadForwarder(() => true);
+  expect(gamepad.sample([], 0)).toBe("waiting");
+  expect(gamepad.sample([pad(1, "")], 1)).toBe("unsupported");
+  expect(gamepad.sample([pad(1, ""), pad(2)], 2)).toBe("connected");
+});
+
 test("maps standard controls and sends snapshots on change or keepalive", () => {
   const messages: unknown[] = [];
   const gamepad = new GamepadForwarder((message) => Boolean(messages.push(message)));

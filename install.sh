@@ -349,4 +349,8 @@ if [ -z "$tailscale_cli" ] || ! "$tailscale_cli" status --json 2>/dev/null |
   grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
   printf '%s\n' 'Warning: install/start Tailscale and sign in: https://tailscale.com/download' >&2
 fi
-"$binary_path" url || printf '%s\n' 'URL unavailable yet; run nanoctl url after Tailscale is running.' >&2
+if url_output="$("$binary_path" url --wait)"; then
+  printf '%s\n%s\n' 'Open on a device connected to Tailscale:' "$url_output"
+else
+  printf '%s\n' 'URL unavailable yet; retry nanoctl url --wait after Tailscale is running.' >&2
+fi

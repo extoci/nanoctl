@@ -48,6 +48,7 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
   await expect(gamepad).toBeEnabled();
   expect(await events()).toBe("");
   await gamepad.click();
+  await expect(page.getByText(/Controller detected.*DualShock 4.*Xbox 360/)).toBeVisible();
   await expect.poll(events).toContain("0 attached xbox360");
   await expect.poll(events).toContain("0 4096 128 0 16384 32767 0 0");
   await expect.poll(events).toContain("1 attached dualShock4");
@@ -57,6 +58,7 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
       false;
   });
   await expect.poll(events).toContain("0 detached");
+  await expect(page.getByText(/Waiting for a controller/)).toBeVisible();
   await expect.poll(events).toContain("1 detached");
   await page.evaluate(() => {
     (window as unknown as { fake: { controllerAttached: boolean } }).fake.controllerAttached = true;
