@@ -52,17 +52,13 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Refresh apt index
         if: runner.os == 'Linux'
-        run: sudo apt-get update
+        run: sudo apt-get update -o Acquire::Retries=10
       - name: Install native Linux capture and desktop dependencies
         if: runner.os == 'Linux'
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          execute_install_scripts: true
-          packages: >
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
-            nasm pkg-config xauth xvfb
+        shell: bash
+        run: >
+          sudo apt-get install -y -o Acquire::Retries=10
+          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config xauth xvfb
       - name: Install Chromium on Linux
         if: runner.os == 'Linux'
         run: bunx playwright install --with-deps chromium

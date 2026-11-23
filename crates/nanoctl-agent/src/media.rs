@@ -1527,7 +1527,9 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
-        .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
+        // A 30s GOP, not 2s: unrepairable IDRs already force a keyframe
+        // through the RTCP loss path, so periodic IDRs are pure overhead.
+        .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 30))
         .usage_type(UsageType::CameraVideoRealTime)
         .vui(
             VuiConfig::srgb()

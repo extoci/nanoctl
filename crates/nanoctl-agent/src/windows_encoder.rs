@@ -387,6 +387,20 @@ impl WindowsEncoder {
             unsafe {
                 let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
                 let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &ui4_variant(0));
+                // A 30s GOP, not 2s: unrepairable IDRs already force a
+                // keyframe through the RTCP loss path, so periodic IDRs are
+                // pure overhead. Vendor MFTs default to ~2s; best-effort.
+                let _ = codec.SetValue(
+                    &CODECAPI_AVEncMPVGOPSize,
+                    &ui4_variant(u32::from(self.max_fps).saturating_mul(30)),
+                );
+                // Peak-constrained VBR lets easy frames undershoot the
+                // target instead of padding to it; MeanBitRate stays the
+                // cap. Vendor MFTs without the property keep CBR.
+                let _ = codec.SetValue(
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    &ui4_variant(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+                );
                 if self.codec == VideoCodec::H264 && self.h264_high {
                     let _ = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &low_latency);
                 }

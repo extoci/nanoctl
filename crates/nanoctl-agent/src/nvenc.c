@@ -60,7 +60,9 @@ void nanoctl_nvenc_close(NanoNvenc *h) {
 }
 
 static void rate_control(NV_ENC_RC_PARAMS *rc, uint32_t bitrate, uint32_t fps) {
-    rc->rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    /* VBR lets easy frames undershoot the target instead of padding to it;
+     * maxBitRate still caps the peak at the negotiated bitrate. */
+    rc->rateControlMode = NV_ENC_PARAMS_RC_VBR;
     rc->averageBitRate = bitrate;
     rc->maxBitRate = bitrate;
     rc->vbvBufferSize = bitrate / fps + (bitrate % fps != 0);
@@ -131,7 +133,9 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, 
         return fail(error, len, "querying low-latency NVENC preset failed", status);
 
     h->config = defaults.presetCfg;
-    h->config.gopLength = fps * 2;
+    /* A 30s GOP, not 2s: unrepairable IDRs already force a keyframe through
+     * the RTCP loss path, so periodic IDRs are pure overhead. */
+    h->config.gopLength = fps * 30;
     h->config.frameIntervalP = 1;
     h->config.rcParams.enableLookahead = 0;
     h->config.rcParams.enableTemporalAQ = 0;
