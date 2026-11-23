@@ -310,6 +310,17 @@ export function attachDataChannelVideo(
     window as unknown as { __dcv?: Record<string, number | boolean | string> }
   ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
   dbg.waitingForKey = true;
+  // Join latency: attach -> first keyframe fed to the decoder.
+  const joinAt = performance.now();
+  dbg.joinAt = joinAt;
+  delete dbg.joinMs;
+  // Ask for a keyframe immediately: without it the request only goes out
+  // after the first delta arrives, and an idle producer can delay that.
+  if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {
+    try {
+      channel.send("KF");
+    } catch {}
+  }
   const pending = new Map<
     number,
     { isKey: boolean; parts: number; got: Uint8Array[]; n: number }
@@ -402,6 +413,7 @@ export function attachDataChannelVideo(
           if (!k) return;
           waitingForKey = false;
           dbg.waitingForKey = false;
+          dbg.joinMs = performance.now() - joinAt;
         }
         dbg.fed = (dbg.fed as number) + 1;
         sink.feed(a, k, s * 16_000);

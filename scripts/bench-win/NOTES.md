@@ -112,6 +112,23 @@ Low+qp26 is the frontier's best point under motion too: Medium buys ~1%
 bits for -1dB, qp30 is dominated, qp34 trades -16% bits for -9dB. 57.5-58
 fps held throughout; capture_to_encode p50 ~14ms (composite-queue bound).
 
+## Join latency (channel attach -> first keyframe fed to the decoder)
+
+`__dcv.joinMs` instruments the DC-video attach-to-first-keyframe window
+(`webcodecs-video.ts`). On loopback, n=5 per variant:
+
+| variant                              | joinMs (n=5)        |
+| ------------------------------------ | ------------------- |
+| baseline (KF sent after first delta) | 103.6 / 105 / 134.8 |
+| KF sent immediately at attach        | 89.1-134, med ~104  |
+
+Loopback gain is ~10ms median — the bigger win is off-box: the KF request
+otherwise waits for the first delta to arrive, which costs at least one
+RTT before the encoder even starts the IDR (and longer when the producer
+is idle). Agent-side proactive IDR on channel open was tried and reverted:
+it raced the viewer's own KF and emitted a duplicate ~150KB IDR that
+congested SCTP (+30-50ms joinMs).
+
 ## Input-to-photon (click through the viewer)
 
 benchwin's band counts WM_LBUTTONDOWN in its marker; clicking the streamed
