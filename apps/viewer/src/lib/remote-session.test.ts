@@ -15,6 +15,60 @@ afterEach(() => {
 });
 
 describe("remote session lifecycle", () => {
+  test("uses the selected video ICE pair and distinguishes missing RTT from zero latency", async () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return 0;
+    });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    peer.stats.set("video", {
+      id: "video",
+      type: "inbound-rtp",
+      timestamp: 1_000,
+      kind: "video",
+      transportId: "transport",
+    });
+    for (const callback of intervals) callback();
+    await flushSignals();
+    expect(controller.snapshot.metrics).toMatchObject({ route: "unknown", rttMs: null });
+
+    peer.stats.set("transport", {
+      type: "transport",
+      selectedCandidatePairId: "selected",
+    });
+    peer.stats.set("other", {
+      type: "candidate-pair",
+      state: "succeeded",
+      nominated: true,
+      currentRoundTripTime: 0.5,
+    });
+    peer.stats.set("selected", {
+      type: "candidate-pair",
+      localCandidateId: "local",
+      remoteCandidateId: "remote",
+      currentRoundTripTime: 0.042,
+    });
+    peer.stats.set("local", { type: "local-candidate", candidateType: "relay" });
+    peer.stats.set("remote", { type: "remote-candidate", candidateType: "host" });
+    for (const callback of intervals) callback();
+    await flushSignals();
+    expect(controller.snapshot.metrics).toMatchObject({ route: "relay", rttMs: 42 });
+    await controller.stop();
+  });
+
   test("audio is recvonly when advertised, even for view-only sessions", async () => {
     installBrowserGlobals();
     for (const enabled of [false, true]) {
@@ -479,14 +533,14 @@ async function flushSignals(): Promise<void> {
   await Promise.resolve();
 }
 
-function installBrowserGlobals(): void {
+function installBrowserGlobals(setInterval?: (callback: () => void) => number): void {
   const eventTarget = {
     addEventListener: () => {},
     removeEventListener: () => {},
   };
   defineGlobal("window", {
     ...eventTarget,
-    setInterval: globalThis.setInterval.bind(globalThis),
+    setInterval: setInterval ?? globalThis.setInterval.bind(globalThis),
     clearInterval: globalThis.clearInterval.bind(globalThis),
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
@@ -550,6 +604,7 @@ class FakeDataChannel {
 }
 
 class FakePeer {
+  stats = new Map<string, Record<string, unknown>>();
   transceivers: [string, RTCRtpTransceiverDirection | undefined][] = [];
   channels = new Map<string, FakeDataChannel>();
   sent: [string, string][] = [];
@@ -591,8 +646,8 @@ class FakePeer {
 
   restartIce(): void {}
 
-  async getStats(): Promise<Map<string, never>> {
-    return new Map<string, never>();
+  async getStats(): Promise<Map<string, Record<string, unknown>>> {
+    return this.stats;
   }
 
   close(): void {
