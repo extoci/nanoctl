@@ -53,7 +53,7 @@ jobs:
           set -euo pipefail
           endpoint="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=20"
 
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 240); do
             if ! run_id="$(gh api "$endpoint" --jq \
                 '[.workflow_runs[] | select(.head_branch == "master" and .status == "completed" and .conclusion == "success")] | sort_by(.created_at) | reverse | .[0].id // empty')"; then
               echo "GitHub could not be queried for the CI run for $GITHUB_SHA." >&2
@@ -76,9 +76,9 @@ jobs:
                 echo "The CI run for this commit failed: $latest_url" >&2
                 exit 1
               fi
-              echo "CI run $latest_id is $latest_status${latest_conclusion:+ ($latest_conclusion)}; waiting (attempt $attempt/120)."
+              echo "CI run $latest_id is $latest_status${latest_conclusion:+ ($latest_conclusion)}; waiting (attempt $attempt/240)."
             else
-              echo "No CI run is visible for $GITHUB_SHA yet; waiting (attempt $attempt/120)."
+              echo "No CI run is visible for $GITHUB_SHA yet; waiting (attempt $attempt/240)."
             fi
             sleep 15
           done
