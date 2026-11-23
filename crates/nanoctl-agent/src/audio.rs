@@ -12,6 +12,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 const SAMPLES: usize = 960 * 2;
 const FRAME_DURATION: Duration = Duration::from_millis(20);
 
+#[cfg(not(target_os = "windows"))]
 pub fn available() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -27,17 +28,65 @@ pub fn available() -> bool {
         };
         probe("parec", "--version") && probe("pactl", "info")
     }
-    #[cfg(target_os = "windows")]
-    {
-        windows_worker().is_some_and(|worker| {
-            let (ready, result) = std::sync::mpsc::sync_channel(1);
-            worker.commands.send(WindowsCommand::Probe(ready)).is_ok()
-                && result.recv().unwrap_or(false)
-        })
-    }
     #[cfg(target_os = "macos")]
     {
         false
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioOutput {
+    pub id: String,
+    name: String,
+    pub is_default: bool,
+}
+
+#[cfg(target_os = "windows")]
+pub fn outputs() -> Vec<AudioOutput> {
+    let Some(worker) = windows_worker() else {
+        return Vec::new();
+    };
+    let (ready, result) = std::sync::mpsc::sync_channel(1);
+    if worker.commands.send(WindowsCommand::Probe(ready)).is_err() {
+        return Vec::new();
+    }
+    result.recv().unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn effective_output<'a>(outputs: &'a [AudioOutput], selected: Option<&str>) -> Option<&'a str> {
+    outputs
+        .iter()
+        .find(|output| selected.map_or(output.is_default, |id| id == output.id))
+        .map(|output| output.id.as_str())
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+pub struct OutputSelection {
+    pub outputs: Vec<AudioOutput>,
+    pub selected: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+impl OutputSelection {
+    pub fn refresh(&mut self, outputs: Vec<AudioOutput>) {
+        self.outputs = outputs;
+        if self.selected.is_some() && self.effective().is_none() {
+            self.selected = None;
+        }
+    }
+
+    pub fn select(&mut self, requested: Option<&str>) {
+        if requested.is_none() || effective_output(&self.outputs, requested).is_some() {
+            self.selected = requested.map(str::to_owned);
+        }
+    }
+
+    pub fn effective(&self) -> Option<String> {
+        effective_output(&self.outputs, self.selected.as_deref()).map(str::to_owned)
     }
 }
 
@@ -136,6 +185,7 @@ fn capture() -> Result<(Capture, mpsc::Receiver<Vec<i16>>)> {
 struct Capture {
     commands: std::sync::mpsc::Sender<WindowsCommand>,
     id: u64,
+    failed: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[cfg(target_os = "windows")]
@@ -148,9 +198,11 @@ impl Drop for Capture {
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 enum WindowsCommand {
-    Probe(std::sync::mpsc::SyncSender<bool>),
+    Probe(std::sync::mpsc::SyncSender<Vec<AudioOutput>>),
     Start {
+        output: u64,
         pcm: mpsc::Sender<Vec<i16>>,
+        failed: tokio::sync::oneshot::Sender<()>,
         ready: std::sync::mpsc::SyncSender<std::result::Result<u64, String>>,
     },
     Stop(u64),
@@ -163,7 +215,6 @@ struct WindowsWorker {
 
 #[cfg(target_os = "windows")]
 fn windows_worker() -> Option<&'static WindowsWorker> {
-    use cpal::traits::HostTrait;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
     static WORKER: std::sync::OnceLock<Option<WindowsWorker>> = std::sync::OnceLock::new();
@@ -175,7 +226,10 @@ fn windows_worker() -> Option<&'static WindowsWorker> {
                 .name("audio-loopback".into())
                 .spawn(move || {
                     // SAFETY: this thread owns its MTA and all CPAL objects created below.
-                    if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
+                    if let Err(error) =
+                        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()
+                    {
+                        tracing::warn!(%error, "cannot initialize Windows audio COM apartment");
                         return;
                     }
                     struct Apartment;
@@ -191,14 +245,24 @@ fn windows_worker() -> Option<&'static WindowsWorker> {
                     }
                     let mut streams = std::collections::HashMap::new();
                     let mut next_id = 0_u64;
+                    let mut endpoints = WindowsOutputs::default();
                     while let Ok(command) = requests.recv() {
                         match command {
                             WindowsCommand::Probe(ready) => {
-                                let _ = ready
-                                    .send(cpal::default_host().default_output_device().is_some());
+                                let _ = ready.send(endpoints.refresh().unwrap_or_else(|error| {
+                                    tracing::debug!(%error, "cannot enumerate Windows audio outputs");
+                                    Vec::new()
+                                }));
                             }
-                            WindowsCommand::Start { pcm, ready } => {
-                                let result = windows_capture(pcm).map(|stream| {
+                            WindowsCommand::Start { output, pcm, failed, ready } => {
+                                let result = endpoints
+                                    .devices
+                                    .iter()
+                                    .find(|(id, _)| *id == output)
+                                    .map(|(_, device)| device)
+                                    .context("selected Windows audio output is unavailable")
+                                    .and_then(|device| windows_capture(device, pcm, failed))
+                                    .map(|stream| {
                                     let id = next_id;
                                     next_id += 1;
                                     streams.insert(id, stream);
@@ -225,32 +289,85 @@ fn windows_worker() -> Option<&'static WindowsWorker> {
 }
 
 #[cfg(target_os = "windows")]
-fn capture() -> Result<(Capture, mpsc::Receiver<Vec<i16>>)> {
+#[derive(Default)]
+struct WindowsOutputs {
+    devices: Vec<(u64, cpal::platform::WasapiDevice)>,
+    next_id: u64,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsOutputs {
+    fn refresh(&mut self) -> Result<Vec<AudioOutput>> {
+        use cpal::traits::HostTrait;
+
+        let host = cpal::platform::WasapiHost::new()?;
+        let default = host.default_output_device();
+        let mut devices = Vec::new();
+        for device in host.output_devices()? {
+            let id = self
+                .devices
+                .iter()
+                .find_map(|(id, previous)| (previous == &device).then_some(*id))
+                .unwrap_or_else(|| {
+                    self.next_id += 1;
+                    self.next_id
+                });
+            devices.push((id, device));
+        }
+        devices.sort_unstable_by_key(|(id, _)| *id);
+        let outputs = devices
+            .iter()
+            .map(|(id, device)| AudioOutput {
+                id: id.to_string(),
+                name: device.name().unwrap_or_else(|_| format!("Output {id}")),
+                is_default: default.as_ref() == Some(device),
+            })
+            .collect();
+        self.devices = devices;
+        Ok(outputs)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture(output: &str) -> Result<(Capture, mpsc::Receiver<Vec<i16>>)> {
     let worker = windows_worker().context("cannot initialize audio worker")?;
     let (pcm, receiver) = mpsc::channel(3);
     let (ready, started) = std::sync::mpsc::sync_channel(1);
-    worker.commands.send(WindowsCommand::Start { pcm, ready })?;
+    let (failed, failure) = tokio::sync::oneshot::channel();
+    worker.commands.send(WindowsCommand::Start {
+        output: output.parse()?,
+        pcm,
+        failed,
+        ready,
+    })?;
     let id = started.recv()?.map_err(anyhow::Error::msg)?;
     Ok((
         Capture {
             commands: worker.commands.clone(),
             id,
+            failed: failure,
         },
         receiver,
     ))
 }
 
 #[cfg(target_os = "windows")]
-fn windows_capture(sender: mpsc::Sender<Vec<i16>>) -> Result<cpal::Stream> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let device = cpal::default_host()
-        .default_output_device()
-        .context("no output device")?;
-    let config = device.default_output_config()?;
+fn windows_capture(
+    device: &cpal::platform::WasapiDevice,
+    sender: mpsc::Sender<Vec<i16>>,
+    failed: tokio::sync::oneshot::Sender<()>,
+) -> Result<cpal::platform::WasapiStream> {
+    use cpal::traits::StreamTrait;
+    let config = device
+        .default_output_config()
+        .context("reading Windows output mix format")?;
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => windows_stream::<f32>(&device, &config.into(), sender),
-        cpal::SampleFormat::I16 => windows_stream::<i16>(&device, &config.into(), sender),
-        cpal::SampleFormat::U16 => windows_stream::<u16>(&device, &config.into(), sender),
+        cpal::SampleFormat::F32 => windows_stream::<f32>(device, &config.into(), sender, failed),
+        cpal::SampleFormat::I16 => windows_stream::<i16>(device, &config.into(), sender, failed),
+        cpal::SampleFormat::U16 => windows_stream::<u16>(device, &config.into(), sender, failed),
+        cpal::SampleFormat::U8 => windows_stream::<u8>(device, &config.into(), sender, failed),
+        cpal::SampleFormat::I32 => windows_stream::<i32>(device, &config.into(), sender, failed),
+        cpal::SampleFormat::I64 => windows_stream::<i64>(device, &config.into(), sender, failed),
         format => anyhow::bail!("unsupported loopback format {format:?}"),
     }?;
     stream.play()?;
@@ -259,10 +376,11 @@ fn windows_capture(sender: mpsc::Sender<Vec<i16>>) -> Result<cpal::Stream> {
 
 #[cfg(target_os = "windows")]
 fn windows_stream<T>(
-    device: &cpal::Device,
+    device: &cpal::platform::WasapiDevice,
     config: &cpal::StreamConfig,
     sender: mpsc::Sender<Vec<i16>>,
-) -> Result<cpal::Stream>
+    failed: tokio::sync::oneshot::Sender<()>,
+) -> Result<cpal::platform::WasapiStream>
 where
     T: cpal::SizedSample + cpal::Sample,
     f32: cpal::FromSample<T>,
@@ -272,6 +390,7 @@ where
     let rate = u64::from(config.sample_rate.0);
     let mut phase = 0_u64;
     let mut frame = Vec::with_capacity(SAMPLES);
+    let mut failed = Some(failed);
     Ok(device.build_input_stream(
         config,
         move |data: &[T], _| {
@@ -290,7 +409,12 @@ where
                 }
             }
         },
-        |error| tracing::warn!(%error, "loopback capture failed"),
+        move |error| {
+            tracing::warn!(%error, "loopback capture failed");
+            if let Some(failed) = failed.take() {
+                let _ = failed.send(());
+            }
+        },
         None,
     )?)
 }
@@ -304,28 +428,74 @@ pub async fn run(
     track: Arc<TrackLocalStaticSample>,
     peer: Arc<RTCPeerConnection>,
     mut shutdown: watch::Receiver<bool>,
+    output: watch::Receiver<Option<String>>,
 ) {
-    let result = run_inner(track, peer, &mut shutdown).await;
-    if let Err(error) = result {
+    if *shutdown.borrow() {
+        return;
+    }
+    while peer.connection_state() != RTCPeerConnectionState::Connected {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(FRAME_DURATION) => {}
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = output;
+    #[cfg(not(target_os = "windows"))]
+    match capture() {
+        Ok((_capture, pcm)) => {
+            tokio::select! {
+                _ = shutdown.changed() => {},
+                _ = stream(&track, pcm) => {},
+            }
+        }
+        Err(error) => tracing::warn!(%error, "system audio stopped"),
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut output = output;
+    #[cfg(target_os = "windows")]
+    loop {
+        let selected = output.borrow_and_update().clone();
+        if let Some(selected) = selected {
+            match capture(&selected) {
+                Ok((mut capture, pcm)) => {
+                    tokio::select! {
+                        _ = shutdown.changed() => return,
+                        result = output.changed() => {
+                            if result.is_err() { return; }
+                            continue;
+                        },
+                        _ = stream(&track, pcm) => {},
+                        _ = &mut capture.failed => {},
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "cannot start Windows loopback capture"),
+            }
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                result = output.changed() => if result.is_err() { return; },
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+            }
+        } else {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                result = output.changed() => if result.is_err() { return; },
+            }
+        }
+    }
+}
+
+async fn stream(track: &TrackLocalStaticSample, pcm: mpsc::Receiver<Vec<i16>>) {
+    if let Err(error) = stream_inner(track, pcm).await {
         tracing::warn!(%error, "system audio stopped");
     }
 }
 
-async fn run_inner(
-    track: Arc<TrackLocalStaticSample>,
-    peer: Arc<RTCPeerConnection>,
-    shutdown: &mut watch::Receiver<bool>,
+async fn stream_inner(
+    track: &TrackLocalStaticSample,
+    mut pcm: mpsc::Receiver<Vec<i16>>,
 ) -> Result<()> {
-    if *shutdown.borrow() {
-        return Ok(());
-    }
-    while peer.connection_state() != RTCPeerConnectionState::Connected {
-        tokio::select! {
-            _ = shutdown.changed() => return Ok(()),
-            _ = tokio::time::sleep(FRAME_DURATION) => {}
-        }
-    }
-    let (_capture, mut pcm) = capture()?;
     let mut encoder = encoder()?;
     let (encoded, mut packets) = mpsc::channel(2);
     tokio::task::spawn_blocking(move || {
@@ -348,15 +518,13 @@ async fn run_inner(
             }
         }
     });
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => break,
-            packet = packets.recv() => {
-                let Some(packet) = packet else { break; };
-                let sample = webrtc::media::Sample { data: packet.into(), duration: FRAME_DURATION, ..Default::default() };
-                let _ = tokio::time::timeout(FRAME_DURATION * 2, track.write_sample(&sample)).await;
-            }
-        }
+    while let Some(packet) = packets.recv().await {
+        let sample = webrtc::media::Sample {
+            data: packet.into(),
+            duration: FRAME_DURATION,
+            ..Default::default()
+        };
+        let _ = tokio::time::timeout(FRAME_DURATION * 2, track.write_sample(&sample)).await;
     }
     Ok(())
 }
@@ -369,8 +537,8 @@ mod tests {
     #[test]
     fn windows_worker_probes_from_multiple_calling_threads() {
         let worker = windows_worker().expect("audio worker initializes COM");
-        let expected = available();
-        let probes: Vec<_> = (0..16).map(|_| std::thread::spawn(available)).collect();
+        let expected = outputs();
+        let probes: Vec<_> = (0..16).map(|_| std::thread::spawn(outputs)).collect();
         for probe in probes {
             assert_eq!(probe.join().unwrap(), expected);
         }
@@ -378,9 +546,36 @@ mod tests {
             .commands
             .send(WindowsCommand::Stop(u64::MAX))
             .unwrap();
-        if !expected {
-            assert!(capture().is_err());
+        if expected.is_empty() {
+            assert!(capture(&u64::MAX.to_string()).is_err());
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn selection_follows_default_unless_an_active_output_is_pinned() {
+        let output = |id: &str, is_default| AudioOutput {
+            id: id.into(),
+            name: id.into(),
+            is_default,
+        };
+        let mut selection = OutputSelection::default();
+        assert_eq!(selection.effective(), None);
+        selection.refresh(vec![output("speakers", false), output("headphones", false)]);
+        assert_eq!(selection.effective(), None);
+        selection.select(Some("headphones"));
+        selection.select(Some("invalid"));
+        assert_eq!(selection.effective().as_deref(), Some("headphones"));
+        selection.refresh(vec![output("speakers", true), output("headphones", false)]);
+        assert_eq!(selection.effective().as_deref(), Some("headphones"));
+        selection.select(None);
+        assert_eq!(selection.effective().as_deref(), Some("speakers"));
+        selection.refresh(vec![output("speakers", false), output("headphones", true)]);
+        assert_eq!(selection.effective().as_deref(), Some("headphones"));
+        selection.select(Some("speakers"));
+        selection.refresh(vec![output("headphones", true)]);
+        assert_eq!(selection.selected, None);
+        assert_eq!(selection.effective().as_deref(), Some("headphones"));
     }
 
     #[test]

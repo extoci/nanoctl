@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { ControlMessage, HostInfo } from "@nanoctl/protocol";
+import type { AudioOutputState, ControlMessage, HostInfo } from "@nanoctl/protocol";
 import type { RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
@@ -36,6 +36,7 @@ function Viewer() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const soundPlayback = useRef<SoundPlayback | null>(null);
   const [sound, setSound] = useState<SoundState>("muted");
+  const [audioOutputState, setAudioOutputState] = useState<AudioOutputState | null>(null);
   const [soundPromptDismissed, setSoundPromptDismissed] = useState(false);
   const transport = useRef<SocketSession | null>(null);
   const [info, setInfo] = useState<HostInfo | null>(null);
@@ -165,8 +166,10 @@ function Viewer() {
       video: videoRef.current,
       audio: audio ?? undefined,
       onAudioTrackChange: () => soundPlayback.current?.trackChanged(),
+      onAudioOutputs: setAudioOutputState,
       onInfo: (host) => {
         setInfo(host);
+        setAudioOutputState(null);
         setSelectedDisplay((previous) =>
           host.displays.some((display) => display.id === previous)
             ? previous
@@ -272,9 +275,11 @@ function Viewer() {
   const showGamepad =
     info?.remoteInput && (info.platform === "windows" || info.capabilities.gamepad);
   const soundOff = sound === "muted" || sound === "blocked";
+  const audioOutputs = audioOutputState?.outputs ?? info?.capabilities.audioOutputs;
+  const audioAvailable = audioOutputs ? audioOutputs.length > 0 : info?.capabilities.systemAudio;
   const soundPrompt =
     status === "online" &&
-    info?.capabilities.systemAudio &&
+    audioAvailable &&
     (sound === "blocked" || (sound === "muted" && !soundPromptDismissed));
   const toggleSound = () => soundPlayback.current?.toggle();
 
@@ -565,7 +570,7 @@ function Viewer() {
             <>
               <h2>Sound</h2>
               <div className="row">
-                {info.capabilities.systemAudio ? (
+                {audioAvailable ? (
                   <button aria-pressed={!soundOff} onClick={toggleSound}>
                     {sound === "blocked"
                       ? "Tap to resume sound"
@@ -579,7 +584,30 @@ function Viewer() {
                   <span>Host audio unavailable</span>
                 )}
               </div>
-              {(sound === "waiting" || sound === "starting") && info.capabilities.systemAudio && (
+              {audioOutputs && audioOutputs.length > 0 && (
+                <div className="display-picker">
+                  <label htmlFor="host-audio-output">Host audio output</label>
+                  <select
+                    id="host-audio-output"
+                    value={audioOutputState?.selectedId ?? ""}
+                    disabled={status !== "online"}
+                    onChange={(event) => {
+                      if (!transport.current?.selectAudioOutput(event.target.value || null)) {
+                        setNotice("Could not change the host audio output.");
+                      }
+                    }}
+                  >
+                    <option value="">System default</option>
+                    {audioOutputs.map((output) => (
+                      <option key={output.id} value={output.id}>
+                        {output.name}
+                        {output.isDefault ? " (default)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {(sound === "waiting" || sound === "starting") && audioAvailable && (
                 <div role="status">Waiting for host audio…</div>
               )}
             </>
