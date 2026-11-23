@@ -2,6 +2,7 @@ import { chromium, expect, test, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { markerBits, readMarker, readMarkerRow, summarize } from "./latency-marker";
+import { closePanel, openPanel } from "./panel";
 
 const numInputs = 12;
 const sampleMs = 10_000;
@@ -123,7 +124,9 @@ test("measures video and input through the real agent", async ({ page, browser }
     await startMarker(host);
     await page.goto("/");
     await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+    await openPanel(page);
     await expect(page.getByRole("button", { name: "Input on", exact: true })).toBeEnabled();
+    await closePanel(page);
     await page.evaluate(`{
       const readMarker = ${readMarker.toString()};
       window.nanoctlReadMarkerRow = ${readMarkerRow.toString()};
