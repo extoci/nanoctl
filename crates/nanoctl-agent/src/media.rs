@@ -25,6 +25,10 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
 
+#[cfg(target_os = "windows")]
+#[path = "media_resize.rs"]
+mod resize;
+
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPTURE_FRAME_STALE_GRACE: Duration = Duration::from_secs(3);
@@ -179,6 +183,8 @@ pub struct CaptureEncoder {
     latest_frame: Arc<LatestFrame>,
     display_id: String,
     encoder: EncoderBackend,
+    #[cfg(target_os = "windows")]
+    resizer: resize::RgbaResizer,
 }
 
 enum EncoderBackend {
@@ -248,6 +254,8 @@ impl CaptureEncoder {
             latest_frame,
             display_id,
             encoder,
+            #[cfg(target_os = "windows")]
+            resizer: resize::RgbaResizer::default(),
         })
     }
 
@@ -320,12 +328,25 @@ impl CaptureEncoder {
         let image = if target_width == source_width && target_height == source_height {
             source
         } else {
-            xcap::image::imageops::resize(
-                &source,
-                target_width,
-                target_height,
-                xcap::image::imageops::FilterType::Triangle,
-            )
+            #[cfg(target_os = "windows")]
+            {
+                self.resizer.resize(
+                    source.as_raw(),
+                    source_width,
+                    source_height,
+                    target_width,
+                    target_height,
+                )?
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                xcap::image::imageops::resize(
+                    &source,
+                    target_width,
+                    target_height,
+                    xcap::image::imageops::FilterType::Triangle,
+                )
+            }
         };
         let (width, height) = image.dimensions();
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
