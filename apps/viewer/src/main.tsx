@@ -272,6 +272,26 @@ function Viewer() {
               : undefined
           }
         />
+        {showStats && (
+          <aside className="stats" aria-label="Connection statistics">
+            <span>
+              Resolution <b>{metrics?.resolution ?? "—"}</b>
+            </span>
+            <span>
+              Frame rate <b>{metrics?.fps == null ? "—" : `${metrics.fps.toFixed(1)} fps`}</b>
+            </span>
+            <span>
+              Bitrate{" "}
+              <b>{metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}</b>
+            </span>
+            <span>
+              RTT <b>{metrics?.rttMs == null ? "—" : `${metrics.rttMs} ms`}</b>
+            </span>
+            <span>
+              Route <b>{metrics?.route ?? "unknown"}</b>
+            </span>
+          </aside>
+        )}
         {touchMode === "trackpad" && live && (
           <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
         )}
@@ -516,22 +536,6 @@ function Viewer() {
               Stats
             </button>
           </div>
-          {showStats && (
-            <dl className="stats" aria-label="Connection statistics">
-              <dt>Resolution</dt>
-              <dd>{metrics?.resolution ?? "—"}</dd>
-              <dt>Frame rate</dt>
-              <dd>{metrics?.fps == null ? "—" : `${metrics.fps.toFixed(1)} fps`}</dd>
-              <dt>Bitrate</dt>
-              <dd>
-                {metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}
-              </dd>
-              <dt>RTT</dt>
-              <dd>{metrics?.rttMs == null ? "—" : `${metrics.rttMs} ms`}</dd>
-              <dt>Route</dt>
-              <dd>{metrics?.route ?? "unknown"}</dd>
-            </dl>
-          )}
           <button
             className="disconnect"
             disabled={terminal}
