@@ -253,6 +253,7 @@ describe("remote session lifecycle", () => {
     const channel = peer.channels.get("nanoctl.control.v1")!;
     channel.sent = [];
     pressKey("keydown", { tagName: "BUTTON" }, { code: "Space", key: " " });
+    pressKey("keydown", body, { code: "Tab", key: "Tab" });
     expect(channel.sent).toEqual([]);
     for (const [target, code] of [
       [video, "KeyA"],

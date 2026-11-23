@@ -710,12 +710,12 @@ export class RemoteSessionController {
 
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
-    // Keys go to the host while the video or nothing in particular has focus; panel controls keep theirs.
+    // Keys go to the host while the video or nothing in particular has focus; panel controls keep
+    // theirs, and Tab from the page still moves browser focus so the controls stay reachable.
     const target = event.target;
     if (
       target !== this.options.video &&
-      target !== document.body &&
-      target !== document.documentElement
+      (event.code === "Tab" || (target !== document.body && target !== document.documentElement))
     )
       return;
     event.preventDefault();
