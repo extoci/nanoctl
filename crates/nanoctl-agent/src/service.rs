@@ -107,6 +107,7 @@ pub(crate) fn spawn_media(
 ) -> crate::media::VideoPipeline {
     crate::media::spawn_video(
         peer.video_track(),
+        peer.video_data_channel(),
         peer.keyframe_requests(),
         peer.link_feedback(),
         peer.display_selection(),

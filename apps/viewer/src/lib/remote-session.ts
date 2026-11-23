@@ -13,6 +13,7 @@ import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
 import {
+  attachDataChannelVideo,
   attachWebCodecsVideo,
   createVideoEncodedStreams,
   supportsWebCodecsVideo,
@@ -558,6 +559,26 @@ export class RemoteSessionController {
           videoTransceiver.receiver,
         ) as { readable: ReadableStream; writable: WritableStream } | null)
       : null;
+    // True low-latency path: raw AUs over an unreliable data channel feed
+    // WebCodecs directly — no jitter buffer anywhere.
+    if (typeof VideoDecoder === "function") {
+      const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
+        ordered: false,
+        maxRetransmits: 0,
+      });
+      const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
+      videoChannel.onopen = () => {
+        if (this.isCurrent(lifecycle, peer)) {
+          // The data-channel path beats the jitter-buffered transform tap.
+          this.webCodecsVideo?.drop();
+          this.webCodecsVideo = attachDataChannelVideo(
+            videoChannel,
+            idrChannel,
+            this.options.video,
+          );
+        }
+      };
+    }
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
@@ -577,6 +598,8 @@ export class RemoteSessionController {
         }
         return;
       }
+      // The transform tap sits behind Chrome's jitter buffer anyway, so
+      // only use it when the data-channel path did not attach.
       if (this.pendingEncodedStreams && !this.webCodecsVideo) {
         const encoded = this.pendingEncodedStreams as Parameters<
           typeof attachWebCodecsVideo

@@ -342,6 +342,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
     }
     let pipeline = crate::media::spawn_video(
         host.video_track(),
+        host.video_data_channel(),
         host.keyframe_requests(),
         host.link_feedback(),
         host.display_selection(),

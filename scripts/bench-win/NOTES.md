@@ -1,0 +1,53 @@
+# Windows G2G benchmark state (devin/g2g-bench)
+
+## Measured (clock-marker, same VM, 1600x1200)
+| path | mean | p50 | p90 | p99 | min | n |
+|---|---|---|---|---|---|---|
+| Sunshine+Moonlight baseline | 19.4 | 17 | 34 | 41 | | 883 |
+| nanoctl baseline | 48.4 | 51 | 68 | 85 | | |
+| nanoctl slice-parallel + parallel RGBA->I420 (RTP) | 29.7 | 34 | 38 | 53 | | 1760 |
+| nanoctl DC-video + canvas overlay | 93.7 | 91 | 113 | 199 | 34 | 981 |
+| nanoctl DC-video + MediaStreamTrackGenerator | 29.5 | 34 | 36 | 49 | 0 | 1779 |
+
+Key findings:
+- Chrome's receiver-side encoded transform sits AFTER its jitter buffer, so
+  tapping RTP frames cannot beat ~20-35ms of target delay. Video over an
+  unordered/unreliable RTCDataChannel bypasses it entirely.
+- Software canvas `drawImage` on this GPU-less VM costs ~60ms of composite
+  time; `MediaStreamTrackGenerator` (the generator IS the track in Chrome
+  156: `new MediaStreamTrackGenerator({kind:"video"})`, write VideoFrames to
+  `.writable`) presents through the composited video layer instead.
+- DC wire format: `[u32 seq][u8 flags(bit0=IDR)][u16 part][u16 parts]
+  [u64 sent_ms][AU chunk]`, chunk <= 48KiB (SCTP rejects >~64KiB messages —
+  IDRs need self-fragmentation). Deltas ride `nanoctl.video.v1`
+  (ordered:false, maxRetransmits:0); IDRs ride reliable `nanoctl.video-idr.v1`.
+- Resync: seq gap -> drop deltas -> send "KF" on the channel (250ms
+  throttle) -> agent `keyframe_requests` counter -> producer
+  `force_intra_frame` -> IDR on the reliable channel.
+- DC transit send->onmessage ~14ms avg (agent->Chrome on loopback).
+
+## Server per-frame costs (agent.log pipeline statistics, /frames_encoded)
+- backend_ns (OpenH264): was ~25ms -> ~10ms (max_slice_len 8000 +
+  num_threads 4, then SM_FIXEDSLCNUM_SLICE uiSliceNum=4 forced via
+  GetOption/SetOption SVC_ENCODE_PARAM_EXT after first encode — SIZELIMITED
+  leaves <8KB deltas single-slice; num_threads alone is a no-op)
+- color_convert_ns (RGBA->I420): was ~4.5ms -> ~2.5ms (4-thread row bands)
+- capture_wait_ns ~6.4ms; send_ns ~0.2ms; compare_ns ~0.01ms
+
+## Honest ceiling on this VM
+No GPU (IddSampleDriver virtual display + Basic Display Adapter), composite
+~30Hz -> ~30ms is roughly the software-presentation floor; Moonlight wins
+here mainly via its native client (no browser) + NVENC on real hardware.
+On a GPU box the DC path should pull ahead: decode+presentation become
+hardware and the jitter-buffer bypass is worth ~20-35ms on its own.
+
+## Env notes
+- bench processes: `nanoctl.exe run --config C:\Users\Administrator\bench\nanoctl.toml`
+  via `C:\Users\Administrator\bench\start-agent.ps1`; Chrome viewer
+  --remote-debugging-port=9222 ("devinbox · nanoctl"); benchwin band
+  --clock; kill Sunshine/Moonlight before nanoctl measurements; move the
+  agent console off the viewer with `benchwin move "nanoctl.exe" 600 500 900 400`.
+- The agent serves the viewer embedded at build time (build.rs packs
+  apps/viewer/dist) — rebuild the agent after rebuilding the viewer.
+- Debug counters on the page: `window.__dcv` {msgs,fed,gaps,kf,transitMs,
+  decoded,decodeDropped,waitingForKey}.

@@ -17,6 +17,7 @@ use openh264_sys2::{
 };
 use xcap::Monitor;
 
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{
@@ -474,6 +475,7 @@ struct SoftwareEncoder {
     dimensions: Option<(u32, u32)>,
     yuv: Option<I420Frame>,
     color_convert_ns: u64,
+    slices_patched: bool,
 }
 
 struct I420Frame {
@@ -1103,6 +1105,7 @@ impl SoftwareEncoder {
             dimensions: None,
             yuv: None,
             color_convert_ns: 0,
+            slices_patched: false,
         })
     }
 }
@@ -1165,6 +1168,7 @@ impl FrameEncoder for SoftwareEncoder {
             self.encoder = create_encoder(self.bitrate_kbps, self.max_fps, self.latency_mode)?;
             self.yuv = None;
             self.dimensions = Some(dimensions);
+            self.slices_patched = false;
         }
         let dimensions = (dimensions.0 as usize, dimensions.1 as usize);
         let color_started = Instant::now();
@@ -1184,6 +1188,12 @@ impl FrameEncoder for SoftwareEncoder {
             .encode(yuv)
             .context("H.264 encode failed")?
             .to_vec();
+        if !self.slices_patched {
+            self.slices_patched = true;
+            if let Err(error) = force_fixed_slices(&mut self.encoder) {
+                tracing::warn!(%error, "fixed-slice encode unavailable");
+            }
+        }
         if tracing::enabled!(target: "nanoctl::encoder", tracing::Level::DEBUG)
             && let Ok(statistics) = encoder_statistics(&mut self.encoder)
         {
@@ -1345,6 +1355,34 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .num_threads(encode_threads());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
+}
+
+/// Forces a fixed slice count once the encoder has produced its first frame:
+/// SIZELIMITED slices only parallelize frames larger than ~8KB, which leaves
+/// most deltas single-threaded. Reading the live params back via GetOption is
+/// the only way to flip the mode without clobbering the configured bitrate,
+/// resolution, and rate control.
+fn force_fixed_slices(encoder: &mut Encoder) -> Result<()> {
+    let mut params = openh264_sys2::SEncParamExt::default();
+    unsafe {
+        if encoder.raw_api().get_option(
+            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+            std::ptr::addr_of_mut!(params).cast(),
+        ) != 0
+        {
+            bail!("failed to read encoder params");
+        }
+        params.sSpatialLayers[0].sSliceArgument.uiSliceMode = openh264_sys2::SM_FIXEDSLCNUM_SLICE;
+        params.sSpatialLayers[0].sSliceArgument.uiSliceNum = u32::from(encode_threads());
+        if encoder.raw_api().set_option(
+            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+            std::ptr::addr_of_mut!(params).cast(),
+        ) != 0
+        {
+            bail!("failed to set fixed-slice encoder params");
+        }
+    }
+    Ok(())
 }
 
 pub fn probe_encoder(preference: EncoderPreference) -> Result<(&'static str, &'static str)> {
@@ -1909,8 +1947,23 @@ pub(crate) async fn release_session_memory() {
     }
 }
 
+fn au_contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let nal_type = data[i + 3] & 0x1f;
+            if nal_type == 5 || nal_type == 7 {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
+    video_data_channel: Arc<crate::rtc::DataChannelVideo>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
     display_selection: tokio::sync::watch::Receiver<String>,
@@ -2172,6 +2225,9 @@ pub fn spawn_video(
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
         let mut recovery_keyframe_requested = false;
+        let mut dc_backed_up = false;
+        let mut dc_seq = 0_u32;
+        let mut dc_kf_seen = 0_u64;
         let mut reference_recovery = ReferenceRecovery::default();
         let mut write_result = Ok(());
         loop {
@@ -2200,6 +2256,79 @@ pub fn spawn_video(
                     // A broken transport must not hold capture/encoder teardown hostage forever.
                     // Cancelling the packetizer future is safe; the next successful delivery is
                     // followed by a forced recovery keyframe.
+                    // Low-latency path: also ship the same Annex-B access unit
+                    // over the viewer's unreliable data channel when present,
+                    // skipping it while its SCTP buffer backs up. Skipped
+                    // deltas would wedge the decoder, so a stall requests a
+                    // fresh keyframe once throughput recovers.
+                    let dc_kf = video_data_channel.keyframe_requests.load(Ordering::Relaxed);
+                    if dc_kf != dc_kf_seen {
+                        dc_kf_seen = dc_kf;
+                        delivery_recovery.send_modify(|generation| {
+                            *generation = generation.wrapping_add(1);
+                        });
+                    }
+                    let video_channel = video_data_channel.channel.lock().unwrap().clone();
+                    let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
+                    if video_channel.is_some() || idr_channel.is_some() {
+                        // [u32 seq][u8 flags][annex-b au]; the viewer drops
+                        // post-gap deltas and asks for a keyframe on "KF".
+                        // Keyframes go over the reliable channel: they are
+                        // large and cannot survive partial reliability.
+                        let is_idr = au_contains_idr(&sample.data);
+                        // SCTP caps a message at ~64KiB, so large AUs are
+                        // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
+                        const CHUNK: usize = 48 * 1024;
+                        let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
+                        if is_idr {
+                            tracing::info!(
+                                "video data channel sending IDR seq={dc_seq} parts={parts}"
+                            );
+                        }
+                        let seq = dc_seq;
+                        dc_seq = dc_seq.wrapping_add(1);
+                        let sent_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or_default();
+                        let target = if is_idr {
+                            idr_channel.as_ref().or(video_channel.as_ref())
+                        } else {
+                            video_channel.as_ref()
+                        };
+                        if let Some(channel) = target {
+                            for part in 0..parts {
+                                let start = part as usize * CHUNK;
+                                let end = (start + CHUNK).min(sample.data.len());
+                                let mut msg = Vec::with_capacity(end - start + 17);
+                                msg.extend_from_slice(&seq.to_le_bytes());
+                                msg.push(u8::from(is_idr));
+                                msg.extend_from_slice(&part.to_le_bytes());
+                                msg.extend_from_slice(&parts.to_le_bytes());
+                                msg.extend_from_slice(&sent_ms.to_le_bytes());
+                                msg.extend_from_slice(&sample.data[start..end]);
+                                if is_idr
+                                    || channel.buffered_amount().await <= 64 * 1024
+                                {
+                                    if let Err(error) =
+                                        channel.send(&Bytes::from(msg)).await
+                                    {
+                                        tracing::warn!(%error, "video data channel send failed");
+                                        dc_backed_up = true;
+                                        break;
+                                    }
+                                } else if !dc_backed_up {
+                                    dc_backed_up = true;
+                                    delivery_recovery.send_modify(|generation| {
+                                        *generation = generation.wrapping_add(1);
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    } else if dc_backed_up {
+                        dc_backed_up = false;
+                    }
                     let result = await_video_delivery(
                         async {
                             track

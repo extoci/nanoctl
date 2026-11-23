@@ -51,15 +51,65 @@ export function createVideoEncodedStreams(
   }
 }
 
-export function attachWebCodecsVideo(
-  streams: EncodedStreams,
-  video: HTMLVideoElement,
-): WebCodecsVideoHandle | null {
-  const canvas = document.createElement("canvas");
-  canvas.className = "webcodecs-video";
-  canvas.setAttribute("aria-hidden", "true");
-  video.insertAdjacentElement("afterend", canvas);
-  const ctx = canvas.getContext("2d", { alpha: false });
+function containsIdr(annexB: Uint8Array): boolean {
+  for (let i = 0; i + 4 < annexB.length; i++) {
+    if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) {
+      const type = annexB[i + 3]! & 0x1f;
+      if (type === 5 || type === 7) return true;
+    }
+  }
+  return false;
+}
+
+interface VideoSink {
+  canvas: HTMLCanvasElement;
+  feed(data: Uint8Array, isKey: boolean, timestampUs: number): void;
+  teardown(): void;
+  stats(): { decoded: number; dropped: number };
+}
+
+interface VideoTrackGeneratorLike {
+  track: MediaStreamTrack;
+  writable: WritableStream<VideoFrame>;
+}
+
+function createVideoSink(video: HTMLVideoElement): VideoSink {
+  // Prefer VideoTrackGenerator: it presents decoded frames through the same
+  // composited video layer as a media stream track, avoiding both the jitter
+  // buffer and the costly software canvas composite. Fall back to a 2D canvas
+  // where the generator does not exist (e.g. Firefox).
+  const g = globalThis as {
+    MediaStreamTrackGenerator?: new (init: { kind: string }) => VideoTrackGeneratorLike;
+    VideoTrackGenerator?: new () => VideoTrackGeneratorLike;
+  };
+  let generator: VideoTrackGeneratorLike | null = null;
+  try {
+    generator = g.MediaStreamTrackGenerator
+      ? new g.MediaStreamTrackGenerator({ kind: "video" })
+      : g.VideoTrackGenerator
+        ? new g.VideoTrackGenerator()
+        : null;
+  } catch {
+    generator = null;
+  }
+  const writer = generator?.writable.getWriter() ?? null;
+  if (generator) {
+    // Older builds expose `.track`; current Chrome makes the generator itself
+    // a MediaStreamTrack subclass.
+    const track =
+      generator.track ?? (generator as unknown as MediaStreamTrack);
+    video.srcObject = new MediaStream([track]);
+    void video.play().catch(() => {});
+  }
+  let canvas: HTMLCanvasElement | null = null;
+  let ctx: CanvasRenderingContext2D | null = null;
+  if (!generator) {
+    canvas = document.createElement("canvas");
+    canvas.className = "webcodecs-video";
+    canvas.setAttribute("aria-hidden", "true");
+    video.insertAdjacentElement("afterend", canvas);
+    ctx = canvas.getContext("2d", { alpha: false });
+  }
 
   let closed = false;
   let decoder: VideoDecoder | null = null;
@@ -84,8 +134,17 @@ export function attachWebCodecsVideo(
     }
     const next = new VideoDecoder({
       output: (frame) => {
+        if (writer) {
+          decoded += 1;
+          // Close once the generator has consumed the frame.
+          void writer
+            .write(frame)
+            .then(() => frame.close())
+            .catch(() => frame.close());
+          return;
+        }
         try {
-          if (ctx) {
+          if (ctx && canvas) {
             if (
               canvas.width !== frame.displayWidth ||
               canvas.height !== frame.displayHeight
@@ -106,7 +165,7 @@ export function attachWebCodecsVideo(
       },
     });
     try {
-      next.configure({ codec, optimizeForLatency: true });
+      next.configure({ codec, optimizeForLatency: true, latencyMode: "realtime" });
       decoder = next;
     } catch (error) {
       console.warn("webcodecs video configure failed", error);
@@ -156,16 +215,6 @@ export function attachWebCodecsVideo(
     return new Uint8Array(out);
   };
 
-  const containsIdr = (annexB: Uint8Array): boolean => {
-    for (let i = 0; i + 4 < annexB.length; i++) {
-      if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) {
-        const type = annexB[i + 3]! & 0x1f;
-        if (type === 5 || type === 7) return true;
-      }
-    }
-    return false;
-  };
-
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number) => {
     const annexB = toAnnexB(data);
     if (!decoderConfigured) {
@@ -178,11 +227,9 @@ export function attachWebCodecsVideo(
       decoderConfigured = true;
     }
     if (!decoder) return;
-    if (decoder.decodeQueueSize > 4) {
-      if (!isKey) {
-        dropped += 1;
-        return;
-      }
+    if (decoder.decodeQueueSize > 1 && !isKey) {
+      dropped += 1;
+      return;
     }
     try {
       decoder.decode(
@@ -197,39 +244,149 @@ export function attachWebCodecsVideo(
     }
   };
 
-  const wrappedTransform = new TransformStream<EncodedVideoFrameLike, EncodedVideoFrameLike>({
-    transform: (frame, controller) => {
-      try {
-        const rtpTimestamp = frame.getMetadata().rtpTimestamp ?? 0;
-        const data = new Uint8Array(frame.data);
-        const isKey = frame.type === "key" || containsIdr(data);
-        feed(data, isKey, Math.round(rtpTimestamp * (1e6 / 90_000)));
-      } catch {
-        // Tap must never break the normal pipeline.
-      }
-      controller.enqueue(frame);
-    },
-  });
-
   const teardown = () => {
     if (closed) return;
     closed = true;
     try {
       decoder?.close();
     } catch {}
-    canvas.remove();
+    if (generator) {
+      void writer?.close().catch(() => {});
+      (generator.track ?? (generator as unknown as MediaStreamTrack)).stop();
+      if (video.srcObject instanceof MediaStream) video.srcObject = null;
+    }
+    canvas?.remove();
   };
 
-  streams.readable.pipeThrough(wrappedTransform).pipeTo(streams.writable).catch(
-    () => {
-      // Track/PC closed mid-pipe — fall back to the plain <video> path.
-      teardown();
+  return { canvas: canvas ?? video.ownerDocument.createElement("canvas"), feed, teardown, stats: () => ({ decoded, dropped }) };
+}
+
+export function attachWebCodecsVideo(
+  streams: EncodedStreams,
+  video: HTMLVideoElement,
+): WebCodecsVideoHandle {
+  const sink = createVideoSink(video);
+  const wrappedTransform = new TransformStream<EncodedVideoFrameLike, EncodedVideoFrameLike>({
+    transform: (frame, controller) => {
+      try {
+        const rtpTimestamp = frame.getMetadata().rtpTimestamp ?? 0;
+        const data = new Uint8Array(frame.data);
+        const isKey = frame.type === "key" || containsIdr(data);
+        sink.feed(data, isKey, Math.round(rtpTimestamp * (1e6 / 90_000)));
+      } catch {
+        // Tap must never break the normal pipeline.
+      }
+      controller.enqueue(frame);
     },
+  });
+  streams.readable.pipeThrough(wrappedTransform).pipeTo(streams.writable).catch(
+    () => sink.teardown(),
   );
+  return { canvas: sink.canvas, drop: sink.teardown, stats: sink.stats };
+}
 
-  return {
-    canvas,
-    drop: teardown,
-    stats: () => ({ decoded, dropped }),
+/**
+ * Direct video delivery over the nanoctl.video.v1 unreliable data channel:
+ * each message is one Annex-B access unit — no jitter buffer at all.
+ */
+export function attachDataChannelVideo(
+  channel: RTCDataChannel,
+  idrChannel: RTCDataChannel | null,
+  video: HTMLVideoElement,
+): WebCodecsVideoHandle {
+  const sink = createVideoSink(video);
+  // Wire format: [u32 seq][u8 flags][annex-b au]. Deltas ride the unordered,
+  // unreliable channel; keyframes (large, loss-fatal) ride the reliable
+  // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
+  // chain — drop deltas until the next keyframe and ask the host for one.
+  let expectedSeq: number | null = null;
+  let waitingForKey = true;
+  let kfRequestedAt = 0;
+  const dbg = ((window as unknown as { __dcv?: Record<string, number | boolean | string> }).__dcv ??=
+    { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
+  dbg.waitingForKey = true;
+  const pending = new Map<number, { isKey: boolean; parts: number; got: Uint8Array[]; n: number }>();
+  const onFrame = (event: MessageEvent) => {
+    try {
+      const data =
+        event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
+      if (!data || data.length < 18) {
+        dbg.nonArrayBuffer = (dbg.nonArrayBuffer as number) + 1;
+        return;
+      }
+      dbg.msgs = (dbg.msgs as number) + 1;
+      const seq =
+        data[0]! | (data[1]! << 8) | (data[2]! << 16) | (data[3]! << 24);
+      const isKey = (data[4]! & 1) !== 0;
+      const part = data[5]! | (data[6]! << 8);
+      const parts = data[7]! | (data[8]! << 8);
+      const dv = new DataView(data.buffer, data.byteOffset + 9);
+      const sentMs = Number(dv.getBigUint64(0, true));
+      const transitMs = Date.now() - sentMs;
+      dbg.transitMs = transitMs;
+      dbg.transitSum = ((dbg.transitSum as number) || 0) + transitMs;
+      const chunk = data.subarray(17);
+      let au: Uint8Array | null = chunk;
+      if (parts > 1) {
+        let entry = pending.get(seq);
+        if (!entry) {
+          entry = { isKey, parts, got: new Array(parts), n: 0 };
+          pending.set(seq, entry);
+        }
+        if (!entry.got[part]) {
+          entry.got[part] = chunk;
+          entry.n += 1;
+        }
+        if (entry.n < parts) return;
+        pending.delete(seq);
+        const total = entry.got.reduce((a, b) => a + b.length, 0);
+        const joined = new Uint8Array(total);
+        let off = 0;
+        for (const g of entry.got) {
+          joined.set(g, off);
+          off += g.length;
+        }
+        au = joined;
+        // Drop stale partials that can never complete.
+        for (const key of pending.keys()) {
+          if (((seq - key) | 0) > 0) pending.delete(key);
+        }
+      }
+      if (!au) return;
+      const diff = expectedSeq === null ? 0 : (seq - expectedSeq) | 0;
+      if (diff < 0) {
+        return; // Late/duplicate on the unordered channel.
+      }
+      expectedSeq = (seq + 1) >>> 0;
+      if (diff > 0 && !waitingForKey) {
+        waitingForKey = true;
+        dbg.gaps = (dbg.gaps as number) + 1;
+      }
+      dbg.waitingForKey = waitingForKey;
+      if (waitingForKey) {
+        if (Date.now() - kfRequestedAt > 250) {
+          kfRequestedAt = Date.now();
+          dbg.kf = (dbg.kf as number) + 1;
+          try {
+            channel.send("KF");
+          } catch {}
+        }
+        if (!isKey) return;
+        waitingForKey = false;
+        dbg.waitingForKey = false;
+      }
+      dbg.fed = (dbg.fed as number) + 1;
+      sink.feed(au, isKey, seq * 16_000);
+      const st = sink.stats();
+      dbg.decoded = st.decoded;
+      dbg.decodeDropped = st.dropped;
+    } catch {
+      // Decoder must never break the channel.
+    }
   };
+  channel.onmessage = onFrame;
+  if (idrChannel) idrChannel.onmessage = onFrame;
+  channel.onclose = () => sink.teardown();
+  if (idrChannel) idrChannel.onclose = () => sink.teardown();
+  return { canvas: sink.canvas, drop: sink.teardown, stats: sink.stats };
 }

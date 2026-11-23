@@ -152,6 +152,21 @@ pub struct HostPeer {
     input_revoked: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
+    /// Optional viewer-created unreliable channel carrying H.264 access
+    /// units straight to WebCodecs, bypassing the track's jitter buffer.
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    video_data_channel: Arc<DataChannelVideo>,
+}
+
+/// Viewer-created unreliable data channel carrying raw Annex-B access units
+/// straight to WebCodecs. The viewer can request a keyframe by sending `KF`
+/// when it detects a sequence gap. `idr_channel` is the reliable channel
+/// (`nanoctl.video-idr.v1`) used to deliver keyframes, which are too large
+/// to survive partial reliability.
+pub(crate) struct DataChannelVideo {
+    pub channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
+    pub idr_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
+    pub keyframe_requests: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -515,6 +530,11 @@ impl HostPeer {
         let input_revoked = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "media")]
         let mut input_tasks = Vec::new();
+        let video_data_channel = Arc::new(DataChannelVideo {
+            channel: std::sync::Mutex::new(None),
+            idr_channel: std::sync::Mutex::new(None),
+            keyframe_requests: AtomicU64::new(0),
+        });
         #[cfg(feature = "media")]
         {
             let input = if allow_remote_input {
@@ -581,9 +601,39 @@ impl HostPeer {
                 None
             };
             let clipboard_shutdown = input_shutdown.subscribe();
+            let video_dc_for_channel = video_data_channel.clone();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let input_revoked = input_revoked_for_channel.clone();
+                if channel.label() == "nanoctl.video.v1"
+                    || channel.label() == "nanoctl.video-idr.v1"
+                {
+                    let is_idr = channel.label() == "nanoctl.video-idr.v1";
+                    tracing::info!(idr = is_idr, "video data channel opened");
+                    let slot = video_dc_for_channel.clone();
+                    if is_idr {
+                        *slot.idr_channel.lock().unwrap() = Some(channel.clone());
+                    } else {
+                        *slot.channel.lock().unwrap() = Some(channel.clone());
+                    }
+                    let kf = video_dc_for_channel.clone();
+                    channel.on_message(Box::new(move |message| {
+                        if message.data.as_ref() == b"KF" {
+                            tracing::info!("video data channel keyframe request received");
+                            kf.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Box::pin(async {})
+                    }));
+                    channel.on_close(Box::new(move || {
+                        if is_idr {
+                            *slot.idr_channel.lock().unwrap() = None;
+                        } else {
+                            *slot.channel.lock().unwrap() = None;
+                        }
+                        Box::pin(async {})
+                    }));
+                    return Box::pin(async {});
+                }
                 if channel.label() == "nanoctl.clipboard.v1" {
                     if let Some(backend) = clipboard.clone() {
                         let initial_backend = backend.clone();
@@ -954,6 +1004,7 @@ impl HostPeer {
             #[cfg(feature = "media")]
             input_revoked,
             video,
+            video_data_channel,
         })
     }
 
@@ -1156,6 +1207,11 @@ impl HostPeer {
     #[cfg(feature = "media")]
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn video_data_channel(&self) -> Arc<DataChannelVideo> {
+        self.video_data_channel.clone()
     }
 
     #[cfg(feature = "media")]
