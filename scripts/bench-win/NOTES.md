@@ -129,6 +129,20 @@ is idle). Agent-side proactive IDR on channel open was tried and reverted:
 it raced the viewer's own KF and emitted a duplicate ~150KB IDR that
 congested SCTP (+30-50ms joinMs).
 
+## Delivered fps under motion (`__dcv` counters, 30s windows)
+
+End-to-end decode delivery while the scrolling checkerboard covers the
+full display. The painter originally cost ~7k FillRects/frame and capped
+the scene at 17.6fps — pre-rendering the checkerboard to a memory bitmap
+(one BitBlt/frame) restored the composite rate:
+
+| delivered | decoded | decodeDropped | gaps | kf  |
+| --------- | ------- | ------------- | ---- | --- |
+| 29.4 fps  | 29.4    | 0             | 0    | 0   |
+
+Every composite tick is delivered and decoded (~30Hz ceiling of the
+IddSample display); the software decoder keeps up with zero queue drops.
+
 ## Input-to-photon (click through the viewer)
 
 benchwin's band counts WM_LBUTTONDOWN in its marker; clicking the streamed

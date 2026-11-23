@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::Media::timeBeginPeriod;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
+};
 use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ---------- marker codec ----------
@@ -260,7 +262,10 @@ fn client_rect(hwnd: HWND) -> RECT {
     unsafe {
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
-        let mut p = POINT { x: r.left, y: r.top };
+        let mut p = POINT {
+            x: r.left,
+            y: r.top,
+        };
         let _ = ClientToScreen(hwnd, &mut p);
         RECT {
             left: p.x,
@@ -320,33 +325,69 @@ unsafe fn band_paint_dc(hwnd: HWND, dc: HDC) {
     if MOTION && h > 56 {
         // Gaming-like motion: 16px checkerboard scrolled right 4px per paint
         // tick — uniform translation that motion estimation should predict,
-        // so P-frames stay cheap only if ME actually works.
-        let tile = 16i32;
-        let scroll = (TICK as i32 % 256) * 4;
-        let black = CreateSolidBrush(COLORREF(0));
-        let white = CreateSolidBrush(COLORREF(0x00FFFFFF));
-        let mut y = top + mh + 4;
-        while y < h {
-            let mut x = -tile;
-            while x < w {
-                let rc = RECT {
-                    left: x,
-                    top: y,
-                    right: x + tile,
-                    bottom: y + tile,
-                };
-                let b = if ((x + scroll) / tile + y / tile) & 1 == 0 {
-                    black
-                } else {
-                    white
-                };
-                FillRect(dc, &rc, b);
-                x += tile;
+        // so P-frames stay cheap only if ME actually works. The pattern is
+        // pre-rendered to a memory bitmap once and shifted with a single
+        // BitBlt per frame: thousands of per-tile FillRects made the painter
+        // itself the bottleneck (~17fps).
+        let y0 = top + mh + 4;
+        static mut TILE_DC: Option<HDC> = None;
+        static mut TILE_BMP: Option<HBITMAP> = None;
+        static mut TILE_WH: (i32, i32) = (0, 0);
+        let span = w + 64;
+        if TILE_BMP.is_none() || TILE_WH != (span, h - y0 + 64) {
+            let mem = CreateCompatibleDC(Some(dc));
+            let bmp = CreateCompatibleBitmap(dc, span, h - y0 + 64);
+            let black = CreateSolidBrush(COLORREF(0));
+            let white = CreateSolidBrush(COLORREF(0x00FFFFFF));
+            let mut yy = 0i32;
+            while yy < h - y0 + 64 {
+                let mut xx = 0i32;
+                while xx < span {
+                    let rc = RECT {
+                        left: xx,
+                        top: yy,
+                        right: xx + 16,
+                        bottom: yy + 16,
+                    };
+                    FillRect(
+                        mem,
+                        &rc,
+                        if (xx / 16 + yy / 16) & 1 == 0 {
+                            black
+                        } else {
+                            white
+                        },
+                    );
+                    xx += 16;
+                }
+                yy += 16;
             }
-            y += tile;
+            let _ = DeleteObject(black.into());
+            let _ = DeleteObject(white.into());
+            if let Some(old) = TILE_BMP.replace(bmp) {
+                let _ = DeleteObject(old.into());
+            }
+            TILE_DC = Some(mem);
+            TILE_WH = (span, h - y0 + 64);
         }
-        let _ = DeleteObject(white.into());
-        let _ = DeleteObject(black.into());
+        let mem = TILE_DC.unwrap();
+        let prev = SelectObject(mem, TILE_BMP.unwrap().into());
+        let scroll = ((TICK as i32 % 256) * 4) % 32;
+        // Wrap scroll into one checker period (32px): alternate the two phase
+        // offsets so the pattern translates smoothly.
+        let phase_a = scroll % 32;
+        let _ = BitBlt(
+            dc,
+            -phase_a - 16,
+            y0,
+            span,
+            h - y0 + 64,
+            Some(mem),
+            0,
+            0,
+            SRCCOPY,
+        );
+        SelectObject(mem, prev);
     }
     let _ = DeleteObject(cyan.into());
     let _ = DeleteObject(magenta.into());
@@ -354,7 +395,12 @@ unsafe fn band_paint_dc(hwnd: HWND, dc: HDC) {
     let _ = DeleteObject(white.into());
 }
 
-unsafe extern "system" fn band_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn band_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_TIMER => {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -483,10 +529,7 @@ fn send_click(x: i32, y: i32) {
                 },
             },
         };
-        let inputs = [
-            mk(MOUSEEVENTF_LEFTDOWN),
-            mk(MOUSEEVENTF_LEFTUP),
-        ];
+        let inputs = [mk(MOUSEEVENTF_LEFTDOWN), mk(MOUSEEVENTF_LEFTUP)];
         SendInput(&inputs, size_of::<INPUT>() as i32);
     }
 }
@@ -611,7 +654,8 @@ fn cmd_watch(args: &[String]) -> i32 {
             bi += 1;
         }
         if let Some((bt, bm)) = band_vals.get(bi) {
-            let _ = writeln!(
+            let _ =
+                writeln!(
                 out,
                 "{{\"t\":{ct:.3},\"src\":\"pair\",\"bandSeq\":{},\"clientSeq\":{},\"dt\":{:.3}}}",
                 bm.0, cm.0, ct - bt
@@ -680,10 +724,7 @@ fn main() {
             match find_marker_row(&scan.pixels, w, h, scan.stride) {
                 Some(row) => {
                     let mid = (row as i32).min(h as i32 - 1);
-                    send_click(
-                        rect.left + (rect.right - rect.left) * 2 / 5,
-                        rect.top + mid,
-                    );
+                    send_click(rect.left + (rect.right - rect.left) * 2 / 5, rect.top + mid);
                     0
                 }
                 None => {
@@ -692,9 +733,16 @@ fn main() {
                 }
             }
         }
-        "wgc-frame" => match cmd_wgc_frame(args.get(1).map(|s| s.as_str()).unwrap_or("C:/Users/Administrator/bench/wgc.png")) {
+        "wgc-frame" => match cmd_wgc_frame(
+            args.get(1)
+                .map(|s| s.as_str())
+                .unwrap_or("C:/Users/Administrator/bench/wgc.png"),
+        ) {
             Ok(()) => 0,
-            Err(e) => { eprintln!("wgc-frame: {}", e); 1 }
+            Err(e) => {
+                eprintln!("wgc-frame: {}", e);
+                1
+            }
         },
         "windows" => {
             list_windows();
@@ -712,7 +760,12 @@ fn main() {
             scan.grab();
             let w = (rect.right - rect.left) as usize;
             let h = (rect.bottom - rect.top) as usize;
-            eprintln!("grab {}x{} first bytes {:02x?}", w, h, &scan.pixels[..16.min(scan.pixels.len())]);
+            eprintln!(
+                "grab {}x{} first bytes {:02x?}",
+                w,
+                h,
+                &scan.pixels[..16.min(scan.pixels.len())]
+            );
             for y in 0..h {
                 let row = &scan.pixels[y * scan.stride..(y + 1) * scan.stride];
                 if let Some(m) = read_marker_row(row, w) {
@@ -758,15 +811,7 @@ fn main() {
                 args[5].parse().unwrap(),
             );
             unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    x,
-                    y,
-                    w,
-                    h,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+                let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             0
         }
@@ -784,7 +829,10 @@ fn _unused() {}
 fn cmd_wgc_frame(path: &str) -> Result<(), String> {
     use xcap::Monitor;
     let monitors = Monitor::all().map_err(|e| e.to_string())?;
-    let m = monitors.into_iter().find(|m| m.is_primary().unwrap_or(false)).ok_or("no monitor")?;
+    let m = monitors
+        .into_iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .ok_or("no monitor")?;
     let img = m.capture_image().map_err(|e| e.to_string())?;
     img.save(path).map_err(|e| e.to_string())?;
     println!("saved {}", path);
