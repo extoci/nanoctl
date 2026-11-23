@@ -199,7 +199,7 @@ export type DisplayInfo = {
   readonly primary: boolean;
 };
 
-export type VideoCodec = "h264" | "vp9" | "av1";
+export type VideoCodec = "h264" | "hevc" | "vp9" | "av1";
 
 export type HostInfo = {
   readonly hostName: string;

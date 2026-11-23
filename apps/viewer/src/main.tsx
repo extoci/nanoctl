@@ -6,6 +6,12 @@ import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
 import { SoundPlayback, type SoundState } from "./lib/sound";
+import {
+  CODEC_CHOICES,
+  loadCodecChoice,
+  saveCodecChoice,
+  type CodecChoice,
+} from "./lib/video-codec";
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
 import { comboMessages, connectSteps, connectionQuality, keyCombos } from "./lib/session-ui";
@@ -38,6 +44,22 @@ function Viewer() {
   const [detail, setDetail] = useState("");
   const [selectedDisplay, setSelectedDisplay] = useState("");
   const [showStats, setShowStats] = useState(false);
+  const [codecChoice, setCodecChoiceState] = useState<CodecChoice>(() => {
+    try {
+      return loadCodecChoice();
+    } catch {
+      return "auto";
+    }
+  });
+  const codecChoiceRef = useRef(codecChoice);
+  const setCodecChoice = (next: CodecChoice) => {
+    codecChoiceRef.current = next;
+    setCodecChoiceState(next);
+    try {
+      saveCodecChoice(next);
+    } catch {}
+    transport.current?.connect();
+  };
   const [fullscreen, setFullscreen] = useState(false);
   const [keyboardLocked, setKeyboardLocked] = useState(false);
   const [notice, setNotice] = useState("");
@@ -152,6 +174,7 @@ function Viewer() {
         );
       },
       onSnapshot: setSnapshot,
+      codecChoice: () => codecChoiceRef.current,
       onStatus: (next, message) => {
         setStatus(next);
         setDetail(message ?? "");
@@ -290,6 +313,15 @@ function Viewer() {
             <span>
               Route <b>{metrics?.route ?? "unknown"}</b>
             </span>
+            <span>
+              Codec <b>{metrics?.codec ?? "—"}</b>
+            </span>
+            <span>
+              Decoder <b>{metrics?.decoder ?? "—"}</b>
+            </span>
+            <span>
+              Decode <b>{metrics?.decodeMs == null ? "—" : `${metrics.decodeMs.toFixed(1)} ms`}</b>
+            </span>
           </aside>
         )}
         {touchMode === "trackpad" && live && (
@@ -425,6 +457,28 @@ function Viewer() {
                     }}
                   >
                     {display.name}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          {info && info.capabilities.codecs.length > 1 && (
+            <>
+              <h2>Video codec</h2>
+              <div className="row" role="group" aria-label="Video codec">
+                {CODEC_CHOICES.filter(
+                  (choice) =>
+                    choice.value === "auto" || info.capabilities.codecs.includes(choice.value),
+                ).map((choice) => (
+                  <button
+                    key={choice.value}
+                    aria-pressed={choice.value === codecChoice}
+                    disabled={terminal}
+                    onClick={() => {
+                      if (choice.value !== codecChoice) setCodecChoice(choice.value);
+                    }}
+                  >
+                    {choice.label}
                   </button>
                 ))}
               </div>

@@ -7,7 +7,9 @@ import {
   type DisplayInfo,
   type NormalizedSignal,
   type SignalPayload,
+  type VideoCodec,
 } from "@nanoctl/protocol";
+import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
@@ -30,6 +32,9 @@ export type RemoteSessionMetrics = {
   packetsLost: number;
   framesDropped: number;
   route: "direct" | "relay" | "unknown";
+  codec: string | null;
+  decoder: string | null;
+  decodeMs: number | null;
 };
 
 export type RemoteSessionSnapshot = {
@@ -73,6 +78,9 @@ export type RemoteSessionOptions = {
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
   preferences?: { inputEnabled: boolean; displayId?: string };
+  /** Codecs the host can encode; the viewer orders its offer so the host picks the best one. */
+  videoCodecs?: readonly VideoCodec[];
+  codecChoice?: CodecChoice;
   operations: RemoteSessionOperations;
   getIceServers?: () => Promise<readonly RTCIceServer[]>;
   revalidateController?: () => Promise<{
@@ -162,6 +170,9 @@ export class RemoteSessionController {
   private readonly offerPublicationGates = new Map<number, Promise<boolean>>();
   private readonly offerCompletionWaiters = new Map<number, () => void>();
   private metrics: RemoteSessionMetrics | null = null;
+  private videoTransceiver: RTCRtpTransceiver | null = null;
+  private codecPreferencesApplied = false;
+  private previousDecode: { id: string; time: number; frames: number } | null = null;
 
   private readonly onWindowBlur = () => {
     this.gamepad.release();
@@ -480,7 +491,9 @@ export class RemoteSessionController {
 
   private attachPeer(peer: RTCPeerConnection, lifecycle: number): void {
     if (this.options.clipboardEnabled && this.remoteInputAllowed) {
-      const channel = peer.createDataChannel("nanoctl.clipboard.v1", { ordered: true });
+      const channel = peer.createDataChannel("nanoctl.clipboard.v1", {
+        ordered: true,
+      });
       this.clipboardChannel = channel;
       this.clipboard = new ClipboardSync({
         focused: () => this.clipboardChannel === channel && document.hasFocus(),
@@ -519,7 +532,10 @@ export class RemoteSessionController {
       this.publishSnapshot();
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
-    peer.addTransceiver("video", { direction: "recvonly" });
+    this.videoTransceiver = peer.addTransceiver("video", {
+      direction: "recvonly",
+    });
+    this.codecPreferencesApplied = false;
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
@@ -918,6 +934,7 @@ export class RemoteSessionController {
       });
       this.offerPublicationGates.set(generation, offerPublication);
       try {
+        await this.applyCodecPreferences();
         const offer = await peer.createOffer({ iceRestart });
         if (!this.isCurrent(lifecycle, peer)) {
           if (this.outstandingOfferGeneration === generation) {
@@ -1197,6 +1214,25 @@ export class RemoteSessionController {
     this.firstFrameTimer = null;
   }
 
+  private async applyCodecPreferences(): Promise<void> {
+    const transceiver = this.videoTransceiver;
+    if (this.codecPreferencesApplied || !transceiver) return;
+    this.codecPreferencesApplied = true;
+    if (typeof transceiver.setCodecPreferences !== "function") return;
+    const receive = RTCRtpReceiver.getCapabilities?.("video")?.codecs;
+    if (!receive || !this.options.videoCodecs) return;
+    try {
+      const order = await orderVideoCodecs(
+        this.options.codecChoice ?? "auto",
+        this.options.videoCodecs,
+        receive,
+      );
+      if (order) transceiver.setCodecPreferences(order);
+    } catch {
+      // Codec ordering is an optimization; the browser's default order still negotiates H.264.
+    }
+  }
+
   private async collectStats(lifecycle: number): Promise<void> {
     const peer = this.peer;
     if (!peer || !this.isCurrent(lifecycle, peer) || this.statsInFlight) return;
@@ -1261,6 +1297,21 @@ export class RemoteSessionController {
             ? "direct"
             : "unknown";
       const rtt = statNumber(candidatePair, "currentRoundTripTime");
+      const codecId = statString(inbound, "codecId");
+      const decodeTime = statNumber(inbound, "totalDecodeTime");
+      const decodedFrames = statNumber(inbound, "framesDecoded");
+      const previousDecode = this.previousDecode;
+      const decodeMs =
+        decodeTime !== undefined &&
+        decodedFrames !== undefined &&
+        previousDecode?.id === inbound.id &&
+        decodedFrames > previousDecode.frames
+          ? ((decodeTime - previousDecode.time) * 1_000) / (decodedFrames - previousDecode.frames)
+          : null;
+      this.previousDecode =
+        decodeTime !== undefined && decodedFrames !== undefined
+          ? { id: inbound.id, time: decodeTime, frames: decodedFrames }
+          : null;
       this.metrics = {
         resolution:
           (statNumber(inbound, "frameWidth") ?? 0) > 0 &&
@@ -1272,6 +1323,9 @@ export class RemoteSessionController {
         packetsLost: Math.max(0, Math.round(statNumber(inbound, "packetsLost") ?? 0)),
         framesDropped: Math.max(0, Math.round(statNumber(inbound, "framesDropped") ?? 0)),
         route,
+        codec: codecLabel(statString(codecId ? report.get(codecId) : undefined, "mimeType")),
+        decoder: statString(inbound, "decoderImplementation") ?? null,
+        decodeMs: decodeMs !== null && decodeMs >= 0 ? Math.round(decodeMs * 10) / 10 : null,
       };
       this.publishSnapshot();
     } catch {

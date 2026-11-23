@@ -9,6 +9,9 @@ const metrics = {
   packetsLost: 0,
   framesDropped: 0,
   route: "direct" as const,
+  codec: null,
+  decoder: null,
+  decodeMs: null,
 };
 
 describe("session ui", () => {
