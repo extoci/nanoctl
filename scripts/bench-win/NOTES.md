@@ -8,6 +8,7 @@
 | nanoctl slice-parallel + parallel RGBA->I420 (RTP) | 29.7 | 34 | 38 | 53 | | 1760 |
 | nanoctl DC-video + canvas overlay | 93.7 | 91 | 113 | 199 | 34 | 981 |
 | nanoctl DC-video + MediaStreamTrackGenerator | 29.5 | 34 | 36 | 49 | 0 | 1779 |
+| + sender pacing + reorder buffer | 29.8 | 34 | 37 | 47 | 16 | 1740 |
 
 Key findings:
 - Chrome's receiver-side encoded transform sits AFTER its jitter buffer, so
@@ -25,6 +26,22 @@ Key findings:
   throttle) -> agent `keyframe_requests` counter -> producer
   `force_intra_frame` -> IDR on the reliable channel.
 - DC transit send->onmessage ~14ms avg (agent->Chrome on loopback).
+
+## Loss robustness (post-E2E fixes)
+- The unreliable delta channel both loses AND reorders packets (~38% of
+  messages arrived out of order under load). Silent drops of out-of-order
+  frames corrupted the reference chain without a seq gap -> garbage
+  decode until the next KF.
+- Viewer: reorder buffer (window 16) holds out-of-order deltas and drains
+  in seq order; an IDR jumps the buffer (delivered even with a gap ahead)
+  so waitingForKey cannot deadlock behind a permanently lost delta.
+- Agent: IDRs are paced on the reliable channel (up to 30ms wait per part
+  while buffered_amount > 128KiB) so a 3-part IDR burst doesn't starve
+  the SCTP cwnd; deltas are skipped when buffered_amount > 64KiB instead
+  of queueing stale frames (dc_backed_up flag + dc_skips counter).
+- Result: 60s stress with viewer maximized -> 0 gaps, 0 KF requests,
+  ~56fps fed, transit ~3ms. Before the fix the same stress produced
+  ~4-5 KF/s (lost IDR parts -> resync loop).
 
 ## Server per-frame costs (agent.log pipeline statistics, /frames_encoded)
 - backend_ns (OpenH264): was ~25ms -> ~10ms (max_slice_len 8000 +
@@ -50,4 +67,7 @@ hardware and the jitter-buffer bypass is worth ~20-35ms on its own.
 - The agent serves the viewer embedded at build time (build.rs packs
   apps/viewer/dist) — rebuild the agent after rebuilding the viewer.
 - Debug counters on the page: `window.__dcv` {msgs,fed,gaps,kf,transitMs,
-  decoded,decodeDropped,waitingForKey}.
+  decoded,decodeDropped,waitingForKey,late,reordered}.
+- Window occlusion breaks the marker scan (locate -> marker_y=-1): the
+  viewer window must be visible and not maximized over the band. If it
+  paints white after restore, `Page.reload` via CDP :9222.

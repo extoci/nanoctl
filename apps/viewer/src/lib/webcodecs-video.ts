@@ -306,6 +306,7 @@ export function attachDataChannelVideo(
     { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
   dbg.waitingForKey = true;
   const pending = new Map<number, { isKey: boolean; parts: number; got: Uint8Array[]; n: number }>();
+  const reordered = new Map<number, { au: Uint8Array; isKey: boolean }>();
   const onFrame = (event: MessageEvent) => {
     try {
       const data =
@@ -353,33 +354,64 @@ export function attachDataChannelVideo(
         }
       }
       if (!au) return;
-      const diff = expectedSeq === null ? 0 : (seq - expectedSeq) | 0;
-      if (diff < 0) {
-        return; // Late/duplicate on the unordered channel.
+      if (expectedSeq === null) {
+        expectedSeq = seq;
       }
-      expectedSeq = (seq + 1) >>> 0;
-      if (diff > 0 && !waitingForKey) {
-        waitingForKey = true;
-        dbg.gaps = (dbg.gaps as number) + 1;
+      const diff = (seq - expectedSeq) | 0;
+      if (diff < 0) {
+        dbg.late = ((dbg.late as number) || 0) + 1;
+        return; // Already delivered (or already declared lost).
+      }
+      let deliverNow = diff === 0;
+      if (diff > 0 && isKey && waitingForKey) {
+        // A keyframe always jumps the reorder window — the missing seq is
+        // declared lost and only this IDR can restart the chain.
+        deliverNow = true;
+      } else if (diff > 0) {
+        // Unordered delivery reorders constantly; hold ahead-of-order frames
+        // in a small reorder window instead of declaring a gap. While waiting
+        // for a key only keys are worth holding.
+        if (isKey || !waitingForKey) {
+          reordered.set(seq, { au, isKey });
+          dbg.reordered = ((dbg.reordered as number) || 0) + 1;
+        }
+        if (reordered.size > 16 && !waitingForKey) {
+          waitingForKey = true;
+          dbg.gaps = (dbg.gaps as number) + 1;
+          reordered.clear();
+        }
+      }
+      // Drain the reorder window in sequence.
+      const deliver = (s: number, a: Uint8Array, k: boolean) => {
+        expectedSeq = (s + 1) >>> 0;
+        if (waitingForKey) {
+          if (Date.now() - kfRequestedAt > 250) {
+            kfRequestedAt = Date.now();
+            dbg.kf = (dbg.kf as number) + 1;
+            try {
+              channel.send("KF");
+            } catch {}
+          }
+          if (!k) return;
+          waitingForKey = false;
+          dbg.waitingForKey = false;
+        }
+        dbg.fed = (dbg.fed as number) + 1;
+        sink.feed(a, k, s * 16_000);
+      };
+      if (deliverNow) {
+        deliver(seq, au, isKey);
+      }
+      while (expectedSeq !== null && reordered.has(expectedSeq)) {
+        const e = reordered.get(expectedSeq)!;
+        reordered.delete(expectedSeq);
+        deliver(expectedSeq, e.au, e.isKey);
       }
       dbg.waitingForKey = waitingForKey;
-      if (waitingForKey) {
-        if (Date.now() - kfRequestedAt > 250) {
-          kfRequestedAt = Date.now();
-          dbg.kf = (dbg.kf as number) + 1;
-          try {
-            channel.send("KF");
-          } catch {}
-        }
-        if (!isKey) return;
-        waitingForKey = false;
-        dbg.waitingForKey = false;
-      }
-      dbg.fed = (dbg.fed as number) + 1;
-      sink.feed(au, isKey, seq * 16_000);
       const st = sink.stats();
       dbg.decoded = st.decoded;
       dbg.decodeDropped = st.dropped;
+      return;
     } catch {
       // Decoder must never break the channel.
     }

@@ -2228,6 +2228,7 @@ pub fn spawn_video(
         let mut dc_backed_up = false;
         let mut dc_seq = 0_u32;
         let mut dc_kf_seen = 0_u64;
+        let mut dc_skips = 0_u64;
         let mut reference_recovery = ReferenceRecovery::default();
         let mut write_result = Ok(());
         loop {
@@ -2282,6 +2283,7 @@ pub fn spawn_video(
                         let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
                         if is_idr {
                             tracing::info!(
+                                dc_skips,
                                 "video data channel sending IDR seq={dc_seq} parts={parts}"
                             );
                         }
@@ -2307,8 +2309,29 @@ pub fn spawn_video(
                                 msg.extend_from_slice(&parts.to_le_bytes());
                                 msg.extend_from_slice(&sent_ms.to_le_bytes());
                                 msg.extend_from_slice(&sample.data[start..end]);
-                                if is_idr
-                                    || channel.buffered_amount().await <= 64 * 1024
+                                if is_idr {
+                                    // Pace IDR parts: bursting ~150KB into the
+                                    // association starves the congestion window
+                                    // and drops deltas on the sibling channel,
+                                    // which re-triggers keyframe requests.
+                                    for _ in 0..30 {
+                                        if channel.buffered_amount().await
+                                            <= 128 * 1024
+                                        {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(1))
+                                            .await;
+                                    }
+                                    if let Err(error) =
+                                        channel.send(&Bytes::from(msg)).await
+                                    {
+                                        tracing::warn!(%error, "video data channel send failed");
+                                        dc_backed_up = true;
+                                        break;
+                                    }
+                                    dc_backed_up = false;
+                                } else if channel.buffered_amount().await <= 64 * 1024
                                 {
                                     if let Err(error) =
                                         channel.send(&Bytes::from(msg)).await
@@ -2317,11 +2340,15 @@ pub fn spawn_video(
                                         dc_backed_up = true;
                                         break;
                                     }
-                                } else if !dc_backed_up {
-                                    dc_backed_up = true;
-                                    delivery_recovery.send_modify(|generation| {
-                                        *generation = generation.wrapping_add(1);
-                                    });
+                                    dc_backed_up = false;
+                                } else {
+                                    dc_skips += 1;
+                                    if !dc_backed_up {
+                                        dc_backed_up = true;
+                                        delivery_recovery.send_modify(|generation| {
+                                            *generation = generation.wrapping_add(1);
+                                        });
+                                    }
                                     break;
                                 }
                             }
