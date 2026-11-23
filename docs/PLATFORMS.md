@@ -31,8 +31,9 @@ session. Grant Screen Recording and Accessibility to the installed binary; permi
 cannot be silently granted by the installer. Tailscale's CLI can be discovered at
 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
 
-Native capture feeds real-time VideoToolbox H.264, with OpenH264 fallback. The pipeline
-still copies captured frames; direct ScreenCaptureKit zero-copy is not claimed.
+macOS 15+ prefers low-queue-depth ScreenCaptureKit, including cursor and click highlights.
+macOS 14 and ScreenCaptureKit startup failures use the existing AVCapture backend.
+Both paths copy frames and feed real-time VideoToolbox H.264, with OpenH264 fallback.
 Legacy Keychain entry deletion is best-effort and is not needed for normal operation.
 
 ## Linux
