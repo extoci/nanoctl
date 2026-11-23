@@ -144,7 +144,7 @@ fast_image_resize = { version = "6.2", default-features = false, features = [
   "std",
   "only_u8x4",
 ], optional = true }
-vigem-client = { version = "0.1.4", optional = true }
+vigem-client = { version = "0.1.4", features = ["unstable_ds4"], optional = true }
 windows = { version = "0.62.2", features = [
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
@@ -166,5 +166,5 @@ tokio-tungstenite = "0.29"
 codegen-units = 1
 lto = "thin"
 opt-level = 3
-panic = "abort"
+panic = "unwind"
 strip = "symbols"
