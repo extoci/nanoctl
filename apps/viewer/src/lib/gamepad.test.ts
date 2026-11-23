@@ -1,0 +1,54 @@
+import { expect, test } from "bun:test";
+import { GamepadForwarder } from "./gamepad";
+
+function pad(index: number, mapping: GamepadMappingType = "standard") {
+  return {
+    axes: [-1, -1, 0.5, 1],
+    buttons: Array.from({ length: 17 }, (_, button) => ({
+      pressed: [0, 6, 12, 16].includes(button),
+      touched: false,
+      value: button === 6 ? 0.5 : button === 7 ? 1 : 0,
+    })),
+    connected: true,
+    index,
+    mapping,
+  };
+}
+
+test("maps standard controls and sends snapshots on change or keepalive", () => {
+  const messages: unknown[] = [];
+  const gamepad = new GamepadForwarder((message) => Boolean(messages.push(message)));
+  const controller = pad(10);
+  gamepad.sample([null, controller, pad(12, "")], 0);
+  gamepad.sample([controller], 499);
+  const state = { type: "gamepad", pads: [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]] };
+  expect(messages).toEqual([state]);
+  gamepad.sample([controller], 500);
+  gamepad.sample([{ ...controller, axes: [NaN] }], 501);
+  gamepad.sample([], 502);
+  gamepad.release();
+  expect(messages).toEqual([
+    state,
+    state,
+    { type: "gamepad", pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
+    { type: "gamepad", pads: [] },
+  ]);
+});
+
+test("bounds to four controllers, preserves slots, and retries a blocked release", () => {
+  let blocked = false;
+  const slots: number[][] = [];
+  const gamepad = new GamepadForwarder(({ pads }) => {
+    if (blocked) return false;
+    slots.push(pads.map((pad) => pad[0]));
+    return true;
+  });
+  gamepad.sample([pad(2), pad(3), pad(4), pad(8), pad(9)], 0);
+  gamepad.sample([pad(8), pad(3), pad(9)], 1);
+  gamepad.sample([pad(8), pad(3), pad(9)], 2);
+  blocked = true;
+  gamepad.release();
+  blocked = false;
+  gamepad.release();
+  expect(slots).toEqual([[0, 1, 2, 3], [1, 3], [0, 1, 3], []]);
+});
