@@ -23,6 +23,7 @@ export class SocketSession {
   private revision = 0;
   private attempt = 0;
   private disposed = false;
+  private readonly preferences = { inputEnabled: true };
   private readonly restored = (event: PageTransitionEvent) => {
     if (event.persisted) this.connect();
   };
@@ -127,6 +128,7 @@ export class SocketSession {
                 video: this.options.video,
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
+                preferences: this.preferences,
                 operations: {
                   sendSignal: async ({ envelope }) =>
                     this.send(socket, { type: "signal", envelope: JSON.parse(envelope) }),

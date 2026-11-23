@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, chromium } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { copyFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -56,6 +56,92 @@ test("host picker lists tailnet machines and supports keyboard", async ({ page }
   await expect(hosts).toBeHidden();
 });
 
+test("an unpaced 200-character key burst reaches native input in order", async ({ page }) => {
+  test.skip(
+    process.env.NANOCTL_BROWSER_MEDIA !== "1" ||
+      process.platform !== "linux" ||
+      !process.env.DISPLAY,
+    "Requires Linux native input and an X display",
+  );
+  await page.addInitScript(() => {
+    const create = RTCPeerConnection.prototype.createDataChannel;
+    RTCPeerConnection.prototype.createDataChannel = function (...args) {
+      const channel = Reflect.apply(create, this, args) as RTCDataChannel;
+      if (args[0] === "nanoctl.control.v1")
+        (window as unknown as { control: RTCDataChannel }).control = channel;
+      return channel;
+    };
+  });
+  const targetBrowser = await chromium.launch({ headless: false });
+  try {
+    const target = await targetBrowser.newPage();
+    await target.setContent('<input aria-label="Native input target" autofocus>');
+    await page.goto("/");
+    await expect(page.getByTestId("connection-state")).toHaveText("Live");
+    await target.bringToFront();
+    await target.getByRole("textbox").focus();
+    const text = "abcdefghijklmnopqrstuvwxyz".repeat(8).slice(0, 200);
+    await page.evaluate((text) => {
+      const channel = (window as unknown as { control: RTCDataChannel }).control;
+      for (const key of text) {
+        for (const action of ["down", "up"])
+          channel.send(
+            JSON.stringify({
+              type: "key",
+              action,
+              code: `Key${key.toUpperCase()}`,
+              key,
+              repeat: false,
+            }),
+          );
+      }
+    }, text);
+    await expect(target.getByRole("textbox")).toHaveValue(text, { timeout: 5000 });
+    let expected = text;
+    const commitText = async (label: string, commit: string, timeout: number) => {
+      const started = performance.now();
+      await page.evaluate((text) => {
+        (window as unknown as { control: RTCDataChannel }).control.send(
+          JSON.stringify({ type: "text", text }),
+        );
+      }, commit);
+      expected += commit;
+      await target
+        .waitForFunction(
+          (expected) => document.querySelector("input")?.value === expected,
+          expected,
+          { timeout },
+        )
+        .catch(async (error: unknown) => {
+          console.log(
+            `${label} received: ${JSON.stringify(await target.getByRole("textbox").inputValue())}`,
+          );
+          throw error;
+        });
+      const elapsed = performance.now() - started;
+      console.log(`${label}: ${elapsed.toFixed(1)} ms`);
+      expect(elapsed).toBeLessThan(timeout);
+    };
+    await commitText(
+      "200-character ASCII/Latin commit",
+      "AbC xyz 123!? ".repeat(20).slice(0, 200),
+      1000,
+    );
+    await commitText(
+      "200-character mixed Unicode commit",
+      Array.from("Hello 日本語 café 🙂! ".repeat(20)).slice(0, 200).join(""),
+      1000,
+    );
+    const distinct = Array.from({ length: 200 }, (_, index) =>
+      String.fromCodePoint(0x4e00 + index),
+    ).join("");
+    for (let attempt = 1; attempt <= 3; attempt++)
+      await commitText(`200-distinct-CJK commit ${attempt}`, distinct, 3000);
+  } finally {
+    await targetBrowser.close();
+  }
+});
+
 test("disabled input stays off across repeated video clicks", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
   await page.addInitScript(() => {
@@ -74,6 +160,15 @@ test("disabled input stays off across repeated video clicks", async ({ page }) =
   });
   await page.locator("video").click();
   await page.locator("video").click();
+  if (process.platform !== "win32") {
+    const pid = Number(await readFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE!, "utf8"));
+    process.kill(pid, "SIGUSR2");
+    await expect(page.getByTestId("connection-state")).toHaveText("Reconnecting");
+    await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+    await page.locator("video").click();
+    await page.locator("video").click();
+    await page.keyboard.press("a");
+  }
   await expect(page.getByRole("button", { name: "Input off", exact: true })).toHaveAttribute(
     "aria-pressed",
     "false",

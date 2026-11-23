@@ -173,6 +173,8 @@ test("replacement releases the peer and requires manual reconnect", async () => 
   const state = fixture();
   const ws = await socket();
   ws.receive({ type: "hello", sessionId: "one", host: info });
+  state.controllers[0]!.options.preferences!.inputEnabled = false;
+  state.controllers[0]!.options.preferences!.displayId = "secondary";
   ws.receive({ type: "end", reason: "replaced" });
   expect(state.details.at(-1)).toBe("Another viewer took over");
   expect(state.controllers[0]!.stopped).toBe(true);
@@ -183,6 +185,11 @@ test("replacement releases the peer and requires manual reconnect", async () => 
   state.session.connect();
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(FakeSocket.instances.length).toBe(2);
+  FakeSocket.instances[1]!.receive({ type: "hello", sessionId: "two", host: info });
+  expect(state.controllers[1]!.options.preferences).toEqual({
+    inputEnabled: false,
+    displayId: "secondary",
+  });
 });
 
 test("forbidden responses preserve the agent explanation without opening a socket", async () => {

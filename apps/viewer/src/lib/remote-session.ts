@@ -62,6 +62,7 @@ export type RemoteSessionOptions = {
   remoteInputEnabled?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
+  preferences?: { inputEnabled: boolean; displayId?: string };
   operations: RemoteSessionOperations;
   getIceServers?: () => Promise<readonly RTCIceServer[]>;
   revalidateController?: () => Promise<{
@@ -117,6 +118,7 @@ export class RemoteSessionController {
   private pendingHostRestartGeneration: number | null = null;
   private lifecycleGeneration = 0;
   private inputEnabled = false;
+  private readonly preferences: { inputEnabled: boolean; displayId?: string };
   private firstFrameReceived = false;
   private stopPromise: Promise<void> | null = null;
   private signalQueue: Promise<void> = Promise.resolve();
@@ -188,6 +190,7 @@ export class RemoteSessionController {
 
   constructor(options: RemoteSessionOptions) {
     this.options = options;
+    this.preferences = options.preferences ?? { inputEnabled: true };
     this.controllerEpoch = options.controllerEpoch;
     this.remoteInputPolicy = options.remoteInputPolicy !== false;
     this.displays = options.displays;
@@ -265,6 +268,7 @@ export class RemoteSessionController {
 
   setInputEnabled(enabled: boolean): void {
     if (this.phase === "ending" || this.phase === "ended" || this.phase === "failed") return;
+    this.preferences.inputEnabled = enabled;
     this.inputEnabled = enabled && this.remoteInputAllowed && this.isControlOpen();
     if (!enabled) this.releaseInput();
     else this.options.video.focus();
@@ -274,7 +278,9 @@ export class RemoteSessionController {
   selectDisplay(displayId: string): boolean {
     if (!this.inputEnabled || !this.isControlOpen()) return false;
     if (!this.displays.some((display) => display.id === displayId)) return false;
-    return this.sendControl({ type: "display", displayId });
+    if (!this.sendControl({ type: "display", displayId })) return false;
+    this.preferences.displayId = displayId;
+    return true;
   }
 
   sendControl(payload: ControlMessage): boolean {
@@ -283,12 +289,10 @@ export class RemoteSessionController {
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
-    if (
-      !this.inputEnabled &&
-      (payload.type === "pointer" || payload.type === "key" || payload.type === "display")
-    ) {
+    if (!this.inputEnabled && (payload.type === "pointer" || payload.type === "key")) {
       return false;
     }
+    if (payload.type === "display" && !this.remoteInputAllowed) return false;
     const isMotion = payload.type === "pointer" && payload.action === "move";
     const serialized = JSON.stringify(payload);
     if (new TextEncoder().encode(serialized).byteLength > MAX_CONTROL_MESSAGE_BYTES) return false;
@@ -380,10 +384,16 @@ export class RemoteSessionController {
     this.controlChannel = peer.createDataChannel("nanoctl.control.v1", {
       ordered: true,
     });
-    this.inputEnabled = this.remoteInputAllowed && this.controlChannel.readyState === "open";
+    this.inputEnabled =
+      this.preferences.inputEnabled &&
+      this.remoteInputAllowed &&
+      this.controlChannel.readyState === "open";
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
-      this.inputEnabled = this.remoteInputAllowed;
+      this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
+      const displayId = this.preferences.displayId;
+      if (displayId && this.displays.some((display) => display.id === displayId))
+        this.sendControl({ type: "display", displayId });
       this.publishSnapshot();
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
