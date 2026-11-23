@@ -139,6 +139,7 @@ export type ControlMessage =
     }
   | { readonly type: "display"; readonly displayId: string }
   | { readonly type: "release" }
+  | { readonly type: "text"; readonly text: string }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }
   | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number };
 

@@ -91,13 +91,9 @@ describe("remote session lifecycle", () => {
       await controller.start();
       expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(!!mayControl && !!remoteInput);
       if (mayControl && remoteInput) {
-        video.listeners.get("keydown")?.({
-          type: "keydown",
-          code: "KeyV",
-          key: "v",
-          ctrlKey: true,
-          preventDefault: () => {},
-        } as unknown as Event);
+        video.dispatchEvent(
+          Object.assign(new Event("keydown"), { code: "KeyV", key: "v", ctrlKey: true }),
+        );
         await flushSignals();
         expect(peer.sent.map(([label]) => label)).toEqual([
           "nanoctl.clipboard.v1",
@@ -511,19 +507,10 @@ function defineGlobal(name: string, value: unknown): void {
 }
 
 class FakeVideo extends EventTarget {
-  listeners = new Map<string, (event: Event) => void>();
   srcObject: unknown = null;
   videoWidth = 1920;
   videoHeight = 1080;
 
-  override addEventListener(
-    type: string,
-    listener: EventListenerOrEventListenerObject | null,
-    options?: boolean | AddEventListenerOptions,
-  ): void {
-    if (typeof listener === "function") this.listeners.set(type, listener);
-    super.addEventListener(type, listener, options);
-  }
   focused = false;
 
   async play(): Promise<void> {}

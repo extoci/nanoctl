@@ -11,6 +11,7 @@ import {
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { videoRates, type VideoSample } from "./video-rates";
+import { normalizedPosition, videoGeometry } from "./touch-input";
 
 export type RemoteSessionPhase =
   | "negotiating"
@@ -304,7 +305,10 @@ export class RemoteSessionController {
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
-    if (!this.inputEnabled && (payload.type === "pointer" || payload.type === "key")) {
+    if (
+      !this.inputEnabled &&
+      (payload.type === "pointer" || payload.type === "key" || payload.type === "text")
+    ) {
       return false;
     }
     if (payload.type === "display" && !this.remoteInputAllowed) return false;
@@ -571,6 +575,7 @@ export class RemoteSessionController {
   }
 
   private readonly onPointer = (event: PointerEvent): void => {
+    if (event.pointerType === "touch") return;
     if (!this.inputEnabled) return;
     const position = this.normalizedPosition(event);
     if (!position) return;
@@ -587,7 +592,9 @@ export class RemoteSessionController {
     });
   };
 
-  private readonly onPointerCancel = (): void => this.releaseInput();
+  private readonly onPointerCancel = (event: PointerEvent): void => {
+    if (event.pointerType !== "touch") this.releaseInput();
+  };
 
   private readonly onLostPointerCapture = (event: PointerEvent): void => {
     if (event.buttons !== 0) this.releaseInput();
@@ -639,19 +646,12 @@ export class RemoteSessionController {
 
   private normalizedPosition(event: MouseEvent): { x: number; y: number } | null {
     const video = this.options.video;
-    if (video.videoWidth === 0 || video.videoHeight === 0) return null;
-    const rect = video.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    const sourceRatio = video.videoWidth / video.videoHeight;
-    const elementRatio = rect.width / rect.height;
-    const renderedWidth = sourceRatio > elementRatio ? rect.width : rect.height * sourceRatio;
-    const renderedHeight = sourceRatio > elementRatio ? rect.width / sourceRatio : rect.height;
-    const left = rect.left + (rect.width - renderedWidth) / 2;
-    const top = rect.top + (rect.height - renderedHeight) / 2;
-    return {
-      x: clamp01((event.clientX - left) / renderedWidth),
-      y: clamp01((event.clientY - top) / renderedHeight),
-    };
+    const geometry = videoGeometry(
+      video.getBoundingClientRect(),
+      video.videoWidth,
+      video.videoHeight,
+    );
+    return geometry ? normalizedPosition({ x: event.clientX, y: event.clientY }, geometry) : null;
   }
 
   private async applyHostSignal(
@@ -1205,11 +1205,6 @@ export class RemoteSessionController {
       if (oldest) this.processedSignals.delete(oldest);
     }
   }
-}
-
-function clamp01(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(1, value));
 }
 
 function clampWheel(value: number): number {
