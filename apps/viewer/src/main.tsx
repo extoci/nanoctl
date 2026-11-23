@@ -15,6 +15,12 @@ import {
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
 import {
+  buildDebugReport,
+  fetchHostReport,
+  recordDebugEvent,
+  recordMetrics,
+} from "./lib/debug-report";
+import {
   comboMessages,
   connectSteps,
   connectionQuality,
@@ -52,6 +58,7 @@ function Viewer() {
   const [detail, setDetail] = useState("");
   const [selectedDisplay, setSelectedDisplay] = useState("");
   const [showStats, setShowStats] = useState(false);
+  const [debugCopy, setDebugCopy] = useState("");
   const [codecChoice, setCodecChoiceState] = useState<CodecChoice>(() => {
     try {
       return loadCodecChoice();
@@ -199,10 +206,14 @@ function Viewer() {
             : (host.displays.find((display) => display.primary)?.id ?? host.displays[0]?.id ?? ""),
         );
       },
-      onSnapshot: setSnapshot,
+      onSnapshot: (next) => {
+        if (next.metrics) recordMetrics(next.metrics);
+        setSnapshot(next);
+      },
       codecChoice: () => codecChoiceRef.current,
       qualityLimits: () => qualityLimitsRef.current,
       onStatus: (next, message) => {
+        recordDebugEvent(`socket ${next}`, message);
         setStatus(next);
         setDetail(message ?? "");
         if (next !== "online") setSnapshot(initial);
@@ -216,6 +227,45 @@ function Viewer() {
       transport.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    recordDebugEvent(
+      `session ${snapshot.phase}`,
+      [snapshot.reason, snapshot.reconnectAttempt ? `attempt ${snapshot.reconnectAttempt}` : ""]
+        .filter(Boolean)
+        .join("; "),
+    );
+  }, [snapshot.phase, snapshot.reason, snapshot.reconnectAttempt]);
+
+  useEffect(() => {
+    if (snapshot.firstFrameReceived) recordDebugEvent("first frame");
+  }, [snapshot.firstFrameReceived]);
+
+  const copyDebugInfo = async () => {
+    setDebugCopy("Collecting…");
+    const report = await buildDebugReport({
+      info,
+      snapshot,
+      socketStatus: status,
+      socketDetail: detail,
+      codecChoice,
+      hostReport: info?.viewer.mayControl
+        ? await fetchHostReport()
+        : "Host report requires control permission.",
+    });
+    try {
+      await navigator.clipboard.writeText(report);
+      setDebugCopy("Copied");
+    } catch {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([report], { type: "text/markdown" }));
+      link.download = `nanoctl-debug-${new Date().toISOString().replaceAll(":", "-")}.md`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setDebugCopy("Downloaded");
+    }
+    setTimeout(() => setDebugCopy(""), 3_000);
+  };
 
   useEffect(() => {
     const keyboard = (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard;
@@ -686,6 +736,9 @@ function Viewer() {
           <div className="row">
             <button aria-pressed={showStats} onClick={() => setShowStats(!showStats)}>
               Stats
+            </button>
+            <button onClick={() => void copyDebugInfo()} disabled={debugCopy === "Collecting…"}>
+              {debugCopy || "Copy debug info"}
             </button>
           </div>
           <button

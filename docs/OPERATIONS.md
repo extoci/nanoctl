@@ -33,6 +33,18 @@ to the agent user, and fix HTTPS configuration; the agent falls back to HTTP mea
 - Windows: `Get-ScheduledTask -TaskName "nanoctl Agent"`;
   logs: `%LOCALAPPDATA%\nanoctl\agent.log`.
 
+## Debugging
+
+`nanoctl debug` prints a Markdown report to paste into an issue or coding agent: version,
+OS, doctor checks, codecs, encoder backends, displays, redacted configuration and the last
+400 lines of the agent log (`--lines N` to change, `--output FILE` to also save it). The agent
+always keeps an info-level log, independent of console verbosity, at
+`<local data dir>/nanoctl/logs/diagnostics.log` (2 MB, one rotated `.log.1`); `RUST_LOG`
+changes its level. In the viewer, Details → Copy debug info copies the same host report plus
+browser codec support, the last two minutes of stats and the session event timeline; it
+downloads a file instead when the clipboard is unavailable. The host report requires control
+permission.
+
 Run the release installer again as the same desktop user. Download checksums,
 atomic binary activation, service registration and startup rollback remain enforced.
 Windows uses PID/version/token ready-file validation and a stability window; Unix
