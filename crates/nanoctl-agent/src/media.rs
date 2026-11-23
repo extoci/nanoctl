@@ -1921,6 +1921,7 @@ pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
@@ -1966,6 +1967,8 @@ pub fn spawn_video(
                 )?;
                 let mut keyframe_requests = keyframe_requests;
                 let mut link_feedback = link_feedback;
+                let mut viewer_limits = viewer_limits;
+                let mut bitrate_ceiling = quality.max_bitrate_kbps;
                 let mut display_selection = display_selection;
                 let display_selection_feedback = display_selection_feedback;
                 let mut controller = controller;
@@ -2022,10 +2025,22 @@ pub fn spawn_video(
                         && let Some(sample) = *link_feedback.borrow_and_update()
                         && let Some(decision) = controller.observe(sample)
                     {
-                        encoder.apply_bitrate_estimate(
-                            decision.bitrate_kbps,
-                            quality.max_bitrate_kbps,
-                        )?;
+                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
+                        fps = decision.fps;
+                        pacer.set_fps(fps);
+                        forced_keyframe |= scale.update(decision.bitrate_kbps);
+                        producer_stats
+                            .target_kbps
+                            .store(decision.bitrate_kbps, Ordering::Relaxed);
+                        producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                    }
+                    if viewer_limits.has_changed().unwrap_or(false) {
+                        let (ceiling, max_fps) = viewer_limits
+                            .borrow_and_update()
+                            .resolve(quality.max_bitrate_kbps, quality.max_fps);
+                        let decision = controller.set_limits(ceiling, max_fps);
+                        bitrate_ceiling = ceiling;
+                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
                         forced_keyframe |= scale.update(decision.bitrate_kbps);

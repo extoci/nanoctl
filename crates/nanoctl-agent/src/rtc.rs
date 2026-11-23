@@ -148,6 +148,8 @@ pub struct HostPeer {
     #[cfg(feature = "media")]
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
+    viewer_limits: tokio::sync::watch::Sender<crate::adaptive::ViewerLimits>,
+    #[cfg(feature = "media")]
     input_shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")]
     input_revoked: Arc<AtomicBool>,
@@ -516,6 +518,9 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
+        let (viewer_limits, _) =
+            tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
+        #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
             tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
@@ -590,8 +595,10 @@ impl HostPeer {
                 None
             };
             let clipboard_shutdown = input_shutdown.subscribe();
+            let viewer_limits_for_channel = viewer_limits.clone();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
+                let viewer_limits = viewer_limits_for_channel.clone();
                 let input_revoked = input_revoked_for_channel.clone();
                 if channel.label() == "nanoctl.clipboard.v1" {
                     if let Some(backend) = clipboard.clone() {
@@ -620,10 +627,22 @@ impl HostPeer {
                     }
                     return Box::pin(async {});
                 }
+                let reliable = channel.label() == "nanoctl.control.v1";
                 if input.is_none() {
+                    // View-only sessions still adjust stream quality.
+                    if reliable {
+                        channel.on_message(Box::new(move |message: DataChannelMessage| {
+                            if message.is_string
+                                && let Some(limits) =
+                                    crate::adaptive::ViewerLimits::parse(&message.data)
+                            {
+                                viewer_limits.send_replace(limits);
+                            }
+                            Box::pin(async {})
+                        }));
+                    }
                     return Box::pin(async {});
                 }
-                let reliable = channel.label() == "nanoctl.control.v1";
                 if reliable {
                     blocked_notices.attach(&channel);
                 }
@@ -635,6 +654,13 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
+                    if reliable
+                        && message.is_string
+                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
+                    {
+                        viewer_limits.send_replace(limits);
+                        return Box::pin(async {});
+                    }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
                     let sender = sender.clone();
@@ -967,6 +993,8 @@ impl HostPeer {
             #[cfg(feature = "media")]
             display_selection_feedback,
             #[cfg(feature = "media")]
+            viewer_limits,
+            #[cfg(feature = "media")]
             input_shutdown,
             #[cfg(feature = "media")]
             input_revoked,
@@ -1189,6 +1217,11 @@ impl HostPeer {
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub fn link_feedback(&self) -> tokio::sync::watch::Receiver<Option<LinkSample>> {
         self.link_feedback.subscribe()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn viewer_limits(&self) -> tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits> {
+        self.viewer_limits.subscribe()
     }
 
     #[cfg(feature = "media")]

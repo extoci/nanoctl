@@ -34,6 +34,44 @@ struct DelaySignal {
     draining: bool,
 }
 
+/// Caps a viewer asked for over the reliable control channel. They can lower the configured
+/// `quality.max_fps` / `quality.max_bitrate_kbps` for one session, never exceed them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerLimits {
+    pub max_fps: Option<u16>,
+    pub max_bitrate_kbps: Option<u32>,
+}
+
+impl ViewerLimits {
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(flatten)]
+            limits: ViewerLimits,
+        }
+        if !data.windows(9).any(|window| window == b"\"quality\"") {
+            return None;
+        }
+        let envelope: Envelope = serde_json::from_slice(data).ok()?;
+        (envelope.kind == "quality").then_some(envelope.limits)
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn resolve(self, max_bitrate_kbps: u32, max_fps: u16) -> (u32, u16) {
+        (
+            self.max_bitrate_kbps.map_or(max_bitrate_kbps, |cap| {
+                cap.clamp(MIN_BITRATE_KBPS.min(max_bitrate_kbps), max_bitrate_kbps)
+            }),
+            self.max_fps
+                .map_or(max_fps, |cap| cap.clamp(15.min(max_fps), max_fps)),
+        )
+    }
+}
+
 pub struct RateController {
     ceiling: u32,
     max_fps: u16,
@@ -87,6 +125,22 @@ impl RateController {
             last_loss_report: None,
             high_loss_reports: 0,
         }
+    }
+
+    /// Replaces the bitrate ceiling and frame-rate cap mid-session. The current estimate is kept
+    /// below the new ceiling and the frame-rate tier is recomputed immediately.
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn set_limits(&mut self, ceiling_kbps: u32, max_fps: u16) -> RateDecision {
+        self.ceiling = ceiling_kbps;
+        self.max_fps = max_fps.max(1);
+        self.rate = self.rate.clamp(
+            ceiling_kbps.min(MIN_BITRATE_KBPS) as f64,
+            ceiling_kbps as f64,
+        );
+        self.fps = Self::tier(self.rate, self.max_fps);
+        self.low_fps_since = None;
+        self.reported = self.decision();
+        self.reported
     }
 
     pub fn decision(&self) -> RateDecision {
@@ -513,6 +567,61 @@ pub fn frame_changed(prev: &[u8], next: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_limits_lower_but_never_exceed_the_configured_maximums() {
+        let limits =
+            ViewerLimits::parse(br#"{"type":"quality","maxFps":30,"maxBitrateKbps":10000}"#)
+                .unwrap();
+        assert_eq!(limits.resolve(50_000, 60), (10_000, 30));
+        let raised =
+            ViewerLimits::parse(br#"{"type":"quality","maxFps":240,"maxBitrateKbps":900000}"#)
+                .unwrap();
+        assert_eq!(raised.resolve(50_000, 120), (50_000, 120));
+        assert_eq!(ViewerLimits::default().resolve(50_000, 120), (50_000, 120));
+        assert_eq!(
+            ViewerLimits::parse(br#"{"type":"quality","maxFps":1}"#)
+                .unwrap()
+                .resolve(50_000, 60),
+            (50_000, 15)
+        );
+        assert!(ViewerLimits::parse(br#"{"type":"key","code":"quality"}"#).is_none());
+        assert!(ViewerLimits::parse(br#"{"type":"display","displayId":"1"}"#).is_none());
+    }
+
+    #[test]
+    fn set_limits_clamps_rate_and_recomputes_fps() {
+        let mut controller = RateController::new(50_000, 120);
+        let initial = controller.decision();
+        assert_eq!(
+            initial,
+            RateDecision {
+                bitrate_kbps: 4_000,
+                fps: 120
+            }
+        );
+        assert_eq!(
+            controller.set_limits(2_000, 60),
+            RateDecision {
+                bitrate_kbps: 2_000,
+                fps: 30
+            }
+        );
+        assert_eq!(
+            controller.set_limits(50_000, 120),
+            RateDecision {
+                bitrate_kbps: 2_000,
+                fps: 30
+            }
+        );
+        assert_eq!(
+            controller.set_limits(50_000, 24),
+            RateDecision {
+                bitrate_kbps: 2_000,
+                fps: 24
+            }
+        );
+    }
 
     fn sample(at: Instant, loss: f64) -> LinkSample {
         LinkSample {

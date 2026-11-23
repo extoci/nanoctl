@@ -10,6 +10,7 @@ import {
   RemoteSessionController,
   createControllerEpoch,
   type RemoteSessionSnapshot,
+  type QualityLimits,
   type RemoteSessionOptions,
 } from "./remote-session";
 
@@ -47,6 +48,7 @@ export class SocketSession {
       onStatus: (status: SocketStatus, detail?: string) => void;
       createController?: (options: RemoteSessionOptions) => RemoteSessionController;
       codecChoice?: () => CodecChoice;
+      qualityLimits?: () => QualityLimits;
     },
   ) {
     window.addEventListener("pageshow", this.restored);
@@ -156,6 +158,7 @@ export class SocketSession {
                 preferences: this.preferences,
                 videoCodecs: message.host.capabilities.codecs,
                 codecChoice: this.options.codecChoice?.(),
+                qualityLimits: this.options.qualityLimits?.(),
                 operations: {
                   sendSignal: async ({ envelope }) =>
                     this.send(socket, {
