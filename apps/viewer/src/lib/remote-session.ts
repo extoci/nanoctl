@@ -137,6 +137,7 @@ export class RemoteSessionController {
 
   private peer: RTCPeerConnection | null = null;
   private webCodecsVideo: WebCodecsVideoHandle | null = null;
+  private remoteVideoStream: MediaStream | null = null;
   private pendingEncodedStreams: {
     readable: ReadableStream;
     writable: WritableStream;
@@ -500,6 +501,7 @@ export class RemoteSessionController {
       this.peer = null;
       this.webCodecsVideo?.drop();
       this.webCodecsVideo = null;
+      this.remoteVideoStream = null;
       this.pendingEncodedStreams = null;
       const stream = this.options.video.srcObject;
       if (stream instanceof MediaStream) {
@@ -586,18 +588,25 @@ export class RemoteSessionController {
     this.codecPreferencesApplied = false;
     // Chrome only allows encoded streams before any RTP arrives, so the
     // transform must be created here — before negotiation — not in ontrack.
+    // The WebCodecs decode paths only handle Annex-B H.264; "auto" prefers
+    // AV1/HEVC, so gate both paths on an explicit H.264 codec choice.
     const receiver = this.videoTransceiver?.receiver as RTCRtpReceiver | undefined;
     this.pendingEncodedStreams =
-      receiver && supportsWebCodecsVideo(receiver)
+      this.options.codecChoice === "h264" && receiver && supportsWebCodecsVideo(receiver)
         ? (createVideoEncodedStreams(receiver) as {
             readable: ReadableStream;
             writable: WritableStream;
           } | null)
         : null;
+    const restoreRemoteVideo = () => {
+      if (!this.isCurrent(lifecycle, peer) || !this.remoteVideoStream) return;
+      if (this.options.video.srcObject !== this.remoteVideoStream) {
+        this.options.video.srcObject = this.remoteVideoStream;
+        void this.options.video.play().catch(() => {});
+      }
+    };
     // True low-latency path: raw AUs over an unreliable data channel feed
-    // WebCodecs directly — no jitter buffer anywhere. The wire format is
-    // Annex-B H.264 only, so this requires an explicit H.264 codec pick;
-    // "auto" prefers AV1/HEVC which this path cannot decode.
+    // WebCodecs directly — no jitter buffer anywhere.
     if (typeof VideoDecoder === "function" && this.options.codecChoice === "h264") {
       const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
         ordered: false,
@@ -612,6 +621,7 @@ export class RemoteSessionController {
             videoChannel,
             idrChannel,
             this.options.video,
+            restoreRemoteVideo,
           );
         }
       };
@@ -635,13 +645,14 @@ export class RemoteSessionController {
         }
         return;
       }
+      const stream = streams[0] ?? new MediaStream([track]);
+      this.remoteVideoStream = stream;
       // The transform tap sits behind Chrome's jitter buffer anyway, so
       // only use it when the data-channel path did not attach.
       if (this.pendingEncodedStreams && !this.webCodecsVideo) {
         const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
-        this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video);
+        this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video, restoreRemoteVideo);
       }
-      const stream = streams[0] ?? new MediaStream([track]);
       this.options.video.srcObject = stream;
       void this.options.video.play().catch(() => {});
     };
