@@ -320,6 +320,11 @@ kbd {
   font-size: 11px;
   color: #91a5c0;
   font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  transition: right 0.2s ease;
+}
+.panel-open .stats {
+  right: calc(var(--session-panel-width) + 16px);
 }
 .stats span {
   display: flex;
@@ -690,18 +695,6 @@ kbd {
 }
 .soft-keys {
   display: contents;
-}
-.session-panel .stats {
-  position: static;
-  width: auto;
-  grid-template-columns: 1fr auto;
-  gap: 6px 12px;
-  margin: 0;
-}
-.session-panel .stats dd {
-  margin: 0;
-  color: #dae7f8;
-  text-align: right;
 }
 .disconnect {
   margin-top: 16px;
