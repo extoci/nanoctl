@@ -131,7 +131,8 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let value = fs::read_to_string(path)
             .with_context(|| format!("cannot read configuration at {}", path.display()))?;
-        let raw: toml::Value = toml::from_str(&value).context("configuration is invalid")?;
+        let mut raw: toml::Value = toml::from_str(&value).context("configuration is invalid")?;
+        drop_control_plane_defaults(&mut raw);
         let mut known = Self::default();
         known.tailnet.tailscale_cli = Some(PathBuf::new());
         warn_unknown(&raw, &toml::Value::try_from(known)?, "");
@@ -170,6 +171,38 @@ impl AgentConfig {
     }
 }
 
+/// Control-plane releases saved every default to disk, so their `[quality]` and `[features]`
+/// tables pin values that have since changed (audio and clipboard off, 60 fps, 24 Mbps).
+/// Those values are indistinguishable from a choice, so files with the control-plane marker
+/// fall back to current defaults for them; any other value is kept as configured.
+const CONTROL_PLANE_DEFAULTS: [(&str, &str, toml::Value); 4] = [
+    ("quality", "max_fps", toml::Value::Integer(60)),
+    ("quality", "max_bitrate_kbps", toml::Value::Integer(24_000)),
+    ("features", "system_audio", toml::Value::Boolean(false)),
+    ("features", "clipboard", toml::Value::Boolean(false)),
+];
+
+fn drop_control_plane_defaults(raw: &mut toml::Value) {
+    let Some(root) = raw.as_table_mut() else {
+        return;
+    };
+    if !root.contains_key("control_plane_url") {
+        return;
+    }
+    for (section, key, legacy) in &CONTROL_PLANE_DEFAULTS {
+        let Some(table) = root.get_mut(*section).and_then(toml::Value::as_table_mut) else {
+            continue;
+        };
+        if table.get(*key) == Some(legacy) {
+            table.remove(*key);
+            tracing::warn!(
+                key = format!("{section}.{key}"),
+                "using the current default instead of a value saved by a control-plane release; remove control_plane_url to keep it"
+            );
+        }
+    }
+}
+
 fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
     if let Some(table) = value.as_table() {
         for (key, value) in table {
@@ -195,6 +228,49 @@ mod tests {
         assert!(AgentConfig::load(&path).unwrap().tailnet.discover_peers);
         fs::write(&path, "[tailnet]\ndiscover_peers = false\n").unwrap();
         assert!(!AgentConfig::load(&path).unwrap().tailnet.discover_peers);
+    }
+
+    #[test]
+    fn control_plane_defaults_fall_back_to_current_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let saved = [
+            "device_id = 'old'",
+            "control_plane_url = 'https://old.example'",
+            "[quality]",
+            "max_fps = 60",
+            "max_bitrate_kbps = 24000",
+            "max_width = 1920",
+            "[features]",
+            "system_audio = false",
+            "clipboard = false",
+            "remote_input = false",
+        ]
+        .join("\n");
+        fs::write(&path, &saved).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        let defaults = AgentConfig::default();
+        assert_eq!(config.quality.max_fps, defaults.quality.max_fps);
+        assert_eq!(
+            config.quality.max_bitrate_kbps,
+            defaults.quality.max_bitrate_kbps
+        );
+        assert_eq!(config.quality.max_width, 1920);
+        assert!(config.features.system_audio);
+        assert!(config.features.clipboard);
+        assert!(!config.features.remote_input);
+
+        fs::write(&path, saved.replace("max_fps = 60", "max_fps = 120")).unwrap();
+        assert_eq!(AgentConfig::load(&path).unwrap().quality.max_fps, 120);
+
+        fs::write(
+            &path,
+            "[quality]\nmax_fps = 60\n[features]\nsystem_audio = false\n",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert_eq!(config.quality.max_fps, 60);
+        assert!(!config.features.system_audio);
     }
 
     #[test]

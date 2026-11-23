@@ -97,8 +97,16 @@ impl TryFrom<WireSnapshot> for Snapshot {
 }
 
 #[cfg(feature = "media")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateStatus {
+    Applied,
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+    Retry,
+}
+
+#[cfg(feature = "media")]
 trait VirtualPad: Send {
-    fn update(&mut self, report: PadReport) -> Result<()>;
+    fn update(&mut self, report: PadReport) -> Result<UpdateStatus>;
 }
 
 #[cfg(feature = "media")]
@@ -149,10 +157,10 @@ impl Gamepads {
             for current in &mut self.pads {
                 if let Some(pad) = current {
                     let neutral = PadReport::neutral(pad.kind);
-                    if pad.target.update(neutral).is_err() {
-                        *current = None;
-                    } else {
-                        pad.last = Some(neutral);
+                    match pad.target.update(neutral) {
+                        Ok(UpdateStatus::Applied) => pad.last = Some(neutral),
+                        Ok(UpdateStatus::Retry) => {}
+                        Err(_) => *current = None,
                     }
                 }
             }
@@ -171,8 +179,8 @@ fn apply(current: &mut Option<Pad>, slot: usize, report: PadReport) -> Result<()
     }
     if let Some(pad) = current
         && pad.last != Some(report)
+        && pad.target.update(report)? == UpdateStatus::Applied
     {
-        pad.target.update(report)?;
         pad.last = Some(report);
     }
     Ok(())
@@ -217,13 +225,17 @@ fn attach(_slot: usize, _kind: PadKind) -> Result<Box<dyn VirtualPad>> {
     }
     #[cfg(target_os = "windows")]
     {
-        let client = vigem_client::Client::connect()?;
+        use anyhow::Context;
+
+        let client = vigem_client::Client::connect().context("ViGEmBus connect")?;
         match _kind {
             PadKind::Xbox360 => {
                 let mut target =
                     vigem_client::Xbox360Wired::new(client, vigem_client::TargetId::XBOX360_WIRED);
-                target.plugin()?;
-                target.wait_ready()?;
+                target.plugin().context("ViGEmBus Xbox 360 plugin")?;
+                target
+                    .wait_ready()
+                    .context("ViGEmBus Xbox 360 wait_ready")?;
                 Ok(Box::new(target))
             }
             PadKind::DualShock4 => {
@@ -231,8 +243,10 @@ fn attach(_slot: usize, _kind: PadKind) -> Result<Box<dyn VirtualPad>> {
                     client,
                     vigem_client::TargetId::DUALSHOCK4_WIRED,
                 );
-                target.plugin()?;
-                target.wait_ready()?;
+                target.plugin().context("ViGEmBus DualShock 4 plugin")?;
+                target
+                    .wait_ready()
+                    .context("ViGEmBus DualShock 4 wait_ready")?;
                 Ok(Box::new(target))
             }
         }
@@ -241,11 +255,28 @@ fn attach(_slot: usize, _kind: PadKind) -> Result<Box<dyn VirtualPad>> {
     anyhow::bail!("gamepad forwarding unavailable")
 }
 
+// ViGEmBus returns STATUS_NO_MORE_ENTRIES (Win32 ERROR_NO_MORE_ITEMS = 259)
+// when a report is submitted before Windows has queued a pending HID read IRP.
+#[cfg(all(feature = "media", target_os = "windows"))]
+const ERROR_NO_MORE_ITEMS: u32 = 259;
+
+#[cfg(all(feature = "media", target_os = "windows"))]
+fn map_vigem_update(result: Result<(), vigem_client::Error>) -> Result<UpdateStatus> {
+    match result {
+        Ok(()) => Ok(UpdateStatus::Applied),
+        Err(
+            vigem_client::Error::WinError(ERROR_NO_MORE_ITEMS)
+            | vigem_client::Error::TargetNotReady,
+        ) => Ok(UpdateStatus::Retry),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(all(feature = "media", target_os = "windows"))]
 impl VirtualPad for vigem_client::Xbox360Wired<vigem_client::Client> {
-    fn update(&mut self, report: PadReport) -> Result<()> {
+    fn update(&mut self, report: PadReport) -> Result<UpdateStatus> {
         let Report(buttons, lt, rt, lx, ly, rx, ry) = report.state;
-        self.update(&vigem_client::XGamepad {
+        map_vigem_update(self.update(&vigem_client::XGamepad {
             buttons: buttons.into(),
             left_trigger: lt,
             right_trigger: rt,
@@ -253,8 +284,7 @@ impl VirtualPad for vigem_client::Xbox360Wired<vigem_client::Client> {
             thumb_ly: ly,
             thumb_rx: rx,
             thumb_ry: ry,
-        })?;
-        Ok(())
+        }))
     }
 }
 
@@ -313,13 +343,13 @@ fn encode_ds4(Report(buttons, lt, rt, lx, ly, rx, ry): Report, ds4: Ds4Buttons) 
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "media", target_os = "windows"))]
 impl VirtualPad for vigem_client::DualShock4Wired<vigem_client::Client> {
-    fn update(&mut self, report: PadReport) -> Result<()> {
+    fn update(&mut self, report: PadReport) -> Result<UpdateStatus> {
         let encoded = encode_ds4(report.state, report.ds4.unwrap_or_default());
         let [thumb_lx, thumb_ly, thumb_rx, thumb_ry] = encoded.sticks;
         let [trigger_l, trigger_r] = encoded.triggers;
-        self.update(&vigem_client::DS4Report {
+        map_vigem_update(self.update(&vigem_client::DS4Report {
             thumb_lx,
             thumb_ly,
             thumb_rx,
@@ -328,8 +358,7 @@ impl VirtualPad for vigem_client::DualShock4Wired<vigem_client::Client> {
             special: encoded.special,
             trigger_l,
             trigger_r,
-        })?;
-        Ok(())
+        }))
     }
 }
 
@@ -344,7 +373,7 @@ struct MockPad(usize, std::fs::File);
 
 #[cfg(all(feature = "media", debug_assertions))]
 impl VirtualPad for MockPad {
-    fn update(&mut self, report: PadReport) -> Result<()> {
+    fn update(&mut self, report: PadReport) -> Result<UpdateStatus> {
         use std::io::Write;
         if let Some(ds4) = report.ds4 {
             let encoded = encode_ds4(report.state, ds4);
@@ -359,7 +388,7 @@ impl VirtualPad for MockPad {
             let Report(buttons, lt, rt, lx, ly, rx, ry) = report.state;
             writeln!(self.1, "{} {buttons} {lt} {rt} {lx} {ly} {rx} {ry}", self.0)?;
         }
-        Ok(())
+        Ok(UpdateStatus::Applied)
     }
 }
 
@@ -489,6 +518,82 @@ mod tests {
                 encode_ds4(Report(mask, 0, 0, 0, 0, 0, 0), Ds4Buttons::default()).buttons,
                 expected
             );
+        }
+    }
+
+    #[cfg(feature = "media")]
+    mod media_tests {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+
+        struct ScriptedPad {
+            outcomes: VecDeque<Result<UpdateStatus>>,
+            updates: Arc<Mutex<Vec<PadReport>>>,
+        }
+
+        impl VirtualPad for ScriptedPad {
+            fn update(&mut self, report: PadReport) -> Result<UpdateStatus> {
+                self.updates.lock().unwrap().push(report);
+                self.outcomes
+                    .pop_front()
+                    .unwrap_or(Ok(UpdateStatus::Applied))
+            }
+        }
+
+        #[test]
+        fn transient_retry_keeps_pad_attached_and_retries_same_report() {
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let mut slot = Some(Pad {
+                kind: PadKind::DualShock4,
+                target: Box::new(ScriptedPad {
+                    outcomes: VecDeque::from([Ok(UpdateStatus::Retry), Ok(UpdateStatus::Applied)]),
+                    updates: Arc::clone(&updates),
+                }),
+                last: None,
+            });
+            let report = PadReport {
+                state: Report(0x1000, 128, 0, 100, -100, 0, 0),
+                ds4: Some(Ds4Buttons::default()),
+            };
+
+            apply(&mut slot, 0, report).unwrap();
+            assert!(slot.is_some());
+            assert_eq!(slot.as_ref().unwrap().last, None);
+
+            apply(&mut slot, 0, report).unwrap();
+            assert_eq!(slot.as_ref().unwrap().last, Some(report));
+
+            // Subsequent identical snapshot is deduplicated once applied.
+            apply(&mut slot, 0, report).unwrap();
+            assert_eq!(updates.lock().unwrap().as_slice(), &[report, report]);
+        }
+
+        #[test]
+        fn neutralize_if_idle_keeps_pad_on_retry_and_drops_on_fatal_error() {
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let mut gamepads = Gamepads::default();
+            gamepads.pads[0] = Some(Pad {
+                kind: PadKind::Xbox360,
+                target: Box::new(ScriptedPad {
+                    outcomes: VecDeque::from([
+                        Ok(UpdateStatus::Retry),
+                        Err(anyhow::anyhow!("bus disconnected")),
+                    ]),
+                    updates: Arc::clone(&updates),
+                }),
+                last: None,
+            });
+
+            gamepads.last_snapshot = Some(Instant::now() - Duration::from_secs(5));
+            gamepads.neutralize_if_idle(Duration::from_secs(1));
+            assert!(gamepads.pads[0].is_some());
+            assert_eq!(gamepads.pads[0].as_ref().unwrap().last, None);
+
+            gamepads.last_snapshot = Some(Instant::now() - Duration::from_secs(5));
+            gamepads.neutralize_if_idle(Duration::from_secs(1));
+            assert!(gamepads.pads[0].is_none());
         }
     }
 }

@@ -14,7 +14,7 @@ Types and validators live in `packages/protocol`.
   {
     "hostName": "desktop",
     "platform": "linux",
-    "version": "3.0.0-alpha.3",
+    "version": "3.0.0-alpha.4",
     "displays": [
       {
         "id": "59",
@@ -105,7 +105,9 @@ transceiver. The agent sends a separate Opus RTP track: 48 kHz stereo, 20 ms fra
 RTCP is drained independently, and bounded audio queues drop stale work rather than
 blocking video. Capture starts after the peer connects and stops with the session.
 
-`features.system_audio` defaults to true. Linux requires `parec` and a reachable
+`features.system_audio` defaults to true. Configuration files saved by control-plane releases
+(they contain `control_plane_url`) pinned it to false; that saved value is treated as unset.
+Linux requires `parec` and a reachable
 PulseAudio/PipeWire-pulse server; capture reads `@DEFAULT_MONITOR@`, not the microphone.
 Windows uses WASAPI output-device loopback. macOS system audio is unsupported and
 advertised false. Opus is bundled statically, so no runtime libopus installation is needed.
