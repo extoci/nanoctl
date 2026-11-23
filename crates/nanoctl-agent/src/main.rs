@@ -7,6 +7,8 @@ mod linux_encoder;
 mod macos_encoder;
 #[cfg(feature = "media")]
 mod media;
+#[cfg(all(feature = "media", target_os = "linux"))]
+mod nvenc_encoder;
 mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;
