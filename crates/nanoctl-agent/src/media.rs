@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
+use openh264::decoder::Decoder;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, MatrixCoefficients,
     QpRange, RateControlMode, UsageType, VuiConfig,
@@ -367,6 +368,8 @@ pub struct CaptureEncoder {
     latest_frame: Arc<LatestFrame>,
     display_id: String,
     encoder: EncoderBackend,
+    /// In-process decode-and-compare probe used by `media-smoke` to report PSNR.
+    psnr: Option<PsnrProbe>,
     #[cfg(target_os = "windows")]
     resizer: resize::RgbaResizer,
 }
@@ -641,6 +644,112 @@ impl YUVSource for I420Frame {
     }
 }
 
+/// Decode-and-compare probe for `media-smoke`: each encoded access unit goes back through
+/// OpenH264's decoder and the result is compared (Y+U+V PSNR, dB) against the exact I420
+/// the encoder consumed. Opt-in so production sessions pay nothing.
+struct PsnrProbe {
+    decoder: Decoder,
+    scratch: Option<I420Frame>,
+    pub decoded: u64,
+    pub samples: Vec<f64>,
+}
+
+impl PsnrProbe {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            decoder: Decoder::new().context("H.264 decoder is unavailable")?,
+            scratch: None,
+            decoded: 0,
+            samples: Vec::new(),
+        })
+    }
+
+    fn observe(&mut self, image: &RgbaFrame<'_>, access_unit: &[u8]) {
+        if let Err(error) = self.observe_inner(image, access_unit) {
+            tracing::debug!(%error, "psnr probe skipped a frame");
+        }
+    }
+
+    fn observe_inner(&mut self, image: &RgbaFrame<'_>, access_unit: &[u8]) -> Result<()> {
+        let dimensions = (image.width() as usize, image.height() as usize);
+        if self
+            .scratch
+            .as_ref()
+            .is_none_or(|frame| (frame.width, frame.height) != dimensions)
+        {
+            self.scratch = Some(I420Frame::new(dimensions.0, dimensions.1)?);
+        }
+        let source = self
+            .scratch
+            .as_mut()
+            .context("I420 buffer is unavailable")?;
+        source.read_rgba(image.as_raw())?;
+        let Some(decoded) = self
+            .decoder
+            .decode(access_unit)
+            .context("H.264 decode failed")?
+        else {
+            return Ok(());
+        };
+        if decoded.dimensions() != dimensions {
+            return Ok(());
+        }
+        self.decoded += 1;
+        self.samples.push(i420_psnr(source, &decoded));
+        Ok(())
+    }
+}
+
+fn plane_mse(
+    source: &[u8],
+    source_stride: usize,
+    decoded: &[u8],
+    decoded_stride: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    let mut sum = 0f64;
+    for row in 0..height {
+        let source_row = &source[row * source_stride..row * source_stride + width];
+        let decoded_row = &decoded[row * decoded_stride..row * decoded_stride + width];
+        for (&a, &b) in source_row.iter().zip(decoded_row.iter()) {
+            let d = f64::from(a) - f64::from(b);
+            sum += d * d;
+        }
+    }
+    sum
+}
+
+/// PSNR (dB) over all three I420 planes; identical frames report the 99dB cap.
+fn i420_psnr(source: &I420Frame, decoded: &impl YUVSource) -> f64 {
+    let (width, height) = source.dimensions();
+    let (sy, su, sv) = decoded.strides();
+    let pixels = (width * height) as f64;
+    let mse_sum = plane_mse(source.y(), width, decoded.y(), sy, width, height)
+        + plane_mse(
+            source.u(),
+            width / 2,
+            decoded.u(),
+            su,
+            width / 2,
+            height / 2,
+        )
+        + plane_mse(
+            source.v(),
+            width / 2,
+            decoded.v(),
+            sv,
+            width / 2,
+            height / 2,
+        );
+    let mse = mse_sum / (pixels * 1.5);
+    if mse <= 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    }
+}
+
 impl CaptureEncoder {
     #[allow(clippy::too_many_arguments)]
     pub fn primary(
@@ -692,6 +801,7 @@ impl CaptureEncoder {
             display_id,
             encoder,
             #[cfg(target_os = "windows")]
+            psnr: None,
             resizer: resize::RgbaResizer::default(),
         })
     }
@@ -727,6 +837,17 @@ impl CaptureEncoder {
 
     fn current_display_id(&self) -> &str {
         &self.display_id
+    }
+
+    pub fn enable_psnr_probe(&mut self) -> Result<()> {
+        self.psnr = Some(PsnrProbe::new()?);
+        Ok(())
+    }
+
+    pub fn psnr_report(&self) -> Option<(u64, &[f64])> {
+        self.psnr
+            .as_ref()
+            .map(|probe| (probe.decoded, probe.samples.as_slice()))
     }
 
     pub fn apply_bitrate_estimate(
@@ -810,6 +931,9 @@ impl CaptureEncoder {
         let color_before = self.encoder.color_convert_ns();
         let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
+        if let Some(probe) = self.psnr.as_mut() {
+            probe.observe(&image, &encoded.bytes);
+        }
         #[cfg(target_os = "linux")]
         trace::encoded(frame, &encoded.bytes, trace_started, trace::now());
         self.latest_frame.stats.backend_ns.fetch_add(
@@ -1392,10 +1516,13 @@ fn encode_threads() -> u16 {
 }
 
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
-    let (complexity, skip_frames) = match latency_mode {
-        LatencyMode::Responsiveness => (Complexity::Low, true),
-        LatencyMode::Balanced => (Complexity::Medium, true),
-        LatencyMode::Quality => (Complexity::High, false),
+    let (complexity, skip_frames, qp_min) = match latency_mode {
+        // Responsiveness caps QP at 26: below ~47dB PSNR the bits are invisible on easy
+        // scenes anyway, and the floor only binds there — a ~40% bitstream cut on
+        // low-motion desktops at no perceptible quality cost (measured in NOTES.md).
+        LatencyMode::Responsiveness => (Complexity::Low, true, 26),
+        LatencyMode::Balanced => (Complexity::Medium, true, 14),
+        LatencyMode::Quality => (Complexity::High, false, 14),
     };
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
@@ -1409,7 +1536,7 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         )
         .rate_control_mode(RateControlMode::Bitrate)
         // A zero minimum is OpenH264's sentinel for its lossy 26–35 screen default.
-        .qp(QpRange::new(14, 51))
+        .qp(QpRange::new(qp_min, 51))
         .complexity(complexity)
         .skip_frames(skip_frames)
         // Slice-parallel encode: OpenH264 only uses encoder threads when the
@@ -1733,6 +1860,16 @@ struct TimingPercentiles {
     encode_p95_milliseconds: f64,
 }
 
+fn percentile_f64(samples: &[f64], percentile: f64) -> f64 {
+    let Some(last) = samples.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((last as f64) * percentile).round() as usize;
+    sorted[index.min(last)]
+}
+
 fn percentile_milliseconds(samples: &[u64], percentile: f64) -> f64 {
     let Some(last) = samples.len().checked_sub(1) else {
         return 0.0;
@@ -1765,6 +1902,11 @@ pub struct MediaSmokeReport {
     pub capture_to_encode_p95_milliseconds: f64,
     pub encode_p50_milliseconds: f64,
     pub encode_p95_milliseconds: f64,
+    /// Y+U+V PSNR (dB) of each decoded access unit vs its I420 source; None when the
+    /// probe was off. p05 is the worst tail — the number a marketing claim must survive.
+    pub psnr_p50_db: Option<f64>,
+    pub psnr_p05_db: Option<f64>,
+    pub psnr_decoded_frames: u64,
     pub width: u32,
     pub height: u32,
     pub idr_frames: u64,
@@ -1793,6 +1935,12 @@ impl MediaSmokeReport {
             self.sps_units,
             self.pps_units
         );
+        if let (Some(p50), Some(p05)) = (self.psnr_p50_db, self.psnr_p05_db) {
+            println!(
+                "media-smoke psnr_p50_db={:.2} psnr_p05_db={:.2} psnr_frames={}",
+                p50, p05, self.psnr_decoded_frames
+            );
+        }
     }
 }
 
@@ -1819,7 +1967,11 @@ fn refresh_to_fps(hz: f32) -> Option<u16> {
     (hz.is_finite() && hz >= 23.5).then(|| (hz.round() as u16).clamp(24, 240))
 }
 
-pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeReport> {
+pub fn run_smoke(
+    quality: &QualityConfig,
+    seconds: u64,
+    measure_psnr: bool,
+) -> Result<MediaSmokeReport> {
     let quality = &QualityConfig {
         max_fps: effective_max_fps(quality.max_fps),
         ..quality.clone()
@@ -1838,6 +1990,9 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         false,
         Arc::default(),
     )?;
+    if measure_psnr {
+        encoder.enable_psnr_probe()?;
+    }
     let started_unix_seconds = crate::update::unix_time_now()?;
     let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
@@ -1889,6 +2044,9 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
     // Auto mode may switch from a native encoder to OpenH264 after the first real frame. Report
     // the backend that completed the smoke test, not merely the one that initialized.
     let backend = encoder.encoder.name();
+    let psnr = encoder
+        .psnr_report()
+        .map(|(decoded, samples)| (decoded, samples.to_vec()));
     let timing = timing_samples.percentiles();
     Ok(MediaSmokeReport {
         schema_version: 1,
@@ -1912,6 +2070,13 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         capture_to_encode_p95_milliseconds: timing.capture_to_encode_p95_milliseconds,
         encode_p50_milliseconds: timing.encode_p50_milliseconds,
         encode_p95_milliseconds: timing.encode_p95_milliseconds,
+        psnr_p50_db: psnr
+            .as_ref()
+            .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.50))),
+        psnr_p05_db: psnr
+            .as_ref()
+            .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.05))),
+        psnr_decoded_frames: psnr.map_or(0, |(d, _)| d),
         width: dimensions.0,
         height: dimensions.1,
         idr_frames,
@@ -2993,6 +3158,7 @@ mod tests {
                 (64, 64),
             )
             .unwrap(),
+            psnr: None,
             #[cfg(target_os = "windows")]
             resizer: super::resize::RgbaResizer::default(),
         };
@@ -3581,7 +3747,13 @@ mod tests {
                 )
             };
             assert_eq!(result, 0);
-            assert_eq!((params.iMinQp, params.iMaxQp), (14, 51));
+            // Responsiveness floors QP at 26 to stop paying for invisible quality on
+            // easy scenes; the fidelity modes keep the full range.
+            let expected_min_qp = match mode {
+                LatencyMode::Responsiveness => 26,
+                _ => 14,
+            };
+            assert_eq!((params.iMinQp, params.iMaxQp), (expected_min_qp, 51));
             assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
             assert_eq!(params.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
             let layer = &params.sSpatialLayers[0];

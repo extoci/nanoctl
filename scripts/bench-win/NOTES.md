@@ -74,6 +74,27 @@ Moonlight's native client burns 43% CPU vs agent's ~21%.
 target bitrate — Sunshine pads toward it; nanoctl's is measured output
 on a mostly-static desktop, so the gap shrinks on high-motion content.
 
+## Rate-vs-quality frontier (`media-smoke --psnr`, same scene)
+
+`media-smoke --psnr` decodes every access unit in-process and reports
+Y+U+V PSNR vs the I420 the encoder consumed (p05 = worst tail). Measured
+the QP-floor frontier at 1600x1200 responsiveness, 20s each:
+
+| qp_min | kbps | PSNR p50 | PSNR p05 |
+| ------ | ---- | -------- | -------- |
+| 14 (was default) | 606 | 50.8 | 49.2 |
+| 22               | 486 | 49.9 | 48.5 |
+| 24               | 416 | 48.5 | 47.2 |
+| 26               | 363-370 | 47.1 | 46.2 |
+| 30               | 373 | 45.0 | 45.0 |
+
+qp_min=26 ships for Responsiveness: **-39% bits** (606->370kbps) while
+the worst tail stays >=46dB — well above the ~40dB transparent threshold;
+the floor only binds on easy scenes, which is exactly where bits are
+wasted. Encode time unchanged (~7ms p50). Also swept and rejected:
+usage=screen (+6x encode cost), AQ/BGD/SCD off (bitrate balloons 2.4x),
+threads 8 / slice 800 (noise).
+
 ## Input-to-photon (click through the viewer)
 
 benchwin's band counts WM_LBUTTONDOWN in its marker; clicking the streamed

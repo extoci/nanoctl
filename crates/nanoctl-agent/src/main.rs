@@ -119,6 +119,10 @@ enum Command {
         /// Fail instead of falling back to the software encoder.
         #[arg(long)]
         require_hardware: bool,
+        /// Also decode each access unit in-process and report Y+U+V PSNR vs the source.
+        /// Adds a few ms of work per frame; leave off when measuring throughput/latency.
+        #[arg(long)]
+        psnr: bool,
         /// Print the acceptance record as JSON.
         #[arg(long)]
         json: bool,
@@ -350,6 +354,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::MediaSmoke {
             seconds,
             require_hardware,
+            psnr,
             json,
         } => {
             let mut config = AgentConfig::load_or_default(&config_path)?;
@@ -357,7 +362,7 @@ async fn run(cli: Cli) -> Result<()> {
             if require_hardware {
                 config.quality.encoder = crate::config::EncoderPreference::Hardware;
             }
-            let report = crate::media::run_smoke(&config.quality, seconds)?;
+            let report = crate::media::run_smoke(&config.quality, seconds, psnr)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
