@@ -31,6 +31,7 @@ jobs:
         with:
           key: viewer
           workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/ms-playwright
@@ -60,6 +61,7 @@ jobs:
         with:
           key: agent-${{ matrix.os }}
           workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: runner.os == 'Windows'
         shell: pwsh
@@ -118,15 +120,19 @@ jobs:
         with:
           key: media-linux
           workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
+      - name: Refresh apt index
+        run: sudo apt-get update
       - name: Install native capture dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          execute_install_scripts: true
+          packages: >
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
             cmake nasm pkg-config
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
@@ -176,6 +182,7 @@ jobs:
         with:
           key: media-${{ matrix.os }}
           workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: runner.os == 'Windows'
         shell: pwsh
@@ -215,6 +222,7 @@ jobs:
         with:
           key: media-package-${{ matrix.os }}
           workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: runner.os == 'Windows'
         shell: pwsh
@@ -226,14 +234,18 @@ jobs:
           Add-MpPreference -ExclusionProcess link.exe
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
+      - name: Refresh apt index
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get update
       - name: Install native capture dependencies
         if: matrix.os == 'ubuntu-24.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          execute_install_scripts: true
+          packages: >
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
             cmake nasm pkg-config
       - name: Build release media binary
         run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
@@ -285,6 +297,7 @@ jobs:
         with:
           key: release-${{ matrix.runner }}
           workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -294,15 +307,20 @@ jobs:
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
-      - name: Install Linux media dependencies
+      - name: Refresh apt index
         if: matrix.platform == 'linux'
         shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
+        run: sudo apt-get update
+      - name: Install Linux media dependencies
+        if: matrix.platform == 'linux'
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          execute_install_scripts: true
+          packages: >
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
+            cmake nasm pkg-config
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'
