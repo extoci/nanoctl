@@ -379,17 +379,18 @@ mod tests {
         let frame = RgbaFrame::from_raw(64, 64, pixels.as_raw().as_slice()).unwrap();
         assert_eq!(backend.software_backend(), ("x264", "software-x264"));
         backend.set_bitrate(8_000).unwrap();
-        let ResilientX264::Native(native) = &backend else {
+        assert!(!backend.encode(&frame).unwrap().bytes.is_empty());
+        let ResilientX264::Native(native) = &mut backend else {
             panic!("expected x264")
         };
         assert_eq!(native.active.parameters().bitrate, 8_000);
-        assert!(!backend.encode(&frame).unwrap().bytes.is_empty());
         let empty = RgbaFrame::from_raw(0, 0, &[][..]).unwrap();
         assert!(backend.encode(&empty).is_err());
         assert_eq!(
             backend.software_backend(),
             ("OpenH264", "software-openh264")
         );
+        assert!(!backend.encode(&frame).unwrap().bytes.is_empty());
         backend.set_bitrate(1_000).unwrap();
         backend.force_keyframe();
         let recovered = backend.encode(&frame).unwrap();
