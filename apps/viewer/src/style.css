@@ -12,6 +12,43 @@
   font-synthesis: none;
   color-scheme: dark;
 }
+.host-picker {
+  position: relative;
+}
+.host-trigger {
+  padding: 4px 8px;
+  font-weight: 600;
+}
+.host-options {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 10;
+  min-width: 270px;
+  padding: 6px;
+  background: #121a27;
+  border: 1px solid #2a3546;
+  border-radius: 8px;
+  box-shadow: 0 12px 32px #0008;
+}
+.host-options button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px;
+  text-align: left;
+}
+.host-options small {
+  margin-left: auto;
+  color: #9aabc1;
+}
+.offline-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #718096;
+}
 * {
   box-sizing: border-box;
 }
@@ -404,6 +441,23 @@ kbd {
   .host {
     padding-left: 10px;
     gap: 2px;
+    flex: 1;
+  }
+  .host-trigger {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .host-options {
+    position: fixed;
+    left: 10px;
+    right: 10px;
+    top: 76px;
+    min-width: 0;
+  }
+  .host-options button {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .host strong {
     white-space: nowrap;
@@ -411,6 +465,11 @@ kbd {
   }
   .host span {
     font-size: 10px;
+  }
+  .host > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .stage {
     touch-action: none;
