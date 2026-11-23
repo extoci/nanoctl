@@ -21,6 +21,7 @@
     "typecheck": "node node_modules/@typescript/native/bin/tsc --build && node node_modules/@typescript/native/bin/tsc -p tests/browser/tsconfig.json",
     "test": "bun test apps/viewer packages scripts",
     "test:browser": "bun run build:viewer && playwright test -c tests/browser/playwright.config.ts",
+    "test:latency": "bun run build:viewer && NANOCTL_BROWSER_LATENCY=1 playwright test -c tests/browser/playwright.config.ts latency.spec.ts",
     "test:agent": "bun run scripts/cargo.ts test --features rtc",
     "evidence:media": "bun run scripts/verify-media-evidence.ts",
     "evidence:network": "bun run scripts/verify-network-evidence.ts",

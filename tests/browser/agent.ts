@@ -8,6 +8,7 @@ await mkdir(cache, { recursive: true });
 const directory = await mkdtemp(join(cache, "nanoctl-browser-"));
 const config = join(directory, "config.toml");
 const port = Number(process.env.NANOCTL_BROWSER_PORT);
+const latency = process.env.NANOCTL_BROWSER_LATENCY === "1";
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Browser-test port required");
 await writeFile(
@@ -37,7 +38,8 @@ const start = () =>
     [
       "run",
       "--features",
-      process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
+      latency || process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
+      ...(latency ? ["--release", "--locked"] : []),
       "--manifest-path",
       "crates/nanoctl-agent/Cargo.toml",
       "--",

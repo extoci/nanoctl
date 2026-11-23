@@ -329,6 +329,9 @@ function Viewer() {
           <small>
             {info?.platform ?? "Tailnet"} · {info?.remoteInput ? "Control" : "View only"} ·{" "}
             <span>{info?.viewer.identity.login ?? "Authenticating…"}</span>
+            {info?.capabilities.clipboard && info.remoteInput && info.viewer.mayControl
+              ? " · Clipboard sync on"
+              : ""}
           </small>
         </header>
         <div className="toolbar">
