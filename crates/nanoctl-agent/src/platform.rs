@@ -109,10 +109,19 @@ pub fn capabilities(
         protocol_version: 2,
         platform: PLATFORM,
         architecture: ARCHITECTURE,
-        codecs: if cfg!(feature = "media") {
-            vec!["h264"]
-        } else {
-            Vec::new()
+        codecs: {
+            #[cfg(feature = "media")]
+            {
+                crate::media::ensure_codecs_probed(encoder_preference);
+                crate::codec::host_codecs()
+                    .into_iter()
+                    .map(crate::codec::VideoCodec::id)
+                    .collect()
+            }
+            #[cfg(not(feature = "media"))]
+            {
+                Vec::new()
+            }
         },
         encoder_backends,
         ready: cfg!(feature = "media")

@@ -212,7 +212,7 @@ export type AudioOutputState = {
   readonly selectedId: string | null;
 };
 
-export type VideoCodec = "h264" | "vp9" | "av1";
+export type VideoCodec = "h264" | "hevc" | "vp9" | "av1";
 
 export type HostInfo = {
   readonly hostName: string;

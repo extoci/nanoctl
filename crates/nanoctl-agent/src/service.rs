@@ -118,6 +118,7 @@ pub(crate) fn spawn_media(
             max_height: config.quality.max_height,
             latency_mode: config.quality.latency_mode,
             encoder_preference: config.quality.encoder,
+            codec: peer.video_codec(),
         },
     )
 }

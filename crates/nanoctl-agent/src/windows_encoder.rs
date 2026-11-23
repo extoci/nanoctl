@@ -9,8 +9,9 @@ use std::ptr;
 use std::slice;
 use std::time::{Duration, Instant};
 
+use crate::codec::VideoCodec;
 use crate::config::LatencyMode;
-use crate::media::{EncodedFrame, FrameEncoder, annex_b_nal_types};
+use crate::media::{EncodedFrame, FrameEncoder};
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Media::MediaFoundation::*;
@@ -169,6 +170,7 @@ impl Drop for ActivatedTransformGuard {
 
 pub struct WindowsEncoder {
     _runtime: MediaFoundationRuntime,
+    codec: VideoCodec,
     active: Option<ActiveEncoder>,
     bitrate_kbps: u32,
     max_fps: u16,
@@ -190,7 +192,8 @@ impl Drop for WindowsEncoder {
 }
 
 impl WindowsEncoder {
-    pub fn new(
+    pub fn with_codec(
+        codec: VideoCodec,
         bitrate_kbps: u32,
         max_fps: u16,
         _latency_mode: LatencyMode,
@@ -199,6 +202,7 @@ impl WindowsEncoder {
         let runtime = MediaFoundationRuntime::start()?;
         let mut encoder = Self {
             _runtime: runtime,
+            codec,
             active: None,
             bitrate_kbps,
             max_fps,
@@ -279,15 +283,15 @@ impl FrameEncoder for WindowsEncoder {
         }
         active.needs_input = false;
         let mut bytes = wait_for_output(active, deadline)?;
-        validate_annex_b(&bytes)?;
-        if std::mem::take(&mut active.first_access_unit) {
-            let types = annex_b_nal_types(&bytes)?;
-            if !(types.contains(&7) && types.contains(&8))
-                && let Some(mut headers) = sequence_header(&active.transform)
-            {
-                headers.append(&mut bytes);
-                bytes = headers;
-            }
+        if self.codec != VideoCodec::Av1 {
+            validate_annex_b(&bytes)?;
+        }
+        if std::mem::take(&mut active.first_access_unit)
+            && !crate::codec::has_parameter_sets(self.codec, &bytes)
+            && let Some(mut headers) = sequence_header(self.codec, &active.transform)
+        {
+            headers.append(&mut bytes);
+            bytes = headers;
         }
         Ok(EncodedFrame {
             bytes,
@@ -312,10 +316,13 @@ impl WindowsEncoder {
 
     fn create_active(&self, width: u32, height: u32) -> Result<ActiveEncoder> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            bail!("Media Foundation H.264 dimensions must be non-zero and even");
+            bail!("Media Foundation encoder dimensions must be non-zero and even");
         }
-        let mut last_error = anyhow!("no NV12-to-H.264 hardware MFT is installed");
-        for activation in enumerate_hardware_encoders()? {
+        let mut last_error = anyhow!(
+            "no NV12-to-{} hardware MFT is installed",
+            self.codec.label()
+        );
+        for activation in enumerate_hardware_encoders(self.codec)? {
             // SAFETY: an enumerated encoder activation is valid on the current COM thread.
             let activated = unsafe { activation.ActivateObject::<IMFTransform>() };
             match activated {
@@ -330,7 +337,10 @@ impl WindowsEncoder {
                 Err(error) => last_error = error.into(),
             }
         }
-        Err(last_error).context("no hardware MFT accepted the H.264 settings")
+        Err(last_error).context(format!(
+            "no hardware MFT accepted the {} settings",
+            self.codec.label()
+        ))
     }
 
     fn configure_active(
@@ -379,8 +389,9 @@ impl WindowsEncoder {
         let events: IMFMediaEventGenerator = transform
             .cast()
             .context("hardware MFT has no asynchronous event interface")?;
+        let (subtype, profile) = output_format(self.codec);
         let output = create_video_type(
-            &MFVideoFormat_H264,
+            &subtype,
             width,
             height,
             self.max_fps,
@@ -390,13 +401,13 @@ impl WindowsEncoder {
         unsafe {
             output
                 .SetUINT32(&MF_MT_COMPRESSED, 1)
-                .context("cannot mark H.264 output as compressed")?;
+                .context("cannot mark encoder output as compressed")?;
             output
-                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
-                .context("cannot request H.264 baseline profile")?;
+                .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
+                .context("cannot request encoder profile")?;
             transform
                 .SetOutputType(0, &output, 0)
-                .context("hardware MFT rejected H.264 output settings")?;
+                .context("hardware MFT rejected encoder output settings")?;
         }
         let input = create_video_type(&MFVideoFormat_NV12, width, height, self.max_fps, None)?;
         // SAFETY: types are complete and stream IDs are zero for an encoder MFT.
@@ -444,7 +455,15 @@ impl WindowsEncoder {
     }
 }
 
-fn sequence_header(transform: &IMFTransform) -> Option<Vec<u8>> {
+fn output_format(codec: VideoCodec) -> (windows::core::GUID, u32) {
+    match codec {
+        VideoCodec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_Base.0 as u32),
+        VideoCodec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
+        VideoCodec::Av1 => (MFVideoFormat_AV1, eAVEncAV1VProfile_Main_420_8.0 as u32),
+    }
+}
+
+fn sequence_header(codec: VideoCodec, transform: &IMFTransform) -> Option<Vec<u8>> {
     // SAFETY: stream zero owns the output media type; GetBlob writes into the provided slice.
     unsafe {
         let media_type = transform.GetOutputCurrentType(0).ok()?;
@@ -456,8 +475,7 @@ fn sequence_header(transform: &IMFTransform) -> Option<Vec<u8>> {
         media_type
             .GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut bytes, None)
             .ok()?;
-        let types = annex_b_nal_types(&bytes).ok()?;
-        (types.contains(&7) && types.contains(&8)).then_some(bytes)
+        crate::codec::has_parameter_sets(codec, &bytes).then_some(bytes)
     }
 }
 
@@ -475,14 +493,14 @@ fn ui4_variant(value: u32) -> VARIANT {
     }
 }
 
-fn enumerate_hardware_encoders() -> Result<Vec<IMFActivate>> {
+fn enumerate_hardware_encoders(codec: VideoCodec) -> Result<Vec<IMFActivate>> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
     };
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: output_format(codec).0,
     };
     let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut activations: *mut Option<IMFActivate> = ptr::null_mut();
@@ -500,13 +518,13 @@ fn enumerate_hardware_encoders() -> Result<Vec<IMFActivate>> {
         .context("cannot enumerate Media Foundation hardware encoders")?;
     }
     if activations.is_null() {
-        bail!("no NV12-to-H.264 hardware MFT is installed");
+        bail!("no NV12-to-{} hardware MFT is installed", codec.label());
     }
     if count == 0 {
         unsafe {
             CoTaskMemFree(Some(activations.cast()));
         }
-        bail!("no NV12-to-H.264 hardware MFT is installed");
+        bail!("no NV12-to-{} hardware MFT is installed", codec.label());
     }
     // SAFETY: the successful call above returned exactly `count` slots. Taking each Option moves
     // ownership of its COM reference before the backing pointer array is freed.
@@ -690,7 +708,7 @@ fn validate_annex_b(bytes: &[u8]) -> Result<()> {
     if bytes.starts_with(&[0, 0, 1]) || bytes.starts_with(&[0, 0, 0, 1]) {
         Ok(())
     } else {
-        bail!("hardware MFT produced H.264 without Annex-B start codes")
+        bail!("hardware MFT produced output without Annex-B start codes")
     }
 }
 

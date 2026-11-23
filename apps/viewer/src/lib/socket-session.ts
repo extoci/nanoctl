@@ -1,3 +1,4 @@
+import type { CodecChoice } from "./video-codec";
 import {
   parseAgentMessage,
   assertHostInfo,
@@ -45,6 +46,7 @@ export class SocketSession {
       onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
       onStatus: (status: SocketStatus, detail?: string) => void;
       createController?: (options: RemoteSessionOptions) => RemoteSessionController;
+      codecChoice?: () => CodecChoice;
     },
   ) {
     window.addEventListener("pageshow", this.restored);
@@ -152,6 +154,8 @@ export class SocketSession {
                   message.host.remoteInput &&
                   message.host.viewer.mayControl,
                 preferences: this.preferences,
+                videoCodecs: message.host.capabilities.codecs,
+                codecChoice: this.options.codecChoice?.(),
                 operations: {
                   sendSignal: async ({ envelope }) =>
                     this.send(socket, {

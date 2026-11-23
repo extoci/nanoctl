@@ -30,7 +30,7 @@ Types and validators live in `packages/protocol`.
       "protocolVersion": 2,
       "platform": "linux",
       "architecture": "x64",
-      "codecs": ["h264"],
+      "codecs": ["av1", "hevc", "h264"],
       "encoderBackends": ["software-openh264"],
       "ready": true,
       "readiness": "ready",
@@ -90,7 +90,8 @@ A newer authorized socket replaces the active session. Socket closure ends the s
 
 ## Media and input
 
-WebRTC uses empty ICE servers, tailnet host candidates, H.264 RTP, DTLS-SRTP video and
+WebRTC uses empty ICE servers, tailnet host candidates, AV1, HEVC or H.264 RTP (the
+host answers with the first offered codec in `capabilities.codecs`), DTLS-SRTP video and
 SCTP data channels. No application-level TURN/STUN is used; Tailscale may relay its
 underlying encrypted transport through DERP. Reliable control carries discrete commands;
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
