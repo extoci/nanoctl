@@ -35,6 +35,10 @@ use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
 
+#[cfg(target_os = "windows")]
+#[path = "media_resize.rs"]
+mod resize;
+
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -315,6 +319,8 @@ pub struct CaptureEncoder {
     latest_frame: Arc<LatestFrame>,
     display_id: String,
     encoder: EncoderBackend,
+    #[cfg(target_os = "windows")]
+    resizer: resize::RgbaResizer,
 }
 
 pub(crate) type RgbaFrame<'a> = xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &'a [u8]>;
@@ -533,6 +539,8 @@ impl CaptureEncoder {
             latest_frame,
             display_id,
             encoder,
+            #[cfg(target_os = "windows")]
+            resizer: resize::RgbaResizer::default(),
         })
     }
 
@@ -604,12 +612,27 @@ impl CaptureEncoder {
         let image = if target_width == source_width && target_height == source_height {
             source
         } else {
-            resized = xcap::image::imageops::resize(
-                &source,
-                target_width,
-                target_height,
-                xcap::image::imageops::FilterType::Triangle,
-            );
+            resized = {
+                #[cfg(target_os = "windows")]
+                {
+                    self.resizer.resize(
+                        source.as_raw(),
+                        source_width,
+                        source_height,
+                        target_width,
+                        target_height,
+                    )?
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    xcap::image::imageops::resize(
+                        &source,
+                        target_width,
+                        target_height,
+                        xcap::image::imageops::FilterType::Triangle,
+                    )
+                }
+            };
             xcap::image::ImageBuffer::from_raw(
                 target_width,
                 target_height,
@@ -2141,6 +2164,8 @@ mod tests {
                 (64, 64),
             )
             .unwrap(),
+            #[cfg(target_os = "windows")]
+            resizer: super::resize::RgbaResizer::default(),
         };
         let mut captured = super::CapturedFrame {
             frame: xcap::Frame::new(64, 64, vec![128; 64 * 64 * 4]),
@@ -2151,6 +2176,9 @@ mod tests {
         encoder.encoder.force_keyframe();
         let (forced, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
         assert!(!forced.bytes.is_empty());
+        let (resized, _) = encoder.encode_captured_frame(&captured, 32, 32).unwrap();
+        assert_eq!((resized.width, resized.height), (32, 32));
+        assert!(!resized.bytes.is_empty());
         assert_eq!(
             encoder
                 .latest_frame
