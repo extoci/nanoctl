@@ -25,6 +25,8 @@ mod rtc;
 mod server;
 mod service;
 mod service_control;
+#[cfg(any(windows, test))]
+mod supervisor;
 mod tailnet;
 mod terminal;
 mod tls;
@@ -64,6 +66,10 @@ struct Cli {
     /// Append service diagnostics to this file instead of the process console.
     #[arg(long, global = true)]
     log_file: Option<PathBuf>,
+
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    supervised_worker: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -177,6 +183,15 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Run => {
             let config = AgentConfig::load_or_default(&config_path)?;
             config.validate()?;
+            #[cfg(windows)]
+            {
+                if cli.supervised_worker {
+                    return service::run_worker(config).await;
+                }
+                if cli.ready_file.is_none() && cli.ready_token.is_none() {
+                    return supervisor::run().await;
+                }
+            }
             service::run(config, cli.ready_file, cli.ready_token).await?;
         }
         Command::Stop => match service_control::request_stop().await? {
