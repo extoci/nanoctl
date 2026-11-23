@@ -1,4 +1,187 @@
-# Current isolated comparison: QP20 retained after quantizer sweep
+# Current results: source-presentation artifact fixed; QP16 retained
+
+2026-11-23 UTC. **The refresh-sized mode is upstream of nanoctl capture, in the
+benchmark source's canvas-to-Xvfb presentation.** The harness now uses an opaque,
+desynchronized source canvas. This is not a viewer, pacer or encoder latency
+optimization. Fresh unprofiled paired validation passed, and QP16 now passes the
+unchanged text/drag gates. Production retains rounded conversion and
+`CameraVideoRealTime`, lowering only the minimum QP to **16**; maximum QP remains
+**51**, with adaptive congestion control unchanged.
+
+## Fast versus slow: per-frame attribution
+
+November 20 diagnostic runs `mode-source-nanoctl-marker-run-2` (fast) and `-6`
+(slow), with identical QP20 binaries, source observers and browser attribution.
+Marker IDs join source draw timestamps, independent source-Xvfb pixel reads,
+agent monotonic logs, browser video metadata and client pixel observations.
+There are 3,489/3,435 joined browser/agent samples respectively. Values below are
+per-segment p50 milliseconds, not additive components of a pooled median.
+
+| Segment                                            |   Fast |   Slow |
+| -------------------------------------------------- | -----: | -----: |
+| Source draw → independently observed source pixels |  3.342 | 19.040 |
+| Source draw → damage dequeued                      |  1.510 | 17.567 |
+| Damage dequeued → capture start                    |  0.036 |  0.037 |
+| Capture start → end                                |  1.532 |  1.624 |
+| Capture end → encode start                         |  0.278 |  0.290 |
+| Encode start → end                                 |  2.360 |  2.409 |
+| Encode end → RTP sample write completed            |  0.164 |  0.167 |
+| RTP sample write completed → Chrome receiveTime    |  0.244 |  0.061 |
+| Reported decode duration                           |  0.400 |  0.400 |
+| Chrome receiveTime → presentationTime              |  0.700 |  0.700 |
+| presentationTime → expectedDisplayTime             |  8.600 |  8.900 |
+| presentationTime → detector observation            | 16.763 | 17.410 |
+| expectedDisplayTime → detector observation         |  8.366 |  8.711 |
+| Source draw → detector observation, run video p50  | 24.275 | 40.759 |
+
+**Localization:** 16.06 ms of the 16.48-ms end-to-end difference is already
+present at damage dequeue. Independent source-pixel observation also shifts by
+15.70 ms, excluding a nanoctl damage-wait, encode, RTP or client-detector queue as
+the origin of this mode. Receive-to-presentation and decode duration do not gain
+a frame. The verified cause is refresh-sized **source presentation delay**,
+not slow conversion or a nanoctl receiver queue. The exact internal Chromium
+buffer/deadline responsible was not separately instrumented.
+
+Damage logging timestamps event dequeue, not the X server's event creation.
+RTP timing brackets the application sample write, not a hardware transmit clock.
+Decode duration is Chrome metadata; adding it to receiveTime would only estimate
+decoder completion. Clock offsets/uncertainties remain in each JSON. The 250-Hz
+source observer can first see a pixel up to roughly one poll after it appears;
+it can therefore observe a frame after nanoctl has captured it. Attribution
+readback perturbs absolute latency: the profiled modes are about 24/41 ms,
+versus about 19/35 ms in unprofiled runs. Use them for segment localization, not
+headline product comparisons.
+
+### Competitor controls and attempted disproof
+
+The same source-side modes occur with both competitors. Below are **per-run
+source-draw → source-pixel p50s**, not product transport latency:
+
+| Stack              | Workload / repetitions | Source-pixel p50s, ms                      |
+| ------------------ | ---------------------- | ------------------------------------------ |
+| nanoctl            | Marker ×6              | 3.390, 3.342, 3.453, 3.386, 19.693, 19.040 |
+| Sunshine/Moonlight | Marker ×5              | 18.656, 19.075, 3.484, 3.473, 3.266        |
+| screen-relay       | Drag ×5                | 4.168, 4.000, 18.936, 4.065, 19.644        |
+
+Their end-to-end p50s were respectively 24.10–41.55, 14.32–40.60 and
+51.43–70.11 ms; these diagnostic cohorts have different instrumentation and are
+**not** a new head-to-head. Source delay does not explain all competitor
+transport/client variation. Screen-relay's source observer ran inside the
+container's IPC namespace; initial host-side MIT-SHM attachment failed, and
+those preflights are excluded. Six source-only legacy trials did **not**
+reproduce the slow mode, so its reproduction without any product is unverified.
+
+An attempted `--run-all-compositor-stages-before-draw` source fix failed: one
+run's source-pixel/video p50 reached 35.06/56.44 ms. It is not retained.
+Disabling threaded compositing failed the source's visibility/readiness check
+and is also not retained. The kept combination is
+`getContext("2d", { alpha: false, desynchronized: true })`; which individual
+option is necessary was not isolated. Chrome accepted both attributes. Six
+instrumented fresh nanoctl stacks then had source-pixel p50s **3.195–3.321 ms**
+and video p50s **24.174–24.495 ms**, with no slow mode observed. Six source-only
+low-latency trials were also fast, but the legacy source-only trials were fast
+too. This is a measured fix on this browser/Xvfb setup, not a portable guarantee
+about the desynchronized hint.
+
+## Strict paired harness validation: five fresh runs per arm/workload
+
+November 23, 00:11–00:37 UTC; **20/20 valid**, each matching 120/120 inputs.
+Same immutable QP20 binary in both arms. Alternate legacy/fixed order within
+pairs; fresh agents/browsers/X servers, only the expected product stack, audited
+inventories, and no tracing, extra source observers, builds or profiling.
+Marker uses ordinary timing; drag combines quality and input timing. Values are
+medians of per-run metrics; CPU is one core = 100%.
+
+| Workload | Source | Input p50 / p95 ms | Video p50 / p95 ms |   FPS | CPU % | RSS MiB |
+| -------- | ------ | -----------------: | -----------------: | ----: | ----: | ------: |
+| Marker   | Legacy |    32.055 / 36.494 |    19.947 / 22.128 | 59.95 | 25.44 |   42.05 |
+| Marker   | Fixed  |    32.063 / 36.473 |    19.862 / 21.951 | 59.95 | 25.24 |   44.32 |
+| Drag     | Legacy |    32.213 / 52.371 |    20.123 / 37.486 | 59.81 | 31.32 |   48.79 |
+| Drag     | Fixed  |    32.073 / 48.388 |    19.059 / 34.842 | 59.90 | 30.71 |   49.58 |
+
+Per-run video p50s (pair order; no headline outliers removed):
+
+| Workload | Legacy, ms                             | Fixed, ms                              |
+| -------- | -------------------------------------- | -------------------------------------- |
+| Marker   | 19.993, 32.764, 19.843, 19.947, 19.642 | 20.102, 19.805, 19.862, 19.863, 19.744 |
+| Drag     | 20.123, 19.765, 50.755, 35.446, 18.745 | 19.059, 18.851, 18.917, 19.279, 19.061 |
+
+No high video-p50 mode was observed in the ten fixed runs. This does not mean
+tails or individual inputs are deterministic: fixed drag video p95 remains
+34.842 ms. The legacy 50.755-ms outlier was not separately instrumented, so its
+entire excess is not independently localized. Drag quality/bitrate was
+46.922→47.038 dB, SSIM .997019→.997146, 1.947→1.954 Mbps; source rendering
+options changed, so do not interpret that as an encoder quality improvement.
+
+The pre-interruption cohort `mode-paired-*` is not mixed into this table. It has
+nine valid marker runs plus one invalid run with 24/120 inputs and a
+**232,717,124-ms detector gap** across the quota interruption. All are preserved.
+After resume, HEAD and origin both matched `8bb1514`; managed Chrome was stopped,
+screen-relay was stopped, and no active benchmark stacks or uprobes remained.
+The whole paired cohort was restarted as `mode-paired-v2-*` after startup load
+cleared.
+
+## QP16 re-test: retained, all unchanged aggregate gates pass
+
+November 23, 00:38–01:06 UTC; **20/20 valid**, five fresh alternating pairs each
+on text and drag, 120/120 inputs/run. Both arms use the fixed source and combined
+quality/input trials. These are independent runs from the harness validation.
+
+| Workload | QP floor |  SSIM Y | PSNR Y dB |  Mbps | Input p50 / p95 ms | Video p50 / p95 ms |   FPS | CPU % | RSS MiB |
+| -------- | -------: | ------: | --------: | ----: | -----------------: | -----------------: | ----: | ----: | ------: |
+| Text     |       20 | .998260 |    46.560 | 1.617 |    28.324 / 36.350 |    18.565 / 20.716 | 59.95 | 27.52 |   47.68 |
+| Text     |       16 | .999150 |    50.027 | 2.159 |    28.352 / 36.339 |    18.571 / 20.690 | 59.96 | 29.49 |   48.75 |
+| Drag     |       20 | .997137 |    46.903 | 1.957 |    28.398 / 36.496 |    18.900 / 22.216 | 59.97 | 29.85 |   50.35 |
+| Drag     |       16 | .996948 |    49.297 | 3.322 |    28.460 / 36.392 |    18.799 / 20.981 | 59.93 | 32.69 |   51.97 |
+
+Differences of arm medians, as in the previous sweep:
+
+| Workload | Input p50 Δ ms | Video p50 Δ ms | CPU Δ points | CPU ≤51% / Δ≤5 | Latency Δ≤2 ms | Drag ≤8 Mbps |
+| -------- | -------------: | -------------: | -----------: | -------------- | -------------- | ------------ |
+| Text     |          +.028 |          +.006 |       +1.971 | Pass           | Pass           | n/a          |
+| Drag     |          +.061 |          −.101 |       +2.840 | Pass           | Pass           | Pass         |
+
+Median paired deltas also pass: text input/video/CPU −.024/+.041/+1.978;
+drag +.061/−.363/+2.666. Individual input-p50 pair deltas remain variable:
+text **+.175, −.066, −.167, +3.515, −.024 ms**; drag
+**+.596, +.061, +3.548, −3.867, +.036 ms**. No individual-pair ≤2-ms claim is
+made. The gate is the same arm-median criterion used in the earlier sweep, not
+a newly relaxed threshold. The passing re-test does not prove the earlier
+QP16 drag input-only rejection was caused by source presentation delay.
+
+QP16 gains **3.467 dB text / 2.394 dB drag PSNR**, but drag median SSIM falls
+slightly. QP14 was not tested in this requested QP16 retry. The production
+effective-parameter regression now asserts QP16–51. Rebuilt release SHA256
+`a64d50ea3c19dfa85f967a0e9d3c1c248b7af859f8e6b29c1fb695b5f0a6bfa8`
+is byte-identical to the measured immutable QP16 candidate. No congestion,
+bitrate-controller, complexity, usage, threading or pacing code changed.
+
+## Scope, artifacts and remaining limits
+
+720p software H.264, Chrome **151.0.7922.34**, one shared Linux VM,
+development-auth **loopback**, not a measured tailnet/impaired link. Video is
+source draw to captured client pixels; input is injection to captured client
+pixels, **not optical input-to-photon**. A 250-Hz detector still quantizes
+observations. CPU/RSS are host-process-tree only, excluding source/client
+browsers, Xvfb and detector. Quality is matched-ROI gray luma, moving content,
+not matched-bitrate or optical quality. The opaque source may change rendering;
+historical quality/latency tables are not a new contemporaneous comparison.
+
+The earlier three-product table below is historical, not evidence that the new
+QP16 build beats either competitor. No new three-product final campaign was
+requested in this handoff. Runtime/install weight was not remeasured; the
+every-axis goal remains unproven. Impaired links, hardware codecs, physical
+displays and the precise internal Chromium presentation deadline were not tested.
+
+Artifacts: `/home/ubuntu/bench-results/latency-modes/`, prefixes
+`mode-trace-*`, `mode-source-*`, `mode-sync-*` (rejected), `source-lab-*`,
+`mode-desync-*`, `mode-paired-v2-*`, and `mode-qp-*`.
+`latency-pairs-summary.json` preserves all per-run metrics/ranges; external
+drivers and analysis are in `/home/ubuntu/bench-candidates/latency-*.{ts,py}`.
+Native-pixel text source/QP16/QP20 crops for `mode-qp-*-text-run-3` were inspected.
+All benchmark stacks are stopped; the screen-relay container is stopped.
+
+# Previous isolated comparison: QP20 quantizer sweep (legacy source)
 
 2026-11-20 UTC. **No lower QP floor retained.** QP18 and QP16 improved text
 quality within the CPU and bitrate budgets, but failed drag latency gates.
@@ -8,7 +191,7 @@ adaptive congestion control. The final rebuilt executable is byte-identical to
 the immutable QP20 control (SHA256
 `a40044d2b46af5424aca3a21aa32ffebebec88d4dc049edbefe2c6f0c42db210`).
 
-## Current three-product campaign
+## Previous three-product campaign
 
 **One fresh campaign, 05:26–06:05 UTC: 42/42 valid runs.** Marker ×5/product,
 plus moving text/drag/gradient ×3/product. Products alternate within each

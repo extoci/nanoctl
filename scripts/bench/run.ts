@@ -11,6 +11,7 @@ import { runtimeBytes } from "./runtime";
 import { setupClicks } from "./viewer";
 import { drawWorkload, workloadName } from "./workloads";
 import { trialPlan } from "./phases";
+import { sourceContextOptions } from "./source";
 import { analyzeQuality, pcapPayloadBytes, receivedVideoRates, idleVideoBursts } from "./quality";
 
 const options = repeatArgs(process.argv.slice(2));
@@ -18,6 +19,7 @@ const viewerSetupClicks = setupClicks(process.env.VIEWER_SETUP_CLICKS);
 const qualityMode = process.env.BENCH_QUALITY === "1";
 const idleInputMode = process.env.BENCH_IDLE_INPUT === "1";
 const qualityInputMode = process.env.BENCH_QUALITY_INPUT === "1";
+const contextOptions = sourceContextOptions(process.env.BENCH_SOURCE_RENDERER);
 const { trials, duration } = trialPlan(
   qualityMode,
   idleInputMode,
@@ -223,13 +225,14 @@ if (qualityMode) {
   await qualityWindow(host, hostWindow, hostDisplay);
 }
 await host.evaluate(
-  ({ encode, draw, workload, idleInputMode }) => {
+  ({ encode, draw, workload, idleInputMode, contextOptions }) => {
     const bits = new Function(`return (${encode})`)() as typeof markerBits;
     const content = new Function(`return (${draw})`)() as typeof drawWorkload;
     const canvas = document.querySelector("canvas")!;
-    const ctx = canvas.getContext("2d")!;
+    const ctx = canvas.getContext("2d", contextOptions)!;
     const state = {
       paints: [] as number[],
+      contextAttributes: ctx.getContextAttributes(),
       input: 0,
       motion: false,
       settled: false,
@@ -287,7 +290,13 @@ await host.evaluate(
     };
     requestAnimationFrame(render);
   },
-  { encode: markerBits.toString(), draw: drawWorkload.toString(), workload, idleInputMode },
+  {
+    encode: markerBits.toString(),
+    draw: drawWorkload.toString(),
+    workload,
+    idleInputMode,
+    contextOptions,
+  },
 );
 let viewerBrowser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 let viewer: Awaited<ReturnType<typeof hostBrowser.newPage>> | undefined;
@@ -592,6 +601,7 @@ const state = await host.evaluate(
       window as unknown as {
         bench: {
           paints: number[];
+          contextAttributes: CanvasRenderingContext2DSettings;
           input: number;
           motion: boolean;
           inputPaints: { input: number; at: number }[];
@@ -700,8 +710,10 @@ const result = {
     viewerSetupClicks,
     workload,
     idleInputMode,
+    sourceContextOptions: contextOptions,
   },
   source: {
+    contextAttributes: state.contextAttributes,
     frames: state.paints.length,
     inputs: state.input,
     clock: "CLOCK_MONOTONIC via libc clock_gettime",

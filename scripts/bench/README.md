@@ -296,6 +296,44 @@ Other allocators/platforms are unchanged.
 
 ### Real content and picture quality
 
+The stimulus canvas defaults to `{ alpha: false, desynchronized: true }`.
+This is a **source-harness** setting, not a nanoctl viewer/encoder optimization.
+On this Linux/Xvfb setup the original canvas could queue a refresh before its
+pixels became capturable, affecting every product. `BENCH_SOURCE_RENDERER=legacy`
+restores the original context options; `low-latency` is the default. Unknown or
+empty values are rejected. Results record both requested context options and
+the browser's `getContextAttributes()` response. This is a browser hint, not a
+portable guarantee of a particular presentation latency; recalibrate source
+presentation when changing browsers, displays or platforms.
+
+For per-frame attribution, start nanoctl with `NANOCTL_BENCH_TRACE=1` and run the
+benchmark with `BENCH_ATTRIBUTION=1`. Agent logs correlate marker IDs with
+monotonic damage-dequeue, capture start/end, encode start/end and RTP-write
+start/end timestamps. Browser attribution correlates the same IDs with
+`requestVideoFrameCallback` receive/presentation/expected-display timestamps and
+reported decode duration. Source clock calibration and client pixel observations
+are retained in the ordinary JSON/pixel artifacts. Damage timestamps denote
+event dequeue, not the X server's damage-creation instant. Decode duration is
+reported metadata, not an independently instrumented decoder-completion clock.
+
+To distinguish source presentation from damage handling, run the compiled
+`pixels` helper against the **source** display with zero inputs after its marker
+appears, for example:
+
+```sh
+BENCH_WINDOW="$HOST_WINDOW" "$OUTPUT/pixels" "$HOST_DISPLAY" 65 0 1729 \
+  > "$OUTPUT/source-pixels.log"
+```
+
+Match its first observation of each marker ID to the source paint timestamp.
+For a container-owned X server, execute this observer in the server's IPC
+namespace: host SysV shared memory is not attachable across a private Docker IPC
+namespace. The ordinary client detector stays on its client display. These
+observers and video readback can perturb absolute latency; use attribution only
+to localize segments, then disable all tracing/additional observers for resource
+and latency gates. The strict paired runs in `RESULTS.md` use fresh stacks and
+unprofiled measurements.
+
 Isolated 720p conversion comparison (no capture, codec, allocation or network in
 the timed loop):
 
