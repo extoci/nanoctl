@@ -5,14 +5,110 @@ import { RemoteSessionController, type HostSignalRow } from "./remote-session";
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
 const originalMediaStream = globalThis.MediaStream;
+const originalNavigator = globalThis.navigator;
 
 afterEach(() => {
   defineGlobal("window", originalWindow);
   defineGlobal("document", originalDocument);
   defineGlobal("MediaStream", originalMediaStream);
+  defineGlobal("navigator", originalNavigator);
 });
 
 describe("remote session lifecycle", () => {
+  test("audio is recvonly when advertised, even for view-only sessions", async () => {
+    installBrowserGlobals();
+    for (const enabled of [false, true]) {
+      const peer = new FakePeer();
+      const video = new FakeVideo();
+      const audio = {
+        srcObject: null as unknown,
+        muted: true,
+        play: async () => {},
+        pause: () => {},
+      };
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: video as unknown as HTMLVideoElement,
+        audio: audio as unknown as HTMLAudioElement,
+        systemAudioEnabled: enabled,
+        remoteInputPolicy: false,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(peer.transceivers).toEqual(
+        enabled
+          ? [
+              ["video", "recvonly"],
+              ["audio", "recvonly"],
+            ]
+          : [["video", "recvonly"]],
+      );
+      peer.ontrack?.({
+        receiver: { playoutDelayHint: 1, jitterBufferTarget: 100 },
+        streams: [],
+        track: { kind: "audio" },
+      } as unknown as RTCTrackEvent);
+      expect(audio.srcObject instanceof FakeMediaStream).toBe(enabled);
+      expect(video.srcObject).toBeNull();
+      expect(audio.muted).toBe(true);
+      await controller.stop();
+      expect(audio.srcObject).toBeNull();
+    }
+  });
+
+  test("clipboard is control-only and sends text before a remote paste key", async () => {
+    installBrowserGlobals();
+    Object.assign(document, { hasFocus: () => true });
+    defineGlobal("navigator", {
+      clipboard: { readText: async () => "local paste", writeText: async () => {} },
+    });
+    for (const [mayControl, remoteInput] of [
+      [false, true],
+      [true, false],
+      [false, false],
+      [true, true],
+    ]) {
+      const peer = new FakePeer();
+      const video = new FakeVideo();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: video as unknown as HTMLVideoElement,
+        clipboardEnabled: true,
+        remoteInputPolicy: mayControl,
+        remoteInputEnabled: remoteInput,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(!!mayControl && !!remoteInput);
+      if (mayControl && remoteInput) {
+        video.listeners.get("keydown")?.({
+          type: "keydown",
+          code: "KeyV",
+          key: "v",
+          ctrlKey: true,
+          preventDefault: () => {},
+        } as unknown as Event);
+        await flushSignals();
+        expect(peer.sent.map(([label]) => label)).toEqual([
+          "nanoctl.clipboard.v1",
+          "nanoctl.control.v1",
+        ]);
+        expect(JSON.parse(peer.sent[0]![1]).text).toBe("local paste");
+      }
+      await controller.stop();
+    }
+  });
+
   test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
     installBrowserGlobals();
     const preferences = { inputEnabled: true, displayId: "secondary" };
@@ -45,10 +141,10 @@ describe("remote session lifecycle", () => {
       await controller.start();
       if (mayControl && displays.length) expect(controller.selectDisplay("secondary")).toBe(true);
       controller.setInputEnabled(false);
-      peer.channels[1]!.sent = [];
-      peer.channels[1]!.onopen?.();
+      peer.channels.get("nanoctl.control.v1")!.sent = [];
+      peer.channels.get("nanoctl.control.v1")!.onopen?.();
       expect(controller.snapshot.inputEnabled).toBe(false);
-      expect(peer.channels[1]!.sent).toEqual(
+      expect(peer.channels.get("nanoctl.control.v1")!.sent).toEqual(
         mayControl && displays.length
           ? [JSON.stringify({ type: "display", displayId: "secondary" })]
           : [],
@@ -75,7 +171,7 @@ describe("remote session lifecycle", () => {
       });
       await controller.start();
       expect(controller.snapshot.inputEnabled).toBe(preferences.inputEnabled && mayControl);
-      peer.channels[1]!.onopen?.();
+      peer.channels.get("nanoctl.control.v1")!.onopen?.();
       expect(controller.snapshot.inputEnabled).toBe(preferences.inputEnabled && mayControl);
       controller.setInputEnabled(false);
       expect(preferences.inputEnabled).toBe(false);
@@ -341,11 +437,14 @@ function defineGlobal(name: string, value: unknown): void {
 }
 
 class FakeVideo {
+  listeners = new Map<string, (event: Event) => void>();
   srcObject: unknown = null;
   videoWidth = 1920;
   videoHeight = 1080;
 
-  addEventListener(): void {}
+  addEventListener(type: string, listener: (event: Event) => void): void {
+    this.listeners.set(type, listener);
+  }
 
   removeEventListener(): void {}
 
@@ -361,14 +460,16 @@ class FakeMediaStream {
 }
 
 class FakeDataChannel {
+  constructor(private readonly record: (message: string) => void = () => {}) {}
   sent: string[] = [];
   readyState: RTCDataChannelState = "open";
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
 
-  send(data: string): void {
-    this.sent.push(data);
+  send(message: string): void {
+    this.sent.push(message);
+    this.record(message);
   }
 
   close(): void {
@@ -378,7 +479,9 @@ class FakeDataChannel {
 }
 
 class FakePeer {
-  channels: FakeDataChannel[] = [];
+  transceivers: [string, RTCRtpTransceiverDirection | undefined][] = [];
+  channels = new Map<string, FakeDataChannel>();
+  sent: [string, string][] = [];
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription: RTCSessionDescriptionInit | null = null;
@@ -387,13 +490,15 @@ class FakePeer {
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onRemoteDescription: ((sdp: string) => void) | null = null;
 
-  createDataChannel(): FakeDataChannel {
-    const channel = new FakeDataChannel();
-    this.channels.push(channel);
+  createDataChannel(label: string): FakeDataChannel {
+    const channel = new FakeDataChannel((message) => this.sent.push([label, message]));
+    this.channels.set(label, channel);
     return channel;
   }
 
-  addTransceiver(): void {}
+  addTransceiver(kind: string, init: RTCRtpTransceiverInit): void {
+    this.transceivers.push([kind, init.direction]);
+  }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
     return { type: "offer", sdp: "v=0\r\na=ice-ufrag:fake" };

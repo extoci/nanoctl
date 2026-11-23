@@ -69,6 +69,8 @@ impl ServerState {
         let node = self.node.read().await;
         let capabilities = serde_json::to_value(crate::platform::capabilities(
             self.config.features.remote_input && control,
+            self.config.features.clipboard && self.config.features.remote_input && control,
+            self.config.features.system_audio,
             self.config.quality.encoder,
         ))
         .unwrap();
@@ -477,7 +479,9 @@ async fn session(
                         match crate::rtc::HostPeer::answer_with_host_epoch(
                             outgoing.clone(), id.clone(), &serialized, Vec::new(),
                             webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
-                            crate::rtc::host_epoch_seed(), state.config.features.remote_input && control).await {
+                            crate::rtc::host_epoch_seed(), state.config.features.remote_input && control,
+                            state.config.features.clipboard && state.config.features.remote_input && control,
+                            state.config.features.system_audio).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
                                 { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }
@@ -654,6 +658,26 @@ mod tests {
         drop(listener);
         assert!(super::probe_peer(peer, port).await.is_none());
     }
+
+    #[tokio::test]
+    async fn view_only_info_never_advertises_clipboard() {
+        for (remote_input, control) in [(false, true), (true, false), (false, false)] {
+            let mut config = AgentConfig::default();
+            config.features.remote_input = remote_input;
+            assert!(config.features.clipboard);
+            let state = ServerState::new(
+                config,
+                Arc::new(crate::tailnet::FakeTailnet {
+                    node: Node::default(),
+                    identity: Identity::default(),
+                }),
+            );
+            let info = state.info(&Identity::default(), control).await;
+            assert_eq!(info["capabilities"]["clipboard"], false);
+            assert_eq!(info["remoteInput"], false);
+        }
+    }
+
     #[cfg(feature = "rtc")]
     #[tokio::test]
     async fn websocket_offer_answer_and_replacement() {
