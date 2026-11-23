@@ -156,7 +156,7 @@ pub struct HostPeer {
     video: Arc<TrackLocalStaticSample>,
     /// Optional viewer-created unreliable channel carrying H.264 access
     /// units straight to WebCodecs, bypassing the track's jitter buffer.
-    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    #[cfg(feature = "media")]
     video_data_channel: Arc<DataChannelVideo>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video_codec: VideoCodec,
@@ -169,6 +169,7 @@ pub struct HostPeer {
 /// when it detects a sequence gap. `idr_channel` is the reliable channel
 /// (`nanoctl.video-idr.v1`) used to deliver keyframes, which are too large
 /// to survive partial reliability.
+#[cfg(feature = "media")]
 pub(crate) struct DataChannelVideo {
     pub channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub idr_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
@@ -545,6 +546,7 @@ impl HostPeer {
         let input_revoked = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "media")]
         let mut input_tasks = Vec::new();
+        #[cfg(feature = "media")]
         let video_data_channel = Arc::new(DataChannelVideo {
             channel: std::sync::Mutex::new(None),
             idr_channel: std::sync::Mutex::new(None),
@@ -1051,6 +1053,7 @@ impl HostPeer {
             #[cfg(feature = "media")]
             input_revoked,
             video,
+            #[cfg(feature = "media")]
             video_data_channel,
             video_codec: negotiated.codec,
             #[cfg(feature = "media")]
