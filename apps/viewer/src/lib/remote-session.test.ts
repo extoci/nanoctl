@@ -20,6 +20,7 @@ describe("remote session lifecycle", () => {
     for (const enabled of [false, true]) {
       const peer = new FakePeer();
       const video = new FakeVideo();
+      const sources: unknown[] = [];
       const audio = {
         srcObject: null as unknown,
         muted: true,
@@ -33,6 +34,7 @@ describe("remote session lifecycle", () => {
         iceServers: [],
         video: video as unknown as HTMLVideoElement,
         audio: audio as unknown as HTMLAudioElement,
+        onAudioTrackChange: () => sources.push(audio.srcObject),
         systemAudioEnabled: enabled,
         remoteInputPolicy: false,
         operations: { sendSignal: async () => null, endSession: async () => null },
@@ -54,10 +56,12 @@ describe("remote session lifecycle", () => {
         track: { kind: "audio" },
       } as unknown as RTCTrackEvent);
       expect(audio.srcObject instanceof FakeMediaStream).toBe(enabled);
+      expect(sources).toEqual(enabled ? [audio.srcObject] : []);
       expect(video.srcObject).toBeNull();
       expect(audio.muted).toBe(true);
       await controller.stop();
       expect(audio.srcObject).toBeNull();
+      if (enabled) expect(sources.at(-1)).toBeNull();
     }
   });
 
