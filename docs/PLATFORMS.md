@@ -20,7 +20,7 @@ config repair requires elevating the same user. Existing config remains unchange
 Old Windows Credential Manager entries are deleted best-effort.
 
 Windows.Graphics.Capture supplies frames, enigo supplies input, and hardware Media
-Foundation H.264 is preferred with OpenH264 fallback. Secure desktop, sign-in screens
+Foundation H.264 is preferred. Secure desktop, sign-in screens
 and elevated application control remain restricted. Direct zero-copy D3D11 capture
 is not a claimed capability.
 
@@ -31,7 +31,7 @@ session. Grant Screen Recording and Accessibility to the installed binary; permi
 cannot be silently granted by the installer. Tailscale's CLI can be discovered at
 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
 
-Native capture feeds real-time VideoToolbox H.264, with OpenH264 fallback. The pipeline
+Native capture feeds real-time hardware VideoToolbox H.264. The pipeline
 still copies captured frames; direct ScreenCaptureKit zero-copy is not claimed.
 Legacy Keychain entry deletion is best-effort and is not needed for normal operation.
 
@@ -42,10 +42,22 @@ not as root. X11 and PipeWire/Wayland capture support depend on the desktop envi
 and permissions. Wayland portal input/restore-token integration is not a blanket promise
 of unattended input support. X11 is a weaker input-isolation environment.
 
-VA-API H.264 needs a compatible driver/render device and libva development headers
-when building. OpenH264 provides the software fallback; `quality.encoder="hardware"`
-requires hardware instead of falling back. Direct DMA-BUF zero-copy is not claimed.
+The encoder tries VA-API first, then NVIDIA NVENC. VA-API needs a writable render
+device and an H.264 encode-capable driver. NVENC needs an encode-capable NVIDIA GPU
+and driver libraries (`libcuda.so.1` and `libnvidia-encode.so.1`) supporting the
+NVENC API used at build time; a CUDA toolkit is not required at runtime. To build the
+Linux media binary, install `libva-dev` and `libffmpeg-nvenc-dev` on Debian/Ubuntu
+(libva and nv-codec-headers on other distributions). Direct DMA-BUF zero-copy is not claimed.
 Legacy Linux keyutils credentials are invalidated best-effort when `keyctl` is available.
+
+## Encoder selection
+
+`quality.encoder = "auto"` (default) tries the native encoder first, then uses
+OpenH264 if hardware is unavailable or fails during encoding or reconfiguration.
+After a switch, the replacement starts with a new H.264 keyframe and stays active
+for that session. Set `"hardware"` to fail instead of using OpenH264, or
+`"software"` to skip hardware entirely. `nanoctl doctor` reports the selected
+backend at probe time; the media smoke report shows the backend that actually encoded.
 
 ## Browser and HTTPS
 

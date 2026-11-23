@@ -99,6 +99,9 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Variant",
 ], optional = true }
 
+[build-dependencies]
+cc = "1.2"
+
 [dev-dependencies]
 proptest = "1.11.0"
 rcgen = "0.13"

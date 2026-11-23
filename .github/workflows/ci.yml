@@ -97,7 +97,7 @@ jobs:
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
             cmake nasm pkg-config
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
@@ -181,7 +181,7 @@ jobs:
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'

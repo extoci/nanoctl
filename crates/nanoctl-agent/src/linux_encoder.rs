@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use cros_codecs::backend::vaapi::encoder::VaapiBackend;
@@ -18,14 +19,14 @@ use cros_codecs::encoder::{
 use cros_codecs::video_frame::{ReadMapping, VideoFrame, WriteMapping};
 use cros_codecs::{BlockingMode, Fourcc, FrameLayout, PlaneLayout, Resolution};
 use cros_libva::{
-    Display, Image, Surface, SurfaceMemoryDescriptor, UsageHint, VA_FOURCC_NV12,
+    Display, DrmDeviceIterator, Image, Surface, SurfaceMemoryDescriptor, UsageHint, VA_FOURCC_NV12,
     VA_RT_FORMAT_YUV420,
     VAEntrypoint::{VAEntrypointEncSlice, VAEntrypointEncSliceLP},
     VAProfile::VAProfileH264ConstrainedBaseline,
 };
 
 use crate::config::LatencyMode;
-use crate::media::{EncodedFrame, bitrate_target};
+use crate::media::{EncodedFrame, FrameEncoder};
 
 type VaEncoder = StatelessEncoder<CpuNv12Frame, VaapiBackend<(), Surface<()>>>;
 
@@ -42,54 +43,54 @@ pub struct LinuxEncoder {
     latency_mode: LatencyMode,
     force_keyframe: bool,
     timestamp: u64,
-    nv12: Vec<u8>,
+    nv12: Arc<Vec<u8>>,
 }
 
 impl LinuxEncoder {
-    pub fn new(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Self> {
-        let display = Display::open().context("cannot open a VA-API render device")?;
-        let entrypoints = display
-            .query_config_entrypoints(VAProfileH264ConstrainedBaseline)
-            .context("cannot query VA-API H.264 capabilities")?;
-        if !entrypoints.contains(&VAEntrypointEncSlice)
-            && !entrypoints.contains(&VAEntrypointEncSliceLP)
-        {
-            bail!("VA-API driver has no constrained-baseline H.264 entrypoint");
+    pub fn new(
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        (width, height): (u32, u32),
+    ) -> Result<Self> {
+        let resolution = Resolution { width, height };
+        let mut last_error = anyhow!("no accessible VA-API render device");
+        for device in DrmDeviceIterator::default() {
+            let display = match Display::open_drm_display(&device) {
+                Ok(display) => display,
+                Err(error) => {
+                    last_error = anyhow!("cannot open {device:?}: {error}");
+                    continue;
+                }
+            };
+            let mut encoder = Self {
+                display,
+                active: None,
+                bitrate_kbps,
+                max_fps,
+                latency_mode,
+                force_keyframe: true,
+                timestamp: 0,
+                nv12: Arc::new(Vec::new()),
+            };
+            match encoder.create_active(resolution) {
+                Ok(active) => {
+                    encoder.active = Some(active);
+                    return Ok(encoder);
+                }
+                Err(error) => last_error = error.context(format!("{device:?}")),
+            }
         }
-        let mut encoder = Self {
-            display,
-            active: None,
-            bitrate_kbps,
-            max_fps,
-            latency_mode,
-            force_keyframe: true,
-            timestamp: 0,
-            nv12: Vec::new(),
-        };
-        // Construction is also the doctor probe. Build a genuine context and surface set rather
-        // than reporting a decode-only profile as encoder availability.
-        encoder.active = Some(encoder.create_active(Resolution {
-            width: 64,
-            height: 64,
-        })?);
-        Ok(encoder)
+        Err(last_error)
     }
+}
 
-    pub fn force_keyframe(&mut self) {
+impl FrameEncoder for LinuxEncoder {
+    fn force_keyframe(&mut self) {
         self.force_keyframe = true;
     }
 
-    pub fn apply_bitrate_estimate(
-        &mut self,
-        estimate_kbps: u32,
-        ceiling_kbps: u32,
-    ) -> Result<bool> {
-        let floor_kbps = 250.min(ceiling_kbps);
-        let Some(target_kbps) =
-            bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
-        else {
-            return Ok(false);
-        };
+    fn set_bitrate(&mut self, target_kbps: u32) -> Result<()> {
         self.bitrate_kbps = target_kbps;
         let tunings = self.tunings();
         if let Some(active) = &mut self.active {
@@ -97,11 +98,11 @@ impl LinuxEncoder {
                 .encoder
                 .tune(tunings)
                 .map_err(|error| anyhow!("VA-API bitrate update failed: {error}"))?;
-        }
-        Ok(true)
+        };
+        Ok(())
     }
 
-    pub fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
         let resolution = Resolution {
             width: image.width(),
             height: image.height(),
@@ -118,11 +119,14 @@ impl LinuxEncoder {
             self.force_keyframe = true;
         }
 
+        if Arc::get_mut(&mut self.nv12).is_none() {
+            self.nv12 = Arc::new(Vec::new());
+        }
         rgba_to_nv12(
             image.as_raw(),
             resolution.width,
             resolution.height,
-            &mut self.nv12,
+            Arc::get_mut(&mut self.nv12).expect("VA-API frame buffer is uniquely owned"),
         )?;
         let active = self
             .active
@@ -130,7 +134,7 @@ impl LinuxEncoder {
             .context("VA-API encoder was not initialized")?;
         let frame = CpuNv12Frame {
             resolution,
-            bytes: self.nv12.clone(),
+            bytes: Arc::clone(&self.nv12),
         };
         let metadata = FrameMetadata {
             timestamp: self.timestamp,
@@ -153,13 +157,14 @@ impl LinuxEncoder {
             })
             .context("blocking VA-API encode returned no access unit")
     }
+}
 
+impl LinuxEncoder {
     fn create_active(&self, resolution: Resolution) -> Result<ActiveEncoder> {
         let entrypoints = self
             .display
             .query_config_entrypoints(VAProfileH264ConstrainedBaseline)
             .context("cannot query VA-API H.264 entrypoints")?;
-        let low_power = entrypoints.contains(&VAEntrypointEncSliceLP);
         let layout = FrameLayout {
             format: (Fourcc::from(b"NV12"), 0),
             size: resolution,
@@ -190,16 +195,29 @@ impl LinuxEncoder {
             },
             initial_tunings: self.tunings(),
         };
-        let encoder = VaEncoder::new_vaapi(
-            Rc::clone(&self.display),
-            config,
-            layout.format.0,
-            resolution,
-            low_power,
-            BlockingMode::Blocking,
-        )
-        .map_err(|error| anyhow!("cannot initialize VA-API H.264 encoder: {error}"))?;
-        Ok(ActiveEncoder { encoder, layout })
+        let mut last_error = anyhow!("VA-API driver has no constrained-baseline H.264 entrypoint");
+        for (entrypoint, low_power) in [
+            (VAEntrypointEncSliceLP, true),
+            (VAEntrypointEncSlice, false),
+        ] {
+            if entrypoints.contains(&entrypoint) {
+                match VaEncoder::new_vaapi(
+                    Rc::clone(&self.display),
+                    config.clone(),
+                    layout.format.0,
+                    resolution,
+                    low_power,
+                    BlockingMode::Blocking,
+                ) {
+                    Ok(encoder) => return Ok(ActiveEncoder { encoder, layout }),
+                    Err(error) => {
+                        last_error =
+                            anyhow!("cannot initialize VA-API H.264 ({entrypoint:?}): {error}")
+                    }
+                }
+            }
+        }
+        Err(last_error)
     }
 
     fn tunings(&self) -> Tunings {
@@ -219,7 +237,7 @@ impl LinuxEncoder {
 
 struct CpuNv12Frame {
     resolution: Resolution,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl fmt::Debug for CpuNv12Frame {
