@@ -18,15 +18,28 @@ pub async fn run(
         .map(|path| ReadyFile::create(path, ready_token.as_deref()))
         .transpose()?;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
-    loop {
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let result = loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            _ = interval.tick() => { if control.take_stop_request()? { break; } }
+            result = &mut interrupt => {
+                break result.context("cannot listen for Ctrl+C").map(|()| "Ctrl+C");
+            }
+            _ = interval.tick() => match control.take_stop_request() {
+                Ok(true) => break Ok("stop request"),
+                Ok(false) => {}
+                Err(error) => break Err(error),
+            }
         }
+    };
+    if let Ok(reason) = &result {
+        tracing::info!(reason, "agent shutdown requested");
     }
     shutdown.send_replace(true);
     state.stop().await;
-    server.await??;
+    let server_result = server.await;
+    result?;
+    server_result??;
     Ok(())
 }
 

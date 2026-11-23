@@ -330,11 +330,11 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn report_error(error: &anyhow::Error, log_file: Option<&Path>) {
+fn append_diagnostic(log_file: Option<&Path>, message: std::fmt::Arguments<'_>) {
     if let Some(path) = log_file
         && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
     {
-        let _ = writeln!(file, "nanoctl command failed: {error:#}");
+        let _ = writeln!(file, "{message}");
     }
 }
 
@@ -342,13 +342,26 @@ fn report_error(error: &anyhow::Error, log_file: Option<&Path>) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let log_file = cli.log_file.clone();
+    if let Some(path) = log_file.clone() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            append_diagnostic(Some(&path), format_args!("{panic}"));
+            previous_hook(panic);
+        }));
+    }
     if let Err(error) = init_logging(log_file.as_deref()) {
-        report_error(&error, log_file.as_deref());
+        append_diagnostic(
+            log_file.as_deref(),
+            format_args!("nanoctl command failed: {error:#}"),
+        );
         return Err(error);
     }
     let result = run(cli).await;
     if let Err(error) = &result {
-        report_error(error, log_file.as_deref());
+        append_diagnostic(
+            log_file.as_deref(),
+            format_args!("nanoctl command failed: {error:#}"),
+        );
     }
     result
 }

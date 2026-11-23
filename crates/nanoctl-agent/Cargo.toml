@@ -166,5 +166,5 @@ tokio-tungstenite = "0.29"
 codegen-units = 1
 lto = "thin"
 opt-level = 3
-panic = "abort"
+panic = "unwind"
 strip = "symbols"
