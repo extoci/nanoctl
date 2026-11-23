@@ -97,6 +97,10 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
   });
   await page.setViewportSize({ width: 412, height: 915 });
   await page.goto("/");
+  const soundPrompt = page.getByRole("button", { name: "Tap for sound" });
+  await expect(soundPrompt).toBeVisible();
+  await page.getByRole("button", { name: "Dismiss sound prompt" }).click();
+  await expect(soundPrompt).toHaveCount(0);
   await openPanel(page);
   await expect(page.getByRole("button", { name: "Input on", exact: true })).toBeEnabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
@@ -156,6 +160,21 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
     true,
   );
   await screenshot(page, "iphone-landscape-connected.png");
+});
+
+test("the sound panel explains when the host has no available audio", async ({ page }) => {
+  await page.routeWebSocket("**/v1/connect", (socket) => {
+    const server = socket.connectToServer();
+    server.onMessage((data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "hello") message.host.capabilities.systemAudio = false;
+      socket.send(JSON.stringify(message));
+    });
+  });
+  await page.goto("/");
+  await openPanel(page);
+  await expect(page.getByText("Host audio unavailable")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Tap for sound" })).toHaveCount(0);
 });
 
 test("mobile live touch, scroll and keyboard control respect the input toggle", async ({

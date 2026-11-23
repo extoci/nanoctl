@@ -38,6 +38,7 @@ export class SocketSession {
     private readonly options: {
       video: HTMLVideoElement;
       audio?: HTMLAudioElement;
+      onAudioTrackChange?: () => void;
       onInfo: (info: HostInfo) => void;
       onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
       onStatus: (status: SocketStatus, detail?: string) => void;
@@ -134,6 +135,7 @@ export class SocketSession {
                 iceServers: [],
                 video: this.options.video,
                 audio: this.options.audio,
+                onAudioTrackChange: this.options.onAudioTrackChange,
                 systemAudioEnabled: message.host.capabilities.systemAudio,
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
