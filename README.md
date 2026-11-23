@@ -59,6 +59,17 @@ display picker, input toggle, fullscreen, secure-context keyboard lock and strea
 Only one viewer is active at a time; a newer viewer replaces the older one.
 Press **Ctrl+Alt+Shift+Esc** to release remote input.
 
+### Game controllers
+
+For a Windows host, install the official [ViGEmBus driver](https://github.com/nefarius/ViGEmBus/releases)
+and restart nanoctl. Pair a controller such as a DualSense with the viewer device (for example,
+an iPhone), open nanoctl in Safari over HTTPS, turn on **Gamepad**, and press a button on the
+controller so the browser can detect it. The browser must expose the controller through the
+standard Gamepad mapping. Windows games see up to four virtual Xbox 360 controllers.
+
+Gamepad forwarding requires permission to control the desktop and only sends input from a
+focused viewer. It does not replace Tailscale or require a native iOS helper.
+
 ## Develop
 
 ```sh

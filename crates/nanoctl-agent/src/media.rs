@@ -39,7 +39,6 @@ mod x264_encoder;
 #[cfg(target_os = "linux")]
 #[path = "media_trace.rs"]
 pub(crate) mod trace;
-
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
