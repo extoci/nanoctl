@@ -2187,9 +2187,15 @@ mod tests {
                 ]);
             }
             if frame == 10 {
-                assert!(encoder.apply_bitrate_estimate(250, 24_000).unwrap());
+                encoder.set_bitrate(250).unwrap();
             }
-            let encoded = encoder.encode(&image).unwrap();
+            let view = super::RgbaFrame::from_raw(
+                image.width(),
+                image.height(),
+                image.as_raw().as_slice(),
+            )
+            .unwrap();
+            let encoded = encoder.encode(&view).unwrap();
             if frame < 10 {
                 before_bytes += encoded.bytes.len();
             } else if frame >= 20 {
