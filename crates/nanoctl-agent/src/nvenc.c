@@ -136,7 +136,9 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, 
     h->config.rcParams.enableLookahead = 0;
     h->config.rcParams.enableTemporalAQ = 0;
     h->config.rcParams.zeroReorderDelay = 1;
-    h->config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+    /* Quarter-resolution first pass (Sunshine's default): better rate allocation within the
+     * one-frame VBV at a negligible latency cost. Falls back to single pass if unsupported. */
+    h->config.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
     rate_control(&h->config.rcParams, bitrate, fps);
     if (codec == NANO_CODEC_H264) {
         /* High with frameIntervalP = 1 is Constrained High: CABAC and 8x8 transforms, no
@@ -183,6 +185,10 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, 
     h->params.enablePTD = 1;
     h->params.encodeConfig = &h->config;
     status = h->api.nvEncInitializeEncoder(h->session, &h->params);
+    if (status != NV_ENC_SUCCESS) {
+        h->config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+        status = h->api.nvEncInitializeEncoder(h->session, &h->params);
+    }
     if (status != NV_ENC_SUCCESS)
         return fail(error, len, "initializing NVENC encoder failed", status);
 
