@@ -1,5 +1,9 @@
 #[cfg_attr(not(feature = "media"), allow(dead_code))]
 mod adaptive;
+#[cfg(feature = "media")]
+mod audio;
+#[cfg(feature = "media")]
+mod clipboard;
 mod config;
 #[cfg(feature = "media")]
 mod input;

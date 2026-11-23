@@ -20,7 +20,17 @@ capture = [
   "dep:xcb",
   "dep:libc",
 ]
-media = ["capture", "dep:enigo", "dep:rtcp", "dep:x11rb", "dep:xkeysym", "rtc"]
+media = [
+  "capture",
+  "dep:arboard",
+  "dep:cpal",
+  "dep:enigo",
+  "dep:opus",
+  "dep:rtcp",
+  "dep:x11rb",
+  "dep:xkeysym",
+  "rtc",
+]
 rtc = ["dep:interceptor", "dep:webrtc"]
 
 [[bin]]
@@ -29,6 +39,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+arboard = { version = "3.6", optional = true }
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 async-trait = "0.1"
@@ -67,6 +78,7 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
 openh264-sys2 = { version = "0.9.7", optional = true }
+opus = { version = "0.4", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
@@ -86,6 +98,7 @@ videotoolbox = { version = "0.18.1", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+cpal = { version = "0.16", optional = true }
 fast_image_resize = { version = "6.2", default-features = false, features = [
   "std",
   "only_u8x4",

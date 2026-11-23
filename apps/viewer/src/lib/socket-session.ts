@@ -31,6 +31,7 @@ export class SocketSession {
   constructor(
     private readonly options: {
       video: HTMLVideoElement;
+      audio?: HTMLAudioElement;
       onInfo: (info: HostInfo) => void;
       onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
       onStatus: (status: SocketStatus, detail?: string) => void;
@@ -126,8 +127,14 @@ export class SocketSession {
                 displays: message.host.displays,
                 iceServers: [],
                 video: this.options.video,
+                audio: this.options.audio,
+                systemAudioEnabled: message.host.capabilities.systemAudio,
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
+                clipboardEnabled:
+                  message.host.capabilities.clipboard &&
+                  message.host.remoteInput &&
+                  message.host.viewer.mayControl,
                 preferences: this.preferences,
                 operations: {
                   sendSignal: async ({ envelope }) =>
