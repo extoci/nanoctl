@@ -30,6 +30,7 @@ pub struct Capabilities {
     readiness: &'static str,
     input: bool,
     remote_input: bool,
+    gamepad: bool,
     clipboard: bool,
     system_audio: bool,
     displays: Vec<DisplayCapability>,
@@ -116,9 +117,22 @@ pub fn capabilities(
         readiness,
         input: remote_input_enabled && input,
         remote_input: remote_input_enabled && input,
+        gamepad: gamepad_available(remote_input_enabled && input),
         clipboard: clipboard_available(clipboard_enabled && remote_input_enabled && input),
         system_audio: system_audio_available(system_audio_enabled),
         displays,
+    }
+}
+
+fn gamepad_available(enabled: bool) -> bool {
+    #[cfg(feature = "media")]
+    {
+        enabled && crate::gamepad::available()
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = enabled;
+        false
     }
 }
 

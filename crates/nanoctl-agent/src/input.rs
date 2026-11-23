@@ -25,6 +25,8 @@ pub struct InputController {
     held_keys: HashSet<Key>,
     held_buttons: HashSet<Button>,
     last_physical_input: Instant,
+    gamepads: crate::gamepad::Gamepads,
+    gamepads_revoked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +53,9 @@ enum ControlMessage {
         text: String,
     },
     Ping,
+    Gamepad {
+        pads: crate::gamepad::Snapshot,
+    },
     Display {
         #[serde(rename = "displayId")]
         display_id: String,
@@ -92,6 +97,8 @@ impl InputController {
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
             last_physical_input: Instant::now(),
+            gamepads: Default::default(),
+            gamepads_revoked: false,
         })
     }
 
@@ -127,7 +134,10 @@ impl InputController {
         }
         if !matches!(
             &message,
-            ControlMessage::Ping | ControlMessage::Release | ControlMessage::Unsupported
+            ControlMessage::Ping
+                | ControlMessage::Release
+                | ControlMessage::Gamepad { .. }
+                | ControlMessage::Unsupported
         ) {
             self.last_physical_input = Instant::now();
         }
@@ -168,6 +178,12 @@ impl InputController {
                 Ok(None)
             }
             ControlMessage::Ping => Ok(None),
+            ControlMessage::Gamepad { pads } => {
+                if !self.gamepads_revoked {
+                    self.gamepads.update(pads)?;
+                }
+                Ok(None)
+            }
             ControlMessage::Display { display_id } => {
                 self.select_display(&display_id)?;
                 Ok(Some(display_id))
@@ -262,11 +278,17 @@ impl InputController {
     }
 
     pub fn release_if_idle(&mut self, timeout: Duration) {
+        self.gamepads.neutralize_if_idle(timeout);
         if self.last_physical_input.elapsed() >= timeout
             && (!self.held_keys.is_empty() || !self.held_buttons.is_empty())
         {
             self.release_all();
         }
+    }
+
+    pub fn revoke_gamepads(&mut self) {
+        self.gamepads_revoked = true;
+        self.gamepads = Default::default();
     }
 }
 
