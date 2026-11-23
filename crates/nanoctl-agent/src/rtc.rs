@@ -438,7 +438,7 @@ impl HostPeer {
         host_epoch: String,
         allow_remote_input: bool,
         allow_clipboard: bool,
-        allow_audio: bool,
+        audio_output: Option<tokio::sync::watch::Receiver<Option<String>>>,
     ) -> Result<Self> {
         Self::answer_with_publisher(
             SignalPublisher::websocket(sender),
@@ -449,7 +449,7 @@ impl HostPeer {
             host_epoch,
             allow_remote_input,
             allow_clipboard,
-            allow_audio,
+            audio_output,
         )
         .await
     }
@@ -464,7 +464,7 @@ impl HostPeer {
         host_epoch: String,
         allow_remote_input: bool,
         allow_clipboard: bool,
-        allow_audio: bool,
+        audio_output: Option<tokio::sync::watch::Receiver<Option<String>>>,
     ) -> Result<Self> {
         let (offer, initial_generation, controller_epoch) =
             parse_offer(serialized_offer, &session_id)?;
@@ -506,7 +506,7 @@ impl HostPeer {
             .with_interceptor_registry(registry)
             .build();
         #[cfg(not(feature = "media"))]
-        let _ = (allow_remote_input, allow_clipboard, allow_audio);
+        let _ = (allow_remote_input, allow_clipboard, audio_output);
         let peer = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
@@ -702,7 +702,9 @@ impl HostPeer {
             }));
         }
         #[cfg(feature = "media")]
-        if allow_audio && crate::audio::available() {
+        if let Some(output) = audio_output
+            && offer.lines().any(|line| line.starts_with("m=audio "))
+        {
             let audio = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability {
                     mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
@@ -719,6 +721,7 @@ impl HostPeer {
                 audio,
                 peer.clone(),
                 input_shutdown.subscribe(),
+                output,
             )));
             let mut shutdown = input_shutdown.subscribe();
             input_tasks.push(tokio::spawn(async move {
@@ -1774,7 +1777,7 @@ mod tests {
             "host-test".to_owned(),
             false,
             false,
-            false,
+            None,
         )
         .await;
 
@@ -1842,7 +1845,7 @@ mod tests {
             "host-test".to_owned(),
             false,
             false,
-            false,
+            None,
         )
         .await
         .unwrap();
