@@ -997,7 +997,7 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         )
         .rate_control_mode(RateControlMode::Bitrate)
         // A zero minimum is OpenH264's sentinel for its lossy 26–35 screen default.
-        .qp(QpRange::new(16, 51))
+        .qp(QpRange::new(14, 51))
         .complexity(complexity)
         .skip_frames(skip_frames);
     Encoder::with_api_config(OpenH264API::from_source(), config)
@@ -2563,7 +2563,7 @@ mod tests {
                 )
             };
             assert_eq!(result, 0);
-            assert_eq!((params.iMinQp, params.iMaxQp), (16, 51));
+            assert_eq!((params.iMinQp, params.iMaxQp), (14, 51));
             assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
             assert_eq!(params.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
             let layer = &params.sSpatialLayers[0];
