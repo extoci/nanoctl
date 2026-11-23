@@ -1,0 +1,71 @@
+name: latency
+
+on:
+  pull_request:
+  push:
+    branches: [master, "rewrite/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: latency-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    name: Latency (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.1
+      - run: bun install --frozen-lockfile
+      - name: Install native Linux capture and desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+            nasm pkg-config xauth xvfb
+          bunx playwright install --with-deps chromium
+      - name: Install Chromium on Windows
+        if: runner.os == 'Windows'
+        run: bunx playwright install chromium
+      - name: Measure on Xvfb
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" bun run test:latency
+      - name: Measure on Windows desktop (experimental)
+        id: windows
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: bun run test:latency
+      - name: Summarize latency
+        shell: bash
+        env:
+          WINDOWS_RESULT: ${{ steps.windows.outcome }}
+        run: |
+          if [[ "$WINDOWS_RESULT" == failure ]]; then
+            echo 'No Windows latency result. See the experimental desktop step for the failure.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat test-results/*/latency.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.windows.outcome != 'failure'
+        with:
+          name: nanoctl-latency-${{ matrix.os }}
+          path: |
+            test-results/*/latency.json
+            test-results/*/latency.md
+          if-no-files-found: error
