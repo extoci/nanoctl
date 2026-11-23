@@ -6,9 +6,9 @@ export type Quality = "good" | "fair" | "poor";
 
 export function connectionQuality(metrics: RemoteSessionMetrics | null): Quality | null {
   if (!metrics) return null;
-  const fps = metrics.fps ?? Infinity;
-  if (metrics.rttMs > 150 || fps < 10) return "poor";
-  if (metrics.rttMs > 60 || fps < 24 || metrics.route === "relay") return "fair";
+  // The host sends fewer frames while the desktop is still, even on a healthy link.
+  if (metrics.rttMs > 150) return "poor";
+  if (metrics.rttMs > 60 || metrics.route === "relay") return "fair";
   return "good";
 }
 

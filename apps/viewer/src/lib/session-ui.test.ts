@@ -17,8 +17,14 @@ describe("session ui", () => {
     expect(connectionQuality(metrics)).toBe("good");
     expect(connectionQuality({ ...metrics, route: "relay" })).toBe("fair");
     expect(connectionQuality({ ...metrics, rttMs: 90 })).toBe("fair");
-    expect(connectionQuality({ ...metrics, fps: 5 })).toBe("poor");
-    expect(connectionQuality({ ...metrics, fps: null })).toBe("good");
+    expect(connectionQuality({ ...metrics, rttMs: 180 })).toBe("poor");
+  });
+
+  test("does not flag an idle desktop as a bad connection", () => {
+    for (const fps of [null, 0, 5, 12]) {
+      expect(connectionQuality({ ...metrics, fps, rttMs: 1 })).toBe("good");
+      expect(connectionQuality({ ...metrics, fps, rttMs: 180 })).toBe("poor");
+    }
   });
 
   test("combos press modifiers, then the key, then release in reverse", () => {
