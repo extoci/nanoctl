@@ -39,6 +39,11 @@ mod x264_encoder;
 #[cfg(target_os = "linux")]
 #[path = "media_trace.rs"]
 pub(crate) mod trace;
+
+#[cfg(target_os = "macos")]
+#[path = "macos_capture.rs"]
+mod macos_capture;
+
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
@@ -282,11 +287,14 @@ impl LatestFrame {
         true
     }
 
-    fn take(&self, timeout: Duration) -> Result<Arc<CapturedFrame>> {
+    fn take(&self, timeout: Duration) -> Result<(Arc<CapturedFrame>, bool)> {
         let slot = self
             .slot
             .lock()
             .map_err(|_| anyhow!("display capture queue was poisoned"))?;
+        if self.finished.load(Ordering::Acquire) {
+            bail!("display capture stopped");
+        }
         if slot.is_none()
             && let Some(last) = self
                 .last
@@ -294,11 +302,13 @@ impl LatestFrame {
                 .map_err(|_| anyhow!("display capture queue was poisoned"))?
                 .clone()
         {
-            return Ok(last);
+            return Ok((last, false));
         }
         let (mut slot, timeout) = self
             .ready
-            .wait_timeout_while(slot, timeout, |frame| frame.is_none())
+            .wait_timeout_while(slot, timeout, |frame| {
+                frame.is_none() && !self.finished.load(Ordering::Acquire)
+            })
             .map_err(|_| anyhow!("display capture queue was poisoned"))?;
         if timeout.timed_out() && slot.is_none() {
             return self
@@ -306,9 +316,11 @@ impl LatestFrame {
                 .lock()
                 .map_err(|_| anyhow!("display capture queue was poisoned"))?
                 .clone()
+                .map(|last| (last, false))
                 .context("display capture stopped without a frame");
         }
         slot.take()
+            .map(|frame| (frame, true))
             .context("display capture stopped without a frame")
     }
 
@@ -330,7 +342,7 @@ impl LatestFrame {
                 return Ok(None);
             }
             if self.finished.load(Ordering::Acquire) {
-                bail!("display capture forwarding thread stopped");
+                bail!("display capture stopped");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -348,13 +360,31 @@ impl LatestFrame {
 pub struct CaptureEncoder {
     // Keeping the recorder alive preserves one native capture session instead of rebuilding the
     // OS capture pipeline for every frame.
-    recorder: Option<xcap::VideoRecorder>,
+    recorder: Option<CaptureRecorder>,
     forwarder: Option<std::thread::JoinHandle<()>>,
     latest_frame: Arc<LatestFrame>,
     display_id: String,
     encoder: EncoderBackend,
     #[cfg(target_os = "windows")]
     resizer: resize::RgbaResizer,
+}
+
+enum CaptureRecorder {
+    Xcap(xcap::VideoRecorder),
+    #[cfg(target_os = "macos")]
+    ScreenCaptureKit(macos_capture::ScreenRecorder),
+}
+
+impl CaptureRecorder {
+    fn stop(self) {
+        match self {
+            Self::Xcap(recorder) => {
+                let _ = recorder.stop();
+            }
+            #[cfg(target_os = "macos")]
+            Self::ScreenCaptureKit(recorder) => drop(recorder),
+        }
+    }
 }
 
 pub(crate) type RgbaFrame<'a> = xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &'a [u8]>;
@@ -572,7 +602,7 @@ impl CaptureEncoder {
         let (recorder, latest_frame, forwarder) = start_capture(&monitor, stats)?;
         Ok(Self {
             recorder,
-            forwarder: Some(forwarder),
+            forwarder,
             latest_frame,
             display_id,
             encoder,
@@ -597,14 +627,13 @@ impl CaptureEncoder {
             start_capture(&monitor, self.latest_frame.stats.clone())?;
         self.latest_frame.stopped.store(true, Ordering::Release);
         if let Some(old_recorder) = self.recorder.take() {
-            let _ = old_recorder.stop();
-            drop(old_recorder);
+            old_recorder.stop();
         }
         if let Some(old_forwarder) = self.forwarder.take() {
             let _ = old_forwarder.join();
         }
         self.recorder = recorder;
-        self.forwarder = Some(forwarder);
+        self.forwarder = forwarder;
         self.latest_frame = latest_frame;
         self.display_id = display_id.to_owned();
         self.encoder.force_keyframe();
@@ -628,9 +657,10 @@ impl CaptureEncoder {
         &mut self,
         max_width: u32,
         max_height: u32,
-    ) -> Result<(EncodedFrame, TimingSample)> {
-        let captured = self.latest_frame.take(Duration::from_secs(5))?;
-        self.encode_captured_frame(&captured, max_width, max_height)
+    ) -> Result<(EncodedFrame, TimingSample, bool)> {
+        let (captured, fresh) = self.latest_frame.take(Duration::from_secs(5))?;
+        let (encoded, timing) = self.encode_captured_frame(&captured, max_width, max_height)?;
+        Ok((encoded, timing, fresh))
     }
 
     fn encode_captured_frame(
@@ -1149,23 +1179,42 @@ fn rgba_view(
         .context("display capture returned an invalid RGBA frame")
 }
 
-fn start_capture(
-    monitor: &Monitor,
-    stats: Arc<PipelineStats>,
-) -> Result<(
-    Option<xcap::VideoRecorder>,
+type StartedCapture = (
+    Option<CaptureRecorder>,
     Arc<LatestFrame>,
-    std::thread::JoinHandle<()>,
-)> {
+    Option<std::thread::JoinHandle<()>>,
+);
+
+fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<StartedCapture> {
     #[cfg(target_os = "linux")]
     match linux_damage::start(monitor, stats.clone()) {
-        Ok((latest, thread)) => return Ok((None, latest, thread)),
+        Ok((latest, thread)) => return Ok((None, latest, Some(thread))),
         Err(error) => tracing::debug!(%error, "XDamage unavailable; retaining continuous capture"),
     }
     #[cfg(target_os = "linux")]
     {
         stats.damage_enabled.store(false, Ordering::Relaxed);
         stats.capture_parked.store(false, Ordering::Relaxed);
+    }
+    #[cfg(target_os = "macos")]
+    if macos_capture::ScreenRecorder::supported() {
+        let latest_frame = Arc::new(LatestFrame {
+            stats: stats.clone(),
+            ..Default::default()
+        });
+        match macos_capture::ScreenRecorder::start(monitor.id()?, &latest_frame) {
+            Ok(recorder) => {
+                tracing::debug!("using ScreenCaptureKit for display capture");
+                return Ok((
+                    Some(CaptureRecorder::ScreenCaptureKit(recorder)),
+                    latest_frame,
+                    None,
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "ScreenCaptureKit unavailable; retaining continuous capture")
+            }
+        }
     }
     let (recorder, native_frames) = monitor
         .video_recorder()
@@ -1204,7 +1253,11 @@ fn start_capture(
         let _ = forwarder.join();
         return Err(error).context("continuous display capture could not start");
     }
-    Ok((Some(recorder), latest_frame, forwarder))
+    Ok((
+        Some(CaptureRecorder::Xcap(recorder)),
+        latest_frame,
+        Some(forwarder),
+    ))
 }
 
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
@@ -1302,8 +1355,7 @@ impl Drop for CaptureEncoder {
     fn drop(&mut self) {
         self.latest_frame.stopped.store(true, Ordering::Release);
         if let Some(recorder) = self.recorder.take() {
-            let _ = recorder.stop();
-            drop(recorder);
+            recorder.stop();
         }
         if let Some(forwarder) = self.forwarder.take() {
             let _ = forwarder.join();
@@ -1470,14 +1522,16 @@ struct TimingSamples {
 const MAX_TIMING_SAMPLES: usize = 524_288;
 
 impl TimingSamples {
-    fn observe(&mut self, sample: TimingSample) {
-        if self.capture_to_encode_micros.len() < MAX_TIMING_SAMPLES {
+    fn observe(&mut self, sample: TimingSample, fresh: bool) {
+        if fresh && self.capture_to_encode_micros.len() < MAX_TIMING_SAMPLES {
             self.capture_to_encode_micros.push(
                 sample
                     .capture_to_encode
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64,
             );
+        }
+        if self.encode_micros.len() < MAX_TIMING_SAMPLES {
             self.encode_micros
                 .push(sample.encode.as_micros().min(u128::from(u64::MAX)) as u64);
         }
@@ -1602,9 +1656,9 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
             std::thread::sleep(next_frame - now);
         }
         next_frame = Instant::now() + frame_interval;
-        let (frame, timing) =
+        let (frame, timing, fresh) =
             encoder.next_access_unit_with_timings(quality.max_width, quality.max_height)?;
-        timing_samples.observe(timing);
+        timing_samples.observe(timing, fresh);
         if frame.bytes.is_empty() {
             continue;
         }
@@ -2174,9 +2228,9 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 mod tests {
     use super::{
         EncodedFrame, EncodedFrameSlot, EncoderBackend, EncoderSettings, FrameEncoder,
-        HARDWARE_BACKENDS, HardwareBackend, LatestFrame, SoftwareEncoder,
-        VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b, await_video_delivery,
-        bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
+        HARDWARE_BACKENDS, HardwareBackend, LatestFrame, SoftwareEncoder, TimingSample,
+        TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b,
+        await_video_delivery, bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
@@ -2314,7 +2368,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert!(queue.take(Duration::ZERO).is_ok());
+        assert!(!queue.take(Duration::ZERO).unwrap().1);
         queue
             .finished
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2789,8 +2843,28 @@ mod tests {
         let queue = LatestFrame::default();
         assert!(queue.replace(xcap::Frame::new(1, 1, vec![1, 0, 0, 255])));
         assert!(queue.replace(xcap::Frame::new(1, 1, vec![2, 0, 0, 255])));
-        let frame = queue.take(Duration::from_millis(1)).unwrap();
+        let (frame, fresh) = queue.take(Duration::from_millis(1)).unwrap();
         assert_eq!(frame.frame.raw[0], 2);
+        assert!(fresh);
+    }
+
+    #[test]
+    fn media_smoke_does_not_measure_cached_frame_age_as_capture_latency() {
+        let mut timings = TimingSamples::default();
+        for (fresh, age) in [
+            (true, Duration::from_millis(20)),
+            (false, Duration::from_secs(3)),
+        ] {
+            timings.observe(
+                TimingSample {
+                    capture_to_encode: age,
+                    encode: Duration::from_millis(4),
+                },
+                fresh,
+            );
+        }
+        assert_eq!(timings.capture_to_encode_micros, [20_000]);
+        assert_eq!(timings.encode_micros, [4_000, 4_000]);
     }
 
     #[test]
