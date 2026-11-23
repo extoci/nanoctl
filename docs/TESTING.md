@@ -27,7 +27,7 @@ Media mode additionally checks first video frame and a nonzero fractional bitrat
 Unit tests cover rate baselines, missing browser FPS, counter resets and idle samples.
 
 Media builds need native capture/encoder development dependencies. On Linux this
-includes X11/XCB, PipeWire/Wayland, libva, clang and pkg-config; CI lists the full
+includes X11/XCB, PipeWire/Wayland, libva, NVENC headers, clang and pkg-config; CI lists the full
 platform packages. Media browser tests need a usable graphical display, e.g. `DISPLAY=:0`.
 Install Chromium with `bunx playwright install chromium` if absent.
 Test code's `NANOCTL_DEV_LOOPBACK_USER=dev@example.com` bypass is never a production setting.
@@ -44,6 +44,27 @@ cargo build --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 Verify that the binary serves the built hashed viewer assets, not the no-viewer placeholder.
 Cargo must also compile without Bun or viewer output. The viewer cannot depend on remote
 runtime origins or unsafe-eval.
+
+## Encode-only performance
+
+Run the ignored release test to measure RGBA-to-Annex-B latency without desktop
+capture, scheduling or WebRTC. Set `NANOCTL_BENCH_ENCODER` to `software-openh264`
+(default), `vaapi`, `nvenc`, `videotoolbox` or `media-foundation`. A requested hardware
+backend must initialize and encode; the benchmark will not substitute software.
+
+```sh
+test_bin=$(cargo test --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml \
+  --bin nanoctl --no-run --message-format=json |
+  jq -r 'select(.profile.test == true and .target.name == "nanoctl" and .executable) | .executable')
+NANOCTL_BENCH_ENCODER=software-openh264 /usr/bin/time -p "$test_bin" \
+  media::tests::benchmark_encoder --exact --ignored --nocapture
+```
+
+The test reports p50/p95 wall time and output count for 180 unpaced, synthetic
+1080p frames after warmup, configured at 30 fps and 4 Mbps. On Unix, `time -p`
+reports process CPU time (user + sys, including warmup and frame generation);
+use `Measure-Command` for wall time or a process profiler for CPU time on Windows.
+Compare encoders on the same machine and report the GPU and driver alongside the result.
 
 ## Release qualification
 

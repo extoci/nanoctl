@@ -10,24 +10,160 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
     UsageType,
 };
-use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::YUVSource;
+use openh264_sys2::{
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
+    SPATIAL_LAYER_ALL,
+};
 use xcap::Monitor;
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU16, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+#[cfg(target_os = "linux")]
+#[path = "linux_damage.rs"]
+mod linux_damage;
+
+use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
 
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-const CAPTURE_FRAME_STALE_GRACE: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct SendRateWindow {
+    writes: VecDeque<(Instant, usize)>,
+}
+
+impl SendRateWindow {
+    fn kbps(&mut self, now: Instant) -> f64 {
+        while self
+            .writes
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > Duration::from_secs(2))
+        {
+            self.writes.pop_front();
+        }
+        self.writes.iter().map(|(_, bytes)| *bytes).sum::<usize>() as f64 * 8.0 / 2000.0
+    }
+}
+
+#[derive(Default)]
+pub struct PipelineStats {
+    send_window: Mutex<SendRateWindow>,
+    pub send_kbps: AtomicU32,
+    #[cfg(target_os = "linux")]
+    pub capture_parked: AtomicBool,
+    #[cfg(target_os = "linux")]
+    pub damage_enabled: AtomicBool,
+    #[cfg(target_os = "linux")]
+    pub damage_resumes: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_samples: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_last_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_max_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_capture_ready_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub first_change_encode_ns: AtomicU64,
+    #[cfg(target_os = "linux")]
+    damage_started: Mutex<Option<Instant>>,
+    pub frames_captured: AtomicU64,
+    pub frames_encoded: AtomicU64,
+    pub changed_encodes: AtomicU64,
+    pub unchanged_encodes: AtomicU64,
+    pub skipped_unchanged: AtomicU64,
+    pub keepalives: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub target_kbps: AtomicU32,
+    pub target_fps: AtomicU16,
+    pub encoded_width: AtomicU32,
+    pub encoded_height: AtomicU32,
+    pub fresh_frames: AtomicU64,
+    pub compare_ns: AtomicU64,
+    pub capture_wait_ns: AtomicU64,
+    pub preprocess_ns: AtomicU64,
+    pub backend_ns: AtomicU64,
+    pub color_convert_ns: AtomicU64,
+    pub encode_attempts: AtomicU64,
+    pub empty_encodes: AtomicU64,
+    pub pacer_skips: AtomicU64,
+    #[cfg(target_os = "linux")]
+    pub producer_tid: AtomicU32,
+}
+
+impl PipelineStats {
+    fn log(&self) {
+        tracing::info!(
+            frames_captured = self.frames_captured.load(Ordering::Relaxed),
+            frames_encoded = self.frames_encoded.load(Ordering::Relaxed),
+            skipped_unchanged = self.skipped_unchanged.load(Ordering::Relaxed),
+            keepalives = self.keepalives.load(Ordering::Relaxed),
+            bytes_sent = self.bytes_sent.load(Ordering::Relaxed),
+            send_kbps = self.send_kbps.load(Ordering::Relaxed),
+            target_kbps = self.target_kbps.load(Ordering::Relaxed),
+            target_fps = self.target_fps.load(Ordering::Relaxed),
+            encoded_width = self.encoded_width.load(Ordering::Relaxed),
+            encoded_height = self.encoded_height.load(Ordering::Relaxed),
+            "video pipeline statistics"
+        );
+    }
+}
+
+struct EncodeScale(u32);
+
+impl EncodeScale {
+    fn new(kbps: u32) -> Self {
+        Self(if kbps < 600 {
+            4
+        } else if kbps < 1500 {
+            2
+        } else {
+            1
+        })
+    }
+
+    fn update(&mut self, kbps: u32) -> bool {
+        let previous = self.0;
+        self.0 = match self.0 {
+            1 if kbps < 1500 => Self::new(kbps).0,
+            2 if kbps < 600 => 4,
+            4 if kbps >= 800 => {
+                if kbps >= 1800 {
+                    1
+                } else {
+                    2
+                }
+            }
+            2 if kbps >= 1800 => 1,
+            _ => self.0,
+        };
+        self.0 != previous
+    }
+
+    fn limits(&self, width: u32, height: u32) -> (u32, u32) {
+        ((width / self.0).max(2), (height / self.0).max(2))
+    }
+}
+
+fn sample_duration(previous: Option<Instant>, now: Instant, fps: u16) -> Duration {
+    previous
+        .map_or_else(
+            || Duration::from_secs_f64(1.0 / f64::from(fps.max(1))),
+            |previous| now.saturating_duration_since(previous),
+        )
+        .clamp(Duration::from_millis(1), Duration::from_secs(5))
+}
 
 #[derive(Debug)]
 struct VideoDeliveryUnavailable;
@@ -68,10 +204,12 @@ where
 
 #[derive(Default)]
 struct LatestFrame {
-    slot: Mutex<Option<CapturedFrame>>,
-    last: Mutex<Option<CapturedFrame>>,
+    slot: Mutex<Option<Arc<CapturedFrame>>>,
+    last: Mutex<Option<Arc<CapturedFrame>>>,
     ready: Condvar,
     stopped: AtomicBool,
+    finished: AtomicBool,
+    stats: Arc<PipelineStats>,
 }
 
 #[derive(Clone)]
@@ -80,24 +218,33 @@ struct CapturedFrame {
     captured_at: Instant,
 }
 
+impl CapturedFrame {
+    fn differs_from(&self, previous: &Self) -> bool {
+        self.frame.width != previous.frame.width
+            || self.frame.height != previous.frame.height
+            || frame_changed(&previous.frame.raw, &self.frame.raw)
+    }
+}
+
 impl LatestFrame {
     fn replace(&self, frame: xcap::Frame) -> bool {
         let Ok(mut slot) = self.slot.lock() else {
             return false;
         };
-        let captured = CapturedFrame {
+        let captured = Arc::new(CapturedFrame {
             frame,
             captured_at: Instant::now(),
-        };
+        });
         if let Ok(mut last) = self.last.lock() {
             *last = Some(captured.clone());
         }
         *slot = Some(captured);
+        self.stats.frames_captured.fetch_add(1, Ordering::Relaxed);
         self.ready.notify_one();
         true
     }
 
-    fn take(&self, timeout: Duration) -> Result<CapturedFrame> {
+    fn take(&self, timeout: Duration) -> Result<Arc<CapturedFrame>> {
         let slot = self
             .slot
             .lock()
@@ -131,7 +278,7 @@ impl LatestFrame {
         &self,
         timeout: Duration,
         stopped: &AtomicBool,
-    ) -> Result<Option<CapturedFrame>> {
+    ) -> Result<Option<Arc<CapturedFrame>>> {
         let deadline = Instant::now() + timeout;
         let mut slot = self
             .slot
@@ -144,23 +291,12 @@ impl LatestFrame {
             if stopped.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            if let Some(last) = self
-                .last
-                .lock()
-                .map_err(|_| anyhow!("display capture queue was poisoned"))?
-                .clone()
-            {
-                return Ok(Some(last));
+            if self.finished.load(Ordering::Acquire) {
+                bail!("display capture forwarding thread stopped");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return self
-                    .last
-                    .lock()
-                    .map_err(|_| anyhow!("display capture queue was poisoned"))?
-                    .clone()
-                    .map(Some)
-                    .context("display capture stopped without a frame");
+                return Ok(None);
             }
             let (next_slot, _) = self
                 .ready
@@ -181,17 +317,80 @@ pub struct CaptureEncoder {
     encoder: EncoderBackend,
 }
 
-enum EncoderBackend {
+pub(crate) type RgbaFrame<'a> = xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &'a [u8]>;
+
+pub(crate) trait FrameEncoder {
+    fn force_keyframe(&mut self);
+    fn set_bitrate(&mut self, target_kbps: u32) -> Result<()>;
+    fn color_convert_ns(&self) -> u64 {
+        0
+    }
+    fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame>;
+}
+
+#[derive(Clone, Copy)]
+struct EncoderSettings {
+    bitrate_kbps: u32,
+    max_fps: u16,
+    latency_mode: LatencyMode,
+}
+
+type OpenEncoder = fn(EncoderSettings, (u32, u32)) -> Result<Box<dyn FrameEncoder>>;
+
+struct HardwareBackend {
+    id: &'static str,
+    name: &'static str,
+    open: OpenEncoder,
+}
+
+macro_rules! hardware_backend {
+    ($id:literal, $name:literal, $encoder:path) => {
+        HardwareBackend {
+            id: $id,
+            name: $name,
+            open: |settings, dimensions| {
+                Ok(Box::new(<$encoder>::new(
+                    settings.bitrate_kbps,
+                    settings.max_fps,
+                    settings.latency_mode,
+                    dimensions,
+                )?))
+            },
+        }
+    };
+}
+
+const HARDWARE_BACKENDS: &[HardwareBackend] = &[
     #[cfg(target_os = "linux")]
-    VaApi(Box<crate::linux_encoder::LinuxEncoder>),
+    hardware_backend!("vaapi", "VA-API", crate::linux_encoder::LinuxEncoder),
+    #[cfg(target_os = "linux")]
+    hardware_backend!("nvenc", "NVENC", crate::nvenc_encoder::NvencEncoder),
     #[cfg(target_os = "macos")]
-    VideoToolbox(Box<crate::macos_encoder::MacOsEncoder>),
+    hardware_backend!(
+        "videotoolbox",
+        "VideoToolbox",
+        crate::macos_encoder::MacOsEncoder
+    ),
     #[cfg(target_os = "windows")]
-    MediaFoundation {
-        encoder: Box<crate::windows_encoder::WindowsEncoder>,
-        allow_software_fallback: bool,
-    },
-    Software(Box<SoftwareEncoder>),
+    hardware_backend!(
+        "media-foundation",
+        "Media Foundation hardware MFT",
+        crate::windows_encoder::WindowsEncoder
+    ),
+];
+
+struct ActiveEncoder {
+    hardware: Option<&'static HardwareBackend>,
+    encoder: Box<dyn FrameEncoder>,
+    needs_initial_idr: bool,
+}
+
+struct EncoderBackend {
+    active: Option<ActiveEncoder>,
+    remaining_hardware: &'static [HardwareBackend],
+    preference: EncoderPreference,
+    settings: EncoderSettings,
+    dimensions: (u32, u32),
 }
 
 struct SoftwareEncoder {
@@ -200,8 +399,93 @@ struct SoftwareEncoder {
     max_fps: u16,
     latency_mode: LatencyMode,
     dimensions: Option<(u32, u32)>,
-    rgb: Vec<u8>,
-    yuv: Option<YUVBuffer>,
+    yuv: Option<I420Frame>,
+    color_convert_ns: u64,
+}
+
+struct I420Frame {
+    width: usize,
+    height: usize,
+    bytes: Vec<u8>,
+}
+
+impl I420Frame {
+    fn new(width: usize, height: usize) -> Result<Self> {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            bail!("I420 dimensions must be non-zero and even");
+        }
+        let pixels = width
+            .checked_mul(height)
+            .context("I420 dimensions overflow")?;
+        let length = pixels
+            .checked_add(pixels / 2)
+            .context("I420 size overflows")?;
+        Ok(Self {
+            width,
+            height,
+            bytes: vec![0; length],
+        })
+    }
+
+    fn read_rgba(&mut self, rgba: &[u8]) -> Result<()> {
+        let pixels = self.width * self.height;
+        if Some(rgba.len()) != pixels.checked_mul(4) {
+            bail!("RGBA pixel buffer does not match I420 dimensions");
+        }
+        let (y, uv) = self.bytes.split_at_mut(pixels);
+        let (u, v) = uv.split_at_mut(pixels / 4);
+        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
+            *y = (((66 * u32::from(pixel[0])
+                + 129 * u32::from(pixel[1])
+                + 25 * u32::from(pixel[2]))
+                >> 8)
+                + 16) as u8;
+        }
+        for ((rows, u), v) in rgba
+            .chunks_exact(self.width * 8)
+            .zip(u.chunks_exact_mut(self.width / 2))
+            .zip(v.chunks_exact_mut(self.width / 2))
+        {
+            let (top, bottom) = rows.split_at(self.width * 4);
+            for (((top, bottom), u), v) in top
+                .chunks_exact(8)
+                .zip(bottom.chunks_exact(8))
+                .zip(u)
+                .zip(v)
+            {
+                let average = |channel| {
+                    (i16::from(top[channel])
+                        + i16::from(top[channel + 4])
+                        + i16::from(bottom[channel])
+                        + i16::from(bottom[channel + 4])
+                        + 2)
+                        / 4
+                };
+                let (r, g, b) = (average(0), average(1), average(2));
+                *u = (((-38 * r + 112 * b - 74 * g) >> 8) + 128) as u8;
+                *v = (((112 * r - 18 * b - 94 * g) >> 8) + 128) as u8;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl YUVSource for I420Frame {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+    fn y(&self) -> &[u8] {
+        &self.bytes[..self.width * self.height]
+    }
+    fn u(&self) -> &[u8] {
+        &self.bytes[self.width * self.height..self.width * self.height * 5 / 4]
+    }
+    fn v(&self) -> &[u8] {
+        &self.bytes[self.width * self.height * 5 / 4..]
+    }
 }
 
 impl CaptureEncoder {
@@ -212,6 +496,7 @@ impl CaptureEncoder {
         max_height: u32,
         latency_mode: LatencyMode,
         encoder_preference: EncoderPreference,
+        stats: Arc<PipelineStats>,
     ) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
         let monitor = monitors
@@ -241,9 +526,9 @@ impl CaptureEncoder {
             .id()
             .context("cannot read primary display identifier")?
             .to_string();
-        let (recorder, latest_frame, forwarder) = start_capture(&monitor)?;
+        let (recorder, latest_frame, forwarder) = start_capture(&monitor, stats)?;
         Ok(Self {
-            recorder: Some(recorder),
+            recorder,
             forwarder: Some(forwarder),
             latest_frame,
             display_id,
@@ -263,7 +548,8 @@ impl CaptureEncoder {
         // Start the replacement while the current recorder is still valid. If the new display
         // cannot be opened, the caller keeps the current stream instead of losing video merely
         // because a display-selection request was invalid or temporarily unavailable.
-        let (recorder, latest_frame, forwarder) = start_capture(&monitor)?;
+        let (recorder, latest_frame, forwarder) =
+            start_capture(&monitor, self.latest_frame.stats.clone())?;
         self.latest_frame.stopped.store(true, Ordering::Release);
         if let Some(old_recorder) = self.recorder.take() {
             let _ = old_recorder.stop();
@@ -272,7 +558,7 @@ impl CaptureEncoder {
         if let Some(old_forwarder) = self.forwarder.take() {
             let _ = old_forwarder.join();
         }
-        self.recorder = Some(recorder);
+        self.recorder = recorder;
         self.forwarder = Some(forwarder);
         self.latest_frame = latest_frame;
         self.display_id = display_id.to_owned();
@@ -299,73 +585,85 @@ impl CaptureEncoder {
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let captured = self.latest_frame.take(Duration::from_secs(5))?;
-        self.encode_captured_frame(captured, max_width, max_height)
+        self.encode_captured_frame(&captured, max_width, max_height)
     }
 
     fn encode_captured_frame(
         &mut self,
-        captured: CapturedFrame,
+        captured: &CapturedFrame,
         max_width: u32,
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let CapturedFrame { frame, captured_at } = captured;
-        if captured_at.elapsed() > CAPTURE_FRAME_STALE_GRACE {
-            bail!("display capture stopped producing fresh frames");
-        }
-        let source = xcap::image::RgbaImage::from_raw(frame.width, frame.height, frame.raw)
-            .context("display capture returned an invalid RGBA frame")?;
+        let preprocess_started = Instant::now();
+        let source = rgba_view(frame)?;
         let (source_width, source_height) = source.dimensions();
         let (target_width, target_height) =
             fit_dimensions(source_width, source_height, max_width, max_height);
+        let resized;
         let image = if target_width == source_width && target_height == source_height {
             source
         } else {
-            xcap::image::imageops::resize(
+            resized = xcap::image::imageops::resize(
                 &source,
                 target_width,
                 target_height,
                 xcap::image::imageops::FilterType::Triangle,
+            );
+            xcap::image::ImageBuffer::from_raw(
+                target_width,
+                target_height,
+                resized.as_raw().as_slice(),
             )
+            .context("resized capture returned an invalid RGBA frame")?
         };
         let (width, height) = image.dimensions();
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
         }
         let encode_started = Instant::now();
+        self.latest_frame.stats.preprocess_ns.fetch_add(
+            encode_started.duration_since(preprocess_started).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.latest_frame
+            .stats
+            .encode_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let color_before = self.encoder.color_convert_ns();
         let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
+        self.latest_frame.stats.backend_ns.fetch_add(
+            encoded_at.duration_since(encode_started).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.latest_frame.stats.color_convert_ns.fetch_add(
+            self.encoder.color_convert_ns().saturating_sub(color_before),
+            Ordering::Relaxed,
+        );
+        if encoded.bytes.is_empty() {
+            self.latest_frame
+                .stats
+                .empty_encodes
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok((
             encoded,
             TimingSample {
-                capture_to_encode: encoded_at.saturating_duration_since(captured_at),
+                capture_to_encode: encoded_at.saturating_duration_since(*captured_at),
                 encode: encoded_at.saturating_duration_since(encode_started),
             },
-        ))
-    }
-
-    fn next_access_unit_until_stopped(
-        &mut self,
-        max_width: u32,
-        max_height: u32,
-        stopped: &AtomicBool,
-    ) -> Result<Option<EncodedFrame>> {
-        let Some(frame) = self
-            .latest_frame
-            .take_until_stopped(Duration::from_secs(5), stopped)?
-        else {
-            return Ok(None);
-        };
-        if stopped.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.encode_captured_frame(frame, max_width, max_height)
-                .map(|(encoded, _timing)| encoded)?,
         ))
     }
 }
 
 impl EncoderBackend {
+    fn color_convert_ns(&self) -> u64 {
+        self.active
+            .as_ref()
+            .map_or(0, |active| active.encoder.color_convert_ns())
+    }
+
     fn new(
         preference: EncoderPreference,
         bitrate_kbps: u32,
@@ -373,138 +671,164 @@ impl EncoderBackend {
         latency_mode: LatencyMode,
         probe_dimensions: (u32, u32),
     ) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        if !matches!(preference, EncoderPreference::Software) {
-            match crate::linux_encoder::LinuxEncoder::new(bitrate_kbps, max_fps, latency_mode) {
-                Ok(encoder) => return Ok(Self::VaApi(Box::new(encoder))),
-                Err(error) if matches!(preference, EncoderPreference::Hardware) => {
-                    return Err(error).context("required VA-API encoder is unavailable");
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "VA-API unavailable; using OpenH264");
-                }
-            }
-        }
-        #[cfg(target_os = "macos")]
-        if !matches!(preference, EncoderPreference::Software) {
-            match crate::macos_encoder::MacOsEncoder::new(bitrate_kbps, max_fps, latency_mode) {
-                Ok(encoder) => return Ok(Self::VideoToolbox(Box::new(encoder))),
-                Err(error) if matches!(preference, EncoderPreference::Hardware) => {
-                    return Err(error).context("required VideoToolbox encoder is unavailable");
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "VideoToolbox unavailable; using OpenH264");
-                }
-            }
-        }
-        #[cfg(target_os = "windows")]
-        if !matches!(preference, EncoderPreference::Software) {
-            match crate::windows_encoder::WindowsEncoder::new(
+        Self::with_hardware(
+            preference,
+            EncoderSettings {
                 bitrate_kbps,
                 max_fps,
                 latency_mode,
-                probe_dimensions.0,
-                probe_dimensions.1,
-            ) {
+            },
+            probe_dimensions,
+            HARDWARE_BACKENDS,
+        )
+    }
+
+    fn with_hardware(
+        preference: EncoderPreference,
+        settings: EncoderSettings,
+        dimensions: (u32, u32),
+        hardware: &'static [HardwareBackend],
+    ) -> Result<Self> {
+        let mut backend = Self {
+            active: None,
+            remaining_hardware: if matches!(preference, EncoderPreference::Software) {
+                &[]
+            } else {
+                hardware
+            },
+            preference,
+            settings,
+            dimensions,
+        };
+        backend.activate_next(None)?;
+        Ok(backend)
+    }
+
+    fn activate_next(&mut self, mut last_error: Option<anyhow::Error>) -> Result<()> {
+        // Some drivers support only one active hardware session.
+        self.active.take();
+        while let Some((hardware, remaining)) = self.remaining_hardware.split_first() {
+            self.remaining_hardware = remaining;
+            match (hardware.open)(self.settings, self.dimensions) {
                 Ok(encoder) => {
-                    return Ok(Self::MediaFoundation {
-                        encoder: Box::new(encoder),
-                        allow_software_fallback: matches!(preference, EncoderPreference::Auto),
+                    self.active = Some(ActiveEncoder {
+                        hardware: Some(hardware),
+                        encoder,
+                        needs_initial_idr: true,
                     });
-                }
-                Err(error) if matches!(preference, EncoderPreference::Hardware) => {
-                    return Err(error)
-                        .context("required Media Foundation hardware encoder is unavailable");
+                    return Ok(());
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "Media Foundation hardware unavailable; using OpenH264");
+                    tracing::debug!(backend = hardware.name, error = %error, "hardware encoder unavailable");
+                    last_error = Some(error.context(hardware.name));
                 }
             }
         }
-        if matches!(preference, EncoderPreference::Hardware) {
-            bail!("hardware encoding was required but no verified native backend is available");
+        if matches!(self.preference, EncoderPreference::Hardware) {
+            return Err(
+                last_error.unwrap_or_else(|| anyhow!("no native hardware encoder was compiled"))
+            )
+            .context("hardware H.264 was required but no usable backend remains");
         }
-        #[cfg(not(target_os = "windows"))]
-        let _ = probe_dimensions;
-        Ok(Self::Software(Box::new(SoftwareEncoder::new(
-            bitrate_kbps,
-            max_fps,
-            latency_mode,
-        )?)))
+        if let Some(error) = last_error {
+            tracing::debug!(%error, "no usable hardware encoder; using OpenH264");
+        }
+        self.active = Some(ActiveEncoder {
+            hardware: None,
+            encoder: Box::new(SoftwareEncoder::new(
+                self.settings.bitrate_kbps,
+                self.settings.max_fps,
+                self.settings.latency_mode,
+            )?),
+            needs_initial_idr: true,
+        });
+        Ok(())
     }
 
     fn force_keyframe(&mut self) {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::VaApi(encoder) => encoder.force_keyframe(),
-            #[cfg(target_os = "macos")]
-            Self::VideoToolbox(encoder) => encoder.force_keyframe(),
-            #[cfg(target_os = "windows")]
-            Self::MediaFoundation { encoder, .. } => encoder.force_keyframe(),
-            Self::Software(encoder) => encoder.encoder.force_intra_frame(),
+        if let Some(active) = &mut self.active {
+            active.encoder.force_keyframe();
         }
     }
 
     fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::VaApi(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
-            #[cfg(target_os = "macos")]
-            Self::VideoToolbox(encoder) => {
-                encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
+        let Some(target_kbps) = bitrate_target(
+            self.settings.bitrate_kbps,
+            estimate_kbps,
+            250.min(ceiling_kbps),
+            ceiling_kbps,
+        ) else {
+            return Ok(false);
+        };
+        let active = self.active.as_mut().context("no active H.264 encoder")?;
+        self.settings.bitrate_kbps = target_kbps;
+        if let Err(error) = active.encoder.set_bitrate(target_kbps) {
+            let Some(hardware) = active.hardware else {
+                return Err(error);
+            };
+            tracing::warn!(backend = hardware.name, %error, "hardware bitrate change failed; switching H.264 backend");
+            self.activate_next(Some(error.context(hardware.name)))?;
+        }
+        Ok(true)
+    }
+
+    fn encode(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+    ) -> Result<EncodedFrame> {
+        let view = xcap::image::ImageBuffer::from_raw(
+            image.width(),
+            image.height(),
+            image.as_raw().as_ref(),
+        )
+        .context("invalid RGBA frame")?;
+        let image = &view;
+        if self.dimensions != image.dimensions()
+            && let Some(active) = &mut self.active
+        {
+            active.needs_initial_idr = true;
+        }
+        self.dimensions = image.dimensions();
+        loop {
+            let active = self.active.as_mut().context("no active H.264 encoder")?;
+            let encoded = active.encoder.encode(image).and_then(|frame| {
+                if active.needs_initial_idr {
+                    let types = annex_b_nal_types(&frame.bytes)?;
+                    if ![5, 7, 8].iter().all(|nal| types.contains(nal)) {
+                        bail!("first H.264 access unit did not contain IDR, SPS and PPS");
+                    }
+                    active.needs_initial_idr = false;
+                }
+                Ok(frame)
+            });
+            match encoded {
+                Ok(frame) => return Ok(frame),
+                Err(error) => {
+                    let Some(hardware) = active.hardware else {
+                        return Err(error);
+                    };
+                    tracing::warn!(backend = hardware.name, %error, "hardware encode failed; switching H.264 backend");
+                    self.activate_next(Some(error.context(hardware.name)))?;
+                }
             }
-            #[cfg(target_os = "windows")]
-            Self::MediaFoundation { encoder, .. } => {
-                encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps)
-            }
-            Self::Software(encoder) => encoder.apply_bitrate_estimate(estimate_kbps, ceiling_kbps),
         }
     }
 
-    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::VaApi(encoder) => encoder.encode(image),
-            #[cfg(target_os = "macos")]
-            Self::VideoToolbox(encoder) => encoder.encode(image),
-            #[cfg(target_os = "windows")]
-            Self::MediaFoundation {
-                encoder,
-                allow_software_fallback,
-            } => match encoder.encode(image) {
-                Ok(frame) => Ok(frame),
-                Err(error) if *allow_software_fallback => {
-                    let bitrate_kbps = encoder.bitrate_kbps();
-                    let max_fps = encoder.max_fps();
-                    let latency_mode = encoder.latency_mode();
-                    tracing::warn!(
-                        error = %error,
-                        "Media Foundation failed on a captured frame; switching session to OpenH264"
-                    );
-                    let mut software = SoftwareEncoder::new(bitrate_kbps, max_fps, latency_mode)
-                        .context("Media Foundation failed and OpenH264 fallback is unavailable")?;
-                    let frame = software
-                        .encode(image)
-                        .context("OpenH264 fallback could not encode the captured frame")?;
-                    *self = Self::Software(Box::new(software));
-                    Ok(frame)
-                }
-                Err(error) => Err(error),
-            },
-            Self::Software(encoder) => encoder.encode(image),
-        }
+    fn selected_hardware(&self) -> Option<&'static HardwareBackend> {
+        self.active.as_ref().and_then(|active| active.hardware)
     }
 
     fn name(&self) -> &'static str {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::VaApi(_) => "VA-API",
-            #[cfg(target_os = "macos")]
-            Self::VideoToolbox(_) => "VideoToolbox",
-            #[cfg(target_os = "windows")]
-            Self::MediaFoundation { .. } => "Media Foundation hardware MFT",
-            Self::Software(_) => "OpenH264",
-        }
+        self.selected_hardware()
+            .map_or("OpenH264", |hardware| hardware.name)
+    }
+
+    fn id(&self) -> &'static str {
+        self.selected_hardware()
+            .map_or("software-openh264", |hardware| hardware.id)
     }
 }
 
@@ -516,24 +840,62 @@ impl SoftwareEncoder {
             max_fps,
             latency_mode,
             dimensions: None,
-            rgb: Vec::new(),
             yuv: None,
+            color_convert_ns: 0,
         })
     }
+}
 
-    fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
-        let floor_kbps = 250.min(ceiling_kbps);
-        let Some(target_kbps) =
-            bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
-        else {
-            return Ok(false);
-        };
-        self.encoder = create_encoder(target_kbps, self.max_fps, self.latency_mode)?;
-        self.bitrate_kbps = target_kbps;
-        Ok(true)
+impl FrameEncoder for SoftwareEncoder {
+    fn force_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
     }
 
-    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn color_convert_ns(&self) -> u64 {
+        self.color_convert_ns
+    }
+
+    fn set_bitrate(&mut self, target_kbps: u32) -> Result<()> {
+        if self.dimensions.is_some() {
+            let mut bitrate = SBitrateInfo {
+                iLayer: SPATIAL_LAYER_0,
+                iBitrate: target_kbps
+                    .max(self.bitrate_kbps)
+                    .saturating_mul(1_000)
+                    .min(i32::MAX as u32) as i32,
+            };
+            // SAFETY: The initialized encoder consumes this matching option structure
+            // synchronously. Keep the layer maximum above the new target before raising it.
+            let result = unsafe {
+                self.encoder.raw_api().set_option(
+                    ENCODER_OPTION_MAX_BITRATE,
+                    std::ptr::from_mut(&mut bitrate).cast(),
+                )
+            };
+            if result != 0 {
+                bail!("OpenH264 maximum bitrate update failed: {result}");
+            }
+            let mut bitrate = SBitrateInfo {
+                iLayer: SPATIAL_LAYER_ALL,
+                iBitrate: target_kbps.saturating_mul(1_000).min(i32::MAX as u32) as i32,
+            };
+            // SAFETY: The encoder is initialized, and SetOption consumes this correctly typed
+            // bitrate structure synchronously without changing dimensions or buffer ownership.
+            let result = unsafe {
+                self.encoder.raw_api().set_option(
+                    ENCODER_OPTION_BITRATE,
+                    std::ptr::from_mut(&mut bitrate).cast(),
+                )
+            };
+            if result != 0 {
+                bail!("OpenH264 bitrate update failed: {result}");
+            }
+        }
+        self.bitrate_kbps = target_kbps;
+        Ok(())
+    }
+
+    fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.dimensions != Some(dimensions) {
             // OpenH264 does not promise dynamic resolution changes. Recreate the software
@@ -544,19 +906,17 @@ impl SoftwareEncoder {
             self.dimensions = Some(dimensions);
         }
         let dimensions = (dimensions.0 as usize, dimensions.1 as usize);
-        self.rgb.clear();
-        self.rgb.reserve(dimensions.0 * dimensions.1 * 3);
-        for pixel in image.as_raw().chunks_exact(4) {
-            self.rgb.extend_from_slice(&pixel[..3]);
-        }
-        let source = RgbSliceU8::new(&self.rgb, dimensions);
-        let yuv = self
+        let color_started = Instant::now();
+        if self
             .yuv
-            .get_or_insert_with(|| YUVBuffer::new(dimensions.0, dimensions.1));
-        if yuv.dimensions() != dimensions {
-            *yuv = YUVBuffer::new(dimensions.0, dimensions.1);
+            .as_ref()
+            .is_none_or(|frame| frame.dimensions() != dimensions)
+        {
+            self.yuv = Some(I420Frame::new(dimensions.0, dimensions.1)?);
         }
-        yuv.read_rgb8(source);
+        let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
+        yuv.read_rgba(image.as_raw())?;
+        self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
         let stream = self.encoder.encode(yuv).context("H.264 encode failed")?;
         Ok(EncodedFrame {
             bytes: stream.to_vec(),
@@ -566,17 +926,38 @@ impl SoftwareEncoder {
     }
 }
 
+fn rgba_view(
+    frame: &xcap::Frame,
+) -> Result<xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &[u8]>> {
+    xcap::image::ImageBuffer::from_raw(frame.width, frame.height, frame.raw.as_slice())
+        .context("display capture returned an invalid RGBA frame")
+}
+
 fn start_capture(
     monitor: &Monitor,
+    stats: Arc<PipelineStats>,
 ) -> Result<(
-    xcap::VideoRecorder,
+    Option<xcap::VideoRecorder>,
     Arc<LatestFrame>,
     std::thread::JoinHandle<()>,
 )> {
+    #[cfg(target_os = "linux")]
+    match linux_damage::start(monitor, stats.clone()) {
+        Ok((latest, thread)) => return Ok((None, latest, thread)),
+        Err(error) => tracing::debug!(%error, "XDamage unavailable; retaining continuous capture"),
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stats.damage_enabled.store(false, Ordering::Relaxed);
+        stats.capture_parked.store(false, Ordering::Relaxed);
+    }
     let (recorder, native_frames) = monitor
         .video_recorder()
         .context("continuous display capture is unavailable")?;
-    let latest_frame = Arc::new(LatestFrame::default());
+    let latest_frame = Arc::new(LatestFrame {
+        stats,
+        ..Default::default()
+    });
     let forwarding_slot = Arc::downgrade(&latest_frame);
     let forwarder = std::thread::Builder::new()
         .name("nanoctl-capture".to_owned())
@@ -595,6 +976,10 @@ fn start_capture(
                     break;
                 }
             }
+            if let Some(latest_frame) = forwarding_slot.upgrade() {
+                latest_frame.finished.store(true, Ordering::Release);
+                latest_frame.ready.notify_one();
+            }
         })
         .context("capture forwarding thread could not start")?;
     if let Err(error) = recorder.start() {
@@ -603,7 +988,7 @@ fn start_capture(
         let _ = forwarder.join();
         return Err(error).context("continuous display capture could not start");
     }
-    Ok((recorder, latest_frame, forwarder))
+    Ok((Some(recorder), latest_frame, forwarder))
 }
 
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
@@ -624,20 +1009,14 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .context("H.264 encoder is unavailable")
 }
 
-pub fn probe_encoder(preference: EncoderPreference) -> Result<&'static str> {
+pub fn probe_encoder(preference: EncoderPreference) -> Result<(&'static str, &'static str)> {
     let encoder = EncoderBackend::new(preference, 1_000, 30, LatencyMode::Balanced, (1_280, 720))?;
-    Ok(encoder.name())
+    Ok((encoder.id(), encoder.name()))
 }
 
 pub(crate) fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Option<u32> {
     let target = estimate.clamp(floor, ceiling);
-    let target = u64::from(target);
-    let current = u64::from(current);
-    if target * 100 <= current * 80 || target * 100 >= current * 125 {
-        Some(target as u32)
-    } else {
-        None
-    }
+    (target != current).then_some(target)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -951,6 +1330,7 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         quality.max_height,
         quality.latency_mode,
         quality.encoder,
+        Arc::default(),
     )?;
     let started_unix_seconds = crate::update::unix_time_now()?;
     let started = Instant::now();
@@ -1034,9 +1414,9 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
     })
 }
 
-fn annex_b_nal_types(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn annex_b_nal_types(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() > 32 * 1024 * 1024 {
-        bail!("H.264 access unit exceeds the smoke-test safety bound");
+        bail!("H.264 access unit exceeds the size limit");
     }
     let mut types = Vec::new();
     let mut offset = 0_usize;
@@ -1078,6 +1458,7 @@ pub(crate) struct VideoPipeline {
     task: tokio::task::JoinHandle<Result<()>>,
     stop: tokio::sync::watch::Sender<bool>,
     stopped: Arc<AtomicBool>,
+    pub stats: Arc<PipelineStats>,
 }
 
 impl VideoPipeline {
@@ -1091,6 +1472,7 @@ impl VideoPipeline {
         if let Err(error) = self.task.await {
             tracing::warn!(error = %error, "video pipeline task stopped unexpectedly");
         }
+        self.stats.log();
     }
 
     pub(crate) async fn finish(self) -> Result<()> {
@@ -1125,6 +1507,7 @@ impl VideoPipeline {
             task,
             stop,
             stopped,
+            stats: Arc::default(),
         }
     }
 }
@@ -1132,12 +1515,20 @@ impl VideoPipeline {
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
-    bitrate_estimate_kbps: tokio::sync::watch::Receiver<u32>,
+    link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
 ) -> VideoPipeline {
     let stopped = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(PipelineStats::default());
+    let controller = RateController::new(quality.max_bitrate_kbps, quality.max_fps);
+    let initial = controller.decision();
+    stats
+        .target_kbps
+        .store(initial.bitrate_kbps, Ordering::Relaxed);
+    stats.target_fps.store(initial.fps, Ordering::Relaxed);
+    let writer_stats = stats.clone();
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker_stopped = stopped.clone();
     let task = tokio::spawn(async move {
@@ -1146,78 +1537,216 @@ pub fn spawn_video(
             tokio::sync::watch::channel(0_u64);
         let producer_slot = encoded_slot.clone();
         let producer_stopped = worker_stopped.clone();
+        let producer_stats = writer_stats.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+            #[cfg(target_os = "linux")]
+            producer_stats.producer_tid.store(
+                std::fs::read_link("/proc/thread-self")
+                    .ok()
+                    .and_then(|path| path.file_name()?.to_str()?.parse().ok())
+                    .unwrap_or_default(),
+                Ordering::Relaxed,
+            );
             let result = (|| -> Result<()> {
                 let mut encoder = CaptureEncoder::primary(
-                    quality.max_bitrate_kbps,
+                    initial.bitrate_kbps,
                     quality.max_fps,
                     quality.max_width,
                     quality.max_height,
                     quality.latency_mode,
                     quality.encoder_preference,
+                    producer_stats.clone(),
                 )?;
                 let mut keyframe_requests = keyframe_requests;
-                let mut bitrate_estimate_kbps = bitrate_estimate_kbps;
+                let mut link_feedback = link_feedback;
                 let mut display_selection = display_selection;
                 let display_selection_feedback = display_selection_feedback;
-                let frame_interval = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
-                let mut next_frame = Instant::now();
+                let mut controller = controller;
+                let mut fps = initial.fps;
+                let mut pacer = DamagePacer::new(fps);
+                let mut scale = EncodeScale::new(initial.bitrate_kbps);
+                let mut last: Option<Arc<CapturedFrame>> = None;
+                let mut last_encoded: Option<Arc<CapturedFrame>> = None;
+                let mut forced_keyframe = false;
+                let mut waiting_since = Instant::now();
                 loop {
                     if producer_stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    let now = Instant::now();
-                    if now < next_frame {
-                        std::thread::sleep(next_frame - now);
+                    if encoder
+                        .forwarder
+                        .as_ref()
+                        .is_some_and(|thread| thread.is_finished())
+                    {
+                        bail!("display capture forwarding thread stopped");
                     }
+                    let now = Instant::now();
+                    let wait = if last.is_some() {
+                        pacer.next_deadline(now, fps).saturating_duration_since(now)
+                    } else {
+                        Duration::from_millis(50)
+                    }
+                    .min(Duration::from_millis(50));
+                    let wait_started = Instant::now();
+                    let fresh = encoder
+                        .latest_frame
+                        .take_until_stopped(wait, &producer_stopped)?;
+                    producer_stats
+                        .capture_wait_ns
+                        .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     if producer_stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    // Advance from the actual clock when capture/encode overruns. This prevents a
-                    // burst of catch-up frames after a slow encode or a suspended machine.
-                    next_frame = Instant::now() + frame_interval;
                     if keyframe_requests.has_changed().unwrap_or(false) {
                         keyframe_requests.borrow_and_update();
-                        encoder.encoder.force_keyframe();
+                        forced_keyframe = true;
                     }
                     if delivery_recovery_requests.has_changed().unwrap_or(false) {
                         delivery_recovery_requests.borrow_and_update();
-                        encoder.encoder.force_keyframe();
+                        forced_keyframe = true;
                     }
-                    if bitrate_estimate_kbps.has_changed().unwrap_or(false) {
-                        let estimate = *bitrate_estimate_kbps.borrow_and_update();
-                        encoder.apply_bitrate_estimate(estimate, quality.max_bitrate_kbps)?;
+                    let now = Instant::now();
+                    let send_kbps = producer_stats.send_window.lock().unwrap().kbps(now);
+                    producer_stats
+                        .send_kbps
+                        .store(send_kbps as u32, Ordering::Relaxed);
+                    controller.update_sender(send_kbps, pacer.idle(), now);
+                    if link_feedback.has_changed().unwrap_or(false)
+                        && let Some(sample) = *link_feedback.borrow_and_update()
+                        && let Some(decision) = controller.observe(sample)
+                    {
+                        encoder.apply_bitrate_estimate(
+                            decision.bitrate_kbps,
+                            quality.max_bitrate_kbps,
+                        )?;
+                        fps = decision.fps;
+                        pacer.set_fps(fps);
+                        forced_keyframe |= scale.update(decision.bitrate_kbps);
+                        producer_stats
+                            .target_kbps
+                            .store(decision.bitrate_kbps, Ordering::Relaxed);
+                        producer_stats.target_fps.store(fps, Ordering::Relaxed);
                     }
+                    let mut switched = false;
                     if display_selection.has_changed().unwrap_or(false) {
                         let display_id = display_selection.borrow_and_update().clone();
-                        if !display_id.is_empty()
-                            && let Err(error) = encoder.select_display(&display_id)
-                        {
-                            tracing::warn!(
-                                display_id,
-                                error = %error,
-                                "display switch rejected; retaining current capture"
-                            );
-                            // Input geometry is updated optimistically by the reliable control
-                            // worker. If capture rejects the same request, publish the actual
-                            // capture target so that worker rolls its geometry back. Do not
-                            // overwrite a newer request that arrived while the switch ran.
-                            if display_selection.borrow().as_str() == display_id.as_str() {
-                                display_selection_feedback
-                                    .send_replace(encoder.current_display_id().to_owned());
+                        if !display_id.is_empty() {
+                            match encoder.select_display(&display_id) {
+                                Ok(()) => {
+                                    last = None;
+                                    last_encoded = None;
+                                    pacer = DamagePacer::new(fps);
+                                    forced_keyframe = true;
+                                    waiting_since = Instant::now();
+                                    switched = true;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        display_id,
+                                        error = %error,
+                                        "display switch rejected; retaining current capture"
+                                    );
+                                    // Input geometry is updated optimistically by the reliable control
+                                    // worker. If capture rejects the same request, publish the actual
+                                    // capture target so that worker rolls its geometry back. Do not
+                                    // overwrite a newer request that arrived while the switch ran.
+                                    if display_selection.borrow().as_str() == display_id.as_str() {
+                                        display_selection_feedback
+                                            .send_replace(encoder.current_display_id().to_owned());
+                                    }
+                                }
                             }
                         }
                     }
-                    let Some(frame) = encoder.next_access_unit_until_stopped(
-                        quality.max_width,
-                        quality.max_height,
-                        &producer_stopped,
-                    )?
-                    else {
-                        break;
+                    let mut changed = false;
+                    if !switched && let Some(fresh) = fresh {
+                        producer_stats.fresh_frames.fetch_add(1, Ordering::Relaxed);
+                        let compare_started = Instant::now();
+                        changed = last_encoded
+                            .as_ref()
+                            .is_none_or(|previous| fresh.differs_from(previous));
+                        producer_stats.compare_ns.fetch_add(
+                            compare_started.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        if !changed {
+                            producer_stats
+                                .skipped_unchanged
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        last = Some(fresh);
+                    }
+                    let Some(captured) = last.as_ref() else {
+                        if waiting_since.elapsed() >= Duration::from_secs(5) {
+                            bail!("display capture stopped without a frame");
+                        }
+                        continue;
                     };
+                    let keepalive = pacer.idle() && !changed && !forced_keyframe;
+                    if pacer.on_frame(Instant::now(), changed, forced_keyframe) == PaceAction::Skip
+                    {
+                        producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if forced_keyframe {
+                        encoder.encoder.force_keyframe();
+                        forced_keyframe = false;
+                    }
+                    let (max_width, max_height) =
+                        scale.limits(quality.max_width, quality.max_height);
+                    let (frame, _timing) =
+                        encoder.encode_captured_frame(captured, max_width, max_height)?;
                     if frame.bytes.is_empty() {
                         continue;
+                    }
+                    let changed_output = last_encoded
+                        .as_ref()
+                        .is_none_or(|previous| captured.differs_from(previous));
+                    if changed_output {
+                        #[cfg(target_os = "linux")]
+                        if let Some(started) = producer_stats.damage_started.lock().unwrap().take()
+                        {
+                            let elapsed = started.elapsed().as_nanos() as u64;
+                            producer_stats.first_change_capture_ready_ns.store(
+                                captured
+                                    .captured_at
+                                    .saturating_duration_since(started)
+                                    .as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                            producer_stats
+                                .first_change_encode_ns
+                                .store(_timing.encode.as_nanos() as u64, Ordering::Relaxed);
+                            producer_stats
+                                .first_change_samples
+                                .fetch_add(1, Ordering::Relaxed);
+                            producer_stats
+                                .first_change_last_ns
+                                .store(elapsed, Ordering::Relaxed);
+                            producer_stats
+                                .first_change_max_ns
+                                .fetch_max(elapsed, Ordering::Relaxed);
+                        }
+                        producer_stats
+                            .changed_encodes
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        producer_stats
+                            .unchanged_encodes
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    last_encoded = Some(captured.clone());
+                    producer_stats
+                        .encoded_width
+                        .store(frame.width, Ordering::Relaxed);
+                    producer_stats
+                        .encoded_height
+                        .store(frame.height, Ordering::Relaxed);
+                    producer_stats
+                        .frames_encoded
+                        .fetch_add(1, Ordering::Relaxed);
+                    if keepalive {
+                        producer_stats.keepalives.fetch_add(1, Ordering::Relaxed);
                     }
                     if !producer_slot.replace(frame) {
                         break;
@@ -1229,13 +1758,16 @@ pub fn spawn_video(
             result
         });
         let mut stop_rx = stop_rx;
-        let duration = Duration::from_secs_f64(1.0 / f64::from(quality.max_fps));
+        let mut previous_written = None;
+        let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
+        stats_tick.tick().await;
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
         let mut recovery_keyframe_requested = false;
         let mut write_result = Ok(());
         loop {
             tokio::select! {
+                _ = stats_tick.tick() => writer_stats.log(),
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
                         break;
@@ -1245,9 +1777,10 @@ pub fn spawn_video(
                     let Some((frame, _dropped)) = frame else { break };
                     // A replaced encoded frame is a local latency policy, not RTP packet loss.
                     // Passing that count as prev_dropped_packets corrupts packet sequencing.
+                    let written_at = Instant::now();
                     let sample = Sample {
                         data: frame.bytes.into(),
-                        duration,
+                        duration: sample_duration(previous_written, written_at, writer_stats.target_fps.load(Ordering::Relaxed)),
                         ..Default::default()
                     };
                     // A broken transport must not hold capture/encoder teardown hostage forever.
@@ -1263,6 +1796,11 @@ pub fn spawn_video(
                         VIDEO_SAMPLE_WRITE_TIMEOUT,
                     )
                     .await;
+                    if result.is_ok() {
+                        previous_written = Some(written_at);
+                        writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
+                        writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
+                    }
                     match result {
                         Ok(()) if delivery_interrupted_since.is_some() => {
                             let outage = delivery_interrupted_since
@@ -1327,6 +1865,7 @@ pub fn spawn_video(
         task,
         stop,
         stopped,
+        stats,
     }
 }
 
@@ -1342,21 +1881,286 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedFrame, EncodedFrameSlot, EncoderBackend, LatestFrame, SoftwareEncoder,
+        EncodedFrame, EncodedFrameSlot, EncoderBackend, EncoderSettings, FrameEncoder,
+        HARDWARE_BACKENDS, HardwareBackend, LatestFrame, SoftwareEncoder,
         VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b, await_video_delivery,
         bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
+    use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
     use std::time::{Duration, Instant};
+    use xcap::image::{Rgba, RgbaImage};
+
+    #[test]
+    fn send_rate_window_counts_successful_payloads_and_expires_idle_bytes() {
+        let now = Instant::now();
+        let mut window = super::SendRateWindow::default();
+        assert_eq!(window.kbps(now), 0.0);
+        window.writes.push_back((now, 125_000));
+        window
+            .writes
+            .push_back((now + Duration::from_secs(1), 125_000));
+        assert_eq!(window.kbps(now + Duration::from_secs(1)), 1_000.0);
+        assert_eq!(window.kbps(now + Duration::from_millis(2001)), 500.0);
+        assert_eq!(window.kbps(now + Duration::from_secs(4)), 0.0);
+        assert!(window.writes.is_empty());
+    }
 
     #[tokio::test]
     async fn stopping_a_video_pipeline_waits_for_the_blocking_capture_worker() {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pipeline = super::VideoPipeline::test_worker(finished.clone());
+        assert_eq!(
+            pipeline
+                .stats
+                .frames_encoded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
         pipeline.stop().await;
 
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn encode_scale_bounds_low_rate_keyframes_and_has_recovery_hysteresis() {
+        let mut scale = super::EncodeScale::new(2_000);
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
+        assert!(scale.update(1_400));
+        assert_eq!(scale.limits(1920, 1080), (960, 540));
+        assert!(!scale.update(1_700));
+        assert!(scale.update(500));
+        assert_eq!(scale.limits(1920, 1080), (480, 270));
+        assert!(!scale.update(700));
+        assert!(scale.update(900));
+        assert!(scale.update(1_900));
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
+        assert_eq!(super::EncodeScale::new(0).limits(0, 1), (2, 2));
+    }
+
+    #[test]
+    fn sample_durations_use_elapsed_wall_time_and_are_bounded() {
+        let now = Instant::now();
+        assert_eq!(
+            super::sample_duration(None, now, 20),
+            Duration::from_millis(50)
+        );
+        assert_eq!(super::sample_duration(None, now, 0), Duration::from_secs(1));
+        assert_eq!(
+            super::sample_duration(Some(now), now + Duration::from_secs(2), 60),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::sample_duration(Some(now), now + Duration::from_secs(10), 60),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            super::sample_duration(Some(now), now, 60),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            super::sample_duration(Some(now), now - Duration::from_secs(1), 60),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn fresh_capture_wait_does_not_return_cached_frames() {
+        let queue = LatestFrame::default();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            queue
+                .take_until_stopped(Duration::ZERO, &stopped)
+                .unwrap()
+                .is_none()
+        );
+        assert!(queue.replace(xcap::Frame::new(1, 1, vec![1, 0, 0, 255])));
+        assert!(
+            queue
+                .take_until_stopped(Duration::ZERO, &stopped)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            queue
+                .take_until_stopped(Duration::ZERO, &stopped)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            queue
+                .stats
+                .frames_captured
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(queue.take(Duration::ZERO).is_ok());
+        queue
+            .finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(queue.take_until_stopped(Duration::ZERO, &stopped).is_err());
+        stopped.store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            queue
+                .take_until_stopped(Duration::ZERO, &stopped)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn software_bitrate_changes_at_runtime_without_forcing_an_idr() {
+        let pixels =
+            xcap::image::RgbaImage::from_pixel(64, 64, xcap::image::Rgba([32, 96, 160, 255]));
+        let image = xcap::image::ImageBuffer::from_raw(64, 64, pixels.as_raw().as_slice()).unwrap();
+        let mut encoder = SoftwareEncoder::new(1_000, 30, LatencyMode::Quality).unwrap();
+        encoder.set_bitrate(1_100).unwrap();
+        let first = encoder.encode(&image).unwrap();
+        assert!(annex_b_nal_types(&first.bytes).unwrap().contains(&5));
+        for target in [900, 2_000, 1_200] {
+            encoder.set_bitrate(target).unwrap();
+            let mut bitrate = openh264_sys2::SBitrateInfo {
+                iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+                iBitrate: 0,
+            };
+            // SAFETY: GetOption writes the requested bitrate into this matching native structure.
+            let result = unsafe {
+                encoder.encoder.raw_api().get_option(
+                    openh264_sys2::ENCODER_OPTION_BITRATE,
+                    std::ptr::from_mut(&mut bitrate).cast(),
+                )
+            };
+            assert_eq!(result, 0);
+            assert_eq!(bitrate.iBitrate, target as i32 * 1_000);
+            let next = encoder.encode(&image).unwrap();
+            let types = annex_b_nal_types(&next.bytes).unwrap();
+            assert!(types.contains(&1));
+            assert!(!types.contains(&5));
+        }
+    }
+
+    #[test]
+    fn captured_rgba_view_borrows_pixels_and_validates_layout() {
+        let frame = xcap::Frame::new(2, 2, vec![128; 16]);
+        let view = super::rgba_view(&frame).unwrap();
+        assert_eq!(view.as_raw().as_ptr(), frame.raw.as_ptr());
+        assert_eq!(view.dimensions(), (2, 2));
+        assert_eq!(view.get_pixel(1, 1).0, [128; 4]);
+        assert!(super::rgba_view(&xcap::Frame::new(2, 2, vec![0; 15])).is_err());
+        assert_eq!(
+            super::rgba_view(&xcap::Frame::new(0, 0, vec![]))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn captured_frame_comparison_checks_pixels_and_dimensions_not_timestamps() {
+        let now = Instant::now();
+        let previous = super::CapturedFrame {
+            frame: xcap::Frame::new(2, 2, vec![0; 16]),
+            captured_at: now,
+        };
+        let mut next = previous.clone();
+        next.captured_at += Duration::from_secs(1);
+        assert!(!next.differs_from(&previous));
+        next.frame.raw[15] = 1;
+        assert!(next.differs_from(&previous));
+        next.frame.raw.clear();
+        assert!(next.differs_from(&previous));
+        next.frame.raw = previous.frame.raw.clone();
+        next.frame.width = 4;
+        next.frame.height = 1;
+        assert!(next.differs_from(&previous));
+        next.frame.raw.clear();
+        next.frame.width = 0;
+        next.frame.height = 0;
+        assert!(!next.differs_from(&next));
+    }
+
+    #[test]
+    fn direct_rgba_conversion_matches_packed_rgb_reference() {
+        let mut seed = 0x12345678_u32;
+        for (width, height) in [(2, 2), (4, 6), (32, 18), (64, 64)] {
+            let mut converted = super::I420Frame::new(width, height).unwrap();
+            let allocation = converted.bytes.as_ptr();
+            for solid in [Some(0), Some(255), None] {
+                let rgba: Vec<_> = (0..width * height * 4)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        solid.unwrap_or((seed >> 24) as u8)
+                    })
+                    .collect();
+                let packed: Vec<_> = rgba
+                    .chunks_exact(4)
+                    .flat_map(|pixel| pixel[..3].iter().copied())
+                    .collect();
+                let reference =
+                    YUVBuffer::from_rgb8_source(RgbSliceU8::new(&packed, (width, height)));
+                converted.read_rgba(&rgba).unwrap();
+                assert_eq!(converted.bytes.as_ptr(), allocation);
+                assert_eq!(converted.strides(), reference.strides());
+                assert_eq!(converted.y(), reference.y());
+                assert_eq!(converted.u(), reference.u());
+                assert_eq!(converted.v(), reference.v());
+            }
+        }
+    }
+
+    #[test]
+    fn direct_rgba_conversion_rejects_invalid_layouts() {
+        for (width, height) in [(0, 0), (1, 2), (2, 3), (usize::MAX - 1, 2)] {
+            assert!(super::I420Frame::new(width, height).is_err());
+        }
+        let mut converted = super::I420Frame::new(2, 2).unwrap();
+        for length in [0, 15, 17] {
+            assert!(converted.read_rgba(&vec![0; length]).is_err());
+        }
+        converted.read_rgba(&[0; 16]).unwrap();
+        let original = converted.bytes.clone();
+        converted
+            .read_rgba(&[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255])
+            .unwrap();
+        assert_eq!(converted.bytes, original);
+    }
+
+    #[test]
+    fn idle_reencodes_accept_old_capture_timestamps_but_reject_invalid_pixels() {
+        let mut encoder = super::CaptureEncoder {
+            recorder: None,
+            forwarder: None,
+            latest_frame: std::sync::Arc::default(),
+            display_id: String::new(),
+            encoder: EncoderBackend::new(
+                EncoderPreference::Software,
+                1_000,
+                30,
+                LatencyMode::Quality,
+                (64, 64),
+            )
+            .unwrap(),
+        };
+        let mut captured = super::CapturedFrame {
+            frame: xcap::Frame::new(64, 64, vec![128; 64 * 64 * 4]),
+            captured_at: Instant::now() - Duration::from_secs(10),
+        };
+        let (frame, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
+        assert!(!frame.bytes.is_empty());
+        encoder.encoder.force_keyframe();
+        let (forced, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
+        assert!(!forced.bytes.is_empty());
+        assert_eq!(
+            encoder
+                .latest_frame
+                .stats
+                .frames_captured
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        captured.frame.raw.clear();
+        assert!(encoder.encode_captured_frame(&captured, 64, 64).is_err());
     }
 
     #[test]
@@ -1490,46 +2294,230 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_hysteresis_avoids_encoder_churn() {
-        assert_eq!(bitrate_target(4_000, 3_500, 250, 8_000), None);
+    fn backend_bitrate_targets_are_clamped_without_additional_hysteresis() {
+        assert_eq!(bitrate_target(4_000, 3_500, 250, 8_000), Some(3_500));
+        assert_eq!(bitrate_target(4_000, 4_000, 250, 8_000), None);
         assert_eq!(bitrate_target(4_000, 3_000, 250, 8_000), Some(3_000));
         assert_eq!(bitrate_target(3_000, 5_000, 250, 8_000), Some(5_000));
         assert_eq!(bitrate_target(4_000, 100, 250, 8_000), Some(250));
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
     }
 
+    const TEST_SETTINGS: EncoderSettings = EncoderSettings {
+        bitrate_kbps: 4_000,
+        max_fps: 30,
+        latency_mode: LatencyMode::Balanced,
+    };
+
     #[test]
-    fn required_hardware_never_silently_falls_back() {
-        if let Ok(backend) = EncoderBackend::new(
-            EncoderPreference::Hardware,
-            4_000,
-            60,
-            LatencyMode::Balanced,
-            (1_920, 1_080),
-        ) {
-            assert_ne!(backend.name(), "OpenH264");
+    fn adaptive_hardware_receives_bitrate_updates_and_borrowed_pixels() {
+        struct AdaptiveHardware {
+            bitrate_kbps: u32,
+            pixels: usize,
+        }
+
+        impl FrameEncoder for AdaptiveHardware {
+            fn force_keyframe(&mut self) {}
+
+            fn set_bitrate(&mut self, target_kbps: u32) -> anyhow::Result<()> {
+                self.bitrate_kbps = target_kbps;
+                Ok(())
+            }
+
+            fn encode(&mut self, image: &super::RgbaFrame<'_>) -> anyhow::Result<EncodedFrame> {
+                assert_eq!(self.pixels, image.as_raw().as_ptr() as usize);
+                assert_eq!(self.bitrate_kbps, u32::from(image.get_pixel(0, 0)[0]) * 100);
+                Ok(EncodedFrame {
+                    bytes: vec![0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 1, 0, 0, 1, 0x65, 1],
+                    width: image.width(),
+                    height: image.height(),
+                })
+            }
+        }
+
+        let mut image = RgbaImage::from_pixel(64, 64, Rgba([40, 96, 160, 255]));
+        let mut encoder = EncoderBackend {
+            active: Some(super::ActiveEncoder {
+                hardware: Some(&FAILING_HARDWARE),
+                encoder: Box::new(AdaptiveHardware {
+                    bitrate_kbps: TEST_SETTINGS.bitrate_kbps,
+                    pixels: image.as_raw().as_ptr() as usize,
+                }),
+                needs_initial_idr: true,
+            }),
+            remaining_hardware: &[],
+            preference: EncoderPreference::Auto,
+            settings: TEST_SETTINGS,
+            dimensions: image.dimensions(),
+        };
+        encoder.encode(&image).unwrap();
+        for target in [2_000, 6_000] {
+            assert!(encoder.apply_bitrate_estimate(target, 8_000).unwrap());
+            image.get_pixel_mut(0, 0)[0] = (target / 100) as u8;
+            encoder.encode(&image).unwrap();
+            assert_eq!(encoder.id(), "first");
         }
     }
 
-    #[test]
-    fn software_fallback_encodes_a_real_1080p_capture_frame() {
-        let image =
-            xcap::image::RgbaImage::from_pixel(1920, 1080, xcap::image::Rgba([32, 96, 160, 255]));
-        let mut encoder =
-            SoftwareEncoder::new(4_000, 30, LatencyMode::Balanced).expect("OpenH264 fallback");
-        let frame = encoder.encode(&image).expect("encode 1080p capture frame");
-        assert_eq!((frame.width, frame.height), (1920, 1080));
-        assert!(!frame.bytes.is_empty());
-        let types = annex_b_nal_types(&frame.bytes).expect("Annex-B output");
-        assert!(types.contains(&7));
-        assert!(types.contains(&8));
+    struct FakeHardware {
+        frames_left: usize,
+        missing_headers: bool,
     }
 
-    #[cfg(target_os = "windows")]
+    impl FrameEncoder for FakeHardware {
+        fn force_keyframe(&mut self) {}
+
+        fn set_bitrate(&mut self, _target_kbps: u32) -> anyhow::Result<()> {
+            anyhow::bail!("simulated bitrate rejection")
+        }
+
+        fn encode(&mut self, image: &super::RgbaFrame<'_>) -> anyhow::Result<EncodedFrame> {
+            anyhow::ensure!(self.frames_left > 0, "simulated device loss");
+            self.frames_left -= 1;
+            Ok(EncodedFrame {
+                bytes: if self.missing_headers {
+                    vec![0, 0, 1, 0x41, 1]
+                } else {
+                    vec![0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 1, 0, 0, 1, 0x65, 1]
+                },
+                width: image.width(),
+                height: image.height(),
+            })
+        }
+    }
+
+    const FAILING_HARDWARE: HardwareBackend = HardwareBackend {
+        id: "first",
+        name: "First native backend",
+        open: |_, _| {
+            Ok(Box::new(FakeHardware {
+                frames_left: 1,
+                missing_headers: false,
+            }))
+        },
+    };
+    const ALTERNATE: HardwareBackend = HardwareBackend {
+        id: "second",
+        name: "Second native backend",
+        open: |_, _| {
+            Ok(Box::new(FakeHardware {
+                frames_left: 1,
+                missing_headers: false,
+            }))
+        },
+    };
+
+    fn assert_decodable_idr(frame: &EncodedFrame) {
+        let types = annex_b_nal_types(&frame.bytes).expect("Annex-B output");
+        assert!([5, 7, 8].iter().all(|nal| types.contains(nal)));
+        let mut decoder = openh264::decoder::Decoder::new().unwrap();
+        let decoded = decoder.decode(&frame.bytes).unwrap().expect("decoded IDR");
+        use openh264::formats::YUVSource;
+        assert_eq!(
+            decoded.dimensions(),
+            (frame.width as usize, frame.height as usize)
+        );
+    }
+
     #[test]
-    fn windows_auto_encoder_survives_the_first_real_1080p_frame() {
-        let image =
-            xcap::image::RgbaImage::from_pixel(1920, 1080, xcap::image::Rgba([32, 96, 160, 255]));
+    fn unavailable_hardware_falls_back_only_in_auto() {
+        const MISSING: &[HardwareBackend] = &[HardwareBackend {
+            id: "missing",
+            name: "Unavailable native backend",
+            open: |_, _| anyhow::bail!("simulated missing driver"),
+        }];
+        let open = |preference| {
+            EncoderBackend::with_hardware(preference, TEST_SETTINGS, (64, 64), MISSING)
+        };
+        assert_eq!(
+            open(EncoderPreference::Auto).unwrap().id(),
+            "software-openh264"
+        );
+        assert!(open(EncoderPreference::Hardware).is_err());
+        const NEVER_OPEN: &[HardwareBackend] = &[HardwareBackend {
+            id: "never",
+            name: "Forbidden native backend",
+            open: |_, _| panic!("software mode probed a hardware driver"),
+        }];
+        let software = EncoderBackend::with_hardware(
+            EncoderPreference::Software,
+            TEST_SETTINGS,
+            (64, 64),
+            NEVER_OPEN,
+        )
+        .unwrap();
+        assert_eq!(software.id(), "software-openh264");
+    }
+
+    #[test]
+    fn active_hardware_failure_reencodes_same_frame_without_reprobing() {
+        let image = RgbaImage::from_pixel(64, 64, Rgba([32, 96, 160, 255]));
+        let mut encoder = EncoderBackend::with_hardware(
+            EncoderPreference::Auto,
+            TEST_SETTINGS,
+            image.dimensions(),
+            &[FAILING_HARDWARE],
+        )
+        .unwrap();
+        encoder.encode(&image).unwrap();
+        assert_eq!(encoder.id(), "first");
+        assert_decodable_idr(&encoder.encode(&image).unwrap());
+        assert_eq!(encoder.id(), "software-openh264");
+        encoder.encode(&image).unwrap();
+        assert_eq!(encoder.id(), "software-openh264");
+    }
+
+    #[test]
+    fn hardware_mode_tries_another_native_backend_but_never_software() {
+        let image = RgbaImage::from_pixel(64, 64, Rgba([32, 96, 160, 255]));
+        let mut encoder = EncoderBackend::with_hardware(
+            EncoderPreference::Hardware,
+            TEST_SETTINGS,
+            image.dimensions(),
+            &[FAILING_HARDWARE, ALTERNATE],
+        )
+        .unwrap();
+        encoder.encode(&image).unwrap();
+        encoder.encode(&image).unwrap();
+        assert_eq!(encoder.id(), "second");
+        assert!(encoder.encode(&image).is_err());
+    }
+
+    #[test]
+    fn auto_recovers_from_missing_initial_headers_or_native_bitrate_failure() {
+        const NO_HEADERS: &[HardwareBackend] = &[HardwareBackend {
+            id: "no-headers",
+            name: "Native backend without headers",
+            open: |_, _| {
+                Ok(Box::new(FakeHardware {
+                    frames_left: 1,
+                    missing_headers: true,
+                }))
+            },
+        }];
+        let image = RgbaImage::from_pixel(64, 64, Rgba([32, 96, 160, 255]));
+        let open = |backends| {
+            EncoderBackend::with_hardware(
+                EncoderPreference::Auto,
+                TEST_SETTINGS,
+                image.dimensions(),
+                backends,
+            )
+            .unwrap()
+        };
+        let mut no_headers = open(NO_HEADERS);
+        assert_decodable_idr(&no_headers.encode(&image).unwrap());
+        assert_eq!(no_headers.id(), "software-openh264");
+        let mut retune_failed = open(&[FAILING_HARDWARE]);
+        retune_failed.encode(&image).unwrap();
+        assert!(retune_failed.apply_bitrate_estimate(2_000, 4_000).unwrap());
+        assert_eq!(retune_failed.settings.bitrate_kbps, 2_000);
+        assert_eq!(retune_failed.id(), "software-openh264");
+        assert_decodable_idr(&retune_failed.encode(&image).unwrap());
+    }
+
+    #[test]
+    fn auto_encodes_a_decodable_idr_at_start_and_after_resize() {
         let mut encoder = EncoderBackend::new(
             EncoderPreference::Auto,
             4_000,
@@ -1537,13 +2525,83 @@ mod tests {
             LatencyMode::Balanced,
             (1_920, 1_080),
         )
-        .expect("Windows auto encoder");
-        let frame = encoder
-            .encode(&image)
-            .expect("Windows auto encoder must encode or fall back");
-        assert_eq!((frame.width, frame.height), (1920, 1080));
-        assert!(!frame.bytes.is_empty());
-        assert!(annex_b_nal_types(&frame.bytes).is_ok());
+        .expect("auto encoder");
+        for (width, height) in [(1_920, 1_080), (1_280, 720)] {
+            let image = RgbaImage::from_pixel(width, height, Rgba([32, 96, 160, 255]));
+            let frame = encoder
+                .encode(&image)
+                .expect("auto encoder must encode or fall back");
+            assert_eq!((frame.width, frame.height), (width, height));
+            assert_decodable_idr(&frame);
+            eprintln!("{} encoded {width}x{height}", encoder.name());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in encode-only performance measurement"]
+    fn benchmark_encoder() {
+        let requested =
+            std::env::var("NANOCTL_BENCH_ENCODER").unwrap_or("software-openh264".into());
+        let dimensions = (1_920, 1_080);
+        let mut encoder = if requested == "software-openh264" {
+            EncoderBackend::with_hardware(
+                EncoderPreference::Software,
+                TEST_SETTINGS,
+                dimensions,
+                &[],
+            )
+        } else {
+            let index = HARDWARE_BACKENDS
+                .iter()
+                .position(|candidate| candidate.id == requested)
+                .expect("unknown encoder ID on this platform");
+            EncoderBackend::with_hardware(
+                EncoderPreference::Hardware,
+                TEST_SETTINGS,
+                dimensions,
+                &HARDWARE_BACKENDS[index..=index],
+            )
+        }
+        .expect("requested encoder unavailable");
+        let mut image = RgbaImage::from_fn(dimensions.0, dimensions.1, |x, y| {
+            if (x / 48 + y / 48) % 2 == 0 {
+                Rgba([46, 51, 56, 255])
+            } else {
+                Rgba([24, 30, 36, 255])
+            }
+        });
+        assert_decodable_idr(&encoder.encode(&image).unwrap());
+        const WARMUP: u32 = 9;
+        const FRAMES: u32 = 180;
+        let mut encode_micros = Vec::new();
+        let mut output_frames = 0;
+        for index in 0..WARMUP + FRAMES {
+            let x = (index * 8) % (dimensions.0 - 256);
+            for y in 420..548 {
+                for column in x..x + 16 {
+                    image.put_pixel(column, y, Rgba([(index % 255) as u8, 96, 160, 255]));
+                }
+            }
+            let started = Instant::now();
+            let frame = encoder.encode(&image).expect("encode benchmark frame");
+            let elapsed = started.elapsed();
+            if index >= WARMUP {
+                encode_micros.push(elapsed.as_micros() as u64);
+                output_frames += u32::from(!frame.bytes.is_empty());
+            }
+        }
+        encode_micros.sort_unstable();
+        assert!(output_frames > 0);
+        println!(
+            "backend={} input={}x{} measured={} output={} p50_ms={:.2} p95_ms={:.2}",
+            encoder.id(),
+            dimensions.0,
+            dimensions.1,
+            FRAMES,
+            output_frames,
+            super::percentile_milliseconds(&encode_micros, 0.50),
+            super::percentile_milliseconds(&encode_micros, 0.95),
+        );
     }
 
     #[test]

@@ -10,14 +10,20 @@ use std::slice;
 use std::time::{Duration, Instant};
 
 use crate::config::LatencyMode;
-use crate::media::{EncodedFrame, bitrate_target};
+use crate::media::{EncodedFrame, FrameEncoder, annex_b_nal_types};
 use anyhow::{Context, Result, anyhow, bail};
+use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
-use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
+use windows::Win32::System::Variant::{
+    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,
+};
 use windows::core::Interface;
+
+const MFT_STARTUP_BUDGET: Duration = Duration::from_secs(2);
+const MFT_FRAME_BUDGET: Duration = Duration::from_millis(500);
 
 struct MediaFoundationRuntime;
 
@@ -57,6 +63,7 @@ struct ActiveEncoder {
     output_buffer_size: u32,
     provides_output_samples: bool,
     needs_input: bool,
+    first_access_unit: bool,
     shut_down: bool,
 }
 
@@ -165,7 +172,6 @@ pub struct WindowsEncoder {
     active: Option<ActiveEncoder>,
     bitrate_kbps: u32,
     max_fps: u16,
-    latency_mode: LatencyMode,
     reconfigure: bool,
     force_keyframe: bool,
     timestamp: i64,
@@ -187,9 +193,8 @@ impl WindowsEncoder {
     pub fn new(
         bitrate_kbps: u32,
         max_fps: u16,
-        latency_mode: LatencyMode,
-        probe_width: u32,
-        probe_height: u32,
+        _latency_mode: LatencyMode,
+        (probe_width, probe_height): (u32, u32),
     ) -> Result<Self> {
         let runtime = MediaFoundationRuntime::start()?;
         let mut encoder = Self {
@@ -197,7 +202,6 @@ impl WindowsEncoder {
             active: None,
             bitrate_kbps,
             max_fps,
-            latency_mode,
             reconfigure: false,
             force_keyframe: false,
             timestamp: 0,
@@ -211,40 +215,27 @@ impl WindowsEncoder {
         encoder.recreate_active(probe_width, probe_height)?;
         Ok(encoder)
     }
+}
 
-    pub fn bitrate_kbps(&self) -> u32 {
-        self.bitrate_kbps
-    }
-
-    pub fn max_fps(&self) -> u16 {
-        self.max_fps
-    }
-
-    pub fn latency_mode(&self) -> LatencyMode {
-        self.latency_mode
-    }
-
-    pub fn force_keyframe(&mut self) {
+impl FrameEncoder for WindowsEncoder {
+    fn force_keyframe(&mut self) {
         self.force_keyframe = true;
     }
 
-    pub fn apply_bitrate_estimate(
-        &mut self,
-        estimate_kbps: u32,
-        ceiling_kbps: u32,
-    ) -> Result<bool> {
-        let floor_kbps = 250.min(ceiling_kbps);
-        let Some(target_kbps) =
-            bitrate_target(self.bitrate_kbps, estimate_kbps, floor_kbps, ceiling_kbps)
-        else {
-            return Ok(false);
-        };
+    fn set_bitrate(&mut self, target_kbps: u32) -> Result<()> {
         self.bitrate_kbps = target_kbps;
-        self.reconfigure = true;
-        Ok(true)
+        self.reconfigure = !self.active.as_ref().is_some_and(|active| {
+            let Ok(codec) = active.transform.cast::<ICodecAPI>() else {
+                return false;
+            };
+            let value = ui4_variant(target_kbps.saturating_mul(1_000));
+            // SAFETY: the live encoder and scalar VARIANT are valid for this call.
+            unsafe { codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value) }.is_ok()
+        });
+        Ok(())
     }
 
-    pub fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(&mut self, image: &crate::media::RgbaFrame<'_>) -> Result<EncodedFrame> {
         let width = image.width();
         let height = image.height();
         let dimensions_changed = self
@@ -275,7 +266,8 @@ impl WindowsEncoder {
             .active
             .as_mut()
             .context("Media Foundation encoder was not initialized")?;
-        wait_until_input_needed(active)?;
+        let deadline = Instant::now() + MFT_FRAME_BUDGET;
+        wait_until_input_needed(active, deadline)?;
 
         // SAFETY: stream zero and the sample are configured for this transform; all pointer
         // ownership is held by projected COM wrappers.
@@ -286,15 +278,26 @@ impl WindowsEncoder {
                 .context("Media Foundation rejected an NV12 frame")?;
         }
         active.needs_input = false;
-        let bytes = wait_for_output(active)?;
+        let mut bytes = wait_for_output(active, deadline)?;
         validate_annex_b(&bytes)?;
+        if std::mem::take(&mut active.first_access_unit) {
+            let types = annex_b_nal_types(&bytes)?;
+            if !(types.contains(&7) && types.contains(&8))
+                && let Some(mut headers) = sequence_header(&active.transform)
+            {
+                headers.append(&mut bytes);
+                bytes = headers;
+            }
+        }
         Ok(EncodedFrame {
             bytes,
             width,
             height,
         })
     }
+}
 
+impl WindowsEncoder {
     fn recreate_active(&mut self, width: u32, height: u32) -> Result<()> {
         // `Option::take` is deliberately a separate statement: evaluating `Some(create_active())`
         // first leaves two hardware MFT sessions alive at once and fails on single-session GPUs.
@@ -311,7 +314,31 @@ impl WindowsEncoder {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("Media Foundation H.264 dimensions must be non-zero and even");
         }
-        let activated = enumerate_hardware_encoder()?;
+        let mut last_error = anyhow!("no NV12-to-H.264 hardware MFT is installed");
+        for activation in enumerate_hardware_encoders()? {
+            // SAFETY: an enumerated encoder activation is valid on the current COM thread.
+            let activated = unsafe { activation.ActivateObject::<IMFTransform>() };
+            match activated {
+                Ok(transform) => match self.configure_active(
+                    ActivatedTransformGuard::new(activation, transform),
+                    width,
+                    height,
+                ) {
+                    Ok(active) => return Ok(active),
+                    Err(error) => last_error = error,
+                },
+                Err(error) => last_error = error.into(),
+            }
+        }
+        Err(last_error).context("no hardware MFT accepted the H.264 settings")
+    }
+
+    fn configure_active(
+        &self,
+        activated: ActivatedTransformGuard,
+        width: u32,
+        height: u32,
+    ) -> Result<ActiveEncoder> {
         let transform = activated.transform();
         let attributes = unsafe {
             transform
@@ -328,6 +355,26 @@ impl WindowsEncoder {
             // accept the pipeline attribute made valid hardware encoders look unavailable; the
             // encoder still uses no frame reordering and a bounded output wait below.
             let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
+        }
+        if let Ok(codec) = transform.cast::<ICodecAPI>() {
+            let low_latency = VARIANT {
+                Anonymous: VARIANT_0 {
+                    Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                        vt: VT_BOOL,
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: VARIANT_0_0_0 {
+                            boolVal: VARIANT_TRUE,
+                        },
+                    }),
+                },
+            };
+            // SAFETY: these optional codec properties take scalar variants.
+            unsafe {
+                let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
+                let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &ui4_variant(0));
+            }
         }
         let events: IMFMediaEventGenerator = transform
             .cast()
@@ -389,10 +436,28 @@ impl WindowsEncoder {
             output_buffer_size,
             provides_output_samples,
             needs_input: false,
+            first_access_unit: true,
             shut_down: false,
         };
-        wait_until_input_needed(&mut active)?;
+        wait_until_input_needed(&mut active, Instant::now() + MFT_STARTUP_BUDGET)?;
         Ok(active)
+    }
+}
+
+fn sequence_header(transform: &IMFTransform) -> Option<Vec<u8>> {
+    // SAFETY: stream zero owns the output media type; GetBlob writes into the provided slice.
+    unsafe {
+        let media_type = transform.GetOutputCurrentType(0).ok()?;
+        let size = media_type.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER).ok()? as usize;
+        if size == 0 || size > 64 * 1024 {
+            return None;
+        }
+        let mut bytes = vec![0; size];
+        media_type
+            .GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut bytes, None)
+            .ok()?;
+        let types = annex_b_nal_types(&bytes).ok()?;
+        (types.contains(&7) && types.contains(&8)).then_some(bytes)
     }
 }
 
@@ -410,7 +475,7 @@ fn ui4_variant(value: u32) -> VARIANT {
     }
 }
 
-fn enumerate_hardware_encoder() -> Result<ActivatedTransformGuard> {
+fn enumerate_hardware_encoders() -> Result<Vec<IMFActivate>> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -450,20 +515,7 @@ fn enumerate_hardware_encoder() -> Result<ActivatedTransformGuard> {
     unsafe {
         CoTaskMemFree(Some(activations.cast()));
     }
-    let mut last_error = None;
-    for activation in owned {
-        let activated = unsafe { activation.ActivateObject::<IMFTransform>() };
-        match activated {
-            Ok(transform) => return Ok(ActivatedTransformGuard::new(activation, transform)),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(anyhow!(
-        "Media Foundation hardware encoders could not be activated: {}",
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "no activation object".to_owned())
-    ))
+    Ok(owned)
 }
 
 fn create_video_type(
@@ -516,11 +568,10 @@ fn create_input_sample(bytes: &[u8], timestamp: i64, duration: i64) -> Result<IM
     }
 }
 
-fn wait_until_input_needed(active: &mut ActiveEncoder) -> Result<()> {
+fn wait_until_input_needed(active: &mut ActiveEncoder, deadline: Instant) -> Result<()> {
     if active.needs_input {
         return Ok(());
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match next_transform_event(active)? {
             Some(event_type) if event_type == METransformNeedInput.0 as u32 => {
@@ -536,8 +587,7 @@ fn wait_until_input_needed(active: &mut ActiveEncoder) -> Result<()> {
     bail!("hardware MFT did not request input before the watchdog deadline")
 }
 
-fn wait_for_output(active: &mut ActiveEncoder) -> Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn wait_for_output(active: &mut ActiveEncoder, deadline: Instant) -> Result<Vec<u8>> {
     while Instant::now() < deadline {
         match next_transform_event(active)? {
             Some(event_type) if event_type == METransformHaveOutput.0 as u32 => {
