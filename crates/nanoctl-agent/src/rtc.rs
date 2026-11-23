@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(feature = "media")]
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
@@ -11,8 +9,6 @@ use interceptor::registry::Registry;
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 #[cfg(feature = "media")]
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-#[cfg(feature = "media")]
-use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -29,9 +25,40 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+use webrtc::rtcp::receiver_report::ReceiverReport;
+use webrtc::rtcp::reception_report::ReceptionReport;
+use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
+use webrtc::rtp::extension::abs_send_time_extension::unix2ntp;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::adaptive::LinkSample;
+
+fn reception_report_sample(
+    report: &ReceptionReport,
+    video_ssrc: u32,
+    remb_kbps: Option<u32>,
+    compact_ntp: u32,
+    at: Instant,
+) -> Option<LinkSample> {
+    if report.ssrc != video_ssrc {
+        return None;
+    }
+    let ticks = compact_ntp
+        .wrapping_sub(report.last_sender_report)
+        .wrapping_sub(report.delay);
+    let rtt = (report.last_sender_report != 0 && ticks <= 10 * 65_536)
+        .then(|| Duration::from_secs_f64(f64::from(ticks) / 65_536.0));
+    Some(LinkSample {
+        fraction_lost: f64::from(report.fraction_lost) / 256.0,
+        rtt,
+        remb_kbps,
+        at,
+        receiver_report_at: Some(at),
+    })
+}
 
 const PROTOCOL_VERSION: u8 = 2;
 const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
@@ -111,8 +138,8 @@ pub struct HostPeer {
     input_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "media")]
     keyframe_requests: tokio::sync::watch::Sender<u64>,
-    #[cfg(feature = "media")]
-    bitrate_estimate_kbps: tokio::sync::watch::Sender<u32>,
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    link_feedback: tokio::sync::watch::Sender<Option<LinkSample>>,
     #[cfg(feature = "media")]
     display_selection: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
@@ -687,15 +714,24 @@ impl HostPeer {
         let (keyframe_requests, _) = tokio::sync::watch::channel(0_u64);
         #[cfg(feature = "media")]
         let keyframe_feedback = keyframe_requests.clone();
-        #[cfg(feature = "media")]
-        let (bitrate_estimate_kbps, _) = tokio::sync::watch::channel(0_u32);
-        #[cfg(feature = "media")]
-        let bitrate_feedback = bitrate_estimate_kbps.clone();
+        let (link_feedback, _) = tokio::sync::watch::channel(None);
+        let link_samples = link_feedback.clone();
+        let video_ssrc = sender
+            .get_parameters()
+            .await
+            .encodings
+            .first()
+            .context("video sender has no encoding")?
+            .ssrc;
         let rtcp_task = tokio::spawn(async move {
-            while let Ok((_packets, _attributes)) = sender.read_rtcp().await {
+            let mut remb_kbps = None;
+            let mut latest_sample: Option<LinkSample> = None;
+            while let Ok((packets, _attributes)) = sender.read_rtcp().await {
+                let at = Instant::now();
+                let compact_ntp = (unix2ntp(SystemTime::now()) >> 16) as u32;
                 #[cfg(feature = "media")]
                 {
-                    if _packets.iter().any(|packet| {
+                    if packets.iter().any(|packet| {
                         packet.as_any().is::<PictureLossIndication>()
                             || packet.as_any().is::<FullIntraRequest>()
                     }) {
@@ -703,16 +739,64 @@ impl HostPeer {
                             *generation = generation.wrapping_add(1);
                         });
                     }
-                    if let Some(estimate) = _packets.iter().find_map(|packet| {
-                        packet
-                            .as_any()
-                            .downcast_ref::<ReceiverEstimatedMaximumBitrate>()
-                    }) && estimate.bitrate.is_finite()
+                }
+                let previous_remb = remb_kbps;
+                for packet in &packets {
+                    if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
+                        tracing::info!(
+                            video_ssrc,
+                            media_ssrc = nack.media_ssrc,
+                            nack_pairs = nack.nacks.len(),
+                            "video NACK"
+                        );
+                    }
+                    if let Some(estimate) = packet
+                        .as_any()
+                        .downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                        && estimate.bitrate.is_finite()
                         && estimate.bitrate > 0.0
                     {
                         let kbps = (estimate.bitrate / 1_000.0).min(u32::MAX as f32) as u32;
-                        bitrate_feedback.send_replace(kbps.max(1));
+                        tracing::info!(video_ssrc, remb_kbps = kbps, "video REMB");
+                        remb_kbps = Some(kbps.max(1));
                     }
+                }
+                let mut reported = false;
+                for report in packets
+                    .iter()
+                    .filter_map(|packet| packet.as_any().downcast_ref::<ReceiverReport>())
+                    .flat_map(|packet| &packet.reports)
+                {
+                    if let Some(sample) =
+                        reception_report_sample(report, video_ssrc, remb_kbps, compact_ntp, at)
+                    {
+                        tracing::debug!(
+                            video_ssrc,
+                            lsr = report.last_sender_report,
+                            dlsr = report.delay,
+                            compact_ntp,
+                            fraction_lost = sample.fraction_lost,
+                            total_lost = report.total_lost,
+                            rtt_ms = sample.rtt.map(|rtt| rtt.as_secs_f64() * 1000.0),
+                            "video receiver report"
+                        );
+                        latest_sample = Some(sample);
+                        link_samples.send_replace(Some(sample));
+                        reported = true;
+                    }
+                }
+                if !reported && remb_kbps != previous_remb {
+                    let mut sample = latest_sample.unwrap_or(LinkSample {
+                        fraction_lost: 0.0,
+                        rtt: None,
+                        remb_kbps,
+                        at,
+                        receiver_report_at: None,
+                    });
+                    sample.at = at;
+                    sample.remb_kbps = remb_kbps;
+                    latest_sample = Some(sample);
+                    link_samples.send_replace(Some(sample));
                 }
             }
         });
@@ -835,8 +919,7 @@ impl HostPeer {
             input_tasks: tokio::sync::Mutex::new(input_tasks),
             #[cfg(feature = "media")]
             keyframe_requests,
-            #[cfg(feature = "media")]
-            bitrate_estimate_kbps,
+            link_feedback,
             #[cfg(feature = "media")]
             display_selection,
             #[cfg(feature = "media")]
@@ -1055,9 +1138,9 @@ impl HostPeer {
         self.keyframe_requests.subscribe()
     }
 
-    #[cfg(feature = "media")]
-    pub fn bitrate_estimate_kbps(&self) -> tokio::sync::watch::Receiver<u32> {
-        self.bitrate_estimate_kbps.subscribe()
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn link_feedback(&self) -> tokio::sync::watch::Receiver<Option<LinkSample>> {
+        self.link_feedback.subscribe()
     }
 
     #[cfg(feature = "media")]
@@ -1278,6 +1361,71 @@ mod tests {
     use tokio::time::{Duration, Instant, timeout};
     use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+    #[test]
+    fn receiver_report_sample_converts_loss_rtt_and_remb() {
+        let at = std::time::Instant::now();
+        let report = super::ReceptionReport {
+            ssrc: 42,
+            fraction_lost: 64,
+            last_sender_report: 100 * 65_536,
+            delay: 65_536 / 2,
+            ..Default::default()
+        };
+        let sample =
+            super::reception_report_sample(&report, 42, Some(3_000), 101 * 65_536, at).unwrap();
+        assert_eq!(sample.fraction_lost, 0.25);
+        assert_eq!(sample.rtt, Some(std::time::Duration::from_millis(500)));
+        assert_eq!(sample.remb_kbps, Some(3_000));
+        assert_eq!(sample.at, at);
+        assert!(super::reception_report_sample(&report, 43, None, 101 * 65_536, at).is_none());
+    }
+
+    #[test]
+    fn receiver_report_sample_rejects_invalid_rtt_but_preserves_loss() {
+        let at = std::time::Instant::now();
+        for (last_sender_report, delay, now) in [
+            (0, 0, 65_536),
+            (2 * 65_536, 0, 65_536),
+            (65_536, 2 * 65_536, 2 * 65_536),
+            (65_536, 0, 11 * 65_536 + 1),
+        ] {
+            let report = super::ReceptionReport {
+                ssrc: 42,
+                fraction_lost: 255,
+                last_sender_report,
+                delay,
+                ..Default::default()
+            };
+            let sample = super::reception_report_sample(&report, 42, None, now, at).unwrap();
+            assert!(sample.rtt.is_none());
+            assert_eq!(sample.fraction_lost, 255.0 / 256.0);
+            assert!(sample.remb_kbps.is_none());
+        }
+    }
+
+    #[test]
+    fn receiver_report_sample_handles_compact_ntp_wrap_and_rtt_boundaries() {
+        let at = std::time::Instant::now();
+        for (last_sender_report, delay, now, expected_ms) in [
+            (u32::MAX - 65_535, 32_768, 0, 500),
+            (65_536, 0, 65_536, 0),
+            (65_536, 0, 11 * 65_536, 10_000),
+        ] {
+            let report = super::ReceptionReport {
+                ssrc: 42,
+                last_sender_report,
+                delay,
+                ..Default::default()
+            };
+            let sample = super::reception_report_sample(&report, 42, None, now, at).unwrap();
+            assert_eq!(
+                sample.rtt,
+                Some(std::time::Duration::from_millis(expected_ms))
+            );
+            assert_eq!(sample.fraction_lost, 0.0);
+        }
+    }
 
     #[test]
     fn rejects_cross_session_offer() {

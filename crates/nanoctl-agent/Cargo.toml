@@ -12,9 +12,12 @@ capture = [
   "dep:cros-codecs",
   "dep:cros-libva",
   "dep:openh264",
+  "dep:openh264-sys2",
   "dep:videotoolbox",
   "dep:windows",
   "dep:xcap",
+  "dep:xcb",
+  "dep:libc",
 ]
 media = [
   "capture",
@@ -73,12 +76,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
+openh264-sys2 = { version = "0.9.7", optional = true }
 opus = { version = "0.4", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1.7", features = ["damage"], optional = true }
+libc = { version = "0.2", optional = true }
 x11rb = { version = "0.13", features = ["xkb", "xtest"], optional = true }
 xkeysym = { version = "0.2", optional = true }
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }

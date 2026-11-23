@@ -1,3 +1,5 @@
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
+mod adaptive;
 #[cfg(feature = "media")]
 mod audio;
 #[cfg(feature = "media")]
@@ -11,6 +13,8 @@ mod linux_encoder;
 mod macos_encoder;
 #[cfg(feature = "media")]
 mod media;
+#[cfg(all(feature = "media", target_os = "linux"))]
+mod media_bench;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod nvenc_encoder;
 mod platform;
@@ -63,6 +67,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Measure the real video pipeline over an in-process loopback WebRTC connection.
+    #[cfg(all(feature = "media", target_os = "linux"))]
+    #[command(hide = true)]
+    MediaBench {
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        seconds: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the foreground service process.
     Run,
     /// Stop the installed background agent gracefully.
@@ -200,6 +213,15 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if !report.passed {
                 std::process::exit(2);
+            }
+        }
+        #[cfg(all(feature = "media", target_os = "linux"))]
+        Command::MediaBench { seconds, json } => {
+            let report = media_bench::run(seconds).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{report}");
             }
         }
         Command::Config => {

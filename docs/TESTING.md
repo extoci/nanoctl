@@ -32,6 +32,51 @@ platform packages. Media browser tests need a usable graphical display, e.g. `DI
 Install Chromium with `bunx playwright install chromium` if absent.
 Test code's `NANOCTL_DEV_LOOPBACK_USER=dev@example.com` bypass is never a production setting.
 
+## End-to-end latency benchmark
+
+On Linux, install Xvfb and xauth in addition to the media build dependencies and
+Playwright Chromium, then run:
+
+```sh
+xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" bun run test:latency
+```
+
+On Windows or macOS, run `bun run test:latency` in an unlocked interactive session
+with a single display (preferably 1280×720) and no other window stealing focus.
+On macOS the agent must have Screen Recording and Accessibility permissions;
+hosted macOS runners cannot be assumed to have those grants, so run it on an
+authorized local desktop. Windows is experimental in hosted CI because the
+runner may not have usable desktop capture or input. The Linux CI job must
+produce results. Do not run on a desktop with sensitive content.
+
+A dedicated Chromium window paints a checksummed frame counter and changes the
+encoded input counter only when the OS delivers a real Space keydown. The release
+media agent captures that desktop, encodes software H.264 at up to 1280×720 and
+30 fps, and serves its real viewer to headless Chromium over loopback WebRTC
+using the existing browser-test identity. Playwright presses Space in the viewer,
+which sends it through the normal input data channel and agent injection path.
+The probe decodes counters from the received video, after startup warm-up.
+
+- **Video latency:** Time from drawing a unique source marker to the viewer's
+  estimated presentation time (`requestVideoFrameCallback.expectedDisplayTime`).
+  Both browser clocks are mapped to the runner's monotonic clock using the
+  midpoint of the shortest of ten local DevTools round trips per browser. The
+  sum of the two half-round-trip times is reported as alignment uncertainty.
+- **Input-to-photon proxy:** Time from the viewer keydown timestamp to estimated
+  presentation of the first decoded frame with the corresponding input counter.
+  This measures 12 sequential presses on the viewer's clock alone.
+- **Presented fps:** Change in Chromium's presented-frame counter divided by
+  elapsed presentation time during the measurement.
+
+The benchmark writes `latency.json` (including raw milliseconds) and `latency.md`
+under `test-results/`. CI publishes them as artifacts and shows nearest-rank
+p50/p95/p99/max and fps in the job summary. Missing markers or input responses
+fail the benchmark; there is no timing regression threshold yet. Compare runs
+with comparable runner, display and encoder settings. This is a glass-to-glass
+**software proxy**, not an optical measurement: it excludes monitor scanout,
+input hardware delay and real tailnet network conditions. It does not measure
+hardware encoders.
+
 ## Build and embed
 
 ```sh

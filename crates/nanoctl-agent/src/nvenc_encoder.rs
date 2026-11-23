@@ -3,7 +3,6 @@ use std::ptr::NonNull;
 use std::slice;
 
 use anyhow::{Result, anyhow, ensure};
-use xcap::image::RgbaImage;
 
 use crate::config::LatencyMode;
 use crate::media::{EncodedFrame, FrameEncoder};
@@ -152,7 +151,7 @@ impl FrameEncoder for NvencEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, image: &RgbaImage) -> Result<EncodedFrame> {
+    fn encode(&mut self, image: &crate::media::RgbaFrame<'_>) -> Result<EncodedFrame> {
         let (width, height) = image.dimensions();
         if (width, height) != self.dimensions || self.session.is_none() {
             self.reopen((width, height))?;
