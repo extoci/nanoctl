@@ -265,7 +265,7 @@ impl FrameEncoder for WindowsEncoder {
             }
             self.force_keyframe = false;
         }
-        rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
+        crate::nv12::rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
         let duration = 10_000_000_i64 / i64::from(self.max_fps);
         let sample = create_input_sample(&self.nv12, self.timestamp, duration)?;
         self.timestamp = self.timestamp.saturating_add(duration);
@@ -719,74 +719,14 @@ fn validate_annex_b(bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) -> Result<()> {
-    let width = width as usize;
-    let height = height as usize;
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        bail!("NV12 dimensions must be non-zero and even");
-    }
-    let pixels = width
-        .checked_mul(height)
-        .context("frame dimensions overflow")?;
-    if rgba.len() != pixels.checked_mul(4).context("RGBA frame size overflow")? {
-        bail!("RGBA frame length does not match its dimensions");
-    }
-    output.clear();
-    output.resize(pixels + pixels / 2, 0);
-    for row in 0..height {
-        for column in 0..width {
-            let offset = (row * width + column) * 4;
-            let r = i32::from(rgba[offset]);
-            let g = i32::from(rgba[offset + 1]);
-            let b = i32::from(rgba[offset + 2]);
-            output[row * width + column] =
-                (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
-        }
-    }
-    let uv_offset = pixels;
-    for row in (0..height).step_by(2) {
-        for column in (0..width).step_by(2) {
-            let mut r = 0_i32;
-            let mut g = 0_i32;
-            let mut b = 0_i32;
-            for y in 0..2 {
-                for x in 0..2 {
-                    let offset = ((row + y) * width + column + x) * 4;
-                    r += i32::from(rgba[offset]);
-                    g += i32::from(rgba[offset + 1]);
-                    b += i32::from(rgba[offset + 2]);
-                }
-            }
-            r /= 4;
-            g /= 4;
-            b /= 4;
-            let chroma = uv_offset + (row / 2) * width + column;
-            output[chroma] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-            output[chroma + 1] =
-                (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{rgba_to_nv12, validate_annex_b};
+    use super::validate_annex_b;
 
     #[test]
     fn validates_only_annex_b_access_units() {
         assert!(validate_annex_b(&[0, 0, 0, 1, 0x67]).is_ok());
         assert!(validate_annex_b(&[0, 0, 1, 0x65]).is_ok());
         assert!(validate_annex_b(&[0, 0, 0, 2, 0x65]).is_err());
-    }
-
-    #[test]
-    fn converts_rgba_to_nv12() {
-        let rgba = [
-            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
-        ];
-        let mut output = Vec::new();
-        rgba_to_nv12(&rgba, 2, 2, &mut output).unwrap();
-        assert_eq!(output, [16, 235, 16, 235, 128, 128]);
     }
 }
