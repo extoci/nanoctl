@@ -144,6 +144,7 @@ export class RemoteSessionController {
   private lifecycleGeneration = 0;
   private inputEnabled = false;
   private inputBlocked = 0;
+  private readonly pressedKeys = new Set<string>();
   private readonly preferences: { inputEnabled: boolean; displayId?: string };
   private firstFrameReceived = false;
   private stopPromise: Promise<void> | null = null;
@@ -712,12 +713,16 @@ export class RemoteSessionController {
     if (!this.inputEnabled) return;
     // Keys go to the host while the video or nothing in particular has focus; panel controls keep
     // theirs, and Tab from the page still moves browser focus so the controls stay reachable.
+    // A key the host saw pressed is always released there, wherever focus has moved since.
     const target = event.target;
+    const releasing = event.type === "keyup" && this.pressedKeys.delete(event.code);
     if (
+      !releasing &&
       target !== this.options.video &&
       (event.code === "Tab" || (target !== document.body && target !== document.documentElement))
     )
       return;
+    if (event.type === "keydown") this.pressedKeys.add(event.code);
     event.preventDefault();
     const message: ControlMessage = {
       type: "key",
@@ -1156,6 +1161,7 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
+    this.pressedKeys.clear();
     if (!this.inputEnabled) this.stopGamepads();
     const channel = this.controlChannel;
     if (channel?.readyState === "open") {

@@ -262,6 +262,12 @@ describe("remote session lifecycle", () => {
       pressKey("keydown", target, { code, key: code.at(-1)!.toLowerCase() });
       expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({ type: "key", code });
     }
+    channel.sent = [];
+    pressKey("keyup", { tagName: "BUTTON" }, { code: "KeyC", key: "c" });
+    expect(channel.sent).toEqual([]);
+    pressKey("keydown", body, { code: "ShiftLeft", key: "Shift", shiftKey: true });
+    pressKey("keyup", { tagName: "BUTTON" }, { code: "ShiftLeft", key: "Shift" });
+    expect(channel.sent.map((data) => JSON.parse(data).action)).toEqual(["down", "up"]);
     await controller.stop();
   });
 
