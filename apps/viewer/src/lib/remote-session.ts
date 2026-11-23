@@ -586,12 +586,14 @@ export class RemoteSessionController {
     this.codecPreferencesApplied = false;
     // Chrome only allows encoded streams before any RTP arrives, so the
     // transform must be created here — before negotiation — not in ontrack.
-    this.pendingEncodedStreams = supportsWebCodecsVideo(this.videoTransceiver.receiver)
-      ? (createVideoEncodedStreams(this.videoTransceiver.receiver) as {
-          readable: ReadableStream;
-          writable: WritableStream;
-        } | null)
-      : null;
+    const receiver = this.videoTransceiver?.receiver as RTCRtpReceiver | undefined;
+    this.pendingEncodedStreams =
+      receiver && supportsWebCodecsVideo(receiver)
+        ? (createVideoEncodedStreams(receiver) as {
+            readable: ReadableStream;
+            writable: WritableStream;
+          } | null)
+        : null;
     // True low-latency path: raw AUs over an unreliable data channel feed
     // WebCodecs directly — no jitter buffer anywhere. The wire format is
     // Annex-B H.264 only, so this requires an explicit H.264 codec pick;

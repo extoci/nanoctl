@@ -337,7 +337,8 @@ export function attachDataChannelVideo(
       if (parts > 1) {
         let entry = pending.get(seq);
         if (!entry) {
-          entry = { isKey, parts, got: new Array(parts), n: 0 };
+          entry = { isKey, parts, got: [], n: 0 };
+          entry.got.length = parts;
           pending.set(seq, entry);
         }
         if (!entry.got[part]) {
