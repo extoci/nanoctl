@@ -16,6 +16,7 @@ const initial: RemoteSessionSnapshot = {
   iceGeneration: 0,
   inputEnabled: false,
   gamepadEnabled: false,
+  gamepadStatus: "waiting",
   firstFrameReceived: false,
   metrics: null,
 };
@@ -232,6 +233,15 @@ function Viewer() {
   const hostName = info?.hostName || "Remote desktop";
   const send = (message: ControlMessage) => transport.current?.controller?.sendControl(message);
   const inputReady = snapshot.inputEnabled && status === "online";
+  const isIOS =
+    /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const standalone =
+    matchMedia("(display-mode: standalone)").matches ||
+    (navigator as Navigator & { standalone?: boolean }).standalone;
+  const gamepadAvailable = typeof navigator.getGamepads === "function";
+  const showGamepad =
+    info?.remoteInput && (info.platform === "windows" || info.capabilities.gamepad);
 
   return (
     <main className={`viewer scale-${scale} ${panelOpen ? "panel-open" : ""}`}>
@@ -338,9 +348,11 @@ function Viewer() {
         <div className="toolbar">
           <h2>Session</h2>
           <div className="row">
-            <button onClick={() => void toggleFullscreen()}>
-              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            </button>
+            {document.fullscreenEnabled && !standalone && (
+              <button onClick={() => void toggleFullscreen()}>
+                {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+              </button>
+            )}
             <button
               aria-pressed={scale === "original"}
               onClick={() => setScale(scale === "fit" ? "original" : "fit")}
@@ -348,6 +360,11 @@ function Viewer() {
               {scale === "fit" ? "Shrink to fit" : "Original size"}
             </button>
           </div>
+          {isIOS && !standalone && (
+            <p className="panel-hint">
+              For a full-screen view, tap Safari’s Share button, then Add to Home Screen.
+            </p>
+          )}
           {info && info.displays.length > 1 && (
             <>
               <h2>Displays</h2>
@@ -379,22 +396,13 @@ function Viewer() {
             >
               {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
             </button>
-            {info?.remoteInput && (info.platform === "windows" || info.capabilities.gamepad) && (
+            {showGamepad && (
               <button
                 aria-pressed={snapshot.gamepadEnabled}
                 disabled={
-                  !info.capabilities.gamepad ||
-                  typeof navigator.getGamepads !== "function" ||
-                  !snapshot.inputEnabled ||
-                  !live
+                  !info.capabilities.gamepad || !gamepadAvailable || !snapshot.inputEnabled || !live
                 }
-                title={
-                  !info.capabilities.gamepad
-                    ? "Install ViGEmBus on the Windows host and restart nanoctl"
-                    : typeof navigator.getGamepads !== "function"
-                      ? "Use a browser with Gamepad API support over HTTPS"
-                      : "Pair a controller with this device, then press a controller button"
-                }
+                aria-describedby="gamepad-hint"
                 onClick={() =>
                   transport.current?.controller?.setGamepadEnabled(!snapshot.gamepadEnabled)
                 }
@@ -420,6 +428,29 @@ function Viewer() {
               <SoftKeyboard enabled={inputReady} platform={info?.platform} send={send} />
             </span>
           </div>
+          {showGamepad && (
+            <p className="panel-hint" id="gamepad-hint" role="status">
+              {!info.capabilities.gamepad
+                ? "Install ViGEmBus on the Windows PC and restart nanoctl."
+                : !gamepadAvailable
+                  ? "Open the HTTPS viewer link in a browser with gamepad support."
+                  : snapshot.gamepadStatus === "connected"
+                    ? "Controller detected. Windows games see an Xbox 360 controller."
+                    : snapshot.gamepadStatus === "unsupported"
+                      ? "Controller detected, but this browser doesn’t support its standard mapping."
+                      : snapshot.gamepadEnabled
+                        ? "Waiting for a controller. Pair it in Bluetooth settings, then press a controller button here."
+                        : "Pair your controller in Bluetooth settings, turn on Gamepad, then press a controller button."}
+            </p>
+          )}
+          {coarse && (
+            <p className="panel-hint">
+              {touchMode === "trackpad"
+                ? "Slide to move the pointer. Tap to click, or tap twice and hold to drag."
+                : "Tap the desktop where you want to click. Touch and hold to right-click."}{" "}
+              Scroll with two fingers or pinch to zoom.
+            </p>
+          )}
           <h2>Send keys</h2>
           <div className="row" role="group" aria-label="Send keys">
             {keyCombos(info?.platform).map((combo) => (

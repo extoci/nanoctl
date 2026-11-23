@@ -173,28 +173,32 @@ pub(crate) struct ServiceControl {
     paths: ServiceControlPaths,
 }
 
+pub(crate) enum StartOutcome {
+    Acquired(ServiceControl),
+    AlreadyRunning,
+    Stopping,
+}
+
 impl ServiceControl {
-    /// Acquires the singleton service lock. `None` means a current stop transaction was already
-    /// published; startup acknowledged it and must exit successfully without becoming ready.
-    pub(crate) fn acquire() -> Result<Option<Self>> {
+    pub(crate) fn acquire() -> Result<StartOutcome> {
         Self::acquire_with_paths(ServiceControlPaths::default()?)
     }
 
-    fn acquire_with_paths(paths: ServiceControlPaths) -> Result<Option<Self>> {
+    fn acquire_with_paths(paths: ServiceControlPaths) -> Result<StartOutcome> {
         let service_lock = paths.open_lock(&paths.service_lock)?;
         if try_lock(&service_lock).context("cannot lock the nanoctl background agent")?
             == LockState::Held
         {
-            bail!("the nanoctl background agent is already running")
+            return Ok(StartOutcome::AlreadyRunning);
         }
         let stop_requests = paths.current_stop_requests()?;
         if !stop_requests.is_empty() {
             for request in stop_requests {
                 request.acknowledge()?;
             }
-            return Ok(None);
+            return Ok(StartOutcome::Stopping);
         }
-        Ok(Some(Self {
+        Ok(StartOutcome::Acquired(Self {
             _service_lock: service_lock,
             paths,
         }))
@@ -459,7 +463,7 @@ fn unix_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LegacyStopOutcome, ServiceControl, ServiceControlPaths, StopOutcome,
+        LegacyStopOutcome, ServiceControl, ServiceControlPaths, StartOutcome, StopOutcome,
         request_stop_with_paths,
     };
     use std::time::Duration;
@@ -468,9 +472,11 @@ mod tests {
     async fn stop_command_requests_shutdown_and_waits_for_service_exit() {
         let temporary = tempfile::tempdir().expect("temporary service directory");
         let paths = ServiceControlPaths::in_directory(temporary.path().to_owned());
-        let control = ServiceControl::acquire_with_paths(paths.clone())
-            .expect("running service lock")
-            .expect("service should start");
+        let StartOutcome::Acquired(control) =
+            ServiceControl::acquire_with_paths(paths.clone()).expect("running service lock")
+        else {
+            panic!("service should start");
+        };
         let stop = tokio::spawn(request_stop_with_paths(
             paths.clone(),
             Duration::from_secs(2),
@@ -535,11 +541,10 @@ mod tests {
             .create_stop_request(Duration::from_secs(2))
             .expect("stop request");
 
-        assert!(
-            ServiceControl::acquire_with_paths(paths)
-                .expect("service start check")
-                .is_none()
-        );
+        assert!(matches!(
+            ServiceControl::acquire_with_paths(paths).expect("service start check"),
+            StartOutcome::Stopping
+        ));
         assert!(request.acknowledged());
     }
 
@@ -547,13 +552,14 @@ mod tests {
     fn a_second_service_instance_cannot_acquire_the_agent_lock() {
         let temporary = tempfile::tempdir().expect("temporary service directory");
         let paths = ServiceControlPaths::in_directory(temporary.path().to_owned());
-        let _control = ServiceControl::acquire_with_paths(paths.clone())
-            .expect("first service lock")
-            .expect("service should start");
-
-        let error = ServiceControl::acquire_with_paths(paths)
-            .err()
-            .expect("duplicate service must fail");
-        assert!(error.to_string().contains("already running"));
+        let StartOutcome::Acquired(_control) =
+            ServiceControl::acquire_with_paths(paths.clone()).expect("first service lock")
+        else {
+            panic!("service should start");
+        };
+        assert!(matches!(
+            ServiceControl::acquire_with_paths(paths).expect("duplicate start outcome"),
+            StartOutcome::AlreadyRunning
+        ));
     }
 }

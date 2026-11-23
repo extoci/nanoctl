@@ -372,9 +372,10 @@ describe("one-command Windows installer", () => {
     const helper = await Bun.file(join(repository, "packaging/tailnet.ps1")).text();
     expect(installer).toContain(helper.trim());
     expect(helper).toContain("https://tailscale.com/download");
-    expect(helper).toContain('BackendState -ne "Running"');
+    expect(helper).toContain('if ($LASTEXITCODE -ne 0 -or -not $url) { throw "URL unavailable." }');
     expect(helper).toContain('"/delete:$($Matches[1]).dev.nanoctl.agent"');
-    expect(helper).toContain("& $BinaryPath --config $ConfigPath url");
+    expect(helper).toContain("& $BinaryPath --config $ConfigPath url --wait");
+    expect(helper).toContain('Write-Host "  $url"');
     for (const path of [
       "install.ps1",
       "packaging/windows/install-service.ps1",

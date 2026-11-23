@@ -6,6 +6,7 @@ const XINPUT_BUTTONS = [
 ];
 const KEEPALIVE_MS = 500;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "index" | "mapping">;
+export type GamepadStatus = "waiting" | "connected" | "unsupported";
 
 function clamp(value: number | undefined, min: number, max: number): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -46,10 +47,13 @@ export class GamepadForwarder {
     private readonly send: (message: Extract<ControlMessage, { type: "gamepad" }>) => boolean,
   ) {}
 
-  sample(pads: ArrayLike<InputPad | null>, now: number): void {
+  sample(pads: ArrayLike<InputPad | null>, now: number): GamepadStatus {
     const available = new Map<number, InputPad>();
+    let unsupported = false;
     for (const pad of Array.from(pads)) {
-      if (pad?.connected && pad.mapping === "standard") available.set(pad.index, pad);
+      if (!pad?.connected) continue;
+      if (pad.mapping === "standard") available.set(pad.index, pad);
+      else unsupported = true;
     }
     for (let slot = 0; slot < this.slots.length; slot++) {
       const index = this.slots[slot];
@@ -69,6 +73,7 @@ export class GamepadForwarder {
       if (pad) reports.push(report(pad, slot));
     });
     this.flush(reports, now);
+    return available.size ? "connected" : unsupported ? "unsupported" : "waiting";
   }
 
   release(): void {

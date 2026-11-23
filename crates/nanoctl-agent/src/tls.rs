@@ -210,11 +210,11 @@ pub async fn prepare(config: &TailnetConfig, node: &Node, tailnet: &dyn Tailnet)
     }
 }
 
-pub fn urls(node: &Node, port: u16, tls: bool) -> Vec<String> {
+pub fn viewer_url(node: &Node, port: u16, tls: bool) -> Option<String> {
     if tls {
-        vec![format!("https://{}:{port}/", node.dns_name)]
+        Some(format!("https://{}:{port}/", node.dns_name))
     } else {
-        crate::tailnet::urls(node, port)
+        crate::tailnet::urls(node, port).into_iter().next()
     }
 }
 
@@ -253,18 +253,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            urls(&node, 7337, true),
-            ["https://host.tail123.ts.net:7337/"]
+            viewer_url(&node, 7337, true).as_deref(),
+            Some("https://host.tail123.ts.net:7337/")
         );
         assert_eq!(
-            urls(&node, 7337, false),
-            ["http://host.tail123.ts.net:7337/"]
+            viewer_url(&node, 7337, false).as_deref(),
+            Some("http://host.tail123.ts.net:7337/")
         );
         assert_eq!(TailnetConfig::default().tls, TlsMode::Auto);
         assert!(toml::from_str::<TailnetConfig>("tls = 'invalid'").is_err());
         assert_eq!(
             toml::from_str::<TailnetConfig>("tls = 'off'").unwrap().tls,
             TlsMode::Off
+        );
+    }
+
+    #[test]
+    fn viewer_url_prefers_magic_dns_and_falls_back_to_one_tailnet_ip() {
+        let mut node = Node {
+            dns_name: "host.tail123.ts.net".into(),
+            ips: vec![
+                "100.64.1.2".parse().unwrap(),
+                "fd7a:115c:a1e0::1".parse().unwrap(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            viewer_url(&node, 7337, false).as_deref(),
+            Some("http://host.tail123.ts.net:7337/")
+        );
+        node.dns_name.clear();
+        assert_eq!(
+            viewer_url(&node, 7337, false).as_deref(),
+            Some("http://100.64.1.2:7337/")
         );
     }
 

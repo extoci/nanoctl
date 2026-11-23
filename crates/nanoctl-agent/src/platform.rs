@@ -236,12 +236,12 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
                 "running; IPs={:?}; MagicDNS={}; open {}",
                 node.ips,
                 node.dns_name,
-                crate::tls::urls(
+                crate::tls::viewer_url(
                     &node,
                     config.tailnet.port,
                     crate::tls::inspect(&config.tailnet, &node).config.is_some()
                 )
-                .join(" ")
+                .unwrap_or_default()
             ),
             Err(error) => error.to_string(),
         },

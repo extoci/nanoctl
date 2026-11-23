@@ -14,6 +14,12 @@ The Linux installer uses a systemd user service, macOS a LaunchAgent, and Window
 a hidden per-user Scheduled Task. Allow Screen Recording and Accessibility on macOS.
 The desktop user must be signed in. See [platform constraints](PLATFORMS.md).
 
+On Windows, installation starts nanoctl for you. Use `nanoctl url` to print the
+link again without restarting anything, or `nanoctl url --wait` if the agent is
+still starting. `nanoctl stop` stops the agent; `nanoctl run` starts it in the
+current PowerShell window until you press Ctrl+C or stop it from another window.
+If it is already running, `nanoctl run` just shows the link.
+
 ## HTTPS
 
 Enable **DNS → HTTPS Certificates** in the Tailscale admin console and use MagicDNS.
@@ -26,6 +32,13 @@ valid existing certificate warns and falls back to `http://<host>.<tailnet>.ts.n
 WireGuard still encrypts HTTP over the tailnet, but keyboard lock and other browser
 secure-context features need HTTPS. Use `nanoctl doctor` to see the fallback reason
 and `nanoctl url` for the URL to open. `tls="off"` explicitly disables native TLS.
+
+On iPhone, connect Tailscale to the same tailnet and paste the full HTTPS link
+(including the port) into Safari. Don’t substitute the PC’s Tailscale IP for its
+MagicDNS name: the HTTPS certificate is issued for the name. Tap Safari’s
+**Share → Add to Home Screen** to open the viewer without Safari’s toolbars.
+In the viewer, tap the blue **Session options** tab for trackpad and keyboard
+controls. See [Game controllers](../README.md#game-controllers) for DualSense setup.
 
 ## Configuration and access
 

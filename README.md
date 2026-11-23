@@ -33,7 +33,9 @@ WebRTC carries video and input between your browser and the host.
    ```
 
 3. Open the printed URL from a browser on your tailnet, normally
-   `https://<host>.<tailnet>.ts.net:7337/`.
+   `https://<host>.<tailnet>.ts.net:7337/`. On iPhone, use the full MagicDNS link
+   in Safari, not the PC’s IP. To find it again, run `nanoctl url` on the host;
+   you don’t need to stop or restart nanoctl.
 
 During prereleases, use the install script from the selected release and set
 `NANOCTL_VERSION=v3.0.0-alpha.1` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.1"`).

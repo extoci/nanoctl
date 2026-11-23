@@ -27,6 +27,29 @@ async function screenshot(page: Page, name: string) {
   await page.screenshot({ path: join(directory, name) });
 }
 
+test("iPhone session options explain standalone launch in a narrow viewport", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "userAgent", { value: "iPhone Safari" });
+    Object.defineProperty(document, "fullscreenEnabled", { value: false });
+  });
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.goto("/");
+  const tab = page.getByRole("button", { name: "Session options" });
+  expect((await tab.boundingBox())?.width).toBeGreaterThanOrEqual(44);
+  await openPanel(page);
+  await expect(page.getByText(/Safari’s Share button, then Add to Home Screen/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Fullscreen", exact: true })).toHaveCount(0);
+  await expect(page.getByText(/Slide to move the pointer/)).toBeVisible();
+  const manifest = await page.request.get("/manifest.webmanifest");
+  expect(manifest.headers()["content-type"]).toBe("application/manifest+json");
+  expect(await manifest.json()).toMatchObject({ start_url: "/", display: "standalone" });
+  await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute(
+    "href",
+    "/app-icon.png",
+  );
+  expect((await page.request.get("/app-icon.png")).ok()).toBe(true);
+});
+
 test("mobile layout, reachable touch targets, keyboard focus and persisted mode", async ({
   page,
 }) => {

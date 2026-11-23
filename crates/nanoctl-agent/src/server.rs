@@ -348,6 +348,7 @@ async fn asset(
             Some("png") => "image/png",
             Some("ico") => "image/x-icon",
             Some("json") => "application/json",
+            Some("webmanifest") => "application/manifest+json",
             Some("woff2") => "font/woff2",
             _ => "application/octet-stream",
         };
@@ -526,6 +527,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
     let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
     let mut cert_node = String::new();
     let mut cert_checked = None::<tokio::time::Instant>;
+    let mut announced_url = None;
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
@@ -632,6 +634,19 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
                     tracing::warn!(%addr, %error, "cannot bind tailnet listener; will retry")
                 }
             }
+        }
+        let node = state.node.read().await;
+        let url = node
+            .ips
+            .iter()
+            .any(|ip| listeners.contains_key(ip))
+            .then(|| crate::tls::viewer_url(&node, state.config.tailnet.port, tls_config.is_some()))
+            .flatten();
+        if url != announced_url {
+            if let Some(url) = &url {
+                tracing::info!("Open on a device connected to Tailscale: {url}");
+            }
+            announced_url = url;
         }
     }
     for (_, (stop, task)) in listeners {

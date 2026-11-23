@@ -32,5 +32,9 @@ remove_legacy_credential() {
 }
 
 print_tailnet_url() {
-  "$1" url || printf '%s\n' 'URL unavailable yet; run nanoctl url after Tailscale is running.' >&2
+  if url_output="$("$1" url --wait)"; then
+    printf '%s\n%s\n' 'Open on a device connected to Tailscale:' "$url_output"
+  else
+    printf '%s\n' 'URL unavailable yet; retry nanoctl url --wait after Tailscale is running.' >&2
+  fi
 }

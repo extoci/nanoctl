@@ -337,8 +337,8 @@ kbd {
 }
 .soft-keyboard-field {
   position: fixed;
-  bottom: 0;
-  left: 0;
+  top: 50%;
+  left: 50%;
   width: 1px;
   height: 1px;
   padding: 0;
@@ -417,10 +417,6 @@ kbd {
     height: 100%;
     overflow: hidden;
     overscroll-behavior: none;
-  }
-  .viewer {
-    padding-left: env(safe-area-inset-left);
-    padding-right: env(safe-area-inset-right);
   }
   .bar {
     flex: 0 0 auto;
@@ -529,8 +525,15 @@ kbd {
 
 /* Full-bleed session with a Chrome Remote Desktop style side panel. */
 .viewer {
+  --panel-tab-width: 28px;
+  --session-panel-width: min(
+    calc(320px + env(safe-area-inset-right)),
+    100vw - var(--panel-tab-width) - env(safe-area-inset-left)
+  );
   position: relative;
   overflow: hidden;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
 }
 .stage.scale-original {
   overflow: auto;
@@ -545,13 +548,13 @@ kbd {
 .panel-tab {
   position: absolute;
   top: 50%;
-  right: 0;
+  right: env(safe-area-inset-right);
   z-index: 21;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  min-width: 28px;
+  width: var(--panel-tab-width);
   min-height: 64px;
   padding: 10px 6px;
   border-radius: 10px 0 0 10px;
@@ -573,7 +576,7 @@ kbd {
   opacity: 1;
 }
 .panel-open .panel-tab {
-  right: min(320px, 100vw - 28px);
+  right: var(--session-panel-width);
 }
 .session-panel {
   position: absolute;
@@ -581,7 +584,7 @@ kbd {
   right: 0;
   bottom: 0;
   z-index: 20;
-  width: min(320px, 100vw - 28px);
+  width: var(--session-panel-width);
   display: flex;
   flex-direction: column;
   background: #101721f2;
@@ -590,7 +593,8 @@ kbd {
   transform: translateX(100%);
   transition: transform 0.2s ease;
   overflow-y: auto;
-  padding-bottom: env(safe-area-inset-bottom);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) 0;
+  overscroll-behavior: contain;
 }
 .panel-open .session-panel {
   transform: none;
@@ -605,7 +609,7 @@ kbd {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 8px;
-  padding: max(16px, env(safe-area-inset-top)) 18px 14px;
+  padding: 16px 18px 14px;
   border-bottom: 1px solid #202b3a;
 }
 .panel-head small {
@@ -641,6 +645,20 @@ kbd {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+.panel-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #a3b1c4;
+}
+@media (max-width: 720px), (pointer: coarse) {
+  .viewer {
+    --panel-tab-width: 44px;
+  }
+  .panel-tab {
+    opacity: 0.9;
+  }
 }
 .session-panel .row button,
 .session-panel .disconnect {

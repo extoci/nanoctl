@@ -10,7 +10,7 @@ import {
 } from "@nanoctl/protocol";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
-import { GamepadForwarder } from "./gamepad";
+import { GamepadForwarder, type GamepadStatus } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
 import { normalizedPosition, videoGeometry } from "./touch-input";
 
@@ -39,6 +39,7 @@ export type RemoteSessionSnapshot = {
   iceGeneration: number;
   inputEnabled: boolean;
   gamepadEnabled: boolean;
+  gamepadStatus: GamepadStatus;
   firstFrameReceived: boolean;
   metrics: RemoteSessionMetrics | null;
 };
@@ -115,6 +116,7 @@ export class RemoteSessionController {
   private clipboardChannel: RTCDataChannel | null = null;
   private clipboard: ClipboardSync | null = null;
   private gamepadFrame: number | null = null;
+  private gamepadStatus: GamepadStatus = "waiting";
   private readonly gamepad = new GamepadForwarder((message) => this.sendControl(message));
   private keyQueue: Promise<void> = Promise.resolve();
   private readonly onClipboardFocus = () => {
@@ -233,6 +235,7 @@ export class RemoteSessionController {
       iceGeneration: this.iceGeneration,
       inputEnabled: this.inputEnabled,
       gamepadEnabled: this.gamepadFrame !== null,
+      gamepadStatus: this.gamepadStatus,
       firstFrameReceived: this.firstFrameReceived,
       metrics: this.metrics,
     };
@@ -326,7 +329,11 @@ export class RemoteSessionController {
       document.hasFocus()
     ) {
       try {
-        this.gamepad.sample(navigator.getGamepads(), now);
+        const status = this.gamepad.sample(navigator.getGamepads(), now);
+        if (status !== this.gamepadStatus) {
+          this.gamepadStatus = status;
+          this.publishSnapshot();
+        }
       } catch {
         this.setGamepadEnabled(false);
       }
@@ -339,6 +346,7 @@ export class RemoteSessionController {
     if (this.gamepadFrame === null) return;
     window.cancelAnimationFrame(this.gamepadFrame);
     this.gamepadFrame = null;
+    this.gamepadStatus = "waiting";
     this.gamepad.release();
   }
 

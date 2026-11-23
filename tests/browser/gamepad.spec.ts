@@ -36,12 +36,14 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
   await expect(gamepad).toBeEnabled();
   expect(await events()).toBe("");
   await gamepad.click();
+  await expect(page.getByText(/Controller detected. Windows games see/)).toBeVisible();
   await expect.poll(events).toContain("0 4096 128 0 16384 32767 0 0");
   await page.evaluate(() => {
     (window as unknown as { fake: { controllerAttached: boolean } }).fake.controllerAttached =
       false;
   });
   await expect.poll(events).toContain("0 detached");
+  await expect(page.getByText(/Waiting for a controller/)).toBeVisible();
   await page.evaluate(() => {
     (window as unknown as { fake: { controllerAttached: boolean } }).fake.controllerAttached = true;
   });

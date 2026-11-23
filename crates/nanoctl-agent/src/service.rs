@@ -4,12 +4,10 @@ use std::{path::PathBuf, time::Duration};
 
 pub async fn run(
     config: AgentConfig,
+    control: ServiceControl,
     ready_file: Option<PathBuf>,
     ready_token: Option<String>,
 ) -> Result<()> {
-    let Some(control) = ServiceControl::acquire()? else {
-        return Ok(());
-    };
     let state =
         crate::server::ServerState::new(config.clone(), crate::tailnet::real(&config.tailnet));
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
