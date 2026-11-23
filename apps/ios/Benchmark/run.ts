@@ -2,6 +2,7 @@ import { chromium } from "@playwright/test";
 import { mkdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { markerBits, summarize } from "../../../tests/browser/latency-marker";
+import { rtpMarkerArrivals } from "./rtp-trace";
 
 const root = resolve(import.meta.dir, "../../..");
 const [app, device, output] = process.argv.slice(2);
@@ -16,14 +17,88 @@ interface Frame {
   sequence: number;
   input: number;
   displayMs: number;
+  receiveMs?: number;
+  presentationMs?: number;
+  processingMs?: number;
+  stages?: {
+    rtp: number;
+    decoder?: { start: number; end?: number };
+    mailbox: number;
+    renderStart: number;
+    submit: number;
+    gpuEnd: number;
+  };
+}
+interface Receiver {
+  ssrc?: number;
+  decoder?: string;
+  powerEfficientDecoder?: boolean;
+  counters: Record<string, number | undefined>;
 }
 interface Probe {
   frames: Frame[];
   inputTimes: number[];
   width: number;
   height: number;
+  epochOffset?: number;
+  receiverStart?: Receiver;
+  receiverEnd?: Receiver;
 }
 type HostWindow = typeof window & { nanoctlMarker: { paintTimes: number[]; input: number } };
+
+function timingBreakdown(frames: Frame[], markers: number[], report: Probe) {
+  const samples = new Map<string, number[]>();
+  const add = (name: string, start: number | undefined, end: number | undefined) => {
+    if (start === undefined || end === undefined || !Number.isFinite(end - start)) return;
+    const series = samples.get(name) ?? [];
+    series.push(end - start);
+    samples.set(name, series);
+  };
+  const toEpoch = (at?: number) =>
+    at === undefined || report.epochOffset === undefined
+      ? undefined
+      : (at + report.epochOffset) * 1000;
+  for (const { stages, displayMs, receiveMs, presentationMs, processingMs, sequence } of frames) {
+    add("hostToReceive", markers[sequence], receiveMs);
+    add("receiveToDisplay", receiveMs, displayMs);
+    if (stages) {
+      const decodeStart = toEpoch(stages.decoder?.start);
+      const decoded = toEpoch(stages.decoder?.end);
+      add("receiveToDecodeStart", receiveMs, decodeStart);
+      add("decode", decodeStart, decoded);
+      add("decodeToMailbox", decoded, toEpoch(stages.mailbox));
+      add("mailboxWait", toEpoch(stages.mailbox), toEpoch(stages.renderStart));
+      add("renderPreparation", toEpoch(stages.renderStart), toEpoch(stages.submit));
+      add("submitToGPUCompletionCallback", toEpoch(stages.submit), toEpoch(stages.gpuEnd));
+      add("gpuCompletionCallbackToDisplay", toEpoch(stages.gpuEnd), displayMs);
+    } else {
+      add("receiveToCompositor", receiveMs, presentationMs);
+      add("compositorToDisplay", presentationMs, displayMs);
+      add("processing", 0, processingMs);
+    }
+  }
+  return Object.fromEntries(Array.from(samples, ([name, series]) => [name, summarize(series)]));
+}
+
+function receiverAverages(start?: Receiver, end?: Receiver) {
+  if (!start || !end || start.ssrc !== end.ssrc) return undefined;
+  const diff = (key: string) => (end.counters[key] ?? NaN) - (start.counters[key] ?? NaN);
+  const avg = (seconds: string, count: string) => {
+    const denominator = diff(count);
+    const value = (1000 * diff(seconds)) / denominator;
+    return denominator > 0 && Number.isFinite(value) ? value : undefined;
+  };
+  return {
+    decoder: end.decoder,
+    powerEfficientDecoder: end.powerEfficientDecoder,
+    jitterBufferMs: avg("jitterBufferDelay", "jitterBufferEmittedCount"),
+    jitterBufferTargetMs: avg("jitterBufferTargetDelay", "jitterBufferEmittedCount"),
+    jitterBufferMinimumMs: avg("jitterBufferMinimumDelay", "jitterBufferEmittedCount"),
+    decodeMs: avg("totalDecodeTime", "framesDecoded"),
+    processingMs: avg("totalProcessingDelay", "framesDecoded"),
+    framesDropped: diff("framesDropped"),
+  };
+}
 
 async function command(args: string[], env?: NodeJS.ProcessEnv) {
   const child = Bun.spawn(args, { cwd: root, env, stdout: "pipe", stderr: "inherit" });
@@ -167,6 +242,7 @@ try {
       await command(["xcrun", "simctl", "launch", device, bundle], {
         ...process.env,
         SIMCTL_CHILD_NANOCTL_BENCHMARK_URL: endpoint,
+        SIMCTL_CHILD_NANOCTL_RENDER_ON_VSYNC: process.env.NANOCTL_RENDER_ON_VSYNC ?? "0",
       });
       result = await wait(
         async () => {
@@ -176,6 +252,18 @@ try {
         45,
         "native presentation sample",
       );
+      if (process.env.NANOCTL_RTP_TRACE && result.receiverEnd?.ssrc !== undefined) {
+        const capture = await Bun.file(process.env.NANOCTL_RTP_TRACE).arrayBuffer();
+        const arrivals = rtpMarkerArrivals(capture, result.receiverEnd.ssrc);
+        for (const frame of result.frames) {
+          if (frame.stages) frame.receiveMs = arrivals.get(frame.stages.rtp);
+        }
+        if (!result.frames.some((frame) => frame.receiveMs !== undefined)) {
+          throw new Error(
+            "No native frames matched the RTP trace; check the selected loopback family",
+          );
+        }
+      }
       await sim("io", device, "screenshot", join(resultsPath, "native.png"));
     } else {
       safariReport = undefined;
@@ -223,6 +311,8 @@ try {
       fps,
       video: summarize(video),
       input: summarize(input),
+      timingsMs: timingBreakdown(frames, marker.paintTimes, result),
+      receiver: receiverAverages(result.receiverStart, result.receiverEnd),
     };
   };
 

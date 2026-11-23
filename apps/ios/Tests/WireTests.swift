@@ -1,8 +1,26 @@
 import CoreVideo
+import WebRTC
 import XCTest
 @testable import Nanoctl
 
 final class WireTests: XCTestCase {
+    func testMailboxOnlyReturnsTheMostRecentFrame() throws {
+        let mailbox = FrameMailbox()
+        let previous = try XCTUnwrap(mailbox.latest(after: -1)).number
+        var created: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA,
+                                           nil, &created), kCVReturnSuccess)
+        let buffer = RTCCVPixelBuffer(pixelBuffer: try XCTUnwrap(created))
+        mailbox.renderFrame(RTCVideoFrame(buffer: buffer, rotation: ._0, timeStampNs: 1))
+        mailbox.renderFrame(RTCVideoFrame(buffer: buffer, rotation: ._0, timeStampNs: 2))
+        let latest = try XCTUnwrap(mailbox.latest(after: previous))
+        XCTAssertEqual(latest.frame?.timeStampNs, 2)
+        XCTAssertNil(mailbox.latest(after: latest.number))
+        mailbox.renderFrame(nil)
+        let cleared = try XCTUnwrap(mailbox.latest(after: latest.number))
+        XCTAssertNil(cleared.frame)
+    }
+
     #if DEBUG && targetEnvironment(simulator)
     func testMarkerDecodesFrameAndRejectsWrongChecksum() throws {
         let sequence = 487, input = 12

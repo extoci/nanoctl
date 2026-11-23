@@ -3,9 +3,14 @@ import WebRTC
 
 @MainActor
 final class Session {
-    private let factory = RTCPeerConnectionFactory(
-        encoderFactory: RTCDefaultVideoEncoderFactory(), decoderFactory: RTCDefaultVideoDecoderFactory()
-    )
+    private let factory: RTCPeerConnectionFactory = {
+        #if DEBUG && targetEnvironment(simulator)
+        let decoder: RTCVideoDecoderFactory = LatencyProbe.enabled ? TimedDecoderFactory() : RTCDefaultVideoDecoderFactory()
+        #else
+        let decoder = RTCDefaultVideoDecoderFactory()
+        #endif
+        return RTCPeerConnectionFactory(encoderFactory: RTCDefaultVideoEncoderFactory(), decoderFactory: decoder)
+    }()
     private let network: URLSession
     private var connection: Connection?
     private var task: Task<Void, Never>?
@@ -17,6 +22,20 @@ final class Session {
         connection?.host?.canControl == true && connection?.control?.readyState == .open
     }
     var onChange: (() -> Void)?
+
+    #if DEBUG && targetEnvironment(simulator)
+    func receiverStats() async -> ReceiverStats? {
+        guard let peer = connection?.peer else { return nil }
+        return await withCheckedContinuation { reply in
+            peer.statistics { report in
+                let stream = report.statistics.values.first {
+                    $0.type == "inbound-rtp" && ($0.values["kind"] as? String) == "video"
+                }
+                reply.resume(returning: stream.map { ReceiverStats($0.values) })
+            }
+        }
+    }
+    #endif
 
     init() {
         let configuration = URLSessionConfiguration.ephemeral

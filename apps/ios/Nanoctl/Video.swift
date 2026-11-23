@@ -4,23 +4,37 @@ import UIKit
 import WebRTC
 
 final class FrameMailbox: NSObject, RTCVideoRenderer {
+    struct Entry {
+        let frame: RTCVideoFrame?
+        let number: Int
+        let receivedAt: CFTimeInterval
+    }
+
     private let lock = NSLock()
-    private var frame: RTCVideoFrame?
-    private var number = 0
+    private var entry = Entry(frame: nil, number: 0, receivedAt: 0)
+    private var wakeup: DispatchSourceUserDataAdd?
 
     func setSize(_ size: CGSize) {}
 
     func renderFrame(_ frame: RTCVideoFrame?) {
+        let now = CACurrentMediaTime()
         lock.lock()
-        self.frame = frame
-        number += 1
+        entry = Entry(frame: frame, number: entry.number + 1, receivedAt: now)
+        let source = wakeup
+        lock.unlock()
+        source?.add(data: 1)
+    }
+
+    func setWakeup(_ source: DispatchSourceUserDataAdd?) {
+        lock.lock()
+        wakeup = source
         lock.unlock()
     }
 
-    func latest(after previous: Int) -> (RTCVideoFrame?, Int)? {
+    func latest(after previous: Int) -> Entry? {
         lock.lock()
         defer { lock.unlock() }
-        return number == previous ? nil : (frame, number)
+        return entry.number == previous ? nil : entry
     }
 }
 
@@ -30,13 +44,15 @@ final class VideoView: UIView {
     private let color = CGColorSpace(name: CGColorSpace.sRGB)!
     private let queue: MTLCommandQueue?
     private let context: CIContext?
-    private var displayLink: CADisplayLink?
+    private let wakeup = DispatchSource.makeUserDataAddSource(queue: .main)
     private var busy = false
     private var last = -1
     private var imageSize = CGSize.zero
     private var mailbox: FrameMailbox?
     #if DEBUG && targetEnvironment(simulator)
     weak var probe: LatencyProbe?
+    private var displayLink: CADisplayLink?
+    private var refresh: (target: CFTimeInterval, interval: CFTimeInterval)?
     #endif
 
     init() {
@@ -50,22 +66,35 @@ final class VideoView: UIView {
         metal.framebufferOnly = false
         metal.maximumDrawableCount = 2
         backgroundColor = .black
+        wakeup.setEventHandler { [weak self] in self?.drawFrame() }
+        wakeup.activate()
     }
 
     required init?(coder: NSCoder) { nil }
 
+    deinit { wakeup.cancel() }
+
     func show(_ mailbox: FrameMailbox?) {
         if self.mailbox === mailbox { return }
+        self.mailbox?.setWakeup(nil)
         self.mailbox = mailbox
         last = -1
         imageSize = .zero
         metal.opacity = mailbox == nil ? 0 : 1
+        #if DEBUG && targetEnvironment(simulator)
         updateLink()
+        if probe?.vsyncBaseline == true { return }
+        #endif
+        mailbox?.setWakeup(wakeup)
+        wakeup.add(data: 1)
     }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        #if DEBUG && targetEnvironment(simulator)
         updateLink()
+        #endif
+        wakeup.add(data: 1)
     }
 
     override func layoutSubviews() {
@@ -73,6 +102,7 @@ final class VideoView: UIView {
         let scale = window?.windowScene?.screen.scale ?? traitCollection.displayScale
         metal.drawableSize = CGSize(width: (bounds.width * scale).rounded(), height: (bounds.height * scale).rounded())
         last = -1
+        wakeup.add(data: 1)
     }
 
     private func fit(_ image: CGSize, in bounds: CGRect) -> CGRect {
@@ -86,24 +116,39 @@ final class VideoView: UIView {
         imageSize.width > 0 && imageSize.height > 0 ? fit(imageSize, in: bounds) : bounds
     }
 
+    #if DEBUG && targetEnvironment(simulator)
     private func updateLink() {
         displayLink?.invalidate()
         displayLink = nil
-        guard mailbox != nil, let screen = window?.windowScene?.screen else { return }
-        let link = screen.displayLink(withTarget: self, selector: #selector(drawFrame))
+        refresh = nil
+        guard probe != nil, mailbox != nil, let screen = window?.windowScene?.screen else { return }
+        let link = screen.displayLink(withTarget: self, selector: #selector(refreshTick))
         let maxRate = Float(screen.maximumFramesPerSecond)
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: min(60, maxRate), maximum: maxRate, preferred: maxRate)
         link?.add(to: .main, forMode: .common)
         displayLink = link
     }
 
-    @objc private func drawFrame(_ link: CADisplayLink) {
-        guard !busy, !bounds.isEmpty, let context, let (frame, number) = mailbox?.latest(after: last),
+    @objc private func refreshTick(_ link: CADisplayLink) {
+        refresh = (link.targetTimestamp, max(link.duration, 0.001))
+        if probe?.vsyncBaseline == true { drawFrame(fromRefresh: true) }
+    }
+    #endif
+
+    private func drawFrame(fromRefresh: Bool = false) {
+        #if DEBUG && targetEnvironment(simulator)
+        if probe?.vsyncBaseline == true && !fromRefresh { return }
+        let startedAt = CACurrentMediaTime()
+        #endif
+        guard !busy, window != nil, !bounds.isEmpty, let context, let entry = mailbox?.latest(after: last),
               let drawable = metal.nextDrawable(), let command = queue?.makeCommandBuffer() else { return }
         let destination = CGRect(x: 0, y: 0, width: drawable.texture.width, height: drawable.texture.height)
         let black = CIImage(color: .black).cropped(to: destination)
         var output = black
-        if let frame, let buffer = pixelBuffer(frame) {
+        #if DEBUG && targetEnvironment(simulator)
+        var sample: (FrameMarker, Int, Int, UInt32)?
+        #endif
+        if let frame = entry.frame, let buffer = pixelBuffer(frame) {
             let image = CIImage(cvPixelBuffer: buffer)
             imageSize = image.extent.size
             let rect = fit(imageSize, in: destination)
@@ -112,26 +157,43 @@ final class VideoView: UIView {
                 .transformed(by: CGAffineTransform(translationX: rect.minX, y: rect.minY))
                 .composited(over: black)
             #if DEBUG && targetEnvironment(simulator)
-            if let probe, let marker = FrameMarker.read(buffer) {
-                let width = Int(frame.width), height = Int(frame.height)
-                let target = link.targetTimestamp
-                let interval = max(link.duration, 0.001)
-                command.addCompletedHandler { [weak probe] command in
-                    guard command.status == .completed else { return }
-                    let late = max(0, CACurrentMediaTime() - target)
-                    let at = target + ceil(late / interval) * interval
-                    DispatchQueue.main.async { probe?.record(marker, at: at, width: width, height: height) }
-                }
+            if probe != nil, let marker = FrameMarker.read(buffer) {
+                sample = (marker, Int(frame.width), Int(frame.height), UInt32(bitPattern: frame.timeStamp))
             }
             #endif
         }
-        last = number
+        last = entry.number
         busy = true
         context.render(output, to: drawable.texture, commandBuffer: command, bounds: destination, colorSpace: color)
-        command.addCompletedHandler { [weak self] _ in
-            DispatchQueue.main.async { self?.busy = false }
-        }
         command.present(drawable)
+        #if DEBUG && targetEnvironment(simulator)
+        if let probe, let (marker, width, height, rtp) = sample, let refresh {
+            let submittedAt = CACurrentMediaTime()
+            let decoder = DecoderTimings.shared.timing(for: rtp)
+            let receivedAt = entry.receivedAt
+            command.addCompletedHandler { [weak probe] command in
+                guard command.status == .completed else { return }
+                let completedAt = CACurrentMediaTime()
+                let ticks = ceil((completedAt - refresh.target) / refresh.interval)
+                let at = refresh.target + ticks * refresh.interval
+                let stages = LatencyProbe.Stages(rtp: rtp, decoder: decoder, mailbox: receivedAt,
+                                                renderStart: startedAt, submit: submittedAt, gpuEnd: completedAt)
+                DispatchQueue.main.async {
+                    probe?.record(marker, at: at, width: width, height: height, stages: stages)
+                }
+            }
+        }
+        #endif
+        command.addCompletedHandler { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.busy = false
+                #if DEBUG && targetEnvironment(simulator)
+                if self.probe?.vsyncBaseline == true { return }
+                #endif
+                if self.mailbox?.latest(after: self.last) != nil { self.wakeup.add(data: 1) }
+            }
+        }
         command.commit()
     }
 

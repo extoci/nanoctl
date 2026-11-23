@@ -59,12 +59,32 @@ and agent launcher, pacing the source marker at 30 fps and using the same softwa
 H.264 settings for both viewers.
 It reports unique visible markers per second and p50/p95 for host draw → estimated
 presentation and scripted Space dispatch → first response presentation. The native
-probe only inspects drawables submitted for presentation whose GPU commands complete;
-the Simulator does not provide Metal's real presentation callback, so it uses the
-display link target rounded to the next eligible refresh after GPU completion.
+probe only inspects drawables submitted for presentation whose GPU commands complete.
+The Simulator does not expose a Metal presentation timestamp, so the probe estimates
+the next eligible refresh after the GPU completion callback. The display link supplies
+the refresh phase; normal rendering does not wait for a display-link tick.
 Safari uses `requestVideoFrameCallback`'s `expectedDisplayTime`. Clock timestamps
 share the Mac's epoch. Neither measures photons. The input test does not measure
 Bluetooth or compare GameController callbacks with Safari's gamepad polling.
 
-Set `NANOCTL_SAFARI_FIRST=1` to reverse the run order. The runner saves raw
-samples and a screenshot of each viewer alongside the summary.
+Set `NANOCTL_SAFARI_FIRST=1` to reverse the run order, or
+`NANOCTL_RENDER_ON_VSYNC=1` to reproduce the old native polling scheduler with
+the same instrumentation. The runner saves raw samples and a screenshot of each
+viewer alongside the summary. Native samples include decoder entry and callback,
+mailbox delivery, render start, submission and GPU completion callback. The
+summary also reports interval averages from inbound WebRTC counters (actual,
+target and minimum jitter-buffer residence, and decode time).
+
+For per-frame receive timing on this Mac-only loopback workload, start this
+capture in another terminal before the benchmark, and set
+`NANOCTL_RTP_TRACE=/tmp/nanoctl-rtp.pcap` for the runner:
+
+```sh
+sudo tcpdump -i lo0 -y NULL -n -U -s 44 -w /tmp/nanoctl-rtp.pcap \
+  'ip and udp and src host 127.0.0.1 and udp[8] & 0xc0 = 0x80 and udp[9] & 0x7f >= 96'
+```
+
+Stop the capture afterward. This recipe saves IPv4 RTP headers, not video payloads;
+the probe joins the loopback timestamp of each end-of-frame RTP packet to its native
+decoder timestamps by SSRC and RTP timestamp. Safari uses video-frame metadata for
+receive and processing timing when WebKit supplies those fields.

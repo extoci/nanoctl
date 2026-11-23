@@ -1,6 +1,72 @@
 #if DEBUG && targetEnvironment(simulator)
 import CoreVideo
 import QuartzCore
+import WebRTC
+
+final class DecoderTimings {
+    struct Sample: Encodable {
+        let start: Double
+        var end: Double?
+    }
+
+    static let shared = DecoderTimings()
+    private let lock = NSLock()
+    private var samples: [UInt32: Sample] = [:]
+    private var order: [UInt32] = []
+
+    func start(_ rtp: UInt32) {
+        let now = CACurrentMediaTime()
+        lock.withLock {
+            if samples[rtp] == nil { order.append(rtp) }
+            if order.count > 128 { samples.removeValue(forKey: order.removeFirst()) }
+            samples[rtp] = Sample(start: now)
+        }
+    }
+
+    func end(_ rtp: UInt32) {
+        let now = CACurrentMediaTime()
+        lock.withLock { samples[rtp]?.end = now }
+    }
+
+    func timing(for rtp: UInt32) -> Sample? { lock.withLock { samples[rtp] } }
+}
+
+final class TimedDecoderFactory: NSObject, RTCVideoDecoderFactory {
+    private let factory = RTCDefaultVideoDecoderFactory()
+
+    func supportedCodecs() -> [RTCVideoCodecInfo] { factory.supportedCodecs() }
+
+    func createDecoder(_ info: RTCVideoCodecInfo) -> RTCVideoDecoder? {
+        factory.createDecoder(info).map(TimedDecoder.init)
+    }
+}
+
+private final class TimedDecoder: NSObject, RTCVideoDecoder {
+    private let decoder: RTCVideoDecoder
+
+    init(_ decoder: RTCVideoDecoder) { self.decoder = decoder }
+
+    func setCallback(_ callback: @escaping RTCVideoDecoderCallback) {
+        decoder.setCallback { frame in
+            DecoderTimings.shared.end(UInt32(bitPattern: frame.timeStamp))
+            callback(frame)
+        }
+    }
+
+    func startDecode(withNumberOfCores numberOfCores: Int32) -> Int {
+        decoder.startDecode(withNumberOfCores: numberOfCores)
+    }
+
+    func release() -> Int { decoder.release() }
+
+    func implementationName() -> String { decoder.implementationName() }
+
+    func decode(_ image: RTCEncodedImage, missingFrames: Bool, codecSpecificInfo info: RTCCodecSpecificInfo?,
+                renderTimeMs: Int64) -> Int {
+        DecoderTimings.shared.start(image.timeStamp)
+        return decoder.decode(image, missingFrames: missingFrames, codecSpecificInfo: info, renderTimeMs: renderTimeMs)
+    }
+}
 
 struct FrameMarker {
     let sequence: Int
@@ -64,9 +130,32 @@ struct FrameMarker {
 
 @MainActor
 final class LatencyProbe {
-    struct Frame: Encodable { let sequence: Int; let input: Int; let displayMs: Double }
-    struct Report: Encodable { let frames: [Frame]; let inputTimes: [Double]; let width: Int; let height: Int }
+    struct Stages: Encodable {
+        let rtp: UInt32
+        let decoder: DecoderTimings.Sample?
+        let mailbox: Double
+        let renderStart: Double
+        let submit: Double
+        let gpuEnd: Double
+    }
+    struct Frame: Encodable {
+        let sequence: Int
+        let input: Int
+        let displayMs: Double
+        let stages: Stages
+    }
+    struct Report: Encodable {
+        let frames: [Frame]
+        let inputTimes: [Double]
+        let width: Int
+        let height: Int
+        let epochOffset: Double
+        let receiverStart: ReceiverStats?
+        let receiverEnd: ReceiverStats?
+    }
 
+    static let enabled = ProcessInfo.processInfo.environment["NANOCTL_BENCHMARK_URL"] != nil
+    let vsyncBaseline = ProcessInfo.processInfo.environment["NANOCTL_RENDER_ON_VSYNC"] == "1"
     private weak var session: Session?
     private let epochOffset = Date().timeIntervalSince1970 - CACurrentMediaTime()
     private var frames: [Frame] = []
@@ -75,12 +164,14 @@ final class LatencyProbe {
 
     init(session: Session) { self.session = session }
 
-    func record(_ marker: FrameMarker, at time: Double, width: Int, height: Int) {
+    func record(_ marker: FrameMarker, at time: Double, width: Int, height: Int, stages: Stages) {
         guard frames.count < 2000 else { return }
-        frames.append(Frame(sequence: marker.sequence, input: marker.input, displayMs: (time + epochOffset) * 1000))
+        frames.append(Frame(sequence: marker.sequence, input: marker.input,
+                            displayMs: (time + epochOffset) * 1000, stages: stages))
         guard run == nil, frames.count >= 30, let session, session.inputReady else { return }
         frames.removeAll(keepingCapacity: true)
         run = Task {
+            let receiverStart = await session.receiverStats()
             let start = CACurrentMediaTime()
             for i in 1...12 {
                 try? await Task.sleep(for: .milliseconds(181 + (i * 43) % 193))
@@ -95,10 +186,29 @@ final class LatencyProbe {
                 }
             }
             try? await Task.sleep(for: .seconds(max(0, 10 - (CACurrentMediaTime() - start))))
-            let report = Report(frames: frames, inputTimes: inputTimes, width: width, height: height)
+            let receiverEnd = await session.receiverStats()
+            let report = Report(frames: frames, inputTimes: inputTimes, width: width, height: height,
+                                epochOffset: epochOffset, receiverStart: receiverStart, receiverEnd: receiverEnd)
             let file = URL.documentsDirectory.appending(path: "latency.json")
             if let data = try? JSONEncoder().encode(report) { try? data.write(to: file, options: .atomic) }
         }
+    }
+}
+
+struct ReceiverStats: Encodable {
+    let decoder: String?
+    let ssrc: UInt32?
+    let powerEfficientDecoder: Bool?
+    let counters: [String: Double]
+
+    init(_ values: [String: NSObject]) {
+        decoder = values["decoderImplementation"] as? String
+        ssrc = (values["ssrc"] as? NSNumber)?.uint32Value
+        powerEfficientDecoder = (values["powerEfficientDecoder"] as? NSNumber)?.boolValue
+        counters = Dictionary(uniqueKeysWithValues: [
+            "jitterBufferDelay", "jitterBufferTargetDelay", "jitterBufferMinimumDelay", "jitterBufferEmittedCount",
+            "totalDecodeTime", "totalProcessingDelay", "framesDecoded", "framesReceived", "framesDropped"
+        ].compactMap { key in (values[key] as? NSNumber).map { (key, $0.doubleValue) } })
     }
 }
 #endif
