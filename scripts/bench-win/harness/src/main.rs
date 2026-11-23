@@ -318,22 +318,35 @@ unsafe fn band_paint_dc(hwnd: HWND, dc: HDC) {
     cell.right = w;
     FillRect(dc, &cell, magenta);
     if MOTION && h > 56 {
-        let y = top + mh + 4;
-        let colors = [0x000000FFu32, 0x0000FF00, 0x00FF0000, 0x0000FFFF];
-        let mut x = 0i32;
-        while x < w {
-            let v = ((x / 32 + TICK as i32) % 4) as usize;
-            let b = CreateSolidBrush(COLORREF(colors[v]));
-            let rc = RECT {
-                left: x,
-                top: y,
-                right: x + 32,
-                bottom: h - 4,
-            };
-            FillRect(dc, &rc, b);
-            let _ = DeleteObject(b.into());
-            x += 32;
+        // Gaming-like motion: 16px checkerboard scrolled right 4px per paint
+        // tick — uniform translation that motion estimation should predict,
+        // so P-frames stay cheap only if ME actually works.
+        let tile = 16i32;
+        let scroll = (TICK as i32 % 256) * 4;
+        let black = CreateSolidBrush(COLORREF(0));
+        let white = CreateSolidBrush(COLORREF(0x00FFFFFF));
+        let mut y = top + mh + 4;
+        while y < h {
+            let mut x = -tile;
+            while x < w {
+                let rc = RECT {
+                    left: x,
+                    top: y,
+                    right: x + tile,
+                    bottom: y + tile,
+                };
+                let b = if ((x + scroll) / tile + y / tile) & 1 == 0 {
+                    black
+                } else {
+                    white
+                };
+                FillRect(dc, &rc, b);
+                x += tile;
+            }
+            y += tile;
         }
+        let _ = DeleteObject(white.into());
+        let _ = DeleteObject(black.into());
     }
     let _ = DeleteObject(cyan.into());
     let _ = DeleteObject(magenta.into());

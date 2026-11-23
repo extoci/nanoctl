@@ -95,6 +95,23 @@ wasted. Encode time unchanged (~7ms p50). Also swept and rejected:
 usage=screen (+6x encode cost), AQ/BGD/SCD off (bitrate balloons 2.4x),
 threads 8 / slice 800 (noise).
 
+## Motion frontier (`benchwin band --motion --height 1200`, scroll scene)
+
+The band's `--motion` mode scrolls a 16px checkerboard 4px per paint tick
+across the full display — a uniform pan that motion estimation should
+predict, i.e. the gaming-like case (30s `media-smoke --psnr` runs):
+
+| config                     | kbps | PSNR p50 | PSNR p05 | encode p50 |
+| -------------------------- | ---- | -------- | -------- | ---------- |
+| Responsiveness (Low, qp26) | 315  | 51.8     | 51.6     | 6.4ms      |
+| Complexity::Medium, qp26   | 312  | 50.8     | 50.6     | 6.5ms      |
+| qp_min 30                  | 334  | 51.4     | 50.7     | 6.5ms      |
+| qp_min 34                  | 264  | 42.8     | 42.8     | 6.4ms      |
+
+Low+qp26 is the frontier's best point under motion too: Medium buys ~1%
+bits for -1dB, qp30 is dominated, qp34 trades -16% bits for -9dB. 57.5-58
+fps held throughout; capture_to_encode p50 ~14ms (composite-queue bound).
+
 ## Input-to-photon (click through the viewer)
 
 benchwin's band counts WM_LBUTTONDOWN in its marker; clicking the streamed
