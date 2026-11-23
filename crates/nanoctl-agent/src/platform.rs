@@ -210,7 +210,7 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
             "invalid; run nanoctl config and inspect service logs".into()
         },
     });
-    let status = async {
+    let status: anyhow::Result<_> = async {
         #[cfg(feature = "embedded-tailnet")]
         if crate::tailnet::uses_embedded(&config.tailnet) {
             return crate::embedded::inspect(&config.tailnet);
