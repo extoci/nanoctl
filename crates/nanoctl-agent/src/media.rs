@@ -32,10 +32,13 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 #[path = "linux_damage.rs"]
 mod linux_damage;
 
+#[cfg(feature = "x264")]
+#[path = "x264_encoder.rs"]
+mod x264_encoder;
+
 #[cfg(target_os = "linux")]
 #[path = "media_trace.rs"]
 pub(crate) mod trace;
-
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
@@ -363,6 +366,9 @@ pub(crate) trait FrameEncoder {
         0
     }
     fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame>;
+    fn software_backend(&self) -> (&'static str, &'static str) {
+        ("OpenH264", "software-openh264")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -789,15 +795,15 @@ impl EncoderBackend {
             .context("hardware H.264 was required but no usable backend remains");
         }
         if let Some(error) = last_error {
-            tracing::debug!(%error, "no usable hardware encoder; using OpenH264");
+            tracing::debug!(%error, "no usable hardware encoder; using software encoding");
         }
         self.active = Some(ActiveEncoder {
             hardware: None,
-            encoder: Box::new(SoftwareEncoder::new(
-                self.settings.bitrate_kbps,
-                self.settings.max_fps,
-                self.settings.latency_mode,
-            )?),
+            encoder: Self::software_encoder(
+                force_openh264(std::env::var("NANOCTL_SOFTWARE_ENCODER").ok().as_deref())?,
+                self.settings,
+                self.dimensions,
+            )?,
             needs_initial_idr: true,
         });
         Ok(())
@@ -807,6 +813,62 @@ impl EncoderBackend {
         if let Some(active) = &mut self.active {
             active.encoder.force_keyframe();
         }
+    }
+
+    fn software_encoder(
+        force_openh264: bool,
+        settings: EncoderSettings,
+        dimensions: (u32, u32),
+    ) -> Result<Box<dyn FrameEncoder>> {
+        #[cfg(feature = "x264")]
+        if !force_openh264 {
+            match x264_encoder::X264Encoder::new(
+                settings.bitrate_kbps,
+                settings.max_fps,
+                settings.latency_mode,
+                dimensions,
+            ) {
+                Ok(encoder) => {
+                    return Ok(Box::new(x264_encoder::ResilientX264::Native(Box::new(
+                        encoder,
+                    ))));
+                }
+                Err(error) => tracing::warn!(%error, "x264 unavailable; using OpenH264"),
+            }
+        }
+        #[cfg(not(feature = "x264"))]
+        let _ = (force_openh264, dimensions);
+        Ok(Box::new(SoftwareEncoder::new(
+            settings.bitrate_kbps,
+            settings.max_fps,
+            settings.latency_mode,
+        )?))
+    }
+
+    #[cfg(test)]
+    fn software_selected(
+        force_openh264: bool,
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        dimensions: (u32, u32),
+    ) -> Result<Self> {
+        let settings = EncoderSettings {
+            bitrate_kbps,
+            max_fps,
+            latency_mode,
+        };
+        Ok(Self {
+            active: Some(ActiveEncoder {
+                hardware: None,
+                encoder: Self::software_encoder(force_openh264, settings, dimensions)?,
+                needs_initial_idr: true,
+            }),
+            remaining_hardware: &[],
+            preference: EncoderPreference::Software,
+            settings,
+            dimensions,
+        })
     }
 
     fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
@@ -881,12 +943,73 @@ impl EncoderBackend {
 
     fn name(&self) -> &'static str {
         self.selected_hardware()
-            .map_or("OpenH264", |hardware| hardware.name)
+            .map_or_else(|| self.software_backend().0, |hardware| hardware.name)
     }
 
     fn id(&self) -> &'static str {
         self.selected_hardware()
-            .map_or("software-openh264", |hardware| hardware.id)
+            .map_or_else(|| self.software_backend().1, |hardware| hardware.id)
+    }
+
+    fn software_backend(&self) -> (&'static str, &'static str) {
+        self.active
+            .as_ref()
+            .map_or(("OpenH264", "software-openh264"), |active| {
+                active.encoder.software_backend()
+            })
+    }
+}
+
+fn force_openh264(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("auto") => Ok(false),
+        Some("openh264") => Ok(true),
+        Some(_) => bail!("NANOCTL_SOFTWARE_ENCODER must be auto or openh264"),
+    }
+}
+
+#[cfg(test)]
+mod software_selection_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_override_accepts_auto_or_openh264_and_rejects_empty_or_unknown() {
+        assert!(!force_openh264(None).unwrap());
+        assert!(!force_openh264(Some("auto")).unwrap());
+        assert!(force_openh264(Some("openh264")).unwrap());
+        for value in ["", "x264", "OpenH264", "other"] {
+            assert!(force_openh264(Some(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_openh264_override_always_selects_openh264() {
+        let backend =
+            EncoderBackend::software_selected(true, 4_000, 60, LatencyMode::Balanced, (64, 64))
+                .unwrap();
+        assert_eq!(backend.name(), "OpenH264");
+    }
+
+    #[test]
+    fn preferred_software_matches_the_feature_and_init_failure_falls_back() {
+        let backend =
+            EncoderBackend::software_selected(false, 4_000, 60, LatencyMode::Balanced, (64, 64))
+                .unwrap();
+        assert_eq!(
+            backend.name(),
+            if cfg!(feature = "x264") {
+                "x264"
+            } else {
+                "OpenH264"
+            }
+        );
+        let mut backend =
+            EncoderBackend::software_selected(false, 4_000, 60, LatencyMode::Balanced, (0, 0))
+                .unwrap();
+        assert_eq!(backend.name(), "OpenH264");
+        let image =
+            xcap::image::RgbaImage::from_pixel(64, 64, xcap::image::Rgba([64, 128, 192, 255]));
+        assert!(!backend.encode(&image).unwrap().bytes.is_empty());
     }
 }
 
@@ -1302,6 +1425,35 @@ fn is_idr(bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[derive(Default)]
+struct ReferenceRecovery {
+    pending: bool,
+}
+
+impl ReferenceRecovery {
+    fn admit(
+        &mut self,
+        bytes: &[u8],
+        dropped: u16,
+        requests: &tokio::sync::watch::Sender<u64>,
+    ) -> bool {
+        if dropped > 0 {
+            self.pending = true;
+            requests.send_modify(|generation| *generation = generation.wrapping_add(1));
+            tracing::warn!(dropped, "encoded reference frame discarded; requesting IDR");
+        }
+        if !self.pending {
+            return true;
+        }
+        if !is_idr(bytes) {
+            return false;
+        }
+        // A drop beside an already queued IDR can affect frames encoded after that IDR.
+        self.pending = dropped > 0;
+        true
+    }
 }
 
 struct TimingSample {
@@ -1891,6 +2043,7 @@ pub fn spawn_video(
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
         let mut recovery_keyframe_requested = false;
+        let mut reference_recovery = ReferenceRecovery::default();
         let mut write_result = Ok(());
         loop {
             tokio::select! {
@@ -1901,7 +2054,10 @@ pub fn spawn_video(
                     }
                 }
                 frame = encoded_slot.take() => {
-                    let Some((frame, _dropped)) = frame else { break };
+                    let Some((frame, dropped)) = frame else { break };
+                    if !reference_recovery.admit(&frame.bytes, dropped, &delivery_recovery) {
+                        continue;
+                    }
                     // A replaced encoded frame is a local latency policy, not RTP packet loss.
                     // Passing that count as prev_dropped_packets corrupts packet sequencing.
                     let written_at = Instant::now();
@@ -2578,6 +2734,46 @@ mod tests {
     }
 
     #[test]
+    fn local_reference_loss_suppresses_deltas_until_a_clean_idr() {
+        let (requests, mut observed) = tokio::sync::watch::channel(0_u64);
+        let mut recovery = super::ReferenceRecovery::default();
+        let delta = [0, 0, 0, 1, 0x41];
+        let idr = [0, 0, 0, 1, 0x65];
+        assert!(recovery.admit(&delta, 0, &requests));
+        assert!(!observed.has_changed().unwrap());
+        assert!(!recovery.admit(&delta, 1, &requests));
+        assert!(observed.has_changed().unwrap());
+        assert_eq!(*observed.borrow_and_update(), 1);
+        assert!(!recovery.admit(&delta, 0, &requests));
+        assert!(!observed.has_changed().unwrap());
+        assert!(recovery.admit(&idr, 0, &requests));
+        assert!(recovery.admit(&delta, 0, &requests));
+    }
+
+    #[test]
+    fn dropping_a_delta_beside_a_queued_idr_still_requires_a_later_idr() {
+        let (requests, _) = tokio::sync::watch::channel(0_u64);
+        let mut recovery = super::ReferenceRecovery::default();
+        let idr = [0, 0, 1, 0x65];
+        let delta = [0, 0, 1, 0x41];
+        assert!(recovery.admit(&idr, 1, &requests));
+        assert!(!recovery.admit(&delta, 0, &requests));
+        assert!(recovery.admit(&idr, 0, &requests));
+        assert!(recovery.admit(&delta, 0, &requests));
+    }
+
+    #[test]
+    fn local_reference_recovery_handles_empty_truncated_and_closed_signals() {
+        let (requests, observed) = tokio::sync::watch::channel(u64::MAX);
+        drop(observed);
+        let mut recovery = super::ReferenceRecovery::default();
+        assert!(!recovery.admit(&[], u16::MAX, &requests));
+        assert_eq!(*requests.borrow(), 0);
+        assert!(!recovery.admit(&[0, 0, 1], 0, &requests));
+        assert!(recovery.admit(&[0, 0, 1, 0x65], 0, &requests));
+    }
+
+    #[test]
     fn preserves_aspect_ratio_and_even_dimensions() {
         assert_eq!(fit_dimensions(3840, 2160, 1920, 1080), (1920, 1080));
         let (width, height) = fit_dimensions(1921, 1081, 1920, 1080);
@@ -2732,7 +2928,7 @@ mod tests {
         };
         assert_eq!(
             open(EncoderPreference::Auto).unwrap().id(),
-            "software-openh264"
+            preferred_software_id()
         );
         assert!(open(EncoderPreference::Hardware).is_err());
         const NEVER_OPEN: &[HardwareBackend] = &[HardwareBackend {
@@ -2747,7 +2943,7 @@ mod tests {
             NEVER_OPEN,
         )
         .unwrap();
-        assert_eq!(software.id(), "software-openh264");
+        assert_eq!(software.id(), preferred_software_id());
     }
 
     #[test]
@@ -2763,9 +2959,9 @@ mod tests {
         encoder.encode(&image).unwrap();
         assert_eq!(encoder.id(), "first");
         assert_decodable_idr(&encoder.encode(&image).unwrap());
-        assert_eq!(encoder.id(), "software-openh264");
+        assert_eq!(encoder.id(), preferred_software_id());
         encoder.encode(&image).unwrap();
-        assert_eq!(encoder.id(), "software-openh264");
+        assert_eq!(encoder.id(), preferred_software_id());
     }
 
     #[test]
@@ -2808,12 +3004,12 @@ mod tests {
         };
         let mut no_headers = open(NO_HEADERS);
         assert_decodable_idr(&no_headers.encode(&image).unwrap());
-        assert_eq!(no_headers.id(), "software-openh264");
+        assert_eq!(no_headers.id(), preferred_software_id());
         let mut retune_failed = open(&[FAILING_HARDWARE]);
         retune_failed.encode(&image).unwrap();
         assert!(retune_failed.apply_bitrate_estimate(2_000, 4_000).unwrap());
         assert_eq!(retune_failed.settings.bitrate_kbps, 2_000);
-        assert_eq!(retune_failed.id(), "software-openh264");
+        assert_eq!(retune_failed.id(), preferred_software_id());
         assert_decodable_idr(&retune_failed.encode(&image).unwrap());
     }
 
@@ -2838,6 +3034,14 @@ mod tests {
         }
     }
 
+    fn preferred_software_id() -> &'static str {
+        if cfg!(feature = "x264") {
+            "software-x264"
+        } else {
+            "software-openh264"
+        }
+    }
+
     #[test]
     #[ignore = "opt-in encode-only performance measurement"]
     fn benchmark_encoder() {
@@ -2845,11 +3049,12 @@ mod tests {
             std::env::var("NANOCTL_BENCH_ENCODER").unwrap_or("software-openh264".into());
         let dimensions = (1_920, 1_080);
         let mut encoder = if requested == "software-openh264" {
-            EncoderBackend::with_hardware(
-                EncoderPreference::Software,
-                TEST_SETTINGS,
+            EncoderBackend::software_selected(
+                true,
+                TEST_SETTINGS.bitrate_kbps,
+                TEST_SETTINGS.max_fps,
+                TEST_SETTINGS.latency_mode,
                 dimensions,
-                &[],
             )
         } else {
             let index = HARDWARE_BACKENDS
