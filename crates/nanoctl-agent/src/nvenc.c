@@ -60,7 +60,9 @@ void nanoctl_nvenc_close(NanoNvenc *h) {
 }
 
 static void rate_control(NV_ENC_RC_PARAMS *rc, uint32_t bitrate, uint32_t fps) {
-    rc->rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    /* VBR lets easy frames undershoot the target instead of padding to it;
+     * maxBitRate still caps the peak at the negotiated bitrate. */
+    rc->rateControlMode = NV_ENC_PARAMS_RC_VBR;
     rc->averageBitRate = bitrate;
     rc->maxBitRate = bitrate;
     rc->vbvBufferSize = bitrate / fps + (bitrate % fps != 0);
