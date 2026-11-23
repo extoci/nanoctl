@@ -661,7 +661,6 @@ mod tests {
         drop(listener);
         assert!(super::probe_peer(peer, port).await.is_none());
     }
-
     #[tokio::test]
     async fn view_only_info_never_advertises_clipboard() {
         for (remote_input, control) in [(false, true), (true, false), (false, false)] {
