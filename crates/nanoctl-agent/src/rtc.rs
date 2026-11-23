@@ -6,10 +6,6 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
-#[cfg(feature = "media")]
-use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
-#[cfg(feature = "media")]
-use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -26,6 +22,8 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtcp::reception_report::ReceptionReport;
@@ -847,9 +845,16 @@ impl HostPeer {
             .ssrc;
         let rtcp_task = tokio::spawn(async move {
             let mut remb_kbps = None;
+            let mut feedback = FeedbackSummary::default();
             let mut latest_sample: Option<LinkSample> = None;
             while let Ok((packets, _attributes)) = sender.read_rtcp().await {
                 let at = std::time::Instant::now();
+                if packets.iter().any(|packet| {
+                    packet.as_any().is::<PictureLossIndication>()
+                        || packet.as_any().is::<FullIntraRequest>()
+                }) {
+                    feedback.keyframe_requests += 1;
+                }
                 let compact_ntp = (unix2ntp(SystemTime::now()) >> 16) as u32;
                 #[cfg(feature = "media")]
                 {
@@ -865,12 +870,14 @@ impl HostPeer {
                 let previous_remb = remb_kbps;
                 for packet in &packets {
                     if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
-                        tracing::info!(
+                        tracing::debug!(
                             video_ssrc,
                             media_ssrc = nack.media_ssrc,
                             nack_pairs = nack.nacks.len(),
                             "video NACK"
                         );
+                        feedback.nacks += 1;
+                        feedback.nack_pairs += nack.nacks.len() as u64;
                     }
                     if let Some(estimate) = packet
                         .as_any()
@@ -879,8 +886,9 @@ impl HostPeer {
                         && estimate.bitrate > 0.0
                     {
                         let kbps = (estimate.bitrate / 1_000.0).min(u32::MAX as f32) as u32;
-                        tracing::info!(video_ssrc, remb_kbps = kbps, "video REMB");
+                        tracing::debug!(video_ssrc, remb_kbps = kbps, "video REMB");
                         remb_kbps = Some(kbps.max(1));
+                        feedback.record_remb(kbps);
                     }
                 }
                 let mut reported = false;
@@ -906,6 +914,18 @@ impl HostPeer {
                         link_samples.send_replace(Some(sample));
                         reported = true;
                     }
+                }
+                if let Some(summary) = feedback.take_due(at) {
+                    tracing::info!(
+                        video_ssrc,
+                        nacks = summary.nacks,
+                        nack_pairs = summary.nack_pairs,
+                        keyframe_requests = summary.keyframe_requests,
+                        remb_min_kbps = summary.remb_min_kbps,
+                        remb_last_kbps = summary.remb_last_kbps,
+                        "video feedback (last {}s)",
+                        FEEDBACK_SUMMARY_INTERVAL.as_secs()
+                    );
                 }
                 if !reported && remb_kbps != previous_remb {
                     let mut sample = latest_sample.unwrap_or(LinkSample {
@@ -1565,8 +1585,69 @@ fn supported_version(version: u8) -> bool {
     (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
 }
 
+const FEEDBACK_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Viewer RTCP feedback folded into one info line per interval: per-packet NACK and REMB
+/// lines would otherwise crowd everything else out of the diagnostics log tail.
+#[derive(Debug, Default, PartialEq)]
+struct FeedbackSummary {
+    nacks: u64,
+    nack_pairs: u64,
+    keyframe_requests: u64,
+    remb_min_kbps: Option<u32>,
+    remb_last_kbps: Option<u32>,
+    since: Option<Instant>,
+}
+
+impl FeedbackSummary {
+    fn record_remb(&mut self, kbps: u32) {
+        self.remb_min_kbps = Some(self.remb_min_kbps.map_or(kbps, |min| min.min(kbps)));
+        self.remb_last_kbps = Some(kbps);
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<Self> {
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since) < FEEDBACK_SUMMARY_INTERVAL {
+            return None;
+        }
+        let summary = std::mem::take(self);
+        self.since = Some(now);
+        (summary.nacks > 0 || summary.keyframe_requests > 0 || summary.remb_last_kbps.is_some())
+            .then_some(summary)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn feedback_summary_reports_once_per_interval() {
+        let start = std::time::Instant::now();
+        let mut feedback = FeedbackSummary::default();
+        assert_eq!(feedback.take_due(start), None);
+        feedback.nacks = 3;
+        feedback.nack_pairs = 5;
+        feedback.record_remb(9_000);
+        feedback.record_remb(7_000);
+        feedback.record_remb(8_000);
+        assert_eq!(feedback.take_due(start + Duration::from_secs(5)), None);
+        let summary = feedback
+            .take_due(start + FEEDBACK_SUMMARY_INTERVAL)
+            .expect("due");
+        assert_eq!(
+            (
+                summary.nacks,
+                summary.nack_pairs,
+                summary.remb_min_kbps,
+                summary.remb_last_kbps
+            ),
+            (3, 5, Some(7_000), Some(8_000))
+        );
+        assert_eq!(
+            feedback.take_due(start + FEEDBACK_SUMMARY_INTERVAL * 2),
+            None
+        );
+    }
+
     use super::*;
     use proptest::prelude::*;
     use serde_json::Value;

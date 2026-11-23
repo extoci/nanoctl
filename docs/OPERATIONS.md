@@ -36,7 +36,7 @@ to the agent user, and fix HTTPS configuration; the agent falls back to HTTP mea
 ## Debugging
 
 `nanoctl debug` prints a Markdown report to paste into an issue or coding agent: version,
-OS, doctor checks, codecs, encoder backends, displays, redacted configuration and the last
+OS, doctor checks, codecs, encoder backends, displays, redacted configuration, every distinct warning and error in the log with counts, and the last
 400 lines of the agent log (`--lines N` to change, `--output FILE` to also save it). The agent
 always keeps an info-level log, independent of console verbosity, at
 `<local data dir>/nanoctl/logs/diagnostics.log` (2 MB, one rotated `.log.1`); `RUST_LOG`

@@ -219,6 +219,7 @@ fn init_logging(log_file: Option<&Path>, command: &Command) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create log directory {}", parent.display()))?;
         }
+        rotate_log_file(path);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -479,6 +480,18 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// `--log-file` (the Windows service's agent.log) is appended across restarts; start a new
+/// file once it passes this size, keeping one previous `.1` copy.
+const LOG_FILE_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn rotate_log_file(path: &Path) {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_FILE_ROTATE_BYTES) {
+        let mut previous = path.as_os_str().to_owned();
+        previous.push(".1");
+        let _ = std::fs::rename(path, previous);
+    }
+}
+
 fn append_diagnostic(log_file: Option<&Path>, message: std::fmt::Arguments<'_>) {
     if let Some(path) = log_file
         && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
@@ -498,6 +511,11 @@ async fn main() -> Result<()> {
             previous_hook(panic);
         }));
     }
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        diagnostics::append(format_args!("nanoctl: {panic}"));
+        previous_hook(panic);
+    }));
     if let Err(error) = init_logging(log_file.as_deref(), &cli.command) {
         append_diagnostic(
             log_file.as_deref(),
@@ -507,6 +525,7 @@ async fn main() -> Result<()> {
     }
     let result = run(cli).await;
     if let Err(error) = &result {
+        diagnostics::append(format_args!("nanoctl: command failed: {error:#}"));
         append_diagnostic(
             log_file.as_deref(),
             format_args!("nanoctl command failed: {error:#}"),
@@ -517,6 +536,21 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_file_rotates_only_past_the_limit() {
+        let dir = std::env::temp_dir().join(format!("nanoctl-logfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.log");
+        std::fs::write(&path, b"small").unwrap();
+        rotate_log_file(&path);
+        assert!(path.exists());
+        std::fs::write(&path, vec![b'x'; LOG_FILE_ROTATE_BYTES as usize + 1]).unwrap();
+        rotate_log_file(&path);
+        assert!(!path.exists());
+        assert!(dir.join("agent.log.1").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     use std::sync::{Arc, Mutex};
 

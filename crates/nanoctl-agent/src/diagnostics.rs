@@ -90,8 +90,9 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+static LOG: OnceLock<Option<RotatingLog>> = OnceLock::new();
+
 fn rotating_log(path: PathBuf) -> Option<&'static RotatingLog> {
-    static LOG: OnceLock<Option<RotatingLog>> = OnceLock::new();
     LOG.get_or_init(|| {
         private_directory(path.parent()?).ok()?;
         let (file, size) = RotatingLog::open(&path).ok()?;
@@ -120,12 +121,49 @@ where
     )
 }
 
+/// Appends a raw line (panics, fatal command errors) once the diagnostics log is open.
+pub fn append(message: std::fmt::Arguments<'_>) {
+    if let Some(log) = LOG.get().and_then(Option::as_ref) {
+        let _ = log.write(format!("{} ERROR {message}\n", now()).as_bytes());
+    }
+}
+
 /// The last `lines` lines across the rotated and current log files.
 pub fn tail(path: &Path, lines: usize) -> Option<String> {
-    let mut text = std::fs::read_to_string(path.with_extension("log.1")).unwrap_or_default();
-    text.push_str(&std::fs::read_to_string(path).ok()?);
+    let text = read_log(path)?;
     let all: Vec<&str> = text.lines().collect();
     Some(all[all.len().saturating_sub(lines)..].join("\n"))
+}
+
+fn read_log(path: &Path) -> Option<String> {
+    let mut text = std::fs::read_to_string(path.with_extension("log.1")).unwrap_or_default();
+    text.push_str(&std::fs::read_to_string(path).ok()?);
+    Some(text)
+}
+
+const REPORT_WARNINGS: usize = 40;
+
+/// Distinct WARN/ERROR lines from the whole log, so failures older than the tail survive:
+/// `(count, last timestamp, line without timestamp)`, most recent last.
+fn warnings(text: &str, limit: usize) -> Vec<(usize, &str, &str)> {
+    let mut seen: Vec<(usize, &str, &str)> = Vec::new();
+    for line in text.lines() {
+        let Some((time, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !(rest.starts_with("WARN ") || rest.starts_with("ERROR ")) {
+            continue;
+        }
+        if let Some(index) = seen.iter().position(|(_, _, known)| *known == rest) {
+            let (count, _, _) = seen.remove(index);
+            seen.push((count + 1, time, rest));
+        } else {
+            seen.push((1, time, rest));
+        }
+    }
+    let skip = seen.len().saturating_sub(limit);
+    seen.split_off(skip)
 }
 
 fn os_version() -> String {
@@ -252,9 +290,24 @@ pub async fn report(config: &AgentConfig, config_path: Option<&Path>, lines: usi
         toml::to_string_pretty(config).unwrap_or_default()
     );
 
+    let log = log_path().and_then(|path| read_log(&path));
+    if let Some(text) = &log {
+        let distinct = warnings(text, REPORT_WARNINGS);
+        let _ = writeln!(out, "\n## Warnings and errors (whole log)\n");
+        if distinct.is_empty() {
+            let _ = writeln!(out, "None.");
+        } else {
+            let _ = writeln!(out, "```text");
+            for (count, time, line) in distinct {
+                let _ = writeln!(out, "{count}x last {time} {line}");
+            }
+            let _ = writeln!(out, "```");
+        }
+    }
+
     let _ = writeln!(out, "\n## Recent agent log\n");
     match log_path() {
-        Some(path) => match tail(&path, lines) {
+        Some(path) => match log.as_deref().and(tail(&path, lines)) {
             Some(log) => {
                 let _ = writeln!(out, "Last {lines} lines of `{}`:\n", path.display());
                 let _ = writeln!(out, "```text\n{log}\n```");
@@ -298,6 +351,24 @@ mod tests {
         assert_eq!(tail, format!("{}\nafter rotation", "x".repeat(1023)));
         assert!(super::tail(&dir.join("missing.log"), 5).is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn warnings_are_distinct_counted_and_most_recent_last() {
+        let text = "\
+t1  WARN nanoctl::media: hardware encode failed
+t2  INFO nanoctl::rtc: negotiated video codec
+t3 ERROR nanoctl: panicked at src/media.rs
+t4  WARN nanoctl::media: hardware encode failed
+garbage";
+        assert_eq!(
+            warnings(text, 10),
+            vec![
+                (1, "t3", "ERROR nanoctl: panicked at src/media.rs"),
+                (2, "t4", "WARN nanoctl::media: hardware encode failed"),
+            ]
+        );
+        assert_eq!(warnings(text, 1).len(), 1);
     }
 
     #[tokio::test]
