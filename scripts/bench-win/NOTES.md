@@ -10,6 +10,7 @@
 | nanoctl DC-video + canvas overlay                  | 93.7 | 91  | 113 | 199 | 34  | 981  |
 | nanoctl DC-video + MediaStreamTrackGenerator       | 29.5 | 34  | 36  | 49  | 0   | 1779 |
 | + sender pacing + reorder buffer                   | 29.8 | 34  | 37  | 47  | 16  | 1740 |
+| + SIZELIMITED@1.5KB slices (post-merge re-run)     | 34.0 | 34  | 34  | 37  | 33  | 903  |
 
 Key findings:
 
@@ -62,16 +63,21 @@ Moonlight's native client burns 43% CPU vs agent's ~21%.
 ## Server per-frame costs (agent.log pipeline statistics, /frames_encoded)
 
 - backend_ns (OpenH264): was ~25ms -> ~10ms (max_slice_len 8000 +
-  num_threads 4, then SM_FIXEDSLCNUM_SLICE uiSliceNum=4 forced via
-  GetOption/SetOption SVC_ENCODE_PARAM_EXT after first encode — SIZELIMITED
-  leaves <8KB deltas single-slice; num_threads alone is a no-op)
-- color_convert_ns (RGBA->I420): was ~4.5ms -> ~2.5ms (4-thread row bands)
-- capture_wait_ns ~6.4ms; send_ns ~0.2ms; compare_ns ~0.01ms
+  num_threads 4), then ~5.6ms with max_slice_len 1500 (SIZELIMITED
+  slices 6-9KB deltas across encode threads — the earlier
+  SM_FIXEDSLCNUM_SLICE writeback via SetOption(SVC_ENCODE_PARAM_EXT)
+  reset encoder state and forced an IDR; reverted to a small size cap)
+- color_convert_ns (RGBA->I420): was ~4.5ms -> ~1.3ms (4-thread row bands)
+- capture_wait_ns ~6.4-11ms; send_ns ~0.2ms; compare_ns ~0.01ms
+- post-merge G2G samples quantize to ~33-37ms == one composite period:
+  the IddSample virtual display composites at ~30Hz, so capture never
+  returns pixels newer than the last tick; ~34ms is the VM's floor
 
 ## Honest ceiling on this VM
 
 No GPU (IddSampleDriver virtual display + Basic Display Adapter), composite
-~30Hz -> ~30ms is roughly the software-presentation floor; Moonlight wins
+~30Hz -> ~33ms is the capture-side floor as well as the presentation floor;
+the latest run sits on it (mean 34.0, min 33). Moonlight wins
 here mainly via its native client (no browser) + NVENC on real hardware.
 On a GPU box the DC path should pull ahead: decode+presentation become
 hardware and the jitter-buffer bypass is worth ~20-35ms on its own.
