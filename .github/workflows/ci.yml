@@ -97,7 +97,7 @@ jobs:
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
             cmake nasm pkg-config
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
@@ -106,6 +106,32 @@ jobs:
       - name: Build release media binary
         if: github.event_name != 'push' || github.ref != 'refs/heads/master'
         run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+
+  agent-x264-linux:
+    # GPL opt-in only; default/release jobs deliberately do not enable this feature.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.1
+          components: clippy
+      - run: bun install --frozen-lockfile
+      - run: bun run build:viewer
+      - name: Install native dependencies including opt-in GPL encoder
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+            libx264-dev cmake nasm pkg-config
+      - run: cargo clippy --all-targets --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
+      - run: cargo build --release --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
     strategy:
@@ -181,7 +207,7 @@ jobs:
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'

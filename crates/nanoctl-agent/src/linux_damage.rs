@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use xcap::Monitor;
-use xcb::{Xid, damage, x, xfixes};
+use xcb::{Xid, damage, randr, x, xfixes};
 
 use super::{LatestFrame, PipelineStats};
 
@@ -43,11 +43,26 @@ impl Gate {
             None
         }
     }
+
+    fn should_capture(
+        &mut self,
+        now: Instant,
+        damaged: bool,
+        initial: bool,
+        fallback: bool,
+    ) -> bool {
+        if !damaged && now.duration_since(self.last_change) >= PARK_AFTER {
+            self.parked = true;
+        }
+        initial || damaged || fallback
+    }
 }
 
 struct DamageWatch {
     connection: xcb::Connection,
     damage: damage::Damage,
+    root: x::Window,
+    fast_capture: bool,
 }
 
 impl DamageWatch {
@@ -82,7 +97,68 @@ impl DamageWatch {
             level: damage::ReportLevel::NonEmpty,
         }))?;
         connection.flush()?;
-        Ok(Self { connection, damage })
+        let screen = connection
+            .get_setup()
+            .roots()
+            .nth(screen as usize)
+            .context("X11 screen unavailable")?;
+        let fast_capture = connection.get_setup().image_byte_order() == x::ImageOrder::LsbFirst
+            && connection
+                .get_setup()
+                .pixmap_formats()
+                .iter()
+                .any(|format| {
+                    format.depth() == screen.root_depth() && format.bits_per_pixel() == 32
+                })
+            && screen
+                .allowed_depths()
+                .flat_map(|depth| depth.visuals())
+                .any(|visual| {
+                    visual.visual_id() == screen.root_visual()
+                        && visual.red_mask() == 0xff0000
+                        && visual.green_mask() == 0xff00
+                        && visual.blue_mask() == 0xff
+                });
+        Ok(Self {
+            connection,
+            damage,
+            root,
+            fast_capture,
+        })
+    }
+
+    fn capture(&self, monitor_id: u32) -> Result<xcap::image::RgbaImage> {
+        let monitors = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&randr::GetMonitors {
+                window: self.root,
+                get_active: true,
+            }))?;
+        let region = monitors
+            .monitors()
+            .find(|monitor| {
+                monitor
+                    .outputs()
+                    .iter()
+                    .any(|output| output.resource_id() == monitor_id)
+            })
+            .context("X11 monitor disappeared")?;
+        let reply = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&x::GetImage {
+                format: x::ImageFormat::ZPixmap,
+                drawable: x::Drawable::Window(self.root),
+                x: region.x(),
+                y: region.y(),
+                width: region.width(),
+                height: region.height(),
+                plane_mask: u32::MAX,
+            }))?;
+        let width = u32::from(region.width());
+        let height = u32::from(region.height());
+        let mut pixels = reply.data().to_vec();
+        bgra_to_rgba(&mut pixels, width, height)?;
+        xcap::image::RgbaImage::from_raw(width, height, pixels).context("Invalid X11 image")
     }
 
     fn drain(&self) -> Result<Option<Instant>> {
@@ -111,7 +187,7 @@ impl DamageWatch {
             revents: 0,
         };
         // The connection owns this descriptor for the entire poll call.
-        let result = unsafe { libc::poll(&mut fd, 1, if parked { 100 } else { 1 }) };
+        let result = unsafe { libc::poll(&mut fd, 1, if parked { 100 } else { 16 }) };
         if result < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
@@ -125,11 +201,26 @@ impl DamageWatch {
     }
 }
 
+fn bgra_to_rgba(pixels: &mut [u8], width: u32, height: u32) -> Result<()> {
+    let length = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4));
+    if width == 0 || height == 0 || length != Some(pixels.len()) {
+        bail!("Invalid X11 BGRA image size");
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+    Ok(())
+}
+
 pub(super) fn start(
     monitor: &Monitor,
     stats: Arc<PipelineStats>,
 ) -> Result<(Arc<LatestFrame>, JoinHandle<()>)> {
     let watch = DamageWatch::new()?;
+    let monitor_id = monitor.id()?;
     let monitor = monitor.clone();
     let latest = Arc::new(LatestFrame {
         stats: stats.clone(),
@@ -142,11 +233,16 @@ pub(super) fn start(
     let thread = std::thread::Builder::new().name("nanoctl-xdamage".to_owned()).spawn(move || {
         let mut watch = Some(watch);
         let mut gate = Gate::new(Instant::now());
+        let mut initial = true;
         while let Some(latest) = weak.upgrade() {
             if latest.stopped.load(Ordering::Acquire) { break; }
+            let mut damaged = false;
+            let mut damage_at = 0.0;
             if let Some(events) = watch.as_ref() {
                 match events.drain() {
                     Ok(Some(received)) => {
+                        damage_at = super::trace::now() - received.elapsed().as_secs_f64() * 1000.0;
+                        damaged = true;
                         if gate.parked { stats.damage_resumes.fetch_add(1, Ordering::Relaxed); }
                         gate.damage(received);
                     }
@@ -159,9 +255,24 @@ pub(super) fn start(
                     }
                 }
             }
-            if !gate.parked {
-                match monitor.capture_image() {
+            if gate.should_capture(Instant::now(), damaged, initial, watch.is_none()) {
+                let started = Instant::now();
+                let trace_started = super::trace::now();
+                let image = if let Some(events) = watch.as_mut().filter(|events| events.fast_capture) {
+                    match events.capture(monitor_id) {
+                        Ok(image) => Ok(image),
+                        Err(error) => {
+                            tracing::debug!(%error, "Persistent X11 capture unavailable; retaining xcap capture");
+                            events.fast_capture = false;
+                            monitor.capture_image().map_err(anyhow::Error::from)
+                        }
+                    }
+                } else { monitor.capture_image().map_err(anyhow::Error::from) };
+                match image {
                     Ok(image) => {
+                        super::trace::capture(&image, damage_at, trace_started, super::trace::now());
+                        initial = false;
+                        stats.capture_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let changed = latest.last.lock().unwrap().as_ref().is_none_or(|old| {
                             old.frame.width != image.width() || old.frame.height != image.height()
                                 || old.frame.raw.as_slice() != image.as_raw().as_slice()
@@ -204,6 +315,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_x11_pixels_preserve_rgb_and_reject_invalid_layouts() {
+        let mut pixels = [1, 2, 3, 0, 254, 127, 42, 99];
+        bgra_to_rgba(&mut pixels, 2, 1).unwrap();
+        assert_eq!(pixels, [3, 2, 1, 255, 42, 127, 254, 255]);
+        assert!(bgra_to_rgba(&mut [], 0, 0).is_err());
+        assert!(bgra_to_rgba(&mut pixels, 3, 1).is_err());
+        assert!(bgra_to_rgba(&mut [], u32::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
     fn park_resume_and_empty_repaints() {
         let now = Instant::now();
         let mut gate = Gate::new(now);
@@ -224,6 +345,21 @@ mod tests {
         gate.damage(event + Duration::from_secs(2));
         assert_eq!(gate.frame(event + Duration::from_secs(2), false), None);
         assert!(gate.parked);
+    }
+
+    #[test]
+    fn capture_requires_damage_except_startup_and_fallback() {
+        let now = Instant::now();
+        let mut gate = Gate::new(now);
+        assert!(gate.should_capture(now, false, true, false));
+        assert!(!gate.should_capture(now, false, false, false));
+        assert!(gate.should_capture(now, true, false, false));
+        assert!(!gate.should_capture(now + PARK_AFTER, false, false, false));
+        assert!(gate.parked);
+        assert!(gate.should_capture(now + PARK_AFTER, false, false, true));
+        gate.damage(now + PARK_AFTER);
+        assert!(!gate.parked);
+        assert!(gate.should_capture(now + PARK_AFTER, true, false, false));
     }
 
     #[test]

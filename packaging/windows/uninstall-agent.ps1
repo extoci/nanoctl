@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\..\tailnet.ps1"
+. "$PSScriptRoot\lifecycle.ps1"
 $taskName = "nanoctl Agent"
 $publicRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "nanoctl"))
 $managedRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles "nanoctl"))
@@ -52,6 +53,7 @@ $resolvedBinary = if ($binaryExists) {
 
 # Remove the task even when a binary was deleted or partially upgraded. Otherwise every logon
 # would continue launching a broken entry and the user could never repair the installation.
+Stop-AgentProcesses -Paths @($resolvedBinary)
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($task) {
   Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -60,8 +62,9 @@ if ($task) {
     if (-not $current -or $current.State -ne "Running") { break }
     Start-Sleep -Milliseconds 100
   }
-  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
+
+Stop-AgentProcesses -Paths @($resolvedBinary)
 
 if ($binaryExists) {
   if (-not $ConfigPath) {
@@ -85,6 +88,9 @@ if (Test-Path -LiteralPath $installRoot -PathType Container) {
   }
   Remove-Item -LiteralPath $installRoot -Recurse -Force
   Write-Verbose "Removed $installRoot"
+}
+if ($task) {
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
 Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue

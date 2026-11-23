@@ -31,7 +31,9 @@ use webrtc::rtcp::reception_report::ReceptionReport;
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use webrtc::rtp::extension::abs_send_time_extension::unix2ntp;
 use webrtc::rtp_transceiver::RTCPFeedback;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpHeaderExtensionCapability, RTPCodecType,
+};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use crate::adaptive::LinkSample;
@@ -470,6 +472,13 @@ impl HostPeer {
         }
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
+        media_engine.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".to_owned(),
+            },
+            RTPCodecType::Video,
+            None,
+        )?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
         let mut settings = SettingEngine::default();
         let dev_loopback = crate::server::dev_user().is_some();
@@ -602,6 +611,7 @@ impl HostPeer {
                 if input.is_none() {
                     return Box::pin(async {});
                 }
+                let reliable = channel.label() == "nanoctl.control.v1";
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
                     "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
@@ -610,6 +620,8 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
+                    #[cfg(target_os = "linux")]
+                    crate::media::trace::input(0, &message.data);
                     let sender = sender.clone();
                     let input = message_input.clone();
                     let weak_channel = weak_channel.clone();
@@ -632,6 +644,7 @@ impl HostPeer {
                                     && let Ok(mut input) = input.lock()
                                 {
                                     input.release_all();
+                                    input.revoke_gamepads();
                                 }
                             });
                         }
@@ -644,6 +657,9 @@ impl HostPeer {
                             && let Ok(mut input) = input.lock()
                         {
                             input.release_all();
+                            if reliable {
+                                input.revoke_gamepads();
+                            }
                         }
                     })
                 }));
@@ -1228,7 +1244,12 @@ fn spawn_input_worker(
                         if input_revoked.load(Ordering::Acquire) {
                             return Ok(None);
                         }
-                        input.dispatch(&bytes, lane)
+                        #[cfg(target_os = "linux")]
+                        crate::media::trace::input(1, &bytes);
+                        let result = input.dispatch(&bytes, lane);
+                        #[cfg(target_os = "linux")]
+                        crate::media::trace::input(2, &bytes);
+                        result
                     })
                     .await;
                     match result {
@@ -1246,6 +1267,11 @@ fn spawn_input_worker(
                     }
                 }
             }
+        }
+        if matches!(lane, crate::input::InputLane::Reliable)
+            && let Ok(mut input) = input.lock()
+        {
+            input.revoke_gamepads();
         }
     })
 }
@@ -1909,7 +1935,17 @@ mod tests {
         .await
         .expect("controller did not reconnect after ICE restart");
 
+        let weak_peer = Arc::downgrade(&host.peer);
+        let weak_video = Arc::downgrade(&host.video);
         host.close().await.unwrap();
         controller.close().await.unwrap();
+        drop(host);
+        timeout(Duration::from_secs(2), async {
+            while weak_peer.strong_count() != 0 || weak_video.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed host peer and video track must be released");
     }
 }

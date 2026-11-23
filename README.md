@@ -59,6 +59,17 @@ display picker, input toggle, fullscreen, secure-context keyboard lock and strea
 Only one viewer is active at a time; a newer viewer replaces the older one.
 Press **Ctrl+Alt+Shift+Esc** to release remote input.
 
+### Game controllers
+
+For a Windows host, install the official [ViGEmBus driver](https://github.com/nefarius/ViGEmBus/releases)
+and restart nanoctl. Pair a controller such as a DualSense with the viewer device (for example,
+an iPhone), open nanoctl in Safari over HTTPS, turn on **Gamepad**, and press a button on the
+controller so the browser can detect it. The browser must expose the controller through the
+standard Gamepad mapping. Windows games see up to four virtual Xbox 360 controllers.
+
+Gamepad forwarding requires permission to control the desktop and only sends input from a
+focused viewer. It does not replace Tailscale or require a native iOS helper.
+
 ## Develop
 
 ```sh
@@ -75,4 +86,58 @@ Native media dependencies and browser checks are described in [testing](docs/TES
 - [Operations](docs/OPERATIONS.md) · [Platforms](docs/PLATFORMS.md)
 - [Product](docs/PRODUCT.md) · [ADR 0004](docs/adr/0004-tailnet-native.md)
 
-MIT licensed.
+## Optional x264 encoder (GPL)
+
+Default builds and published release jobs do **not** include x264. Their software encoder
+remains OpenH264. To opt into system libx264 on Linux, install `libx264-dev` and the normal
+[native media dependencies](docs/TESTING.md), then build:
+
+```sh
+bun run build:viewer
+cargo build --release --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
+```
+
+The `x264` Cargo feature is off by default and includes `media`. **libx264 is GPL:** enabling
+this feature is an explicit GPL opt-in, not an MIT-only distribution. Distributing a combined
+binary/library requires complying with the applicable GPL terms, including corresponding
+source obligations. Dynamic loading does not remove those obligations. Official default
+builds and existing release packaging stay non-GPL with respect to x264.
+
+We use a thin C shim compiled against the installed x264 headers instead of reproducing
+ABI-sensitive `x264_param_t`/picture structs in Rust. It dynamically loads the system shared
+library and resolves the header-versioned `x264_encoder_open_<ABI>` symbol; no x264 source
+or static library is vendored or linked into nanoctl. Install the matching runtime library
+(for example `libx264-164` on Ubuntu 24.04). Missing/incompatible libraries and initialization
+failures fall back to OpenH264; the running library remains loaded until its encoder closes.
+The Linux feature-on CI job builds and tests this separately. Other platforms require their
+own x264 headers, pkg-config metadata and matching shared library and are not yet validated.
+
+Hardware keeps its existing priority. Once software encoding is selected, x264 is preferred
+when available. Set `NANOCTL_SOFTWARE_ENCODER=openh264` to force the OpenH264 software path;
+`auto` or an unset variable restores normal selection. Empty/unknown values are errors.
+This override does not disable hardware: also set `[quality] encoder = "software"` when
+comparing software backends. x264 frame/resolution initialization failures also fall back
+to OpenH264 for the rest of the session.
+
+The configuration is ultrafast/zerolatency, up to two sliced threads, CRF 12, I420 8-bit,
+Constrained Baseline, no B-frames/lookahead/scheduled IDRs, and Annex-B with repeated SPS/PPS
+on requested IDRs. The existing rounded RGB-to-I420 conversion is shared with OpenH264;
+VUI signals limited range, BT.709 primaries, sRGB transfer and SMPTE 170M/BT.601 matrix,
+with centered 4:2:0 chroma. It intentionally does not copy screen-relay's BT.709 matrix tag.
+The existing adaptive controller changes x264's VBV maximum bitrate **and** buffer budget
+without resetting CRF, allowing QP to rise to 51 under congestion. Responsiveness, balanced
+and quality modes respectively allow one, two and four frame budgets of VBV capacity;
+these are rate-control budgets, not queued frames. Existing capture/pacing and viewer
+latency-mode behavior are unchanged. See [benchmark results](scripts/bench/RESULTS.md) for
+measured quality, bandwidth, CPU, latency and runtime-library costs.
+
+If the bounded encoded-frame handoff drops a reference frame, the sender requests an IDR
+and suppresses dependent deltas until a clean recovery IDR arrives. This is required for
+long-lived x264 streams without scheduled IDRs and also protects the other backends.
+
+The initial Linux qualification exceeded the historical text/drag PSNR targets but
+**failed the +2-ms text input-p50 gate** (+3.54 ms). This remains an experimental
+opt-in, not a validated every-axis improvement; no fresh three-product campaign
+was run. See the results for paired tables, failed tuning attempts and scope.
+
+Source is MIT licensed; the optional combined x264 build is subject to the GPL as above.

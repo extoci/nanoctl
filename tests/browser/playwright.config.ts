@@ -20,6 +20,13 @@ if (!process.env.NANOCTL_BROWSER_PORT) {
   );
 }
 const baseURL = `http://127.0.0.1:${process.env.NANOCTL_BROWSER_PORT}`;
+const latency = process.env.NANOCTL_BROWSER_LATENCY === "1";
+if (process.env.NANOCTL_BROWSER_MEDIA === "1" && !latency)
+  process.env.NANOCTL_DEV_GAMEPAD_REPORTS ??= join(
+    homedir(),
+    ".cache",
+    `nanoctl-browser-gamepads-${process.pid}-${Date.now()}.log`,
+  );
 
 export default defineConfig({
   tsconfig: "./tsconfig.json",
@@ -28,25 +35,25 @@ export default defineConfig({
   workers: 1,
   timeout: 45_000,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 2 : 0,
+  retries: process.env.CI && !latency ? 2 : 0,
   reporter: process.env.CI ? "github" : "list",
   use: {
     baseURL,
-    trace: "retain-on-failure",
+    trace: latency ? "off" : "retain-on-failure",
   },
   webServer: {
     cwd: "../..",
     command: "bun tests/browser/agent.ts",
     url: baseURL + "/v1/info",
     reuseExistingServer: false,
-    timeout: 300_000,
+    timeout: latency ? 1_200_000 : 300_000,
     gracefulShutdown: { signal: "SIGTERM", timeout: 15_000 },
   },
   projects: [
     {
       name: "chromium",
       testIgnore: "mobile.spec.ts",
-      use: { ...devices["Desktop Chrome"] },
+      use: latency ? {} : { ...devices["Desktop Chrome"] },
     },
     {
       name: "mobile-chromium",

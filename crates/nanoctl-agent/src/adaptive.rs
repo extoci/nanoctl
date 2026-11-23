@@ -357,7 +357,7 @@ impl DamagePacer {
     }
 
     fn interval(fps: u16) -> Duration {
-        Duration::from_secs_f64(1.0 / fps.max(1) as f64)
+        Duration::from_secs_f64(0.5 / fps.max(1) as f64)
     }
 
     pub fn next_deadline(&self, now: Instant, fps: u16) -> Instant {
@@ -375,14 +375,39 @@ impl DamagePacer {
     }
 
     pub fn on_frame(&mut self, now: Instant, changed: bool, forced_keyframe: bool) -> PaceAction {
+        self.on_frame_inner(now, changed, forced_keyframe, Duration::ZERO)
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub fn on_capture_frame(
+        &mut self,
+        now: Instant,
+        changed: bool,
+        forced_keyframe: bool,
+    ) -> PaceAction {
+        if !changed {
+            return self.on_frame(now, changed, forced_keyframe);
+        }
+        let tolerance = Duration::from_millis(2).min(Self::interval(self.fps) / 10);
+        self.on_frame_inner(now, changed, forced_keyframe, tolerance)
+    }
+
+    fn on_frame_inner(
+        &mut self,
+        now: Instant,
+        changed: bool,
+        forced_keyframe: bool,
+        tolerance: Duration,
+    ) -> PaceAction {
         if changed {
             self.pending = true;
             self.refresh_pending = true;
             self.last_change = Some(now);
         }
-        let ready = self
-            .last_encode
-            .is_none_or(|last| now.saturating_duration_since(last) >= Self::interval(self.fps));
+        let ready = self.last_encode.is_none_or(|last| {
+            now.saturating_duration_since(last)
+                >= Self::interval(self.fps).saturating_sub(tolerance)
+        });
         let refresh = self.refresh_pending
             && self
                 .last_change
@@ -925,7 +950,7 @@ mod tests {
         );
         assert_eq!(
             pacer.next_deadline(now, 20),
-            now + Duration::from_millis(50)
+            now + Duration::from_millis(25)
         );
         assert_eq!(
             pacer.on_frame(now + Duration::from_millis(50), false, false),
@@ -979,5 +1004,126 @@ mod tests {
             next[index] = 0;
             assert!(frame_changed(&prev, &next));
         }
+    }
+
+    #[test]
+    fn half_interval_pacer_preserves_pending_damage_and_clamps_zero_fps() {
+        let start = Instant::now();
+        let mut pacer = DamagePacer::new(60);
+        assert_eq!(pacer.on_frame(start, true, false), PaceAction::Encode);
+        assert_eq!(
+            pacer.on_frame(start + Duration::from_millis(8), true, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.next_deadline(start, 60),
+            start + Duration::from_secs_f64(0.5 / 60.0)
+        );
+        assert_eq!(
+            pacer.on_frame(start + Duration::from_secs_f64(0.5 / 60.0), false, false),
+            PaceAction::Encode
+        );
+        assert_eq!(
+            pacer.on_frame(start + Duration::from_millis(9), false, true),
+            PaceAction::Encode
+        );
+        let mut slow = DamagePacer::new(0);
+        assert_eq!(slow.on_frame(start, false, false), PaceAction::Skip);
+        assert_eq!(slow.on_frame(start, true, false), PaceAction::Encode);
+        assert_eq!(slow.on_frame(start, true, false), PaceAction::Skip);
+        assert_eq!(
+            slow.next_deadline(start, 0),
+            start + Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn capture_pacing_tolerates_callback_jitter_but_not_unpaced_bursts() {
+        let start = Instant::now();
+        let mut pacer = DamagePacer::new(30);
+        assert_eq!(
+            pacer.on_capture_frame(start, true, false),
+            PaceAction::Encode
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(14), true, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(16), true, false),
+            PaceAction::Encode
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(16), true, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(32), true, false),
+            PaceAction::Encode
+        );
+    }
+
+    #[test]
+    fn capture_pacing_does_not_advance_unchanged_damage_or_idle_refresh() {
+        let start = Instant::now();
+        let mut pacer = DamagePacer::new(30);
+        assert_eq!(
+            pacer.on_capture_frame(start, true, false),
+            PaceAction::Encode
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(10), true, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(16), false, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(17), false, false),
+            PaceAction::Encode
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(18), false, true),
+            PaceAction::Encode
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + REFRESH_DELAY, false, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(
+                start + REFRESH_DELAY + Duration::from_millis(10),
+                false,
+                false
+            ),
+            PaceAction::Encode
+        );
+        assert!(pacer.idle());
+    }
+
+    #[test]
+    fn capture_pacing_tracks_rate_changes_and_clamps_invalid_zero_fps() {
+        let start = Instant::now();
+        let mut pacer = DamagePacer::new(30);
+        pacer.on_capture_frame(start, true, false);
+        pacer.set_fps(10);
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(47), true, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(48), true, false),
+            PaceAction::Encode
+        );
+        pacer.set_fps(0);
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(545), true, false),
+            PaceAction::Skip
+        );
+        assert_eq!(
+            pacer.on_capture_frame(start + Duration::from_millis(546), true, false),
+            PaceAction::Encode
+        );
     }
 }

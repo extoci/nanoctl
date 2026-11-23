@@ -10,6 +10,7 @@ import {
 } from "@nanoctl/protocol";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
+import { GamepadForwarder } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
 import { normalizedPosition, videoGeometry } from "./touch-input";
 
@@ -37,6 +38,7 @@ export type RemoteSessionSnapshot = {
   reconnectAttempt: number;
   iceGeneration: number;
   inputEnabled: boolean;
+  gamepadEnabled: boolean;
   firstFrameReceived: boolean;
   metrics: RemoteSessionMetrics | null;
 };
@@ -65,6 +67,7 @@ export type RemoteSessionOptions = {
   systemAudioEnabled?: boolean;
   remoteInputEnabled?: boolean;
   clipboardEnabled?: boolean;
+  gamepadAvailable?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
   preferences?: { inputEnabled: boolean; displayId?: string };
@@ -111,6 +114,8 @@ export class RemoteSessionController {
   private controlChannel: RTCDataChannel | null = null;
   private clipboardChannel: RTCDataChannel | null = null;
   private clipboard: ClipboardSync | null = null;
+  private gamepadFrame: number | null = null;
+  private readonly gamepad = new GamepadForwarder((message) => this.sendControl(message));
   private keyQueue: Promise<void> = Promise.resolve();
   private readonly onClipboardFocus = () => {
     void this.clipboard?.focus();
@@ -155,9 +160,12 @@ export class RemoteSessionController {
   private readonly offerCompletionWaiters = new Map<number, () => void>();
   private metrics: RemoteSessionMetrics | null = null;
 
-  private readonly onWindowBlur = () => this.releaseInput();
+  private readonly onWindowBlur = () => {
+    this.gamepad.release();
+    this.releaseInput();
+  };
   private readonly onVisibilityChange = () => {
-    if (document.visibilityState === "hidden") this.releaseInput();
+    if (document.visibilityState === "hidden") this.onWindowBlur();
     else this.onClipboardFocus();
   };
   private readonly onPageHide = (event: PageTransitionEvent) => {
@@ -224,6 +232,7 @@ export class RemoteSessionController {
       reconnectAttempt: this.reconnectAttempt,
       iceGeneration: this.iceGeneration,
       inputEnabled: this.inputEnabled,
+      gamepadEnabled: this.gamepadFrame !== null,
       firstFrameReceived: this.firstFrameReceived,
       metrics: this.metrics,
     };
@@ -291,6 +300,48 @@ export class RemoteSessionController {
     this.publishSnapshot();
   }
 
+  setGamepadEnabled(enabled: boolean): void {
+    if (enabled) {
+      if (
+        this.gamepadFrame !== null ||
+        !this.options.gamepadAvailable ||
+        !this.inputEnabled ||
+        this.phase !== "connected" ||
+        typeof navigator.getGamepads !== "function"
+      )
+        return;
+      this.gamepadFrame = window.requestAnimationFrame(this.pollGamepads);
+    } else {
+      this.stopGamepads();
+    }
+    this.publishSnapshot();
+  }
+
+  private readonly pollGamepads = (now: number): void => {
+    this.gamepadFrame = window.requestAnimationFrame(this.pollGamepads);
+    if (
+      this.inputEnabled &&
+      this.phase === "connected" &&
+      document.visibilityState === "visible" &&
+      document.hasFocus()
+    ) {
+      try {
+        this.gamepad.sample(navigator.getGamepads(), now);
+      } catch {
+        this.setGamepadEnabled(false);
+      }
+    } else {
+      this.gamepad.release();
+    }
+  };
+
+  private stopGamepads(): void {
+    if (this.gamepadFrame === null) return;
+    window.cancelAnimationFrame(this.gamepadFrame);
+    this.gamepadFrame = null;
+    this.gamepad.release();
+  }
+
   selectDisplay(displayId: string): boolean {
     if (!this.inputEnabled || !this.isControlOpen()) return false;
     if (!this.displays.some((display) => display.id === displayId)) return false;
@@ -305,6 +356,20 @@ export class RemoteSessionController {
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
+    if (payload.type === "gamepad") {
+      if (
+        !this.options.gamepadAvailable ||
+        (payload.pads.length > 0 && (!this.inputEnabled || !this.remoteInputAllowed)) ||
+        channel.bufferedAmount > 4 * 1024
+      )
+        return false;
+      try {
+        channel.send(JSON.stringify(payload));
+        return true;
+      } catch {
+        return false;
+      }
+    }
     if (
       !this.inputEnabled &&
       (payload.type === "pointer" || payload.type === "key" || payload.type === "text")
@@ -357,6 +422,7 @@ export class RemoteSessionController {
       const peer = this.peer;
       this.lifecycleGeneration += 1;
       this.clearTimers();
+      this.stopGamepads();
       this.releaseInput();
       this.detachInput();
       if (peer) {
@@ -447,6 +513,9 @@ export class RemoteSessionController {
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
+      if ("jitterBufferTarget" in receiver) {
+        (receiver as RTCRtpReceiver & { jitterBufferTarget?: number }).jitterBufferTarget = 0;
+      }
       if ("playoutDelayHint" in receiver) {
         (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
       }
@@ -537,7 +606,7 @@ export class RemoteSessionController {
     video.addEventListener("pointerdown", this.onPointer);
     video.addEventListener("pointerup", this.onPointer);
     video.addEventListener("pointercancel", this.onPointerCancel);
-    video.addEventListener("lostpointercapture", this.onPointerCancel);
+    video.addEventListener("lostpointercapture", this.onLostPointerCapture);
     video.addEventListener("wheel", this.onWheel, { passive: false });
     video.addEventListener("contextmenu", this.onContextMenu);
     video.addEventListener("keydown", this.onKey);
@@ -557,7 +626,7 @@ export class RemoteSessionController {
     video.removeEventListener("pointerdown", this.onPointer);
     video.removeEventListener("pointerup", this.onPointer);
     video.removeEventListener("pointercancel", this.onPointerCancel);
-    video.removeEventListener("lostpointercapture", this.onPointerCancel);
+    video.removeEventListener("lostpointercapture", this.onLostPointerCapture);
     video.removeEventListener("wheel", this.onWheel);
     video.removeEventListener("contextmenu", this.onContextMenu);
     video.removeEventListener("keydown", this.onKey);
@@ -591,6 +660,10 @@ export class RemoteSessionController {
 
   private readonly onPointerCancel = (event: PointerEvent): void => {
     if (event.pointerType !== "touch") this.releaseInput();
+  };
+
+  private readonly onLostPointerCapture = (event: PointerEvent): void => {
+    if (event.buttons !== 0) this.releaseInput();
   };
 
   private readonly onWheel = (event: WheelEvent): void => {
@@ -1051,6 +1124,7 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
+    if (!this.inputEnabled) this.stopGamepads();
     const channel = this.controlChannel;
     if (channel?.readyState === "open") {
       try {

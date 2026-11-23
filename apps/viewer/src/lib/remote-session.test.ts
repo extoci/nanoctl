@@ -91,13 +91,9 @@ describe("remote session lifecycle", () => {
       await controller.start();
       expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(!!mayControl && !!remoteInput);
       if (mayControl && remoteInput) {
-        video.listeners.get("keydown")?.({
-          type: "keydown",
-          code: "KeyV",
-          key: "v",
-          ctrlKey: true,
-          preventDefault: () => {},
-        } as unknown as Event);
+        video.dispatchEvent(
+          Object.assign(new Event("keydown"), { code: "KeyV", key: "v", ctrlKey: true }),
+        );
         await flushSignals();
         expect(peer.sent.map(([label]) => label)).toEqual([
           "nanoctl.clipboard.v1",
@@ -109,6 +105,80 @@ describe("remote session lifecycle", () => {
     }
   });
 
+  test("requests zero receiver buffering only through supported browser APIs", async () => {
+    installBrowserGlobals();
+    for (const receiver of [
+      { jitterBufferTarget: 100, playoutDelayHint: 0.1 },
+      { playoutDelayHint: 0.1 },
+      {},
+    ]) {
+      const peer = new FakePeer();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: new FakeVideo() as unknown as HTMLVideoElement,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      const supported = Object.keys(receiver);
+      await controller.start();
+      peer.ontrack?.({ receiver, streams: [], track: {} } as unknown as RTCTrackEvent);
+      for (const property of supported) expect(Reflect.get(receiver, property)).toBe(0);
+      expect(Object.keys(receiver)).toEqual(supported);
+      await controller.stop();
+    }
+  });
+  test("normal pointer capture loss preserves keyboard focus; cancellation still releases input", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    channel.sent = [];
+    video.focus();
+    video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
+    expect(video.focused).toBe(true);
+    expect(channel.sent).toEqual([]);
+    video.dispatchEvent(
+      Object.assign(new Event("keydown"), { code: "Space", key: " ", repeat: false }),
+    );
+    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+      type: "key",
+      action: "down",
+      code: "Space",
+    });
+    for (const [type, buttons] of [
+      ["lostpointercapture", 1],
+      ["pointercancel", 0],
+    ] as const) {
+      video.focus();
+      video.dispatchEvent(Object.assign(new Event(type), { buttons }));
+      expect(video.focused).toBe(false);
+      expect(JSON.parse(channel.sent.at(-1)!)).toEqual({ type: "release" });
+    }
+    controller.setInputEnabled(false);
+    channel.sent = [];
+    video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
+    video.dispatchEvent(Object.assign(new Event("keydown"), { code: "Space", key: " " }));
+    expect(channel.sent).toEqual([]);
+    channel.readyState = "closed";
+    video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 1 }));
+    expect(channel.sent).toEqual([]);
+    await controller.stop();
+  });
   test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
     installBrowserGlobals();
     const preferences = { inputEnabled: true, displayId: "secondary" };
@@ -436,21 +506,22 @@ function defineGlobal(name: string, value: unknown): void {
   });
 }
 
-class FakeVideo {
-  listeners = new Map<string, (event: Event) => void>();
+class FakeVideo extends EventTarget {
   srcObject: unknown = null;
   videoWidth = 1920;
   videoHeight = 1080;
 
-  addEventListener(type: string, listener: (event: Event) => void): void {
-    this.listeners.set(type, listener);
+  focused = false;
+
+  async play(): Promise<void> {}
+
+  focus(): void {
+    this.focused = true;
   }
 
-  removeEventListener(): void {}
-
-  focus(): void {}
-
-  blur(): void {}
+  blur(): void {
+    this.focused = false;
+  }
 }
 
 class FakeMediaStream {

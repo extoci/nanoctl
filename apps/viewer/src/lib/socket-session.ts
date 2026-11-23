@@ -137,6 +137,7 @@ export class SocketSession {
                 systemAudioEnabled: message.host.capabilities.systemAudio,
                 remoteInputEnabled: message.host.remoteInput,
                 remoteInputPolicy: message.host.viewer.mayControl,
+                gamepadAvailable: message.host.capabilities.gamepad === true,
                 clipboardEnabled:
                   message.host.capabilities.clipboard &&
                   message.host.remoteInput &&
