@@ -1,3 +1,126 @@
+# Optional x264: quality target met, latency qualification failed
+
+2026-11-23 UTC. The **GPL opt-in** `x264` feature adds a dynamically loaded system
+libx264 software backend; default builds remain OpenH264. Hardware priority is
+unchanged. The measured candidate uses ultrafast/zerolatency, CRF12, up to two
+sliced threads, constrained baseline, I420, no B-frames/lookahead, Annex-B repeated
+headers and controller-driven VBV. Limited-range VUI matches the existing rounded
+RGB→I420 conversion. The maximum adaptive QP remains 51.
+
+**Not qualified for promotion:** text input p50 increased **3.540 ms**, exceeding
+the +2-ms arm-median gate. Text/drag PSNR exceed the historical screen-relay targets
+52.2/52.4 dB, but this is not a fresh competitor comparison. The conditional fresh
+three-product campaign was **not run**. No new three-product table or claim of
+every-axis superiority replaces the historical comparisons below.
+
+## Strict paired qualification
+
+Five fresh alternating pairs per workload, **40/40 valid runs, 4,800/4,800 inputs**.
+Both arms use the same immutable feature-enabled executable, with
+`NANOCTL_SOFTWARE_ENCODER=openh264` for the QP14–51 control and `auto` for x264.
+This isolates encoder choice while keeping the necessary reference-drop recovery
+fix in both arms. All use the opaque/desynchronized source, combined quality/input
+phases and fresh isolated stacks. No builds or other benchmark products ran during
+these trials. Medians are medians of per-run metrics, not pooled frames.
+
+| Workload | Encoder       | PSNR Y dB |  SSIM Y |   Mbps | Input p50 / p95 ms | Video p50 / p95 ms |    FPS |  CPU % | RSS MiB |
+| -------- | ------------- | --------: | ------: | -----: | -----------------: | -----------------: | -----: | -----: | ------: |
+| Text     | OpenH264 QP14 |    51.269 | .999326 |  2.250 |    28.500 / 42.027 |    19.145 / 30.423 | 59.652 | 37.396 |  51.114 |
+| Text     | x264 CRF12    |    56.865 | .999839 |  2.937 |    32.040 / 44.074 |    19.088 / 29.455 | 59.933 | 33.773 |  61.526 |
+| Drag     | OpenH264 QP14 |    50.755 | .998143 |  3.853 |    28.445 / 36.475 |    18.805 / 21.096 | 59.763 | 32.409 |  51.084 |
+| Drag     | x264 CRF12    |    57.238 | .999747 |  6.472 |    28.530 / 44.334 |    18.985 / 34.617 | 59.556 | 38.446 |  60.512 |
+| Gradient | OpenH264 QP14 |    48.008 | .994676 |  8.140 |    32.365 / 56.064 |    21.732 / 38.949 | 59.519 | 53.388 |  55.465 |
+| Gradient | x264 CRF12    |    50.957 | .994864 | 11.222 |    32.331 / 52.316 |    19.595 / 36.573 | 59.953 | 39.855 |  64.625 |
+| Marker   | OpenH264 QP14 |    57.318 | .999956 |   .296 |    28.415 / 36.391 |    18.719 / 20.843 | 60.001 | 24.294 |  43.381 |
+| Marker   | x264 CRF12    |    63.182 | .999992 |   .467 |    28.427 / 36.384 |    18.995 / 20.973 | 59.967 | 26.617 |  54.139 |
+
+Runtime closure: **23.485306 MiB** with OpenH264 forced versus **25.262245 MiB**
+with x264, including `/usr/lib/x86_64-linux-gnu/libx264.so.163` and its dependencies:
+**+1.776939 MiB**. Both closures contain the same executable; the unused x264
+library is excluded from the forced-OpenH264 closure. A live forced-OpenH264 process
+had no libx264 mappings. Runtime means logical host application/assets plus linked
+libraries, not a complete installation or a client/browser footprint.
+
+| Workload | Input p50 Δ ms | Video p50 Δ ms | x264 CPU / ceiling % | Drag Mbps ≤8 | Quality target | Result         |
+| -------- | -------------: | -------------: | -------------------: | ------------ | -------------- | -------------- |
+| Text     |         +3.540 |          −.057 |       33.773 / 51.00 | n/a          | 56.865 >52.2   | **Fail input** |
+| Drag     |          +.085 |          +.179 |       38.446 / 49.17 | 6.472: pass  | 57.238 >52.4   | Pass           |
+| Gradient |          −.034 |         −2.137 |       39.855 / 51.00 | n/a          | n/a            | Pass           |
+| Marker   |          +.012 |          +.276 |       26.617 / 43.44 | n/a          | n/a            | Pass           |
+
+CPU ceilings conservatively use the prior corresponding Moonlight CPU or 51%,
+whichever is lower. Latency gates use differences of arm-median p50s, as in the
+preceding sweeps; p95 regressions are not hidden. Text median **paired** input
+delta is −.138 ms, but the specified **difference of arm medians fails** and is
+the decision criterion. Its five paired input deltas are
+−.255 / +.077 / −.138 / +3.909 / +3.528 ms. Video deltas are
++.001 / +.083 / −.527 / +.419 / −.156 ms. The input-only difference remains
+unlocalized; it is not established as an intrinsic x264 encode penalty or excused
+as detector/source noise. Gradient still has a +15.941-ms video-p50 pair delta;
+the earlier source-presentation issue is not claimed eliminated.
+
+Per-run x264 PSNR medians span text **56.845–56.868**, drag **57.221–57.699**,
+gradient **50.952–51.203**, marker **63.168–69.771 dB**. Individual matched text
+pairs fall as low as **42.119 dB**; the headline PSNR is not a worst-frame guarantee.
+Median >100-ms stall counts are zero in both arms across all workloads.
+
+### Tuning and retained failure evidence
+
+The first CRF10/single-thread candidate exposed persistent visible prediction
+corruption: x264 drag run2 scored **18.402 dB** despite a valid 120/120-input flag.
+All 19 completed attempts and the interrupted twentieth are preserved under
+`~/bench-results/x264-paired/`; that broken candidate was retired, not filtered
+into a passing median. The affected run maintained a one-frame encoded/sent gap;
+healthy neighboring runs did not. Its exact local-drop event was not logged, so
+the attribution of that original event remains a leading explanation rather than
+a fully observed causal chain.
+
+A deterministic real-codec regression deliberately drops a P-reference, observes
+damaged decode, requests an IDR and verifies independent clean recovery. The
+capacity-one encoded handoff previously ignored local drop counts. The sender now
+requests the existing recovery generation and suppresses dependent deltas until a
+clean IDR; a queued IDR with later discarded deltas does not prematurely clear
+recovery. RTP packet sequence counters remain untouched. This necessary integration
+fix also protects OpenH264 and hardware streams.
+
+The repaired CRF10 cohort actually exercised this path: x264 drag2 logged a local
+drop/IDR request at **08:35:15.224297 UTC**, with PSNR **58.499 dB**, individual
+pairs **56.480–59.223 dB**, rather than persistent corruption. The repaired cohort
+completed five text and five drag pairs, all valid, before retirement for its
+**+3.239-ms text input-p50** failure. Drag passed (58.626 dB, 7.254 Mbps,
+35.736% CPU). All 20 completed attempts and the interrupted gradient attempt remain
+under `~/bench-results/x264-paired-v2/`.
+
+CRF12/two sliced threads was the one substantive retune: it reduced text bitrate
+and CPU and drag bitrate, but still failed text input p50. There was no unchanged
+configuration resampling to obtain a passing median. The final full 40-run cohort
+is `~/bench-results/x264-paired-v3/summary.json`; executable SHA256:
+`1bee72484c17a77196eb9121938c6fa170544fbc874fec3a9929ce06aef69ace`.
+
+### Remaining losing axes and scope
+
+Against its contemporaneous OpenH264 control, x264 spends more bitrate and RSS in
+every workload and adds 1.777 MiB runtime. Text input p50/p95 worsen
+**3.540/2.047 ms**. Drag input/video p95 worsen **7.859/13.521 ms**, CPU rises
+**6.037 points**, FPS falls **.207**, and p95/p99 frame intervals grow
+**.104/2.790 ms**. Marker video p50/p95 worsen **.276/.130 ms**, CPU rises
+**2.323 points** and FPS falls **.034**. Smaller losing p50 differences are in the
+table; these are arithmetic observations, not significance claims.
+
+No fresh x264-versus-competitor losing-axis table can be established because
+qualification failed and the conditional campaign was not run. In particular,
+better historical-target PSNR is not evidence of beating the competitors on
+latency, CPU, RSS, jitter, bitrate or picture quality contemporaneously.
+
+These are **720p software-H.264, development-loopback, captured-pixel** results
+on a shared Linux VM: not optical input-to-photon, impaired-link, tailnet or
+hardware-codec validation. Host CPU uses one core=100%; CPU/RSS exclude browsers,
+clients, Xvfb and detector. Quality is matched-ROI gray-luma, not full-color or
+matched-bitrate quality. Nanoctl bitrate is video-RTP payload, excluding transport
+and WireGuard overhead. Native x264 on macOS/Windows remains unverified. The
+measurements precede the subsequent integration of master's new viewer/audio/
+hardware features; that integrated tree is not a newly measured candidate.
+
 # Follow-up: gradient attribution and validated QP14
 
 2026-11-23 UTC. **Retained: QP14–51**, rounded conversion and
