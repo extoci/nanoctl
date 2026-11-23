@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { RemoteSessionController, type HostSignalRow } from "./remote-session";
+import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
 
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
@@ -732,3 +732,15 @@ class FakePeer {
     this.signalingState = "closed";
   }
 }
+
+describe("wheel normalization", () => {
+  test("keeps fine-grained trackpad deltas and normalizes delta modes", () => {
+    expect(wheelPixels(1, 0)).toBe(1);
+    expect(wheelPixels(0.5, 0)).toBe(0.5);
+    expect(wheelPixels(100, 0)).toBe(100);
+    expect(wheelPixels(3, 1)).toBeCloseTo(100, 5);
+    expect(wheelPixels(0.5, 2)).toBe(400);
+    expect(wheelPixels(10_000, 0)).toBe(4_000);
+    expect(wheelPixels(Number.NaN, 0)).toBe(0);
+  });
+});

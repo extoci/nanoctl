@@ -2,13 +2,116 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+#[cfg(not(target_os = "windows"))]
+use enigo::Coordinate;
+use enigo::{Axis, Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::Deserialize;
 use xcap::Monitor;
 
 #[cfg(target_os = "linux")]
 #[path = "x11_text.rs"]
 mod x11_text;
+
+#[cfg(target_os = "windows")]
+mod win_send {
+    //! Raw `SendInput` for absolute moves and wheel deltas. enigo 0.6 maps
+    //! absolute coordinates onto the primary display only (no
+    //! `MOUSEEVENTF_VIRTUALDESK`), so input intended for a secondary monitor
+    //! lands on the wrong screen, and it can only emit whole wheel notches,
+    //! which discards fine-grained precision-trackpad deltas.
+
+    use anyhow::Result;
+
+    const INPUT_MOUSE: u32 = 0;
+    const MOUSEEVENTF_MOVE: u32 = 0x0001;
+    const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+    const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+    const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
+    const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
+    const SM_XVIRTUALSCREEN: i32 = 76;
+    const SM_YVIRTUALSCREEN: i32 = 77;
+    const SM_CXVIRTUALSCREEN: i32 = 78;
+    const SM_CYVIRTUALSCREEN: i32 = 79;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MouseInput {
+        dx: i32,
+        dy: i32,
+        mouse_data: u32,
+        flags: u32,
+        time: u32,
+        extra_info: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Input {
+        kind: u32,
+        padding: u32,
+        mouse: MouseInput,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+
+    fn send(input: Input) -> Result<()> {
+        let sent = unsafe { SendInput(1, &input, std::mem::size_of::<Input>() as i32) };
+        anyhow::ensure!(sent == 1, "SendInput rejected the mouse event");
+        Ok(())
+    }
+
+    fn event(flags: u32, data: i32, dx: i32, dy: i32) -> Input {
+        Input {
+            kind: INPUT_MOUSE,
+            padding: 0,
+            mouse: MouseInput {
+                dx,
+                dy,
+                mouse_data: data as u32,
+                flags,
+                time: 0,
+                extra_info: 0,
+            },
+        }
+    }
+
+    /// Absolute move across the whole virtual desktop (all monitors).
+    pub fn move_abs(x: i32, y: i32) -> Result<()> {
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        anyhow::ensure!(vw > 1 && vh > 1, "virtual screen metrics unavailable");
+        let nx = virtual_normalized(x - vx, vw);
+        let ny = virtual_normalized(y - vy, vh);
+        send(event(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            0,
+            nx,
+            ny,
+        ))
+    }
+
+    /// One wheel event in raw wheel-delta units (120 = one notch).
+    pub fn wheel(units: i32, horizontal: bool) -> Result<()> {
+        let (flags, data) = if horizontal {
+            (MOUSEEVENTF_HWHEEL, units)
+        } else {
+            // Positive mouseData scrolls up; viewer deltas are down-positive.
+            (MOUSEEVENTF_WHEEL, -units)
+        };
+        send(event(flags, data, 0, 0))
+    }
+
+    fn virtual_normalized(offset: i32, extent: i32) -> i32 {
+        let extent = i64::from(extent) - 1;
+        ((i64::from(offset) * 65535 + extent / 2) / extent).clamp(0, 65535) as i32
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum InputLane {
@@ -27,6 +130,10 @@ pub struct InputController {
     last_physical_input: Instant,
     gamepads: crate::gamepad::Gamepads,
     gamepads_revoked: bool,
+    #[cfg(not(target_os = "windows"))]
+    scroll_remainder_x: f64,
+    #[cfg(not(target_os = "windows"))]
+    scroll_remainder_y: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +204,10 @@ impl InputController {
             last_physical_input: Instant::now(),
             gamepads: Default::default(),
             gamepads_revoked: false,
+            #[cfg(not(target_os = "windows"))]
+            scroll_remainder_x: 0.0,
+            #[cfg(not(target_os = "windows"))]
+            scroll_remainder_y: 0.0,
         })
     }
 
@@ -219,28 +330,62 @@ impl InputController {
         let x = display_pixel(x, self.width, self.origin_x);
         let y = display_pixel(y, self.height, self.origin_y);
         match action {
-            PointerAction::Move => self.enigo.move_mouse(x, y, Coordinate::Abs)?,
+            PointerAction::Move => self.move_to(x, y)?,
             PointerAction::Down => {
-                self.enigo.move_mouse(x, y, Coordinate::Abs)?;
+                self.move_to(x, y)?;
                 let button = map_button(button)?;
                 self.enigo.button(button, Direction::Press)?;
                 self.held_buttons.insert(button);
             }
             PointerAction::Up => {
-                self.enigo.move_mouse(x, y, Coordinate::Abs)?;
+                self.move_to(x, y)?;
                 let button = map_button(button)?;
                 self.enigo.button(button, Direction::Release)?;
                 self.held_buttons.remove(&button);
             }
             PointerAction::Wheel => {
-                let horizontal = bounded_scroll(delta_x.unwrap_or(0.0));
-                let vertical = bounded_scroll(delta_y.unwrap_or(0.0));
-                if horizontal != 0 {
-                    self.enigo.scroll(horizontal, Axis::Horizontal)?;
-                }
-                if vertical != 0 {
-                    self.enigo.scroll(vertical, Axis::Vertical)?;
-                }
+                // Wheel input reaches the window under the physical cursor,
+                // so it has to arrive where the viewer's pointer is first.
+                self.move_to(x, y)?;
+                self.wheel(delta_x.unwrap_or(0.0), Axis::Horizontal)?;
+                self.wheel(delta_y.unwrap_or(0.0), Axis::Vertical)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            win_send::move_abs(x, y)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(self.enigo.move_mouse(x, y, Coordinate::Abs)?)
+        }
+    }
+
+    /// Wheel deltas arrive in pixels. On Windows they are sent as raw wheel
+    /// units so precision-trackpad deltas accumulate like real hardware
+    /// input; elsewhere whole notches are emitted once enough pixels accrue.
+    fn wheel(&mut self, pixels: f64, axis: Axis) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            let units = wheel_units(pixels);
+            if units != 0 {
+                win_send::wheel(units, matches!(axis, Axis::Horizontal))?;
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let remainder = if matches!(axis, Axis::Horizontal) {
+                &mut self.scroll_remainder_x
+            } else {
+                &mut self.scroll_remainder_y
+            };
+            let notches = accrued_notches(remainder, pixels);
+            if notches != 0 {
+                self.enigo.scroll(notches, axis)?;
             }
         }
         Ok(())
@@ -313,11 +458,33 @@ fn display_pixel(value: f64, extent: u32, origin: i32) -> i32 {
     origin.saturating_add(normalized_pixel(value, extent))
 }
 
-fn bounded_scroll(value: f64) -> i32 {
-    if !value.is_finite() {
+/// Pixels per wheel notch: browsers report a physical wheel notch as
+/// roughly 100 CSS pixels, and one notch is 120 wheel-delta units.
+const PIXELS_PER_NOTCH: f64 = 100.0;
+
+/// Converts a pixel scroll delta into raw wheel-delta units, bounded to
+/// twenty notches per event. Fractional units are kept so fine-grained
+/// trackpad deltas scroll smoothly instead of rounding to zero.
+#[cfg(any(target_os = "windows", test))]
+fn wheel_units(pixels: f64) -> i32 {
+    if !pixels.is_finite() {
         return 0;
     }
-    (value / 100.0).round().clamp(-20.0, 20.0) as i32
+    (pixels * 120.0 / PIXELS_PER_NOTCH)
+        .round()
+        .clamp(-2_400.0, 2_400.0) as i32
+}
+
+/// Accumulates pixel scroll deltas and reports how many whole notches are
+/// due; the sub-notch remainder is carried into the next event.
+#[cfg(any(not(target_os = "windows"), test))]
+fn accrued_notches(remainder: &mut f64, pixels: f64) -> i32 {
+    if pixels.is_finite() {
+        *remainder = (*remainder + pixels).clamp(-4_800.0, 4_800.0);
+    }
+    let notches = (*remainder / PIXELS_PER_NOTCH).trunc() as i32;
+    *remainder -= f64::from(notches) * PIXELS_PER_NOTCH;
+    notches
 }
 
 fn map_button(value: Option<u8>) -> Result<Button> {
@@ -480,10 +647,26 @@ mod tests {
     }
 
     #[test]
-    fn scroll_is_bounded() {
-        assert_eq!(bounded_scroll(10_000.0), 20);
-        assert_eq!(bounded_scroll(-10_000.0), -20);
-        assert_eq!(bounded_scroll(f64::INFINITY), 0);
+    fn wheel_deltas_are_bounded_and_precise() {
+        assert_eq!(wheel_units(10_000.0), 2_400);
+        assert_eq!(wheel_units(-10_000.0), -2_400);
+        assert_eq!(wheel_units(f64::INFINITY), 0);
+        assert_eq!(wheel_units(100.0), 120);
+        assert_eq!(wheel_units(40.0), 48);
+        assert_eq!(wheel_units(1.0), 1);
+    }
+
+    #[test]
+    fn scroll_remainder_accrues_across_events() {
+        let mut remainder = 0.0;
+        assert_eq!(accrued_notches(&mut remainder, 60.0), 0);
+        assert_eq!(accrued_notches(&mut remainder, 60.0), 1);
+        assert!((remainder - 20.0).abs() < f64::EPSILON);
+        assert_eq!(accrued_notches(&mut remainder, -260.0), -2);
+        assert!((remainder + 40.0).abs() < f64::EPSILON);
+        assert_eq!(accrued_notches(&mut remainder, f64::NAN), 0);
+        remainder = 4_700.0;
+        assert_eq!(accrued_notches(&mut remainder, 4_700.0), 48);
     }
 
     #[test]
@@ -519,7 +702,9 @@ mod tests {
             let displayed = display_pixel(coordinate, extent, origin);
             prop_assert!(displayed >= origin);
             prop_assert!(displayed <= origin.saturating_add(upper));
-            prop_assert!((-20..=20).contains(&bounded_scroll(scroll)));
+            prop_assert!((-2_400..=2_400).contains(&wheel_units(scroll)));
+            let mut remainder = 0.0;
+            prop_assert!((-48..=48).contains(&accrued_notches(&mut remainder, scroll)));
         }
 
         #[test]
