@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 
 const temporaryDirectories: string[] = [];
 const repository = resolve(import.meta.dir, "..");
+const describeUnix = describe.skipIf(process.platform === "win32");
+const testUnix = test.skipIf(process.platform === "win32");
 
 afterEach(async () => {
   await Promise.all(
@@ -131,7 +133,7 @@ async function installUnix(environment: NodeJS.ProcessEnv, source: string) {
   return { exit, stdout, stderr };
 }
 
-describe("Linux user-service packaging", () => {
+describeUnix("Linux user-service packaging", () => {
   test("installs, refuses overwrite, and uninstalls in the desktop user home", async () => {
     const { home, source, environment } = await fixture();
     const install = Bun.spawn(["sh", "packaging/linux/install-user-service.sh", source], {
@@ -164,7 +166,7 @@ describe("Linux user-service packaging", () => {
   });
 });
 
-describe("one-command Linux installer", () => {
+describeUnix("one-command Linux installer", () => {
   test("installs, registers the user service, and updates without changing legacy config", async () => {
     const { home, source, environment } = await fixture();
     expect((await installUnix(environment, source)).exit).toBe(0);
@@ -199,7 +201,7 @@ describe("one-command Linux installer", () => {
   });
 });
 
-test("prints the macOS URL from its stable launch path", async () => {
+testUnix("prints the macOS URL from its stable launch path", async () => {
   const { home, source, environment } = await fixture("Darwin");
   const original = await Bun.file(source).text();
   await writeFile(
@@ -215,7 +217,7 @@ for (const [platform, registration] of [
   ["Linux", ".config/systemd/user/nanoctl.service"],
   ["Darwin", "Library/LaunchAgents/dev.nanoctl.agent.plist"],
 ] as const) {
-  describe(`one-command ${platform} installer rollback`, () => {
+  describeUnix(`one-command ${platform} installer rollback`, () => {
     test("rejects an invalid candidate before contacting the service manager", async () => {
       const { home, source, environment } = await fixture(platform);
       expect((await installUnix(environment, source)).exit).toBe(0);
@@ -340,6 +342,31 @@ for (const [platform, registration] of [
 }
 
 describe("one-command Windows installer", () => {
+  test.skipIf(process.platform !== "win32")(
+    "checks native job lifetime and stop edge cases",
+    async () => {
+      const child = Bun.spawn(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-File",
+          join(repository, "scripts/windows-lifecycle.test.ps1"),
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(stderr).toBe("");
+      expect(stdout).toContain("WINDOWS_LIFECYCLE_OK");
+      expect(code).toBe(0);
+    },
+    30_000,
+  );
+
   test("uses nonfatal tailnet discovery and legacy-only credential cleanup without enrollment", async () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     const helper = await Bun.file(join(repository, "packaging/tailnet.ps1")).text();
@@ -364,8 +391,8 @@ describe("one-command Windows installer", () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     expect(installer).toContain("-RestartInterval (New-TimeSpan -Minutes 1)");
     expect(installer).not.toContain("-RestartInterval (New-TimeSpan -Seconds");
-    expect(installer).toContain("System32\\wscript.exe");
-    expect(installer).toContain("run-agent.vbs");
+    expect(installer).toContain("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(installer).toContain("run-agent.ps1");
     expect(installer).toContain("agent.ready");
     expect(installer).toContain("[IO.FileShare]::None");
     expect(installer).toContain("-Hidden");
@@ -376,41 +403,63 @@ describe("one-command Windows installer", () => {
     expect(installer).not.toContain('New-ScheduledTaskAction -Execute $binaryPath -Argument "run"');
   });
 
-  test("uses a direct hidden runner with file-backed diagnostics", async () => {
-    const scripts = await Promise.all(
-      [
-        "install.ps1",
-        "packaging/windows/install-service.ps1",
-        "packaging/windows/update-agent.ps1",
-      ].map((path) => Bun.file(join(repository, path)).text()),
-    );
-
-    for (const script of scripts) {
-      expect(script).toContain('" --log-file "');
-      expect(script).toContain("--ready-token");
-      expect(script).toContain("Err.Clear");
-      expect(script).toContain("headless runner started");
-      expect(script).not.toContain("headless runner started for");
-      expect(script).toContain("child exited with code");
-      expect(script).toContain("shell.Run(command, 0, True)");
-      expect(script).not.toContain("cmd.exe /d /s /c");
-      expect(script).toContain("New-Item -ItemType File -Path $logPath -Force");
-      expect(script).toContain("WorkingDirectory");
-    }
-  });
-
-  test("writes the Windows Script Host runner as ASCII", async () => {
+  test("owns the hidden agent with a kill-on-close job from process creation", async () => {
+    const runner = await Bun.file(join(repository, "packaging/windows/run-agent.ps1")).text();
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    expect(installer.replaceAll("\r\n", "\n")).toContain(runner.trim().replaceAll("\r\n", "\n"));
+    expect(runner).toContain("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE");
+    expect(runner).toContain("UpdateProcThreadAttribute");
+    expect(runner).toContain("new IntPtr(0x2000D)");
+    expect(runner).toContain("inheritHandles");
+    expect(runner).toContain("false, 0x08080000");
+    expect(runner).toContain("CloseHandle(job)");
+    expect(runner).toContain("--log-file");
+    expect(runner).toContain("--ready-token");
+    expect(runner).toContain("headless runner started");
+    expect(runner).toContain("child exited with code");
     for (const path of [
       "install.ps1",
       "packaging/windows/install-service.ps1",
       "packaging/windows/update-agent.ps1",
     ]) {
       const script = await Bun.file(join(repository, path)).text();
-      const encoding = script.match(
-        /Set-Content -LiteralPath \$Path -Value \$runner -Encoding (\w+) -Force/,
-      )?.[1];
-      expect(encoding).toBe("ASCII");
+      expect(script).toContain("-WindowStyle Hidden");
+      expect(script).toContain("run-agent.ps1");
+      expect(script).not.toContain("shell.Run(command, 0, True)");
+      expect(script).toContain("New-Item -ItemType File -Path $logPath -Force");
+      expect(script).toContain("WorkingDirectory");
     }
+  });
+
+  test("stops only matching executable paths and waits before replacing or deleting", async () => {
+    const helper = await Bun.file(join(repository, "packaging/windows/lifecycle.ps1")).text();
+    const installer = await Bun.file(join(repository, "install.ps1")).text();
+    expect(installer.replaceAll("\r\n", "\n")).toContain(helper.trim().replaceAll("\r\n", "\n"));
+    expect(helper).toContain("$normalizedPaths -contains [IO.Path]::GetFullPath($_.Path)");
+    expect(helper).toContain('-ArgumentList "stop"');
+    expect(helper).toContain("$unrelated.Count -eq 0");
+    expect(helper).toContain("$stopCommand.WaitForExit(70000)");
+    expect(helper).toContain("$process.Kill()");
+    expect(helper).toContain("$process.WaitForExit(30000)");
+    expect(helper).not.toContain("Stop-Process -Name");
+    for (const path of [
+      "packaging/windows/install-service.ps1",
+      "packaging/windows/update-agent.ps1",
+      "packaging/windows/uninstall-agent.ps1",
+    ]) {
+      const script = await Bun.file(join(repository, path)).text();
+      expect(script).toContain('lifecycle.ps1"');
+      expect(script).toContain("Stop-AgentProcesses -Paths");
+    }
+    const uninstaller = await Bun.file(
+      join(repository, "packaging/windows/uninstall-agent.ps1"),
+    ).text();
+    expect(uninstaller.indexOf("Stop-AgentProcesses -Paths")).toBeLessThan(
+      uninstaller.indexOf("Unregister-ScheduledTask"),
+    );
+    expect(uninstaller.lastIndexOf("Stop-AgentProcesses -Paths")).toBeLessThan(
+      uninstaller.indexOf("Remove-Item -LiteralPath $installRoot"),
+    );
   });
 
   test("migrates a legacy task's implicit config path and allows slow startup", async () => {
@@ -499,9 +548,9 @@ describe("one-command Windows installer", () => {
     const installer = await Bun.file(
       join(repository, "packaging/windows/install-service.ps1"),
     ).text();
-    expect(installer).toContain("System32\\wscript.exe");
-    expect(installer).toContain("run-agent.vbs");
-    expect(installer).not.toContain("$powershell");
+    expect(installer).toContain("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(installer).toContain("run-agent.ps1");
+    expect(installer).toContain("-WindowStyle Hidden");
     expect(installer).toContain("-Hidden");
     expect(installer).toContain("agent.log");
     expect(installer).toContain("-ReadyVersion $ReadyVersion");

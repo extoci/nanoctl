@@ -37,7 +37,8 @@ jobs:
           sudo apt-get install --yes \
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config xauth xvfb
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+            nasm pkg-config xauth xvfb
           bunx playwright install --with-deps chromium
       - name: Install Chromium on Windows
         if: runner.os == 'Windows'

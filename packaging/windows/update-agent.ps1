@@ -20,6 +20,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\..\tailnet.ps1"
+. "$PSScriptRoot\lifecycle.ps1"
 $taskName = "nanoctl Agent"
 $resolvedBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -60,7 +61,7 @@ $candidate = "$resolvedBinary.$transactionId.candidate"
 $previous = "$resolvedBinary.$transactionId.previous"
 $failed = "$resolvedBinary.$transactionId.failed"
 $previousTaskXml = "$resolvedBinary.$transactionId.previous-task.xml"
-$runnerPath = Join-Path $installRoot "run-agent.vbs"
+$runnerPath = Join-Path $installRoot "run-agent.ps1"
 $logPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.log"
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
 $lockPath = "$resolvedBinary.update.lock"
@@ -124,51 +125,16 @@ function Assert-TaskOwner {
 function Ensure-HeadlessRunner {
   param([Parameter(Mandatory = $true)][string]$Path)
 
-  $runner = @'
-Option Explicit
-On Error Resume Next
-
-Dim shell, fso, binaryPath, configPath, logPath, readyPath, readyToken, command, exitCode, stream
-Set shell = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-binaryPath = WScript.Arguments(0)
-configPath = WScript.Arguments(1)
-logPath = WScript.Arguments(2)
-readyPath = WScript.Arguments(3)
-readyToken = WScript.Arguments(4)
-Set stream = fso.OpenTextFile(logPath, 8, True)
-stream.WriteLine "headless runner started"
-stream.Close
-If fso.FileExists(readyPath) Then fso.DeleteFile readyPath, True
-command = Chr(34) & binaryPath & Chr(34) & " --config " & Chr(34) & configPath & Chr(34) & _
-  " --log-file " & Chr(34) & logPath & Chr(34) & " --ready-file " & Chr(34) & readyPath & Chr(34) & _
-  " --ready-token " & Chr(34) & readyToken & Chr(34) & " run"
-Err.Clear
-exitCode = shell.Run(command, 0, True)
-If Err.Number <> 0 Then
-  Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "headless runner error " & Err.Description
-  stream.Close
-  exitCode = 1
-Else
-  Set stream = fso.OpenTextFile(logPath, 8, True)
-  stream.WriteLine "headless runner child exited with code " & exitCode
-  stream.Close
-End If
-WScript.Quit exitCode
-'@
-  # Keep the WSH runner ASCII-only; Windows PowerShell 5.1 UTF8 output includes a BOM that can
-  # make wscript.exe reject the script before it can write diagnostics.
-  Set-Content -LiteralPath $Path -Value $runner -Encoding ASCII -Force
+  Copy-Item -LiteralPath "$PSScriptRoot\run-agent.ps1" -Destination $Path -Force
 }
 
 function Set-HeadlessTaskAction {
   Ensure-HeadlessRunner -Path $runnerPath
-  $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-  $arguments = '//B //NoLogo "{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f `
+  $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f `
     $runnerPath, $resolvedBinary, $resolvedConfig, $logPath, $readyPath, $transactionId
   $action = New-ScheduledTaskAction `
-    -Execute $wscript `
+    -Execute $powershell `
     -Argument $arguments `
     -WorkingDirectory $installRoot
   $settings = New-ScheduledTaskSettingsSet `
@@ -195,6 +161,7 @@ function Restore-PreviousTask {
 }
 
 function Stop-AgentTask {
+  Wait-AgentProcessExit
   Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   for ($attempt = 0; $attempt -lt 50; $attempt++) {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -217,24 +184,7 @@ function Get-AgentFailureDetails {
 }
 
 function Wait-AgentProcessExit {
-  $expectedPath = [IO.Path]::GetFullPath($resolvedBinary)
-  for ($attempt = 0; $attempt -lt 600; $attempt++) {
-    $running = @(Get-Process -Name nanoctl -ErrorAction SilentlyContinue | Where-Object {
-        if (-not $_.Path) { return $false }
-        try {
-          [String]::Equals(
-            [IO.Path]::GetFullPath([string]$_.Path),
-            $expectedPath,
-            [StringComparison]::OrdinalIgnoreCase
-          )
-        } catch {
-          return $false
-        }
-      })
-    if ($running.Count -eq 0) { return }
-    Start-Sleep -Milliseconds 100
-  }
-  throw "Timed out while waiting for the previous nanoctl process to exit."
+  Stop-AgentProcesses -Paths @($resolvedBinary)
 }
 
 function Get-ReadyAgentProcess {
