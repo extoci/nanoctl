@@ -118,6 +118,30 @@ async function socket() {
   return value;
 }
 
+test("clipboard requires both available remote input and a control grant", async () => {
+  for (const [remoteInput, mayControl] of [
+    [false, true],
+    [true, false],
+    [false, false],
+    [true, true],
+  ]) {
+    const state = fixture();
+    const ws = await socket();
+    ws.receive({
+      type: "hello",
+      sessionId: "one",
+      host: {
+        ...info,
+        remoteInput,
+        viewer: { ...info.viewer, mayControl },
+        capabilities: { ...info.capabilities, clipboard: true },
+      },
+    });
+    expect(state.controllers[0]!.options.clipboardEnabled).toBe(!!remoteInput && !!mayControl);
+    state.session.dispose();
+  }
+});
+
 test("hello creates a view-only controller with no ICE servers and streams host signals directly", async () => {
   const state = fixture("https:");
   const ws = await socket();

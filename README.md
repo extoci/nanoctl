@@ -2,6 +2,13 @@
 
 Fast browser-based remote desktop, served by your own machine over Tailscale.
 
+## Tailnet host picker
+
+The viewer header lists other online nanoctl hosts on your tailnet so you can jump between machines.
+Discovery probes each online Tailscale peer on the configured agent port (400ms timeout), caches
+results for 15 seconds, and refreshes the picker every 30 seconds. Each destination still applies
+its own authentication policy. Set `tailnet.discover_peers = false` to disable discovery.
+
 **3.0 alpha is tailnet-native.** Each Rust agent embeds its static browser viewer.
 There is no hosted nanoctl control plane, account, enrollment code, device credential,
 STUN or TURN service. Tailscale supplies identity, reachability and WireGuard encryption;
