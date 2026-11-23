@@ -14,7 +14,7 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, UdpSocket},
-    process::{Child, Command},
+    process::{Child, ChildStdin, Command},
 };
 
 use crate::{
@@ -28,17 +28,28 @@ pub const PEER_HEADER: &str = "x-nanoctl-peer";
 
 pub struct Helper {
     child: Child,
+    stdin: ChildStdin,
     _executable: tempfile::TempDir,
 }
 
 impl Helper {
+    fn new(mut child: Child, executable: tempfile::TempDir) -> Result<Self> {
+        // Child::wait closes its own stdin; the helper treats EOF as a shutdown signal.
+        let stdin = child.stdin.take().context("no helper stdin")?;
+        Ok(Self {
+            child,
+            stdin,
+            _executable: executable,
+        })
+    }
+
     pub async fn wait(&mut self) -> Result<()> {
         let status = self.child.wait().await?;
         bail!("embedded Tailscale exited unexpectedly ({status})");
     }
 
     pub async fn stop(mut self) {
-        drop(self.child.stdin.take());
+        drop(self.stdin);
         if tokio::time::timeout(Duration::from_secs(3), self.child.wait())
             .await
             .is_err()
@@ -158,12 +169,13 @@ pub async fn start(config: &TailnetConfig) -> Result<(Arc<EmbeddedTailnet>, TcpL
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(3))
         .build()?;
-    let mut child = command
+    let child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("cannot start the embedded Tailscale helper")?;
+    let mut helper = Helper::new(child, executable)?;
     let init = json!({
         "StateDir": state_dir,
         "Port": config.port,
@@ -172,9 +184,11 @@ pub async fn start(config: &TailnetConfig) -> Result<(Arc<EmbeddedTailnet>, TcpL
         "UDP": udp.local_addr()?.port(),
         "Token": token,
     });
-    let stdin = child.stdin.as_mut().context("no helper stdin")?;
-    stdin.write_all(format!("{init}\n").as_bytes()).await?;
-    let mut stdout = BufReader::new(child.stdout.take().context("no helper stdout")?);
+    helper
+        .stdin
+        .write_all(format!("{init}\n").as_bytes())
+        .await?;
+    let mut stdout = BufReader::new(helper.child.stdout.take().context("no helper stdout")?);
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut line))
         .await
@@ -194,14 +208,7 @@ pub async fn start(config: &TailnetConfig) -> Result<(Arc<EmbeddedTailnet>, TcpL
         #[cfg(not(feature = "rtc"))]
         _udp: udp,
     });
-    Ok((
-        net,
-        web,
-        Helper {
-            child,
-            _executable: executable,
-        },
-    ))
+    Ok((net, web, helper))
 }
 
 impl EmbeddedTailnet {
@@ -277,6 +284,54 @@ pub mod ice;
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    #[ignore = "subprocess fixture for the helper lifetime test"]
+    fn wait_for_lifetime_pipe_eof() {
+        println!("lifetime pipe ready");
+        std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
+        println!("lifetime pipe closed");
+    }
+
+    #[tokio::test]
+    async fn monitoring_the_helper_keeps_its_lifetime_pipe_open_until_stop() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "embedded::tests::wait_for_lifetime_pipe_eof",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut helper = Helper::new(child, tempfile::tempdir().unwrap()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stdout
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .ends_with("lifetime pipe ready")
+            {}
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), helper.wait())
+                .await
+                .is_err(),
+            "monitoring must not trigger EOF in the helper"
+        );
+        helper.stop().await;
+        assert_eq!(
+            stdout.next_line().await.unwrap().as_deref(),
+            Some("lifetime pipe closed")
+        );
+    }
 
     #[tokio::test]
     async fn bundled_helper_runs_without_an_installed_tailscale() {
