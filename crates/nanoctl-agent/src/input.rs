@@ -361,7 +361,7 @@ impl InputController {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            self.enigo.move_mouse(x, y, Coordinate::Abs)
+            Ok(self.enigo.move_mouse(x, y, Coordinate::Abs)?)
         }
     }
 
