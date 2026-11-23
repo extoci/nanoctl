@@ -43,6 +43,18 @@ Key findings:
   ~56fps fed, transit ~3ms. Before the fix the same stress produced
   ~4-5 KF/s (lost IDR parts -> resync loop).
 
+## Resources (same VM, 60s samples, 1600x1200)
+| process | CPU (% of 8 cores) | RSS avg |
+|---|---|---|
+| nanoctl agent (server) | 20.2-21.8 | ~99 MB (peak 109) |
+| Sunshine (server) | 21.3 | ~112 MB |
+| Moonlight (client) | 43.0 | ~147 MB |
+| nanoctl viewer (Chrome, 10 procs) | — | ~400 MB |
+
+Agent == Sunshine in CPU/RSS. Client side: Chrome viewer is ~2.7x
+Moonlight's RSS (browser overhead — a Tauri/egui client would erase it);
+Moonlight's native client burns 43% CPU vs agent's ~21%.
+
 ## Server per-frame costs (agent.log pipeline statistics, /frames_encoded)
 - backend_ns (OpenH264): was ~25ms -> ~10ms (max_slice_len 8000 +
   num_threads 4, then SM_FIXEDSLCNUM_SLICE uiSliceNum=4 forced via
