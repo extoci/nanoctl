@@ -3,13 +3,18 @@ import { createRoot } from "react-dom/client";
 import type { HostInfo } from "@nanoctl/protocol";
 import type { RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
+import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
+import { SoftKeyboard } from "./soft-keyboard";
+import { setSoundEnabled } from "./lib/sound";
 import "./style.css";
+import { HostPicker } from "./lib/host-picker";
 
 const initial: RemoteSessionSnapshot = {
   phase: "negotiating",
   reconnectAttempt: 0,
   iceGeneration: 0,
   inputEnabled: false,
+  gamepadEnabled: false,
   firstFrameReceived: false,
   metrics: null,
 };
@@ -17,6 +22,8 @@ type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => vo
 
 function Viewer() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [soundEnabled, setSound] = useState(false);
   const transport = useRef<SocketSession | null>(null);
   const [info, setInfo] = useState<HostInfo | null>(null);
   const [snapshot, setSnapshot] = useState(initial);
@@ -27,6 +34,63 @@ function Viewer() {
   const [fullscreen, setFullscreen] = useState(false);
   const [keyboardLocked, setKeyboardLocked] = useState(false);
   const [notice, setNotice] = useState("");
+  const [touchMode, setTouchMode] = useState<TouchMode>(() => {
+    try {
+      return localStorage.getItem("touch-mode") === "direct" ? "direct" : "trackpad";
+    } catch {
+      return "trackpad";
+    }
+  });
+  const cursorRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      localStorage.setItem("touch-mode", touchMode);
+    } catch {
+      /* Storage may be unavailable. */
+    }
+    let cursor = { x: 0.5, y: 0.5 };
+    const paintCursor = () => {
+      const geometry = videoGeometry(
+        video.getBoundingClientRect(),
+        video.videoWidth,
+        video.videoHeight,
+      );
+      const stage = video.parentElement?.getBoundingClientRect();
+      if (!geometry || !stage || !cursorRef.current) return;
+      cursorRef.current.style.left = `${geometry.left - stage.left + cursor.x * geometry.width}px`;
+      cursorRef.current.style.top = `${geometry.top - stage.top + cursor.y * geometry.height}px`;
+    };
+    const gestures = new TouchGestures({
+      mode: touchMode,
+      geometry: () =>
+        videoGeometry(video.getBoundingClientRect(), video.videoWidth, video.videoHeight),
+      send: (message) => transport.current?.controller?.sendControl(message),
+      onCursor: (position) => {
+        cursor = position;
+        paintCursor();
+      },
+      onZoom: (zoom) => {
+        video.style.transform = `translate(${zoom.offsetX}px, ${zoom.offsetY}px) scale(${zoom.scale})`;
+        paintCursor();
+      },
+    });
+    const detach = attachTouchInput(video, gestures);
+    const resize = new ResizeObserver(paintCursor);
+    resize.observe(video);
+    video.addEventListener("loadeddata", paintCursor);
+    window.addEventListener("resize", paintCursor);
+    paintCursor();
+    return () => {
+      detach();
+      resize.disconnect();
+      video.removeEventListener("loadeddata", paintCursor);
+      window.removeEventListener("resize", paintCursor);
+      video.style.transform = "";
+    };
+  }, [touchMode, snapshot.inputEnabled]);
 
   useEffect(() => {
     if (info?.hostName) document.title = `${info.hostName} · nanoctl`;
@@ -41,6 +105,7 @@ function Viewer() {
     }
     const session = new SocketSession({
       video: videoRef.current,
+      audio: audioRef.current ?? undefined,
       onInfo: (host) => {
         setInfo(host);
         setSelectedDisplay((previous) =>
@@ -138,10 +203,13 @@ function Viewer() {
           n<span>nanoctl</span>
         </div>
         <div className="host">
-          <strong>{info?.hostName || "Remote desktop"}</strong>
+          <HostPicker name={info?.hostName || "Remote desktop"} />
           <span>
             {info?.platform ?? "Tailnet connection"} <i>·</i>{" "}
             {info?.remoteInput ? "Control" : "View only"}
+            {info?.capabilities.clipboard && info.remoteInput && info.viewer.mayControl
+              ? " · Clipboard sync on"
+              : ""}
           </span>
         </div>
         <div className="identity">
@@ -150,6 +218,7 @@ function Viewer() {
         </div>
       </header>
       <section className="stage" aria-label="Remote desktop">
+        <audio ref={audioRef} autoPlay muted={!soundEnabled} />
         <video
           ref={videoRef}
           autoPlay
@@ -158,6 +227,9 @@ function Viewer() {
           tabIndex={0}
           aria-label="Remote desktop video"
         />
+        {touchMode === "trackpad" && live && (
+          <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
+        )}
         {!live && (
           <div className="overlay" role={terminal ? "alert" : "status"}>
             <div className="status-card">
@@ -220,6 +292,25 @@ function Viewer() {
           </span>
         </div>
         <div className="actions">
+          <SoftKeyboard
+            enabled={snapshot.inputEnabled && status === "online"}
+            platform={info?.platform}
+            send={(message) => transport.current?.controller?.sendControl(message)}
+          />
+          <button onClick={() => setTouchMode(touchMode === "trackpad" ? "direct" : "trackpad")}>
+            {touchMode === "trackpad" ? "Trackpad" : "Direct"}
+          </button>
+          {info?.capabilities.systemAudio && (
+            <button
+              aria-pressed={soundEnabled}
+              onClick={async () => {
+                if (audioRef.current)
+                  setSound(await setSoundEnabled(audioRef.current, !soundEnabled));
+              }}
+            >
+              {soundEnabled ? "Mute sound" : "Enable sound"}
+            </button>
+          )}
           <label className="display-picker">
             <span>Display</span>
             <select
@@ -250,6 +341,31 @@ function Viewer() {
           >
             {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
           </button>
+          {info?.remoteInput && (info.platform === "windows" || info.capabilities.gamepad) && (
+            <button
+              aria-pressed={snapshot.gamepadEnabled}
+              disabled={
+                !info.capabilities.gamepad ||
+                typeof navigator.getGamepads !== "function" ||
+                !snapshot.inputEnabled ||
+                !live
+              }
+              title={
+                !info.capabilities.gamepad
+                  ? "Install ViGEmBus on the Windows host and restart nanoctl"
+                  : typeof navigator.getGamepads !== "function"
+                    ? "Use a browser with Gamepad API support over HTTPS"
+                    : "Pair a controller with this device, then press a controller button"
+              }
+              onClick={() =>
+                transport.current?.controller?.setGamepadEnabled(!snapshot.gamepadEnabled)
+              }
+            >
+              {!info.capabilities.gamepad
+                ? "Gamepad unavailable"
+                : `Gamepad ${snapshot.gamepadEnabled ? "on" : "off"}`}
+            </button>
+          )}
           <button aria-pressed={showStats} onClick={() => setShowStats(!showStats)}>
             Stats
           </button>

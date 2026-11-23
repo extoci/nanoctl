@@ -394,6 +394,34 @@ enum OutgoingPayload {
     },
 }
 
+#[cfg(feature = "media")]
+async fn forward_clipboard(
+    backend: crate::clipboard::Backend,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    output: Arc<RTCDataChannel>,
+    revoked: Arc<AtomicBool>,
+) {
+    let mut changes = backend.changes.clone();
+    changes.borrow_and_update();
+    if !revoked.load(Ordering::Acquire)
+        && let Some(message) = backend.current()
+    {
+        let _ = output.send_text(message).await;
+    }
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            result = changes.changed() => {
+                if result.is_err() || revoked.load(Ordering::Acquire) { break; }
+                let message = changes.borrow_and_update().clone();
+                if let Some(message) = message {
+                    let _ = output.send_text(message).await;
+                }
+            }
+        }
+    }
+}
+
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
@@ -404,6 +432,8 @@ impl HostPeer {
         ice_transport_policy: RTCIceTransportPolicy,
         host_epoch: String,
         allow_remote_input: bool,
+        allow_clipboard: bool,
+        allow_audio: bool,
     ) -> Result<Self> {
         Self::answer_with_publisher(
             SignalPublisher::websocket(sender),
@@ -413,10 +443,13 @@ impl HostPeer {
             ice_transport_policy,
             host_epoch,
             allow_remote_input,
+            allow_clipboard,
+            allow_audio,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn answer_with_publisher(
         publisher: SignalPublisher,
         session_id: String,
@@ -425,6 +458,8 @@ impl HostPeer {
         ice_transport_policy: RTCIceTransportPolicy,
         host_epoch: String,
         allow_remote_input: bool,
+        allow_clipboard: bool,
+        allow_audio: bool,
     ) -> Result<Self> {
         let (offer, initial_generation, controller_epoch) =
             parse_offer(serialized_offer, &session_id)?;
@@ -460,7 +495,7 @@ impl HostPeer {
             .with_interceptor_registry(registry)
             .build();
         #[cfg(not(feature = "media"))]
-        let _ = allow_remote_input;
+        let _ = (allow_remote_input, allow_clipboard, allow_audio);
         let peer = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
@@ -537,12 +572,46 @@ impl HostPeer {
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
+            let clipboard = if allow_clipboard {
+                crate::clipboard::backend()
+            } else {
+                None
+            };
+            let clipboard_shutdown = input_shutdown.subscribe();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let input_revoked = input_revoked_for_channel.clone();
+                if channel.label() == "nanoctl.clipboard.v1" {
+                    if let Some(backend) = clipboard.clone() {
+                        let initial_backend = backend.clone();
+                        let shutdown = clipboard_shutdown.clone();
+                        let output = channel.clone();
+                        let revoked = input_revoked.clone();
+                        channel.on_open(Box::new(move || {
+                            tokio::spawn(forward_clipboard(
+                                initial_backend.clone(),
+                                shutdown.clone(),
+                                output.clone(),
+                                revoked.clone(),
+                            ));
+                            Box::pin(async {})
+                        }));
+                        channel.on_message(Box::new(move |message: DataChannelMessage| {
+                            if message.is_string
+                                && !input_revoked.load(Ordering::Acquire)
+                                && let Some(text) = crate::clipboard::parse(&message.data)
+                            {
+                                backend.set(text);
+                            }
+                            Box::pin(async {})
+                        }));
+                    }
+                    return Box::pin(async {});
+                }
                 if input.is_none() {
                     return Box::pin(async {});
                 }
+                let reliable = channel.label() == "nanoctl.control.v1";
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
                     "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
@@ -575,6 +644,7 @@ impl HostPeer {
                                     && let Ok(mut input) = input.lock()
                                 {
                                     input.release_all();
+                                    input.revoke_gamepads();
                                 }
                             });
                         }
@@ -587,10 +657,42 @@ impl HostPeer {
                             && let Ok(mut input) = input.lock()
                         {
                             input.release_all();
+                            if reliable {
+                                input.revoke_gamepads();
+                            }
                         }
                     })
                 }));
                 Box::pin(async {})
+            }));
+        }
+        #[cfg(feature = "media")]
+        if allow_audio && crate::audio::available() {
+            let audio = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".into(),
+                    ..Default::default()
+                },
+                "system-audio".into(),
+                "nanoctl-audio".into(),
+            ));
+            let sender = peer.add_track(audio.clone()).await?;
+            input_tasks.push(tokio::spawn(crate::audio::run(
+                audio,
+                peer.clone(),
+                input_shutdown.subscribe(),
+            )));
+            let mut shutdown = input_shutdown.subscribe();
+            input_tasks.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        result = sender.read_rtcp() => { if result.is_err() { break; } }
+                    }
+                }
             }));
         }
         let video = Arc::new(TrackLocalStaticSample::new(
@@ -1166,6 +1268,11 @@ fn spawn_input_worker(
                 }
             }
         }
+        if matches!(lane, crate::input::InputLane::Reliable)
+            && let Ok(mut input) = input.lock()
+        {
+            input.revoke_gamepads();
+        }
     })
 }
 
@@ -1580,6 +1687,8 @@ mod tests {
             RTCIceTransportPolicy::All,
             "host-test".to_owned(),
             false,
+            false,
+            false,
         )
         .await;
 
@@ -1645,6 +1754,8 @@ mod tests {
             Vec::new(),
             RTCIceTransportPolicy::All,
             "host-test".to_owned(),
+            false,
+            false,
             false,
         )
         .await

@@ -116,6 +116,15 @@ Controller decisions and congestion attempts log at info with their reason
 flag distinguishing emitted decisions from changes below output hysteresis.
 Raw REMB/NACK events log at info; Receiver Report loss and timing log at debug.
 Targets, FPS and sizes are absolute gauges, not measurement-window deltas.
+Adaptive bitrate updates dispatch to the active encoder, including hardware:
+VA-API tunes its rate control, VideoToolbox updates AverageBitRate, Media
+Foundation updates the codec property (or recreates the transform), and NVENC
+reconfigures (or reopens) its session. Auto mode retains the latest target when
+falling back to another native backend or OpenH264. OpenH264 updates its bitrate
+in place without forcing an IDR. All backends borrow the captured RGBA pixels.
+Adaptive FPS controls the shared damage pacer and hence hardware input cadence;
+codec nominal FPS/timebases remain at the configured maximum, not dynamically
+retuned. Resolution changes still recreate native resources as needed.
 Time to target >=4000 kbps can be read from `target_series` at one-second
 resolution, relative to second 10 (idle-motion) or 20 (recovery). Idle never
 needs to fill the link; its keepalive gaps are intentional.

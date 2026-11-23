@@ -281,6 +281,8 @@ pub async fn run(seconds: u64) -> Result<Value> {
         RTCIceTransportPolicy::All,
         "bench-host".into(),
         false,
+        false,
+        false,
     )
     .await?;
     timeout(Duration::from_secs(20), async {

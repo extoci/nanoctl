@@ -28,6 +28,7 @@ pub struct QualityConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TailnetConfig {
+    pub discover_peers: bool,
     pub port: u16,
     pub allow_users: Vec<String>,
     pub allow_tags: Vec<String>,
@@ -98,6 +99,7 @@ impl Default for QualityConfig {
 impl Default for TailnetConfig {
     fn default() -> Self {
         Self {
+            discover_peers: true,
             port: 7337,
             allow_users: Vec::new(),
             allow_tags: Vec::new(),
@@ -111,8 +113,8 @@ impl Default for TailnetConfig {
 impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
-            system_audio: false,
-            clipboard: false,
+            system_audio: true,
+            clipboard: true,
             remote_input: true,
         }
     }
@@ -160,9 +162,6 @@ impl AgentConfig {
         {
             bail!("quality resolution limits are outside the supported range");
         }
-        if self.features.system_audio || self.features.clipboard {
-            bail!("system audio and clipboard are reserved and unavailable in protocol v2");
-        }
         if !matches!(
             self.quality.codec,
             CodecPreference::Auto | CodecPreference::H264
@@ -195,16 +194,20 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "device_id = 'old'\ncontrol_plane_url = 'https://old.example'\n[network]\nheartbeat_seconds = 30\n").unwrap();
         assert_eq!(AgentConfig::load(&path).unwrap().tailnet.port, 7337);
+        assert!(AgentConfig::load(&path).unwrap().tailnet.discover_peers);
+        fs::write(&path, "[tailnet]\ndiscover_peers = false\n").unwrap();
+        assert!(!AgentConfig::load(&path).unwrap().tailnet.discover_peers);
     }
 
     #[test]
-    fn rejects_reserved_v1_features() {
+    fn accepts_clipboard_and_system_audio() {
         let mut config = AgentConfig::default();
         config.features.clipboard = true;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
         config.features.clipboard = false;
         config.features.system_audio = true;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
+        assert!(AgentConfig::default().features.system_audio);
     }
 
     #[test]

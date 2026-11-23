@@ -1,4 +1,348 @@
-# Current results: source-presentation artifact fixed; QP16 retained
+# Follow-up: gradient attribution and validated QP14
+
+2026-11-23 UTC. **Retained: QP14–51**, rounded conversion and
+`CameraVideoRealTime`; adaptive congestion control is unchanged. No product
+latency change or new source-renderer change is retained. The gradient mode
+is localized before capture, but neither source mitigation tested here reliably
+removes it. The previous three-product campaign below used QP16, not this new
+floor: **there is no fresh three-product campaign on QP14**.
+
+## Step 1: gradient source versus damage, encoding, packets and Chrome
+
+Six fresh diagnostic runs used the immutable QP16 release from the preceding
+campaign, the same opaque/desynchronized source canvas, agent per-frame traces,
+independent source/client XShm marker readers, Chrome rVFC metadata and loopback
+UDP captures. Instrumentation adds overhead: these approximately 24/40-ms runs
+localize the unprofiled approximately 20/36-ms modes, not their absolute headline
+latency. Run video p50s were **39.400, 40.442, 40.176, 36.311, 23.632, 24.471 ms**.
+
+Representative fast run 5 versus slow run 1, per-segment p50 milliseconds:
+
+| Segment                                            |       Fast |       Slow |
+| -------------------------------------------------- | ---------: | ---------: |
+| Source draw → independently observed source pixels |      5.442 |     18.086 |
+| Source draw → damage dequeued                      |      3.749 |     17.218 |
+| Damage → capture start                             |       .042 |       .040 |
+| Capture start → end                                |      1.433 |      1.561 |
+| Capture end → encode start                         |       .184 |       .184 |
+| Encode start → end                                 |      6.166 |      6.302 |
+| Encode end → sample write start                    |       .210 |       .158 |
+| Sample write start → end                           |       .183 |       .190 |
+| Sample write end → Chrome receiveTime              |       .296 |       .345 |
+| Encode end → first RTP packet                      |       .094 |       .068 |
+| First → last RTP packet of a frame                 |       .108 |       .112 |
+| Last RTP packet → Chrome receiveTime               |       .486 |       .547 |
+| Chrome reported decode duration                    |      1.400 |      1.400 |
+| receiveTime → presentationTime                     |      1.800 |      1.800 |
+| presentationTime → expectedDisplayTime             |     16.700 |      2.500 |
+| presentationTime → detector observation            |      9.208 |     10.854 |
+| **Run source draw → detector video p50**           | **23.632** | **39.400** |
+
+There are 1,088/1,068 joined fast/slow frames. **13.47 ms of the 15.77-ms
+end-to-end difference is already present at damage dequeue**, while independent
+source pixels shift 12.64 ms. This checks against delayed agent damage handling
+as the sole explanation. Capture, encode, packet transit and receive→presentation
+do not carry a refresh-sized difference. Segment medians need not add to the
+end-to-end median. Damage timestamps are dequeue observations, not compositor
+completion events. `expectedDisplayTime` is Chrome's prediction, not observed
+Xvfb scanout; it must not be interpreted as a measured extra frame queue.
+
+The reachable path is source draw timestamps in `run.ts`, damage/capture and
+encoded-marker traces in `media.rs`/`media_trace.rs`, then rVFC marker IDs and
+independent detector observations. **The extra delay is localized to source
+canvas-to-Xvfb presentation, not proved to be a particular Chromium queue or
+vsync implementation.** CPU/scheduling interactions on this shared VM are not
+isolated. No product-side pacing or viewer fix is justified by these traces.
+
+### Pacer, RTP bursts and decode counterchecks
+
+`DamagePacer::interval` is 8.333 ms at 60 FPS. `on_frame` uses it as a **minimum
+interval between encode admissions**, not a finish-by deadline that adds a
+refresh whenever encoding exceeds it. Median encode time is 6.166/6.302 ms;
+p95 is 6.717/9.404 ms. Across the complete fast/slow traces, 2.29%/7.60% of
+encodes exceed 8.333 ms and .36%/1.46% exceed 16.667 ms. Rare overruns remain,
+but cannot explain the dominant delay already observed before capture.
+
+Both runs have **13 RTP packets/frame at p50, 14 at p95**. Burst p95 is
+.148/.178 ms; last-packet→receiveTime p95 is .753/.852 ms. Reported decode p95
+is 1.5/2.2 ms. Packet timestamps include IPv4 and IPv6 loopback RTP grouped by
+SSRC/timestamp and correlated with Chrome metadata; cross-clock alignment uses
+agent log timestamps. These are diagnostic software timestamps, not hardware
+or optical measurements. **The sender does burst packets**; this loopback result
+does not establish acceptable queueing on a bandwidth-limited tailnet. No
+transport pacing or congestion-response change was made.
+
+### Source mitigations: rejected after paired validation
+
+Adding `willReadFrequently: true` to the source context failed its diagnostic
+pilot: video p50s 24.984, 24.923, 30.955, 41.217 ms. A source-only Chromium
+`--disable-gpu-vsync` pilot looked promising (25.270, 23.867, 23.878, 26.414 ms),
+but the full paired test disproved its reliability. **Both prototypes were
+reverted**; the default remains `{ alpha: false, desynchronized: true }` with
+the existing browser arguments. No timestamp origin or workload was changed
+to hide the source delay.
+
+Strict fresh-stack CT/TC alternating pairs, identical QP16 binary in both arms;
+combined moving-quality/input phases, no instrumentation, builds or full-frame
+quality captures during performance measurement. Five gradient pairs and six
+drag pairs; medians of all per-run metrics:
+
+| Workload | Source arm        | Input p50 / p95 ms | Video p50 / p95 ms |    FPS |  CPU % |  Mbps |
+| -------- | ----------------- | -----------------: | -----------------: | -----: | -----: | ----: |
+| Gradient | Control           |    36.035 / 52.389 |    20.505 / 38.135 | 59.724 | 54.614 | 7.136 |
+| Gradient | Disable GPU vsync |    40.307 / 52.458 |    33.351 / 37.422 | 59.733 | 51.249 | 7.124 |
+| Drag     | Control           |    30.204 / 40.439 |    19.058 / 27.966 | 59.969 | 32.301 | 3.321 |
+| Drag     | Disable GPU vsync |    28.470 / 36.583 |    18.958 / 23.229 | 59.951 | 32.190 | 3.322 |
+
+Gradient video p50s, control: **20.168, 34.362, 34.300, 20.505, 20.320**;
+candidate: **19.396, 35.269, 23.540, 33.824, 33.351**. Gradient input/video
+arm-median deltas **+4.272/+12.846 ms** reject the mitigation. A favorable
+instrumented pilot was not enough evidence to retain it.
+
+**21/22 fully valid.** Drag control run 2 matched 119/120 inputs (response 29
+unobserved; source received all 120). It remains flagged invalid and included
+in the six-run medians; no finite timeout was imputed. The runner initially
+stopped, then preserved completed runs and extended drag to six balanced pairs,
+giving at least five complete runs per arm without dropping the incomplete run.
+Gradient matched 600/600 inputs per arm; drag control/candidate 719/720 and
+720/720. All 22 launch inventories passed. Mean/max whole-run VM steal was
+1.35%/33% gradient, 1.02%/46% drag; no resource outliers were removed.
+
+## Step 2: QP14 versus the current QP16 control — retained
+
+Five fresh alternating pairs **each** on text and drag, using the unchanged
+source default after reverting both prototypes. **20/20 valid**, all 2,400/2,400
+inputs observed and all isolation inventories passed. No profiling, extra source
+readers, builds or quality-frame analysis during performance phases. The only
+encoder difference is minimum QP 16→14; maximum remains 51, including in the
+effective-parameter regression for all three latency modes. Rate-control mode,
+bitrate feedback, adaptive controller, encoder usage and pacing are unchanged.
+
+| Workload |          Min QP |  PSNR Y dB |  Mbps | Input p50 / p95 ms | Video p50 / p95 ms |  CPU % |
+| -------- | --------------: | ---------: | ----: | -----------------: | -----------------: | -----: |
+| Text     |      16 control |     50.030 | 2.149 |    28.354 / 36.373 |    18.666 / 20.921 | 31.113 |
+| Text     | **14 retained** | **51.213** | 2.249 |    28.447 / 36.391 |    18.844 / 21.239 | 30.526 |
+| Drag     |      16 control |     49.366 | 3.317 |    32.029 / 40.232 |    19.056 / 24.051 | 37.549 |
+| Drag     | **14 retained** | **50.484** | 3.854 |    31.946 / 39.563 |    19.048 / 22.968 | 35.041 |
+
+| Workload | PSNR gain dB | Input p50 Δ ms | Video p50 Δ ms | CPU Δ points | Gate result |
+| -------- | -----------: | -------------: | -------------: | -----------: | ----------- |
+| Text     |       +1.183 |          +.093 |          +.178 |        −.587 | Pass        |
+| Drag     |       +1.119 |          −.084 |          −.008 |       −2.509 | Pass        |
+
+Both arm-median latency deltas are ≤+2 ms, CPU is ≤control+5 points (and below
+51%), and drag is ≤8 Mbps. Median paired deltas also pass. Every individual
+pair's positive input/video delta is below +.34 ms. Lower measured CPU is not
+claimed as an encoder optimization: whole-run VM steal mean/max was .47%/25%
+text and 1.25%/30% drag. These are shared-VM measurements, not confidence bounds.
+
+Retained executable SHA256:
+`2d368416c810e7b0dd238208a04f9ebb786e1f6985aa484640730aa95023866e`.
+QP14 was **not** benchmarked on gradient or in a new three-product campaign.
+Against the previous screen-relay references (text 52.202, drag 52.397 dB), the
+new scores remain approximately **.989/1.913 dB lower**. Those references are
+not contemporaneous paired competitors, so this is a target comparison, not a
+freshly measured head-to-head gap. The every-axis goal remains unmet.
+
+### Why screen-relay differs
+
+Inspected the **installed, unmodified 0.1.2** engine source and tag
+[`v0.1.2`](https://github.com/vercel-labs/screen-relay/tree/0a0a0a9c7e3ddee0b035e3ecd659e86fa7d57d21).
+Installed `src/engine/core/capture.cpp` hashes identically to that tag
+(`1196bc7d85fec0bbba52fdda1ceb14ab6c6367607d2a256a9ea3482be22e0f5d`).
+The installed engine hashes identically to the benchmark runtime snapshot
+(`87487a836556e11efaa17b97556eb1447954bf30f22aa3f5d00521da01aad140`).
+The last campaign's actual engine log reports **Constrained Baseline, level
+3.2, 4:2:0, 8-bit**. This rules out a 4:4:4/high-profile explanation.
+
+`Resources::openEncoder` in `src/engine/core/capture.cpp` unconditionally selects
+**libx264**, preset **ultrafast**, tune **zerolatency**, **CRF 10**, **NV12
+(4:2:0)**, no B frames, no lookahead and no periodic IDRs. Scene-cut IDRs are
+disabled; session/recovery forces IDR. It signals limited-range BT.709, unlike
+nanoctl's correctly signaled limited BT.601 conversion. Changed macroblocks are
+passed as `mb_info`; unchanged blocks can avoid redundant work. Its 150-ms idle
+refinement path is not an explanation for these continuously moving workloads.
+
+CRF 10 is a quality target, **not equivalent to fixed QP10 or minimum QP10**.
+Motion uses VBV max rate from the adaptive flow controller, with four frame
+budgets of buffer; keyframes/refinement use eight. CLI defaults start at 8 Mbps
+with a 1–40-Mbps range. It is not unconstrained CRF, but spends more bandwidth:
+the earlier screen-relay text/drag payloads were 3.362/7.528 Mbps, versus QP14's
+2.249/3.854 Mbps here. CRF policy, encoder decisions and different conversion
+rounding are not individually ablated; no measured percentage of the remaining
+quality difference is assigned to one setting.
+
+### Cheap lower-floor probes: not retained
+
+Two additional immutable builds changed only the minimum QP to 10 or 6, leaving
+maximum 51 and adaptive control intact. Each got **one fresh paired text run and
+one fresh paired drag run** against QP14, reversing order between workloads.
+All eight runs were valid (960/960 inputs). These are pilots, **not five-pair
+gate validations**, and neither lower floor is retained:
+
+| Prototype | Workload | PSNR Y dB |  Mbps | Input p50 Δ ms | Video p50 Δ ms | CPU Δ points |
+| --------- | -------- | --------: | ----: | -------------: | -------------: | -----------: |
+| QP10      | Text     |    52.906 | 2.527 |         +3.677 |          −.039 |       −1.118 |
+| QP10      | Drag     |    51.361 | 4.697 |         −4.010 |          −.239 |       −1.691 |
+| QP6       | Text     |    53.134 | 2.503 |         +3.642 |          +.163 |       +2.880 |
+| QP6       | Drag     |    51.332 | 4.603 |         +2.714 |          +.097 |       +5.487 |
+
+QP10 buys +1.543/+.915 dB over its paired QP14 text/drag controls for
++.277/+.840 Mbps; QP6 buys +1.740/+.577 dB for +.263/+.789 Mbps. Text exceeds
+the earlier screen-relay PSNR reference, **but drag still trails by about
+1.04/1.06 dB**. These probes do not establish a gap-closing drag configuration.
+QP10's text input delta and QP6's input/drag CPU deltas exceed the limits in
+their single pairs. QP6 also loses .83/.73 FPS; shared-VM scheduling and content
+sampling are not isolated, so these are observations, not proof of an intrinsic
+QP-induced latency penalty or quality ceiling. No further floor was tried.
+
+The measured gap-closing reference is screen-relay's **whole x264 CRF10 + VBV
+pipeline**, not 4:4:4 or a higher H.264 profile. Mirroring that quality policy
+would require an x264 backend or a more detailed OpenH264 rate-control,
+deblocking and conversion ablation; matching only the numeric QP is insufficient.
+The reference spends about **49% more text and 95% more drag payload bandwidth**
+than validated QP14 here (3.362/7.528 versus 2.249/3.854 Mbps), already close to
+the 8-Mbps drag gate. Native x264 CPU, latency, library weight and exact quality
+are **unmeasured**, not assumed equal to the full screen-relay product. A new
+backend also needs cross-platform packaging and x264 GPL/commercial-licensing
+review. That is not a cheap prototype, so none was added; no guaranteed
+gap-closing nanoctl configuration is claimed. **QP14 is the only retained,
+fully validated change from this follow-up.**
+
+Artifacts: `/home/ubuntu/bench-results/gradient-fidelity/`, including diagnostic
+`gradient-trace-v2-control-*`, rejected `gradient-{software,vsync}-trace-*`,
+`gradient-paired-*`, retained `fidelity-paired-*`, all inventories, source/client
+logs, vmstat and matched images; `fidelity-prototype-*`/`fidelity-prototype6-*`
+and `prototype{,6}-summary.json` preserve both lower-floor pilots.
+`attribution-summary.json` and
+`final-summary.json` preserve stage distributions, run vectors, validity and
+paired/arm-median deltas. Drivers and analysis live under
+`/home/ubuntu/bench-candidates/gradient-*`. These remain 720p software H.264,
+loopback, captured-pixel and matched-ROI luma measurements, not optical latency,
+tailnet capacity, chroma quality or matched-bitrate quality comparisons.
+Native-pixel QP14/QP16 text client crops for `fidelity-paired-*-text-run-3` were
+inspected; no optical or impaired-link check was performed.
+
+# Previous head-to-head: QP16, desynchronized source, url 2.5.9
+
+2026-11-23 UTC, 01:38–02:18. **This single campaign supersedes every older
+three-product comparison below, but predates the QP14 follow-up above.** This
+campaign's release includes QP16–51, rounded
+conversion, `CameraVideoRealTime`, unchanged congestion control, and the source
+canvas `{ alpha: false, desynchronized: true }` for **all three products**.
+The security-only lockfile update is commit `1a32505`: `url` 2.5.9 requires
+`form_urlencoded` 1.2.3; no other dependencies changed. Its CI passed all ten
+required checks before this campaign started. Measured release SHA256:
+`40e4e6868f2c238fc224f7a7b07634ee71318e00899d3a992d61f40cbf403a36`.
+
+## Protocol and completeness
+
+Exactly **42 measured runs**, with no replacement runs or excluded outliers:
+marker ×5/product, moving text/drag/gradient ×3/product. Within each repetition
+the order is nanoctl, Sunshine/Moonlight, screen-relay. Fresh agents, clients,
+browsers and X servers per run; all **42 launch inventories** passed the
+expected-engine/client check, exactly two Xvfb servers, and zero pre-existing
+Chrome. No builds, profiling, extra source observers or offline reports ran
+during measurements. The runner stopped after Moonlight's first incomplete
+run, then resumed without remeasuring either completed run.
+
+**41/42 runs satisfy the full validity predicate.** Moonlight marker run 1
+matched **119/120** inputs: source counter 104 never appeared as a separate
+paint, although the source received all 120 inputs. Its detector was healthy
+(247.30 Hz; source clock uncertainty ±0.31 ms), but that trial has no observable
+finite response latency. This is not proof of a lost input packet. The cause
+of the coalesced/unobservable paint was not localized. The run remains flagged
+`valid: false` and **is included** in all five-run Moonlight headline medians;
+no timeout was imputed as a finite latency and no substitute run was selected.
+Moonlight's input percentiles therefore describe observed responses, with one
+unobservable trial reported separately. Nanoctl and screen-relay each matched
+600/600 marker inputs; Moonlight matched 599/600. All 27 quality runs are valid.
+
+Values are medians of per-run metrics, not pooled percentiles or confidence
+intervals. Scope: 1280×720 software H.264, Chrome 151.0.7922.34, one shared Linux
+VM, development-auth **loopback**, not a tailnet/impaired link. Video means
+source draw → captured client pixels; input means injection → captured client
+pixels, **not optical input-to-photon**. The approximately 250-Hz detector
+quantizes observations. CPU uses one core = 100%; CPU/RSS cover host process
+trees, excluding clients, browsers, Xvfb and detector. Whole-run VM steal was
+0.70% mean, 39% maximum; these are shared-VM samples, not a portability claim.
+
+## Marker latency, resources and runtime: five runs per product
+
+| Product            | Inputs  | Input p50 / p95 ms | Video p50 / p95 ms |   FPS | CPU % | RSS MiB | Host runtime MiB |
+| ------------------ | ------- | -----------------: | -----------------: | ----: | ----: | ------: | ---------------: |
+| nanoctl QP16       | 600/600 |      31.81 / 40.07 |      19.80 / 22.15 | 59.92 | 25.43 |   44.80 |            23.47 |
+| Sunshine/Moonlight | 599/600 |      32.30 / 40.80 |      22.56 / 28.63 | 59.86 | 43.44 |  165.86 |           124.98 |
+| screen-relay       | 600/600 |      56.37 / 88.35 |      54.26 / 73.90 | 59.81 | 24.21 |   48.22 |           139.59 |
+
+Runtime is logical host application/assets plus transitive ELF libraries,
+excluding clients, browsers, Xvfb, toolchains, Docker layers and other OS files;
+it is **not total install footprint**. Nanoctl's snapshot was rebuilt for this
+binary; existing competitor snapshots were checked against their live files.
+
+## Moving quality: three runs per product/workload
+
+| Workload | Product      |  SSIM Y | PSNR Y dB |   Mbps |   FPS | Video p50 / p95 ms | CPU % | RSS MiB |
+| -------- | ------------ | ------: | --------: | -----: | ----: | -----------------: | ----: | ------: |
+| Text     | nanoctl QP16 | .999145 |    49.955 |  2.140 | 59.84 |      19.50 / 21.52 | 29.45 |   44.70 |
+| Text     | Moonlight    | .999343 |    48.415 |  5.309 | 59.86 |      17.10 / 21.24 | 53.92 |  155.73 |
+| Text     | screen-relay | .999577 |    52.202 |  3.362 | 59.58 |      24.58 / 27.43 | 29.04 |   48.45 |
+| Drag     | nanoctl QP16 | .998226 |    49.596 |  3.306 | 59.95 |      19.63 / 21.90 | 32.37 |   48.18 |
+| Drag     | Moonlight    | .999163 |    48.572 |  7.759 | 59.89 |      24.95 / 28.68 | 49.17 |  156.75 |
+| Drag     | screen-relay | .999564 |    52.397 |  7.528 | 59.78 |      24.31 / 26.69 | 29.99 |   48.46 |
+| Gradient | nanoctl QP16 | .994576 |    47.931 |  7.007 | 59.58 |      35.90 / 38.02 | 48.78 |   49.78 |
+| Gradient | Moonlight    | .992738 |    45.905 |  7.266 | 59.84 |      31.96 / 36.45 | 58.65 |  154.64 |
+| Gradient | screen-relay | .994068 |    47.670 | 16.563 | 59.81 |      51.99 / 58.36 | 42.13 |   48.25 |
+
+Quality is matched-content ROI, gray luma, moving rather than settled text.
+Bitrate scopes differ: nanoctl video-RTP payload; screen-relay decoded
+WebSocket payload including protocol/control; Sunshine video-port UDP payload
+including framing/FEC. These are configured-product results, **not
+matched-bitrate quality or identical wire-traffic measurements**. No new
+impaired-link or hardware-codec results are claimed.
+
+## Remaining deficits: every losing measured median
+
+Differences below use unrounded medians. Tiny gaps are reported for completeness,
+not asserted statistically significant; many are smaller than detector polling
+quantization. Percentage-point CPU differences use one core = 100%.
+
+- **Marker:** nanoctl uses **1.216 CPU points more than screen-relay**.
+  Its other marker headline medians beat both products, but its 0.493-ms input
+  p50 advantage over Moonlight is below one detector poll.
+- **Text versus Moonlight:** video p50 **+2.402 ms**, p95 **+.279 ms**;
+  FPS **−.0147**; SSIM **−.000198**. Versus screen-relay: CPU **+.412 points**,
+  PSNR **−2.247 dB**, SSIM **−.000432**.
+- **Drag versus Moonlight:** SSIM **−.000937**. Versus screen-relay:
+  CPU **+2.385 points**, PSNR **−2.800 dB**, SSIM **−.001338**;
+  p99 frame interval **+.080 ms** (20.491 versus 20.412 ms).
+- **Gradient versus Moonlight:** video p50 **+3.945 ms**, p95 **+1.567 ms**,
+  FPS **−.2546**. Versus screen-relay: CPU **+6.645 points**,
+  RSS **+1.531 MiB**, FPS **−.2239**.
+
+There are no other losing medians among input/video p50/p95, FPS, CPU, RSS,
+runtime, measured payload Mbps, SSIM, PSNR, p95/p99 frame intervals and >100-ms
+stall counts where those metrics apply. Stall-count medians are zero for all
+products/workloads. Total marker stalls were nanoctl/Moonlight/screen-relay
+**1/2/1**; total gradient stalls **0/0/7**; text and drag had none. Runtime is
+smaller than both competitors, but complete installation size was not measured.
+
+**The every-axis goal remains unmet.** Nanoctl gradient video p50s were
+**19.878, 36.067, 35.903 ms** despite the fixed source options. This campaign
+did not instrument their segments. The follow-up above localizes the dominant
+delay before capture, but no reliable mitigation was retained. Do not claim
+that all latency modes are eliminated.
+
+Artifacts: `/home/ubuntu/bench-results/final-qp16/final-qp16-*`, including all
+42 JSONs, inventories, detector/source logs, vmstat and matched quality images.
+`summary.json` includes medians, min–max ranges, validity, input and stall
+counts. Reproduction/analysis drivers:
+`/home/ubuntu/bench-candidates/final-qp16-{campaign,stack}.ts` and
+`final-qp16-summary.py`. Native-pixel text source and all three client crops for
+`*-text-run-2` were inspected. All product stacks and the screen-relay container
+are stopped.
+
+# Supporting evidence: source-presentation investigation and QP16 validation
 
 2026-11-23 UTC. **The refresh-sized mode is upstream of nanoctl capture, in the
 benchmark source's canvas-to-Xvfb presentation.** The harness now uses an opaque,
