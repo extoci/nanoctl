@@ -88,7 +88,8 @@ async function startProbe(page: Page) {
       if (marker) {
         probe.frames.push({
           ...marker,
-          displayMs: metadata.expectedDisplayTime,
+          // Chromium can reuse an expired display deadline for a newly submitted frame.
+          displayMs: Math.max(metadata.expectedDisplayTime, metadata.presentationTime),
           presented: metadata.presentedFrames,
         });
       }
@@ -207,7 +208,7 @@ test("measures video and input through the real agent", async ({ page, browser }
     const markdown = [
       `### nanoctl latency — ${report.platform}/${report.arch}`,
       "",
-      `Chromium ${report.chromium}, ${size.width}×${size.height} at ${fps.toFixed(1)} presented fps (software H.264, loopback). Clock alignment uncertainty: ±${uncertaintyMs.toFixed(2)} ms.`,
+      `Chromium ${report.chromium}, ${size.width}×${size.height} at ${fps.toFixed(1)} presented fps (software H.264, loopback). Display estimates cannot precede compositor submission. Clock alignment uncertainty: ±${uncertaintyMs.toFixed(2)} ms.`,
       "",
       "| Metric | Samples | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |",
       "| --- | ---: | ---: | ---: | ---: | ---: |",
