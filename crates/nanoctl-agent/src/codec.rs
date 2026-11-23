@@ -27,6 +27,7 @@ impl VideoCodec {
         }
     }
 
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub fn label(self) -> &'static str {
         match self {
             Self::H264 => "H.264",
@@ -181,6 +182,12 @@ fn offered_video_codecs(sdp: &str) -> Vec<NegotiatedCodec> {
         if codec == VideoCodec::H264 && !fmtp_has(parameters, "packetization-mode", "1") {
             continue;
         }
+        // HEVC and AV1 encoders emit 8-bit 4:2:0 Main / profile 0 streams.
+        if (codec == VideoCodec::Hevc && !fmtp_allows(parameters, "profile-id", "1"))
+            || (codec == VideoCodec::Av1 && !fmtp_allows(parameters, "profile", "0"))
+        {
+            continue;
+        }
         if offered
             .iter()
             .any(|existing: &NegotiatedCodec| existing.codec == codec)
@@ -193,6 +200,14 @@ fn offered_video_codecs(sdp: &str) -> Vec<NegotiatedCodec> {
         });
     }
     offered
+}
+
+/// A missing parameter means the codec's default, which is the value nanoctl emits.
+fn fmtp_allows(parameters: &str, key: &str, value: &str) -> bool {
+    let present = parameters
+        .split(';')
+        .any(|parameter| parameter.split('=').next().map(str::trim) == Some(key));
+    !present || fmtp_has(parameters, key, value)
 }
 
 fn fmtp_has(parameters: &str, key: &str, value: &str) -> bool {
@@ -417,6 +432,20 @@ a=fmtp:103 packetization-mode=1\r\n";
             negotiate("", ALL, CodecPreference::Av1).codec,
             VideoCodec::H264
         );
+    }
+
+    #[test]
+    fn high_bit_depth_profiles_are_skipped() {
+        let offer = "m=video 9 RTP 50 51 52 53\r\n\
+a=rtpmap:50 H265/90000\r\na=fmtp:50 level-id=156;profile-id=2;tier-flag=0\r\n\
+a=rtpmap:51 AV1/90000\r\na=fmtp:51 level-idx=5;profile=1;tier=0\r\n\
+a=rtpmap:52 AV1/90000\r\n\
+a=rtpmap:53 H265/90000\r\na=fmtp:53 level-id=156;profile-id=1;tier-flag=0\r\n";
+        let chosen = negotiate(offer, ALL, CodecPreference::Auto);
+        assert_eq!(chosen.codec, VideoCodec::Av1);
+        assert_eq!(chosen.offered_fmtp, "");
+        let chosen = negotiate(offer, ALL, CodecPreference::Hevc);
+        assert!(chosen.offered_fmtp.contains("profile-id=1"));
     }
 
     #[test]

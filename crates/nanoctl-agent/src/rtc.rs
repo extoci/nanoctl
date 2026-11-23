@@ -1167,6 +1167,7 @@ impl HostPeer {
         self.video_codec
     }
 
+    #[cfg(feature = "media")]
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
     }
