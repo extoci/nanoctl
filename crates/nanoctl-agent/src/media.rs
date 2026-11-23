@@ -1696,8 +1696,11 @@ pub fn spawn_video(
                         continue;
                     };
                     let keepalive = pacer.idle() && !changed && !forced_keyframe;
-                    if pacer.on_frame(Instant::now(), changed, forced_keyframe) == PaceAction::Skip
-                    {
+                    #[cfg(target_os = "windows")]
+                    let action = pacer.on_capture_frame(Instant::now(), changed, forced_keyframe);
+                    #[cfg(not(target_os = "windows"))]
+                    let action = pacer.on_frame(Instant::now(), changed, forced_keyframe);
+                    if action == PaceAction::Skip {
                         producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
