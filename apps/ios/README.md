@@ -1,0 +1,70 @@
+# nanoctl for iPhone (prototype)
+
+The native viewer connects directly to an existing nanoctl agent. It receives H.264 over
+WebRTC and has basic touch pointer and gamepad input. It does not change the agent or
+the browser viewer. Audio, clipboard, display selection and automatic reconnect are not
+part of this prototype.
+
+## Build and connect
+
+1. On a Mac with Xcode 16 or newer and an iOS simulator installed, run
+   `brew install xcodegen`, then `cd apps/ios && xcodegen generate`.
+2. Open `Nanoctl.xcodeproj` and run the **Nanoctl** scheme. To run on an iPhone
+   (iOS 17 or later), select your Signing team in Xcode and use a unique bundle ID if needed.
+3. Sign the iPhone and host into the same Tailscale network. Use the agent's full HTTPS
+   MagicDNS address, e.g. `https://host.tailnet.ts.net:7337`. No token is needed: the
+   agent uses the existing tailnet identity and access policy. Allow the agent port
+   and direct WebRTC UDP in tailnet policy and host firewalls. There is no STUN or TURN
+   fallback, and the app does not bypass TLS validation.
+
+Touch the video to click or swipe to move the remote pointer. Pair a controller with
+iOS to forward its standard controls. The app uses native controller change events
+instead of polling; only idle keepalive uses a timer. A DualSense or DualShock profile
+requests a **virtual DualShock 4** on a Windows host with ViGEm; other supported
+profiles request an Xbox 360. This is not a native DualSense device on the host, and
+does not forward rumble, adaptive triggers, touchpad, or motion.
+
+## External display, no tvOS app
+
+When iOS provides a separate external-display scene, nanoctl sends only video there
+and keeps the touchpad, gamepad and connection controls on the phone. When the display
+disconnects, playback returns to the phone without a second WebRTC session.
+
+For AirPlay, select the TV from iOS Control Center. The split view requires iOS to
+expose that AirPlay route as a separate screen. A mirrored-only route cannot show
+different phone and TV content; this prototype does not implement a separate AirPlay
+transport or promise split view on all receivers. The Simulator can exercise the
+external scene, but does not measure AirPlay.
+
+## Repeat the Simulator comparison
+
+Run from the repo root after installing Bun dependencies. The Mac needs Chrome,
+Screen Recording and Accessibility permission for the test agent, and one booted
+iOS Simulator. Close other capture and build workloads and leave the Mac's Chrome
+marker window in front. Ports 7337 and 7338 must be free.
+
+```sh
+(cd apps/ios && xcodegen generate)
+xcodebuild -project apps/ios/Nanoctl.xcodeproj -scheme Nanoctl \
+  -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+  -derivedDataPath apps/ios/DerivedData -parallel-testing-enabled NO test
+bun apps/ios/Benchmark/run.ts \
+  apps/ios/DerivedData/Build/Products/Debug-iphonesimulator/Nanoctl.app \
+  "$SIMULATOR_ID" /tmp/nanoctl-ios-latency
+```
+
+The runner temporarily instruments the generated viewer assets; do not use those
+assets or its dev loopback identity in production. It uses the browser suite's marker
+and agent launcher, pacing the source marker at 30 fps and using the same software
+H.264 settings for both viewers.
+It reports unique visible markers per second and p50/p95 for host draw → estimated
+presentation and scripted Space dispatch → first response presentation. The native
+probe only inspects drawables submitted for presentation whose GPU commands complete;
+the Simulator does not provide Metal's real presentation callback, so it uses the
+display link target rounded to the next eligible refresh after GPU completion.
+Safari uses `requestVideoFrameCallback`'s `expectedDisplayTime`. Clock timestamps
+share the Mac's epoch. Neither measures photons. The input test does not measure
+Bluetooth or compare GameController callbacks with Safari's gamepad polling.
+
+Set `NANOCTL_SAFARI_FIRST=1` to reverse the run order. The runner saves raw
+samples and a screenshot of each viewer alongside the summary.
