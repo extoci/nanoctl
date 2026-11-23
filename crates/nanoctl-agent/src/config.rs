@@ -88,7 +88,7 @@ impl Default for QualityConfig {
             codec: CodecPreference::Auto,
             encoder: EncoderPreference::Auto,
             max_fps: 60,
-            max_bitrate_kbps: 24_000,
+            max_bitrate_kbps: 50_000,
             max_width: 3840,
             max_height: 2160,
             latency_mode: LatencyMode::Balanced,
