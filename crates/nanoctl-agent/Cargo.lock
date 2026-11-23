@@ -2524,8 +2524,10 @@ dependencies = [
  "futures-util",
  "hostname",
  "interceptor",
+ "libc",
  "nanoctl-update",
  "openh264",
+ "openh264-sys2",
  "proptest",
  "rcgen",
  "reqwest",
@@ -2549,6 +2551,7 @@ dependencies = [
  "x11rb",
  "x509-parser",
  "xcap",
+ "xcb",
  "xkeysym",
 ]
 

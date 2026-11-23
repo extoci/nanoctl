@@ -102,7 +102,7 @@ impl FrameEncoder for LinuxEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(&mut self, image: &crate::media::RgbaFrame<'_>) -> Result<EncodedFrame> {
         let resolution = Resolution {
             width: image.width(),
             height: image.height(),
