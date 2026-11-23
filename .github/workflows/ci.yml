@@ -178,20 +178,89 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
-          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: x264
+          workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
+      - name: Refresh apt index
+        run: sudo apt-get update
       - name: Install native dependencies including opt-in GPL encoder
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
-            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
-            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev \
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          execute_install_scripts: true
+          packages: >
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
+            libx264-dev cmake nasm pkg-config
+      - run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
+
+  agent-x264-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.1
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: x264-check
+          workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: bun install --frozen-lockfile
+      - run: bun run build:viewer
+      - name: Refresh apt index
+        run: sudo apt-get update
+      - name: Install native dependencies including opt-in GPL encoder
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          execute_install_scripts: true
+          packages: >
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
             libx264-dev cmake nasm pkg-config
       - run: cargo clippy --all-targets --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
-      - run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
-      - run: cargo build --release --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
+
+  agent-x264-package:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "64"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: x264-package
+          workspaces: crates/nanoctl-agent
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: bun install --frozen-lockfile
+      - run: bun run build:viewer
+      - name: Refresh apt index
+        run: sudo apt-get update
+      - name: Install native dependencies including opt-in GPL encoder
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          execute_install_scripts: true
+          packages: >
+            clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev
+            libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev
+            libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev
+            libx264-dev cmake nasm pkg-config
+      - run: cargo build --release --locked --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
     strategy:
