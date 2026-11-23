@@ -64,6 +64,7 @@ export type RemoteSessionOptions = {
   iceServers: readonly RTCIceServer[];
   video: HTMLVideoElement;
   audio?: HTMLAudioElement;
+  onAudioTrackChange?: () => void;
   systemAudioEnabled?: boolean;
   remoteInputEnabled?: boolean;
   clipboardEnabled?: boolean;
@@ -438,6 +439,7 @@ export class RemoteSessionController {
         if (this.options.audio) {
           this.options.audio.pause();
           this.options.audio.srcObject = null;
+          this.options.onAudioTrackChange?.();
         }
         this.pointerChannel = null;
         this.controlChannel = null;
@@ -525,7 +527,7 @@ export class RemoteSessionController {
       if (track.kind === "audio") {
         if (this.options.audio && this.options.systemAudioEnabled) {
           this.options.audio.srcObject = new MediaStream([track]);
-          void this.options.audio.play().catch(() => {});
+          this.options.onAudioTrackChange?.();
         }
         return;
       }

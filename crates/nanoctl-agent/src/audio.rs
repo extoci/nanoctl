@@ -29,7 +29,11 @@ pub fn available() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        windows_worker().is_some_and(|worker| worker.available)
+        windows_worker().is_some_and(|worker| {
+            let (ready, result) = std::sync::mpsc::sync_channel(1);
+            worker.commands.send(WindowsCommand::Probe(ready)).is_ok()
+                && result.recv().unwrap_or(false)
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -144,6 +148,7 @@ impl Drop for Capture {
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 enum WindowsCommand {
+    Probe(std::sync::mpsc::SyncSender<bool>),
     Start {
         pcm: mpsc::Sender<Vec<i16>>,
         ready: std::sync::mpsc::SyncSender<std::result::Result<u64, String>>,
@@ -154,7 +159,6 @@ enum WindowsCommand {
 #[cfg(target_os = "windows")]
 struct WindowsWorker {
     commands: std::sync::mpsc::Sender<WindowsCommand>,
-    available: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -182,14 +186,17 @@ fn windows_worker() -> Option<&'static WindowsWorker> {
                         }
                     }
                     let _apartment = Apartment;
-                    let available = cpal::default_host().default_output_device().is_some();
-                    if ready.send(available).is_err() {
+                    if ready.send(()).is_err() {
                         return;
                     }
                     let mut streams = std::collections::HashMap::new();
                     let mut next_id = 0_u64;
                     while let Ok(command) = requests.recv() {
                         match command {
+                            WindowsCommand::Probe(ready) => {
+                                let _ = ready
+                                    .send(cpal::default_host().default_output_device().is_some());
+                            }
                             WindowsCommand::Start { pcm, ready } => {
                                 let result = windows_capture(pcm).map(|stream| {
                                     let id = next_id;
@@ -211,10 +218,8 @@ fn windows_worker() -> Option<&'static WindowsWorker> {
                     }
                 })
                 .ok()?;
-            Some(WindowsWorker {
-                commands,
-                available: started.recv().ok()?,
-            })
+            started.recv().ok()?;
+            Some(WindowsWorker { commands })
         })
         .as_ref()
 }
@@ -222,7 +227,6 @@ fn windows_worker() -> Option<&'static WindowsWorker> {
 #[cfg(target_os = "windows")]
 fn capture() -> Result<(Capture, mpsc::Receiver<Vec<i16>>)> {
     let worker = windows_worker().context("cannot initialize audio worker")?;
-    anyhow::ensure!(worker.available, "no output device");
     let (pcm, receiver) = mpsc::channel(3);
     let (ready, started) = std::sync::mpsc::sync_channel(1);
     worker.commands.send(WindowsCommand::Start { pcm, ready })?;
@@ -363,10 +367,9 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_probe_is_cached_across_calling_threads() {
+    fn windows_worker_probes_from_multiple_calling_threads() {
         let worker = windows_worker().expect("audio worker initializes COM");
         let expected = available();
-        assert_eq!(worker.available, expected);
         let probes: Vec<_> = (0..16).map(|_| std::thread::spawn(available)).collect();
         for probe in probes {
             assert_eq!(probe.join().unwrap(), expected);

@@ -108,8 +108,9 @@ blocking video. Capture starts after the peer connects and stops with the sessio
 PulseAudio/PipeWire-pulse server; capture reads `@DEFAULT_MONITOR@`, not the microphone.
 Windows uses WASAPI output-device loopback. macOS system audio is unsupported and
 advertised false. Opus is bundled statically, so no runtime libopus installation is needed.
-The browser starts muted; **Enable sound** opts in for the session, and **Mute sound**
-disables playback again. Autoplay rejection leaves playback muted. Audio is host-to-viewer
+The browser starts muted; **Tap for sound** or **Enable sound** opts in for the session, and
+**Mute sound** disables playback again. If the browser blocks playback, **Tap to resume sound**
+retries it with a gesture. Audio is host-to-viewer
 only and does not require permission to control the host.
 
 ### Clipboard
