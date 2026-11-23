@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { comboMessages, connectSteps, connectionQuality, keyCombos } from "./session-ui";
+import {
+  comboMessages,
+  connectSteps,
+  connectionQuality,
+  formatBitrate,
+  keyCombos,
+} from "./session-ui";
 
 const metrics = {
   resolution: "1920x1080",
@@ -8,6 +14,8 @@ const metrics = {
   rttMs: 8,
   packetsLost: 0,
   framesDropped: 0,
+  lossPercent: null,
+  jitterMs: null,
   route: "direct" as const,
   codec: null,
   decoder: null,
@@ -21,6 +29,15 @@ describe("session ui", () => {
     expect(connectionQuality({ ...metrics, route: "relay" })).toBe("fair");
     expect(connectionQuality({ ...metrics, rttMs: 90 })).toBe("fair");
     expect(connectionQuality({ ...metrics, rttMs: 180 })).toBe("poor");
+    expect(connectionQuality({ ...metrics, lossPercent: 0.5 })).toBe("good");
+    expect(connectionQuality({ ...metrics, lossPercent: 2 })).toBe("fair");
+    expect(connectionQuality({ ...metrics, lossPercent: 8 })).toBe("poor");
+  });
+
+  test("formats bitrate", () => {
+    expect(formatBitrate(null)).toBe("—");
+    expect(formatBitrate(640.4)).toBe("640 kbps");
+    expect(formatBitrate(24_550)).toBe("24.6 Mbps");
   });
 
   test("does not flag an idle desktop as a bad connection", () => {

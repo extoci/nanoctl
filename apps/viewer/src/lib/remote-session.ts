@@ -31,6 +31,9 @@ export type RemoteSessionMetrics = {
   rttMs: number | null;
   packetsLost: number;
   framesDropped: number;
+  /** Share of packets lost since the previous stats sample. */
+  lossPercent: number | null;
+  jitterMs: number | null;
   route: "direct" | "relay" | "unknown";
   codec: string | null;
   decoder: string | null;
@@ -181,6 +184,7 @@ export class RemoteSessionController {
   private qualityLimits: QualityLimits = {};
   private codecPreferencesApplied = false;
   private previousDecode: { id: string; time: number; frames: number } | null = null;
+  private previousLoss: { id: string; lost: number; received: number } | null = null;
 
   private readonly onWindowBlur = () => {
     this.gamepad.release();
@@ -1353,6 +1357,22 @@ export class RemoteSessionController {
         decodeTime !== undefined && decodedFrames !== undefined
           ? { id: inbound.id, time: decodeTime, frames: decodedFrames }
           : null;
+      const lost = statNumber(inbound, "packetsLost");
+      const received = statNumber(inbound, "packetsReceived");
+      const previousLoss = this.previousLoss;
+      const lostDelta =
+        lost !== undefined && previousLoss?.id === inbound.id ? lost - previousLoss.lost : 0;
+      const receivedDelta =
+        received !== undefined && previousLoss?.id === inbound.id
+          ? received - previousLoss.received
+          : 0;
+      const lossPercent =
+        receivedDelta + lostDelta > 0
+          ? Math.round((Math.max(0, lostDelta) / (receivedDelta + lostDelta)) * 1_000) / 10
+          : null;
+      this.previousLoss =
+        lost !== undefined && received !== undefined ? { id: inbound.id, lost, received } : null;
+      const jitter = statNumber(inbound, "jitter");
       this.metrics = {
         resolution:
           (statNumber(inbound, "frameWidth") ?? 0) > 0 &&
@@ -1363,6 +1383,8 @@ export class RemoteSessionController {
         rttMs: rtt !== undefined && rtt > 0 ? Math.round(rtt * 1_000) : null,
         packetsLost: Math.max(0, Math.round(statNumber(inbound, "packetsLost") ?? 0)),
         framesDropped: Math.max(0, Math.round(statNumber(inbound, "framesDropped") ?? 0)),
+        lossPercent,
+        jitterMs: jitter !== undefined && jitter >= 0 ? Math.round(jitter * 10_000) / 10 : null,
         route,
         codec: codecLabel(statString(codecId ? report.get(codecId) : undefined, "mimeType")),
         decoder: statString(inbound, "decoderImplementation") ?? null,

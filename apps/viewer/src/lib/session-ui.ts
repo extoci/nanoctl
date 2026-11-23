@@ -8,9 +8,15 @@ export function connectionQuality(metrics: RemoteSessionMetrics | null): Quality
   if (!metrics) return null;
   const rttMs = metrics.rttMs ?? 0;
   // The host sends fewer frames while the desktop is still, even on a healthy link.
-  if (rttMs > 150) return "poor";
-  if (rttMs > 60 || metrics.route === "relay") return "fair";
+  const lossPercent = metrics.lossPercent ?? 0;
+  if (rttMs > 150 || lossPercent >= 5) return "poor";
+  if (rttMs > 60 || lossPercent >= 1 || metrics.route === "relay") return "fair";
   return "good";
+}
+
+export function formatBitrate(kbps: number | null): string {
+  if (kbps == null) return "—";
+  return kbps >= 1_000 ? `${(kbps / 1_000).toFixed(1)} Mbps` : `${Math.round(kbps)} kbps`;
 }
 
 export type KeyCombo = {
