@@ -38,7 +38,7 @@ WebRTC carries video and input between your browser and the host.
    you don’t need to stop or restart nanoctl.
 
 During prereleases, use the install script from the selected release and set
-`NANOCTL_VERSION=v3.0.0-alpha.2` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.2"`).
+`NANOCTL_VERSION=v3.0.0-alpha.3` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.3"`).
 Run the installer again to upgrade. Downloads are checksum-verified; failed startup
 restores the previous installation. Existing config is preserved and legacy credentials
 are removed best-effort.
