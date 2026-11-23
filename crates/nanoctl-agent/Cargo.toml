@@ -80,7 +80,10 @@ videotoolbox = { version = "0.18.1", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-fast_image_resize = { version = "6.2", default-features = false, features = ["std", "only_u8x4"], optional = true }
+fast_image_resize = { version = "6.2", default-features = false, features = [
+  "std",
+  "only_u8x4",
+], optional = true }
 windows = { version = "0.62.2", features = [
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
