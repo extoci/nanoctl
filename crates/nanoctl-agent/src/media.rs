@@ -800,8 +800,8 @@ impl CaptureEncoder {
             latest_frame,
             display_id,
             encoder,
-            #[cfg(target_os = "windows")]
             psnr: None,
+            #[cfg(target_os = "windows")]
             resizer: resize::RgbaResizer::default(),
         })
     }
