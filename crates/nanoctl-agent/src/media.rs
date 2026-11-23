@@ -7,13 +7,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
-    UsageType,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, MatrixCoefficients,
+    QpRange, RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSource;
 use openh264_sys2::{
-    ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
-    SPATIAL_LAYER_ALL,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_GET_STATISTICS, ENCODER_OPTION_MAX_BITRATE,
+    SBitrateInfo, SEncoderStatistics, SPATIAL_LAYER_0, SPATIAL_LAYER_ALL,
 };
 use xcap::Monitor;
 
@@ -25,11 +25,16 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use webrtc::media::Sample;
+use webrtc::rtp::extension::{HeaderExtension, playout_delay_extension::PlayoutDelayExtension};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 #[cfg(target_os = "linux")]
 #[path = "linux_damage.rs"]
 mod linux_damage;
+
+#[cfg(target_os = "linux")]
+#[path = "media_trace.rs"]
+pub(crate) mod trace;
 
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::config::QualityConfig;
@@ -41,6 +46,17 @@ mod resize;
 
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn video_playout_delay(mode: LatencyMode) -> HeaderExtension {
+    HeaderExtension::PlayoutDelay(PlayoutDelayExtension {
+        min_delay: 0,
+        max_delay: if matches!(mode, LatencyMode::Quality) {
+            10
+        } else {
+            0
+        },
+    })
+}
 
 #[derive(Default)]
 struct SendRateWindow {
@@ -99,6 +115,9 @@ pub struct PipelineStats {
     pub preprocess_ns: AtomicU64,
     pub backend_ns: AtomicU64,
     pub color_convert_ns: AtomicU64,
+    pub capture_ns: AtomicU64,
+    pub send_ns: AtomicU64,
+    pub sample_writes: AtomicU64,
     pub encode_attempts: AtomicU64,
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
@@ -119,6 +138,18 @@ impl PipelineStats {
             target_fps = self.target_fps.load(Ordering::Relaxed),
             encoded_width = self.encoded_width.load(Ordering::Relaxed),
             encoded_height = self.encoded_height.load(Ordering::Relaxed),
+            capture_ns = self.capture_ns.load(Ordering::Relaxed),
+            compare_ns = self.compare_ns.load(Ordering::Relaxed),
+            preprocess_ns = self.preprocess_ns.load(Ordering::Relaxed),
+            color_convert_ns = self.color_convert_ns.load(Ordering::Relaxed),
+            backend_ns = self.backend_ns.load(Ordering::Relaxed),
+            encode_attempts = self.encode_attempts.load(Ordering::Relaxed),
+            empty_encodes = self.empty_encodes.load(Ordering::Relaxed),
+            capture_wait_ns = self.capture_wait_ns.load(Ordering::Relaxed),
+            send_ns = self.send_ns.load(Ordering::Relaxed),
+            sample_writes = self.sample_writes.load(Ordering::Relaxed),
+            fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
+            pacer_skips = self.pacer_skips.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
     }
@@ -441,11 +472,11 @@ impl I420Frame {
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
         for (pixel, y) in rgba.chunks_exact(4).zip(y) {
-            *y = (((66 * u32::from(pixel[0])
-                + 129 * u32::from(pixel[1])
-                + 25 * u32::from(pixel[2]))
-                >> 8)
-                + 16) as u8;
+            *y = ((66 * u16::from(pixel[0])
+                + 129 * u16::from(pixel[1])
+                + 25 * u16::from(pixel[2])
+                + 4224)
+                >> 8) as u8;
         }
         for ((rows, u), v) in rgba
             .chunks_exact(self.width * 8)
@@ -460,16 +491,16 @@ impl I420Frame {
                 .zip(v)
             {
                 let average = |channel| {
-                    (i16::from(top[channel])
-                        + i16::from(top[channel + 4])
-                        + i16::from(bottom[channel])
-                        + i16::from(bottom[channel + 4])
+                    (u16::from(top[channel])
+                        + u16::from(top[channel + 4])
+                        + u16::from(bottom[channel])
+                        + u16::from(bottom[channel + 4])
                         + 2)
-                        / 4
+                        >> 2
                 };
                 let (r, g, b) = (average(0), average(1), average(2));
-                *u = (((-38 * r + 112 * b - 74 * g) >> 8) + 128) as u8;
-                *v = (((112 * r - 18 * b - 94 * g) >> 8) + 128) as u8;
+                *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
+                *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
             }
         }
         Ok(())
@@ -603,6 +634,8 @@ impl CaptureEncoder {
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let CapturedFrame { frame, captured_at } = captured;
+        #[cfg(target_os = "linux")]
+        let trace_started = trace::now();
         let preprocess_started = Instant::now();
         let source = rgba_view(frame)?;
         let (source_width, source_height) = source.dimensions();
@@ -656,6 +689,8 @@ impl CaptureEncoder {
         let color_before = self.encoder.color_convert_ns();
         let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
+        #[cfg(target_os = "linux")]
+        trace::encoded(frame, &encoded.bytes, trace_started, trace::now());
         self.latest_frame.stats.backend_ns.fetch_add(
             encoded_at.duration_since(encode_started).as_nanos() as u64,
             Ordering::Relaxed,
@@ -939,14 +974,49 @@ impl FrameEncoder for SoftwareEncoder {
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
         yuv.read_rgba(image.as_raw())?;
-        self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
-        let stream = self.encoder.encode(yuv).context("H.264 encode failed")?;
+        let color_elapsed = color_started.elapsed();
+        self.color_convert_ns += color_elapsed.as_nanos() as u64;
+        let bytes = self
+            .encoder
+            .encode(yuv)
+            .context("H.264 encode failed")?
+            .to_vec();
+        if tracing::enabled!(target: "nanoctl::encoder", tracing::Level::DEBUG)
+            && let Ok(statistics) = encoder_statistics(&mut self.encoder)
+        {
+            tracing::debug!(target: "nanoctl::encoder",
+                frame = statistics.uiInputFrameCount,
+                qp = statistics.uiAverageFrameQP,
+                target_kbps = self.bitrate_kbps,
+                bytes = bytes.len(),
+                skipped = statistics.uiSkippedFrameCount,
+                idr = statistics.uiIDRSentNum,
+                convert_us = color_elapsed.as_micros(),
+                native_us = color_started.elapsed().saturating_sub(color_elapsed).as_micros(),
+                "software encoder frame"
+            );
+        }
         Ok(EncodedFrame {
-            bytes: stream.to_vec(),
+            bytes,
             width: image.width(),
             height: image.height(),
         })
     }
+}
+
+fn encoder_statistics(encoder: &mut Encoder) -> Result<SEncoderStatistics> {
+    let mut statistics = SEncoderStatistics::default();
+    // SAFETY: The initialized encoder writes the matching statistics structure synchronously.
+    let result = unsafe {
+        encoder.raw_api().get_option(
+            ENCODER_OPTION_GET_STATISTICS,
+            std::ptr::from_mut(&mut statistics).cast(),
+        )
+    };
+    if result != 0 {
+        bail!("OpenH264 statistics query failed: {result}");
+    }
+    Ok(statistics)
 }
 
 fn rgba_view(
@@ -1024,8 +1094,15 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
-        .usage_type(UsageType::ScreenContentRealTime)
+        .usage_type(UsageType::CameraVideoRealTime)
+        .vui(
+            VuiConfig::srgb()
+                .full_range(false)
+                .matrix_coefficients(MatrixCoefficients::Smpte170M),
+        )
         .rate_control_mode(RateControlMode::Bitrate)
+        // A zero minimum is OpenH264's sentinel for its lossy 26–35 screen default.
+        .qp(QpRange::new(14, 51))
         .complexity(complexity)
         .skip_frames(skip_frames);
     Encoder::with_api_config(OpenH264API::from_source(), config)
@@ -1535,6 +1612,24 @@ impl VideoPipeline {
     }
 }
 
+pub(crate) async fn release_session_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Err(error) = tokio::task::spawn_blocking(|| {
+        let started = Instant::now();
+        // glibc releases only free pages; live allocations in other sessions remain valid.
+        let trimmed = unsafe { libc::malloc_trim(0) };
+        tracing::debug!(
+            trim_us = started.elapsed().as_micros(),
+            trimmed,
+            "session allocator trimmed"
+        );
+    })
+    .await
+    {
+        tracing::warn!(%error, "session allocator cleanup failed");
+    }
+}
+
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
@@ -1782,7 +1877,16 @@ pub fn spawn_video(
         });
         let mut stop_rx = stop_rx;
         let mut previous_written = None;
-        let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
+        let extensions = [video_playout_delay(quality.latency_mode)];
+        let mut stats_tick = tokio::time::interval(Duration::from_secs(
+            if tracing::enabled!(
+                target: "nanoctl::encoder", tracing::Level::DEBUG
+            ) {
+                1
+            } else {
+                10
+            },
+        ));
         stats_tick.tick().await;
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
@@ -1801,6 +1905,8 @@ pub fn spawn_video(
                     // A replaced encoded frame is a local latency policy, not RTP packet loss.
                     // Passing that count as prev_dropped_packets corrupts packet sequencing.
                     let written_at = Instant::now();
+                    #[cfg(target_os = "linux")]
+                    let trace_started = trace::now();
                     let sample = Sample {
                         data: frame.bytes.into(),
                         duration: sample_duration(previous_written, written_at, writer_stats.target_fps.load(Ordering::Relaxed)),
@@ -1812,14 +1918,18 @@ pub fn spawn_video(
                     let result = await_video_delivery(
                         async {
                             track
-                                .write_sample(&sample)
+                                .write_sample_with_extensions(&sample, &extensions)
                                 .await
                                 .map_err(anyhow::Error::from)
                         },
                         VIDEO_SAMPLE_WRITE_TIMEOUT,
                     )
                     .await;
+                    writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
                     if result.is_ok() {
+                        #[cfg(target_os = "linux")]
+                        trace::sent(&sample.data, trace_started, trace::now());
                         previous_written = Some(written_at);
                         writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
                         writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
@@ -1946,6 +2056,16 @@ mod tests {
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn session_memory_cleanup_preserves_live_buffers_and_is_repeatable() {
+        super::release_session_memory().await;
+        let pixels = vec![37_u8; 4 * 1024 * 1024];
+        super::release_session_memory().await;
+        assert!(pixels.iter().all(|byte| *byte == 37));
+        drop(pixels);
+        super::release_session_memory().await;
+    }
+
     #[test]
     fn encode_scale_bounds_low_rate_keyframes_and_has_recovery_hysteresis() {
         let mut scale = super::EncodeScale::new(2_000);
@@ -1989,6 +2109,23 @@ mod tests {
     }
 
     #[test]
+    fn desktop_playout_is_immediate_except_when_quality_buffering_is_requested() {
+        for (mode, max_delay) in [
+            (LatencyMode::Responsiveness, 0),
+            (LatencyMode::Balanced, 0),
+            (LatencyMode::Quality, 10),
+        ] {
+            let webrtc::rtp::extension::HeaderExtension::PlayoutDelay(delay) =
+                super::video_playout_delay(mode)
+            else {
+                panic!("Expected playout delay")
+            };
+            assert_eq!(delay.min_delay, 0);
+            assert_eq!(delay.max_delay, max_delay);
+        }
+    }
+
+    #[test]
     fn fresh_capture_wait_does_not_return_cached_frames() {
         let queue = LatestFrame::default();
         let stopped = std::sync::atomic::AtomicBool::new(false);
@@ -2029,6 +2166,47 @@ mod tests {
                 .take_until_stopped(Duration::ZERO, &stopped)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn software_quality_floor_still_honors_a_congestion_bitrate_cut() {
+        let mut encoder = SoftwareEncoder::new(4_000, 60, LatencyMode::Balanced).unwrap();
+        let mut image = xcap::image::RgbaImage::new(256, 128);
+        let mut seed = 1_u32;
+        let mut before_bytes = 0;
+        let mut after_bytes = 0;
+        for frame in 0..40 {
+            for pixel in image.pixels_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *pixel = xcap::image::Rgba([
+                    (seed >> 24) as u8,
+                    (seed >> 16) as u8,
+                    (seed >> 8) as u8,
+                    255,
+                ]);
+            }
+            if frame == 10 {
+                encoder.set_bitrate(250).unwrap();
+            }
+            let view = super::RgbaFrame::from_raw(
+                image.width(),
+                image.height(),
+                image.as_raw().as_slice(),
+            )
+            .unwrap();
+            let encoded = encoder.encode(&view).unwrap();
+            if frame < 10 {
+                before_bytes += encoded.bytes.len();
+            } else if frame >= 20 {
+                after_bytes += encoded.bytes.len();
+            }
+        }
+        assert_eq!(encoder.bitrate_kbps, 250);
+        assert!(before_bytes > 0);
+        assert!(
+            after_bytes < before_bytes / 2,
+            "congested twenty-frame output {after_bytes}, clean ten-frame output {before_bytes}"
         );
     }
 
@@ -2103,8 +2281,99 @@ mod tests {
         assert!(!next.differs_from(&next));
     }
 
+    fn reference_rgba<const ROUND: u32>(frame: &mut super::I420Frame, rgba: &[u8]) {
+        let pixels = frame.width * frame.height;
+        let (y, uv) = frame.bytes.split_at_mut(pixels);
+        let (u, v) = uv.split_at_mut(pixels / 4);
+        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
+            *y = (((66 * u32::from(pixel[0])
+                + 129 * u32::from(pixel[1])
+                + 25 * u32::from(pixel[2])
+                + ROUND)
+                >> 8)
+                + 16) as u8;
+        }
+        for ((rows, u), v) in rgba
+            .chunks_exact(frame.width * 8)
+            .zip(u.chunks_exact_mut(frame.width / 2))
+            .zip(v.chunks_exact_mut(frame.width / 2))
+        {
+            let (top, bottom) = rows.split_at(frame.width * 4);
+            for (((top, bottom), u), v) in top
+                .chunks_exact(8)
+                .zip(bottom.chunks_exact(8))
+                .zip(u)
+                .zip(v)
+            {
+                let average = |channel| {
+                    (i16::from(top[channel])
+                        + i16::from(top[channel + 4])
+                        + i16::from(bottom[channel])
+                        + i16::from(bottom[channel + 4])
+                        + 2)
+                        / 4
+                };
+                let (r, g, b) = (average(0), average(1), average(2));
+                *u = (((-38 * r + 112 * b - 74 * g + ROUND as i16) >> 8) + 128) as u8;
+                *v = (((112 * r - 18 * b - 94 * g + ROUND as i16) >> 8) + 128) as u8;
+            }
+        }
+    }
+
     #[test]
-    fn direct_rgba_conversion_matches_packed_rgb_reference() {
+    #[ignore = "isolated 720p conversion timing; run release, single test thread"]
+    fn benchmark_rgba_conversion_720p() {
+        use std::hint::black_box;
+        let rgba: Vec<_> = (0..1280 * 720 * 4)
+            .map(|i| (i * 71 + i / 997) as u8)
+            .collect();
+        let mut frame = super::I420Frame::new(1280, 720).unwrap();
+        let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+        for batch in 0..9 {
+            for position in 0..3 {
+                let variant = (batch + position) % 3;
+                let started = Instant::now();
+                for _ in 0..50 {
+                    let frame = black_box(&mut frame);
+                    let rgba = black_box(&rgba);
+                    match variant {
+                        0 => reference_rgba::<0>(frame, rgba),
+                        1 => reference_rgba::<128>(frame, rgba),
+                        _ => frame.read_rgba(rgba).unwrap(),
+                    }
+                    black_box(&frame.bytes);
+                }
+                samples[variant].push(started.elapsed().as_nanos() / 50);
+            }
+        }
+        for (name, mut samples) in [
+            "truncating-reference",
+            "rounded-reference",
+            "production-rounded",
+        ]
+        .into_iter()
+        .zip(samples)
+        {
+            samples.sort_unstable();
+            println!(
+                "{name}: ns/frame median={} min={} max={}",
+                samples[4], samples[0], samples[8]
+            );
+        }
+    }
+
+    #[test]
+    fn direct_rgba_conversion_rejects_empty_and_short_buffers_without_mutation() {
+        let mut frame = super::I420Frame::new(2, 2).unwrap();
+        frame.read_rgba(&[255; 16]).unwrap();
+        let before = frame.bytes.clone();
+        assert!(frame.read_rgba(&[]).is_err());
+        assert!(frame.read_rgba(&[0; 15]).is_err());
+        assert_eq!(frame.bytes, before);
+    }
+
+    #[test]
+    fn direct_rgba_conversion_checks_truncated_and_rounded_kernels() {
         let mut seed = 0x12345678_u32;
         for (width, height) in [(2, 2), (4, 6), (32, 18), (64, 64)] {
             let mut converted = super::I420Frame::new(width, height).unwrap();
@@ -2122,12 +2391,16 @@ mod tests {
                     .collect();
                 let reference =
                     YUVBuffer::from_rgb8_source(RgbSliceU8::new(&packed, (width, height)));
+                let mut expected = super::I420Frame::new(width, height).unwrap();
+                reference_rgba::<0>(&mut expected, &rgba);
+                assert_eq!(expected.y(), reference.y());
+                assert_eq!(expected.u(), reference.u());
+                assert_eq!(expected.v(), reference.v());
+                reference_rgba::<128>(&mut expected, &rgba);
                 converted.read_rgba(&rgba).unwrap();
                 assert_eq!(converted.bytes.as_ptr(), allocation);
                 assert_eq!(converted.strides(), reference.strides());
-                assert_eq!(converted.y(), reference.y());
-                assert_eq!(converted.u(), reference.u());
-                assert_eq!(converted.v(), reference.v());
+                assert_eq!(converted.bytes, expected.bytes);
             }
         }
     }
@@ -2630,6 +2903,53 @@ mod tests {
             super::percentile_milliseconds(&encode_micros, 0.50),
             super::percentile_milliseconds(&encode_micros, 0.95),
         );
+    }
+
+    #[test]
+    fn software_encoder_reports_the_last_encoded_frame_statistics() {
+        let mut encoder = super::create_encoder(4_000, 60, LatencyMode::Balanced).unwrap();
+        assert!(super::encoder_statistics(&mut encoder).is_err());
+        let frame = super::I420Frame::new(32, 32).unwrap();
+        for count in 1..=3 {
+            assert!(!encoder.encode(&frame).unwrap().to_vec().is_empty());
+            let statistics = super::encoder_statistics(&mut encoder).unwrap();
+            assert_eq!(statistics.uiInputFrameCount, count);
+            assert_eq!((statistics.uiWidth, statistics.uiHeight), (32, 32));
+            assert!(statistics.uiAverageFrameQP <= 51);
+        }
+    }
+
+    #[test]
+    fn software_encoder_signals_the_limited_bt601_matrix_of_its_srgb_input() {
+        for mode in [
+            LatencyMode::Responsiveness,
+            LatencyMode::Balanced,
+            LatencyMode::Quality,
+        ] {
+            let mut encoder = super::create_encoder(4_000, 60, mode).unwrap();
+            let mut frame = super::I420Frame::new(16, 16).unwrap();
+            frame.read_rgba(&[128; 16 * 16 * 4]).unwrap();
+            encoder.encode(&frame).unwrap();
+            let mut params = openh264_sys2::SEncParamExt::default();
+            // SAFETY: GetOption synchronously writes the matching initialized parameter structure.
+            let result = unsafe {
+                encoder.raw_api().get_option(
+                    openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                    std::ptr::from_mut(&mut params).cast(),
+                )
+            };
+            assert_eq!(result, 0);
+            assert_eq!((params.iMinQp, params.iMaxQp), (14, 51));
+            assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
+            assert_eq!(params.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
+            let layer = &params.sSpatialLayers[0];
+            assert!(layer.bVideoSignalTypePresent);
+            assert!(layer.bColorDescriptionPresent);
+            assert!(!layer.bFullRange);
+            assert_eq!(layer.uiColorPrimaries, 1);
+            assert_eq!(layer.uiTransferCharacteristics, 13);
+            assert_eq!(layer.uiColorMatrix, 6);
+        }
     }
 
     #[test]
