@@ -1,6 +1,4 @@
 mod config;
-mod control_plane;
-mod credential;
 #[cfg(feature = "media")]
 mod input;
 #[cfg(all(feature = "media", target_os = "linux"))]
@@ -12,8 +10,11 @@ mod media;
 mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;
+mod server;
 mod service;
 mod service_control;
+mod tailnet;
+mod tls;
 mod update;
 #[cfg(all(feature = "media", target_os = "windows"))]
 mod windows_encoder;
@@ -27,7 +28,6 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::AgentConfig;
-use crate::control_plane::ControlPlane;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,19 +57,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Enroll this computer using a single-use setup code.
-    Enroll {
-        code: String,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        control_plane: Option<url::Url>,
-    },
     /// Run the foreground service process.
     Run,
     /// Stop the installed background agent gracefully.
     Stop,
-    /// Check configuration, credentials, capture, input, and network readiness.
+    /// Check configuration, Tailscale, capture, and input readiness.
     Doctor {
         #[arg(long)]
         json: bool,
@@ -91,8 +83,8 @@ enum Command {
     Config,
     /// Print the configuration path used by this invocation.
     Paths,
-    /// Delete this computer's local device credential and enrollment configuration.
-    Unenroll,
+    /// Print this host's tailnet viewer URLs.
+    Url,
     /// Verify a signed update manifest and print the artifact for this executable.
     VerifyUpdate {
         manifest: PathBuf,
@@ -152,39 +144,15 @@ fn init_logging(log_file: Option<&Path>) -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    control_plane::install_crypto_provider()?;
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("cannot install TLS provider"))?;
     let config_path = cli.config.unwrap_or(AgentConfig::default_path()?);
 
     match cli.command {
-        Command::Enroll {
-            code,
-            name,
-            control_plane,
-        } => {
-            let mut config = AgentConfig::load_or_default(&config_path)?;
-            if let Some(url) = control_plane {
-                config.control_plane_url = url;
-            }
-            config.validate()?;
-            let device_name = name.unwrap_or_else(platform::default_device_name);
-            let client = ControlPlane::new(config.control_plane_url.clone())?;
-            let enrollment = client
-                .enroll(
-                    code,
-                    device_name,
-                    config.features.remote_input,
-                    config.quality.encoder,
-                )
-                .await
-                .context("enrollment failed")?;
-            credential::store(&enrollment.device_id, &enrollment.token)?;
-            config.device_id = Some(enrollment.device_id);
-            config.save(&config_path)?;
-            println!("Enrolled successfully.");
-        }
         Command::Run => {
-            let config = AgentConfig::load(&config_path)?;
-            config.validate_enrolled()?;
+            let config = AgentConfig::load_or_default(&config_path)?;
+            config.validate()?;
             service::run(config, cli.ready_file, cli.ready_token).await?;
         }
         Command::Stop => match service_control::request_stop().await? {
@@ -230,21 +198,24 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Config => {
             let config = AgentConfig::load_or_default(&config_path)?;
+            println!(
+                "# tailnet.serve_loopback: only enable on single-user machines when fronted by tailscale serve"
+            );
             println!("{}", toml::to_string_pretty(&config)?);
         }
         Command::Paths => {
             println!("config={}", config_path.display());
         }
-        Command::Unenroll => {
+        Command::Url => {
             let config = AgentConfig::load_or_default(&config_path)?;
-            if let Some(device_id) = config.device_id.as_deref() {
-                credential::delete(device_id)?;
+            let node = tailnet::real(&config.tailnet).status().await?;
+            let tls = tls::inspect(&config.tailnet, &node);
+            if tls.config.is_none() && config.tailnet.tls == config::TlsMode::Auto {
+                eprintln!("{}", tls.detail);
             }
-            if config_path.exists() {
-                std::fs::remove_file(&config_path)
-                    .with_context(|| format!("cannot remove {}", config_path.display()))?;
+            for url in tls::urls(&node, config.tailnet.port, tls.config.is_some()) {
+                println!("{url}");
             }
-            println!("Local enrollment removed. Revoke the device in the web dashboard if needed.");
         }
         Command::VerifyUpdate {
             manifest,

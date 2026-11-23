@@ -1,6 +1,6 @@
 [package]
 name = "nanoctl-agent"
-version = "2.0.0-alpha.1"
+version = "3.0.0-alpha.1"
 edition = "2024"
 license = "MIT"
 description = "Headless nanoctl remote desktop agent"
@@ -16,7 +16,7 @@ capture = [
   "dep:windows",
   "dep:xcap",
 ]
-media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
+media = ["capture", "dep:enigo", "dep:rtcp", "dep:x11rb", "dep:xkeysym", "rtc"]
 rtc = ["dep:interceptor", "dep:webrtc"]
 
 [[bin]]
@@ -25,6 +25,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6.0"
@@ -45,7 +48,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
 sha2 = "0.11"
-tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.49", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "time",
+  "net",
+  "process",
+] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -54,22 +64,21 @@ uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
-zeroize = { version = "1.8", features = ["derive"] }
+x509-parser = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xkb", "xtest"], optional = true }
+xkeysym = { version = "0.2", optional = true }
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
 cros-libva = { version = "0.0.12", optional = true }
-keyring = { version = "3.6", features = ["linux-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-cf = { version = "0.9.3", optional = true }
-keyring = { version = "3.6", features = ["apple-native"] }
 videotoolbox = { version = "0.18.1", default-features = false, features = [
   "compression",
 ], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3.6", features = ["windows-native"] }
 windows = { version = "0.62.2", features = [
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
@@ -79,7 +88,9 @@ windows = { version = "0.62.2", features = [
 
 [dev-dependencies]
 proptest = "1.11.0"
+rcgen = "0.13"
 tempfile = "3.24"
+tokio-tungstenite = "0.29"
 
 [profile.release]
 codegen-units = 1

@@ -1,28 +1,12 @@
-/**
- * The small, boring contract shared by the browser, control plane, and native agent.
- *
- * Protocol 2 adds explicit peer epochs and ICE generations to the wire. Native readers retain
- * bounded protocol-1 parsing for cleanup/diagnostics during rollout, but the control plane only
- * admits protocol-2 sessions so an old browser cannot bypass the epoch ownership rules.
- */
+/** The wire contract shared by the tailnet viewer and native agent. */
 export const PROTOCOL_VERSION = 2 as const;
 export const MIN_SUPPORTED_PROTOCOL_VERSION = 1 as const;
 
 export type SupportedProtocolVersion = 1 | typeof PROTOCOL_VERSION;
 
-export const SESSION_STATES = [
-  "requested",
-  "ringing",
-  "negotiating",
-  "connected",
-  "ended",
-  "failed",
-] as const;
-
-export type SessionState = (typeof SESSION_STATES)[number];
 export type SessionRole = "controller" | "host";
 
-/** A monotonic ICE generation. It is not the database signal sequence. */
+/** A monotonic ICE generation, independent of the signal sequence. */
 export type IceGeneration = number;
 
 /** Identifies one controller peer, independently of its ICE restart generation. */
@@ -105,7 +89,7 @@ export type DeviceCapabilities = {
   readonly input: boolean;
   readonly clipboard: boolean;
   readonly systemAudio: boolean;
-  /** Whether the enrolled agent can accept remote input in this capability state. */
+  /** Whether the agent can accept remote input in this capability state. */
   readonly remoteInput?: boolean;
   readonly ready?: boolean;
   readonly readiness?: ReadinessState;
@@ -131,16 +115,87 @@ export type DisplayInfo = {
 
 export type VideoCodec = "h264" | "vp9" | "av1";
 
-export type SessionPreferences = {
-  readonly codec: VideoCodec | "auto";
-  readonly maxFps: 30 | 60 | 90 | 120;
-  readonly maxBitrateKbps: number;
-  readonly maxWidth: number;
-  readonly maxHeight: number;
-  readonly enableAudio: boolean;
-  readonly enableClipboard: boolean;
-  readonly quality: "responsiveness" | "balanced" | "quality";
+export type HostInfo = {
+  readonly hostName: string;
+  readonly platform: string;
+  readonly version: string;
+  readonly displays: readonly DisplayInfo[];
+  readonly remoteInput: boolean;
+  readonly capabilities: DeviceCapabilities & { readonly encoderBackends?: readonly string[] };
+  readonly viewer: {
+    readonly identity: {
+      readonly login: string;
+      readonly displayName: string;
+      readonly tags: readonly string[];
+    };
+    readonly mayControl: boolean;
+  };
 };
+
+export type AgentClientMessage =
+  | { readonly type: "signal"; readonly envelope: SignalEnvelope }
+  | { readonly type: "end"; readonly reason: string };
+
+export type AgentServerMessage =
+  | { readonly type: "hello"; readonly sessionId: string; readonly host: HostInfo }
+  | AgentClientMessage;
+
+export function assertHostInfo(value: unknown): asserts value is HostInfo {
+  if (
+    !isRecord(value) ||
+    typeof value.hostName !== "string" ||
+    typeof value.platform !== "string" ||
+    typeof value.version !== "string" ||
+    typeof value.remoteInput !== "boolean" ||
+    !Array.isArray(value.displays) ||
+    !value.displays.every(isDisplayInfo) ||
+    !isRecord(value.capabilities) ||
+    !Array.isArray(value.capabilities.displays) ||
+    !value.capabilities.displays.every(isDisplayInfo) ||
+    !isRecord(value.viewer) ||
+    typeof value.viewer.mayControl !== "boolean" ||
+    !isRecord(value.viewer.identity) ||
+    typeof value.viewer.identity.login !== "string" ||
+    typeof value.viewer.identity.displayName !== "string" ||
+    !Array.isArray(value.viewer.identity.tags) ||
+    !value.viewer.identity.tags.every((tag) => typeof tag === "string")
+  ) {
+    throw new Error("invalid host info");
+  }
+}
+
+export function parseAgentMessage(value: unknown): AgentServerMessage {
+  if (!isRecord(value)) throw new Error("invalid agent message");
+  switch (value.type) {
+    case "hello":
+      if (!isBoundedString(value.sessionId, 1, 128)) throw new Error("invalid session ID");
+      assertHostInfo(value.host);
+      return { type: "hello", sessionId: value.sessionId, host: value.host };
+    case "signal": {
+      const envelope = normalizeSignalEnvelope(value.envelope);
+      if (!isRecord(value.envelope) || value.envelope.version !== PROTOCOL_VERSION)
+        throw new Error("expected protocol 2");
+      return { type: "signal", envelope };
+    }
+    case "end":
+      if (!isBoundedString(value.reason, 1, 512)) throw new Error("invalid end reason");
+      return { type: "end", reason: value.reason };
+    default:
+      throw new Error("unknown agent message");
+  }
+}
+
+function isDisplayInfo(value: unknown): value is DisplayInfo {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.width === "number" &&
+    typeof value.height === "number" &&
+    typeof value.scaleFactor === "number" &&
+    typeof value.primary === "boolean"
+  );
+}
 
 export type NormalizedSignal = Omit<
   SignalEnvelope,

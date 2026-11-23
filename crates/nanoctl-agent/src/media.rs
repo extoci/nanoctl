@@ -71,6 +71,7 @@ struct LatestFrame {
     slot: Mutex<Option<CapturedFrame>>,
     last: Mutex<Option<CapturedFrame>>,
     ready: Condvar,
+    stopped: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -263,6 +264,7 @@ impl CaptureEncoder {
         // cannot be opened, the caller keeps the current stream instead of losing video merely
         // because a display-selection request was invalid or temporarily unavailable.
         let (recorder, latest_frame, forwarder) = start_capture(&monitor)?;
+        self.latest_frame.stopped.store(true, Ordering::Release);
         if let Some(old_recorder) = self.recorder.take() {
             let _ = old_recorder.stop();
             drop(old_recorder);
@@ -579,9 +581,14 @@ fn start_capture(
     let forwarder = std::thread::Builder::new()
         .name("nanoctl-capture".to_owned())
         .spawn(move || {
-            while let Ok(frame) = native_frames.recv() {
-                let Some(latest_frame) = forwarding_slot.upgrade() else {
+            while let Some(latest_frame) = forwarding_slot.upgrade() {
+                if latest_frame.stopped.load(Ordering::Acquire) {
                     break;
+                }
+                let frame = match native_frames.recv_timeout(Duration::from_millis(100)) {
+                    Ok(frame) => frame,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 // Replacement, rather than append, makes this queue exactly one frame deep.
                 if !latest_frame.replace(frame) {
@@ -591,6 +598,7 @@ fn start_capture(
         })
         .context("capture forwarding thread could not start")?;
     if let Err(error) = recorder.start() {
+        latest_frame.stopped.store(true, Ordering::Release);
         let _ = recorder.stop();
         let _ = forwarder.join();
         return Err(error).context("continuous display capture could not start");
@@ -690,6 +698,7 @@ pub(crate) fn avcc_to_annex_b(
 
 impl Drop for CaptureEncoder {
     fn drop(&mut self) {
+        self.latest_frame.stopped.store(true, Ordering::Release);
         if let Some(recorder) = self.recorder.take() {
             let _ = recorder.stop();
             drop(recorder);

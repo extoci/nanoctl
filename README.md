@@ -1,98 +1,71 @@
 # nanoctl
 
-nanoctl is a fast, headless remote-desktop service with a browser controller. The host agent runs
-as an operating-system service on Windows, macOS, or Linux. The web application authenticates with
-[Shoo](https://shoo.dev), stores control-plane state in Convex, and negotiates an encrypted WebRTC
-connection directly to the host. A TURN relay is used only when a direct connection cannot be made.
+Fast browser-based remote desktop, served by your own machine over Tailscale.
 
-This repository contains the nanoctl 2.0 rewrite. The release keeps the browser/WebRTC transport
-model while giving each session one lifecycle owner, generation-safe signaling, bounded newest-frame
-handoffs, and actionable readiness/recovery UX.
+**3.0 alpha is tailnet-native.** Each Rust agent embeds its static browser viewer.
+There is no hosted nanoctl control plane, account, enrollment code, device credential,
+STUN or TURN service. Tailscale supplies identity, reachability and WireGuard encryption;
+WebRTC carries video and input between your browser and the host.
 
-## Repository
+## Get started
 
-| Path                   | Purpose                                                                      |
-| ---------------------- | ---------------------------------------------------------------------------- |
-| `apps/web`             | Next.js dashboard, browser controller, Convex schema/functions               |
-| `crates/nanoctl-agent` | Native headless capture, input, WebRTC, and service process                  |
-| `packages/protocol`    | Versioned signaling and control protocol                                     |
-| `infra/coturn`         | Reference TURN deployment                                                    |
-| `docs`                 | Product, architecture, security, platform, protocol, testing, and operations |
+1. [Install Tailscale](https://tailscale.com/download) on the host and controller device,
+   sign into your tailnet, and leave Tailscale running.
+2. Run the nanoctl installer as the host's interactive desktop user:
 
-## Prerequisites
+   **Linux / macOS**
 
-- Bun 1.3.14 or newer
-- Rust 1.96 or newer
-- a Convex project
-- a Shoo-supported HTTPS origin
-- a public TURN service for production
+   ```sh
+   curl -fsSL https://github.com/extoci/nanoctl/releases/latest/download/install.sh | sh
+   ```
 
-## Install
+   **Windows PowerShell**
 
-Linux and macOS:
+   ```powershell
+   irm https://github.com/extoci/nanoctl/releases/latest/download/install.ps1 | iex
+   ```
 
-```sh
-curl -fsSL https://extoci.lol/nanoctl/install | sh
-```
+3. Open the printed URL from a browser on your tailnet, normally
+   `https://<host>.<tailnet>.ts.net:7337/`.
 
-Windows PowerShell:
+During prereleases, use the install script from the selected release and set
+`NANOCTL_VERSION=v3.0.0-alpha.1` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.1"`).
+Run the installer again to upgrade. Downloads are checksum-verified; failed startup
+restores the previous installation. Existing config is preserved and legacy credentials
+are removed best-effort.
 
-```powershell
-irm https://extoci.lol/nanoctl/install | iex
-```
+Enable HTTPS certificates in the **Tailscale admin console → DNS → HTTPS Certificates**.
+The agent runs `tailscale cert` automatically, privately stores and renews the certificate,
+and serves native HTTPS. If issuance is unavailable, it warns and falls back to HTTP
+over the encrypted tailnet. Some browser APIs then require HTTPS. See [setup](docs/SETUP.md).
 
-The installer downloads and verifies the latest release, asks for the setup code on first install,
-and starts nanoctl automatically in the current desktop session. Run the same command again to
-update to the latest release.
+## Access
 
-To test the v2 alpha explicitly:
+By default only the user who owns the host's Tailscale node can connect and control it.
+`tailnet.allow_users`, `tailnet.allow_tags`, or the grant capability
+`extoci.lol/cap/nanoctl` extend access; grants can make a viewer view-only.
+Tailscale network policy must also permit TCP 7337 and WebRTC UDP traffic.
+See [security and sample grants](docs/SECURITY.md).
 
-```sh
-curl -fsSL https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.sh \
-  | NANOCTL_VERSION=v2.0.0-alpha.1 sh
-```
+The viewer auto-connects, displays the host and your tailnet identity, and includes a
+display picker, input toggle, fullscreen, secure-context keyboard lock and stream stats.
+Only one viewer is active at a time; a newer viewer replaces the older one.
+Press **Ctrl+Alt+Shift+Esc** to release remote input.
 
-On Windows PowerShell:
-
-```powershell
-$env:NANOCTL_VERSION = "v2.0.0-alpha.1"
-irm https://github.com/extoci/nanoctl/releases/download/v2.0.0-alpha.1/install.ps1 | iex
-```
-
-## Development
+## Develop
 
 ```sh
-bun install
-cp apps/web/.env.example apps/web/.env.local
-bun run convex:dev
-bun run dev
+bun install --frozen-lockfile
+bun run check
+bun run build:agent
 ```
 
-In another terminal:
+The release build embeds `apps/viewer/dist`; build the viewer before invoking Cargo directly.
+Cargo alone still builds without Bun and serves a placeholder if the viewer was not built.
+Native media dependencies and browser checks are described in [testing](docs/TESTING.md).
 
-```sh
-cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- doctor
-cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- enroll ABCDE-FGHJK-MNPQR-STVWX
-cargo run --manifest-path crates/nanoctl-agent/Cargo.toml -- run
-```
+- [Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/PROTOCOL.md)
+- [Operations](docs/OPERATIONS.md) · [Platforms](docs/PLATFORMS.md)
+- [Product](docs/PRODUCT.md) · [ADR 0004](docs/adr/0004-tailnet-native.md)
 
-Run all repository checks with `bun run check`. Media-feature builds also require the native desktop
-capture development libraries for the target platform.
-
-Host registration and removal instructions are in [docs/SETUP.md](docs/SETUP.md).
-
-## Security posture
-
-nanoctl is designed for device-owner-authorized access. It does not hide its installation, bypass
-OS consent, capture a locked secure desktop without supported system APIs, or provide an arbitrary
-remote shell. Media and input travel over DTLS-SRTP/SCTP. The control plane sees device metadata,
-session metadata, and encrypted transport addresses, but not unencrypted desktop content.
-
-Read [docs/SECURITY.md](docs/SECURITY.md) before deploying.
-
-## Current deployment boundary
-
-The source is production-oriented, but a release is not considered supported until its platform
-package has passed the physical-machine matrix in [docs/TESTING.md](docs/TESTING.md). VM-only tests
-cannot validate hardware encoders, macOS TCC prompts, Windows secure desktop behavior, Wayland
-portals, or hostile NAT traversal.
+MIT licensed.

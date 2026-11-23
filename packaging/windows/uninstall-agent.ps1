@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. "$PSScriptRoot\..\tailnet.ps1"
 $taskName = "nanoctl Agent"
 $publicRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "nanoctl"))
 $managedRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles "nanoctl"))
@@ -70,10 +71,7 @@ if ($binaryExists) {
     }
   }
   if ($ConfigPath -and (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    & $resolvedBinary --config $ConfigPath unenroll
-    if ($LASTEXITCODE -ne 0) {
-      throw "nanoctl could not remove its local enrollment."
-    }
+    Remove-LegacyCredential -ConfigPath $ConfigPath
   }
 } else {
   Write-Warning "The installed nanoctl binary is missing; removing the broken task and install directory."
@@ -91,4 +89,4 @@ if (Test-Path -LiteralPath $installRoot -PathType Container) {
 $readyPath = Join-Path $env:LOCALAPPDATA "nanoctl\agent.ready"
 Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
-Write-Host "nanoctl background agent, installed binary, and local enrollment removed."
+Write-Host "nanoctl background agent and installed binary removed; configuration preserved."

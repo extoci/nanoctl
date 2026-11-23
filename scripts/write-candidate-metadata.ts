@@ -40,7 +40,7 @@ const [rootPackage, agentManifest] = await Promise.all([
 ]);
 const version = packageVersion(rootPackage);
 if (cargoVersion(agentManifest) !== version) {
-  throw new Error("web/repository and agent versions do not match");
+  throw new Error("repository and agent versions do not match");
 }
 if (process.env.GITHUB_REF_TYPE === "tag" && process.env.GITHUB_REF_NAME !== `v${version}`) {
   throw new Error(`release tag must be v${version}`);
