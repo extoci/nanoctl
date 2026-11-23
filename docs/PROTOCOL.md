@@ -108,8 +108,9 @@ blocking video. Capture starts after the peer connects and stops with the sessio
 PulseAudio/PipeWire-pulse server; capture reads `@DEFAULT_MONITOR@`, not the microphone.
 Windows uses WASAPI output-device loopback. macOS system audio is unsupported and
 advertised false. Opus is bundled statically, so no runtime libopus installation is needed.
-The browser starts muted; **Enable sound** opts in for the session, and **Mute sound**
-disables playback again. Autoplay rejection leaves playback muted. Audio is host-to-viewer
+The browser starts muted; **Tap for sound** or **Enable sound** opts in for the session, and
+**Mute sound** disables playback again. If the browser blocks playback, **Tap to resume sound**
+retries it with a gesture. Audio is host-to-viewer
 only and does not require permission to control the host.
 
 ### Clipboard
@@ -132,7 +133,12 @@ When `capabilities.gamepad` is true, an opted-in viewer with control permission 
 `{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel.
 Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
 slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
-are signed 16-bit values with positive Y up. Each message is a full snapshot; the
-host unplugs slots not present. An empty snapshot detaches all pads. The viewer sends
+are signed 16-bit values with positive Y up. For PlayStation controllers, the viewer adds
+an optional `dualShock4` array to the snapshot with one
+`{"slot":0,"leftTriggerPressed":false,"rightTriggerPressed":false,"touchpadPressed":false}`
+entry per PlayStation pad. The host presents those slots as DualShock 4 controllers and
+all other slots as Xbox 360 controllers. The original `pads` entries are unchanged, so
+older hosts can ignore the extension. Each message is a full snapshot; the host unplugs
+slots not present. An empty snapshot detaches all pads. The viewer sends
 changes and a 500 ms keepalive while forwarding; after 2 seconds without a snapshot
 the host neutralizes the current pads. Channel or session teardown unplugs them.

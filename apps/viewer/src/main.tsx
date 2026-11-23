@@ -5,7 +5,7 @@ import type { RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
-import { setSoundEnabled } from "./lib/sound";
+import { SoundPlayback, type SoundState } from "./lib/sound";
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
 import { comboMessages, connectSteps, connectionQuality, keyCombos } from "./lib/session-ui";
@@ -27,7 +27,9 @@ type KeyboardLock = {
 function Viewer() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
-  const [soundEnabled, setSound] = useState(false);
+  const soundPlayback = useRef<SoundPlayback | null>(null);
+  const [sound, setSound] = useState<SoundState>("muted");
+  const [soundPromptDismissed, setSoundPromptDismissed] = useState(false);
   const transport = useRef<SocketSession | null>(null);
   const [info, setInfo] = useState<HostInfo | null>(null);
   const [snapshot, setSnapshot] = useState(initial);
@@ -134,9 +136,12 @@ function Viewer() {
       setDetail("Browser unsupported. Use a current browser with WebRTC enabled.");
       return;
     }
+    const audio = audioRef.current;
+    if (audio) soundPlayback.current = new SoundPlayback(audio, setSound);
     const session = new SocketSession({
       video: videoRef.current,
-      audio: audioRef.current ?? undefined,
+      audio: audio ?? undefined,
+      onAudioTrackChange: () => soundPlayback.current?.trackChanged(),
       onInfo: (host) => {
         setInfo(host);
         setSelectedDisplay((previous) =>
@@ -155,6 +160,7 @@ function Viewer() {
     transport.current = session;
     session.connect();
     return () => {
+      soundPlayback.current = null;
       session.dispose();
       transport.current = null;
     };
@@ -232,11 +238,17 @@ function Viewer() {
   const hostName = info?.hostName || "Remote desktop";
   const send = (message: ControlMessage) => transport.current?.controller?.sendControl(message);
   const inputReady = snapshot.inputEnabled && status === "online";
+  const soundOff = sound === "muted" || sound === "blocked";
+  const soundPrompt =
+    status === "online" &&
+    info?.capabilities.systemAudio &&
+    (sound === "blocked" || (sound === "muted" && !soundPromptDismissed));
+  const toggleSound = () => soundPlayback.current?.toggle();
 
   return (
     <main className={`viewer scale-${scale} ${panelOpen ? "panel-open" : ""}`}>
       <section className={`stage scale-${scale}`} aria-label="Remote desktop">
-        <audio ref={audioRef} autoPlay muted={!soundEnabled} />
+        <audio ref={audioRef} muted />
         <video
           ref={videoRef}
           autoPlay
@@ -298,6 +310,18 @@ function Viewer() {
           </button>
         )}
       </section>
+      {soundPrompt && (
+        <div className="sound-prompt">
+          <button onClick={toggleSound}>
+            {sound === "blocked" ? "Tap to resume sound" : "Tap for sound"}
+          </button>
+          {sound !== "blocked" && (
+            <button aria-label="Dismiss sound prompt" onClick={() => setSoundPromptDismissed(true)}>
+              ×
+            </button>
+          )}
+        </div>
+      )}
       <button
         className="panel-tab"
         aria-label="Session options"
@@ -432,20 +456,27 @@ function Viewer() {
               </button>
             ))}
           </div>
-          {info?.capabilities.systemAudio && (
+          {info && (
             <>
               <h2>Sound</h2>
               <div className="row">
-                <button
-                  aria-pressed={soundEnabled}
-                  onClick={async () => {
-                    if (audioRef.current)
-                      setSound(await setSoundEnabled(audioRef.current, !soundEnabled));
-                  }}
-                >
-                  {soundEnabled ? "Mute sound" : "Enable sound"}
-                </button>
+                {info.capabilities.systemAudio ? (
+                  <button aria-pressed={!soundOff} onClick={toggleSound}>
+                    {sound === "blocked"
+                      ? "Tap to resume sound"
+                      : soundOff
+                        ? "Enable sound"
+                        : sound === "playing"
+                          ? "Mute sound"
+                          : "Cancel sound"}
+                  </button>
+                ) : (
+                  <span>Host audio unavailable</span>
+                )}
               </div>
+              {(sound === "waiting" || sound === "starting") && info.capabilities.systemAudio && (
+                <div role="status">Waiting for host audio…</div>
+              )}
             </>
           )}
           <h2>Details</h2>
@@ -465,7 +496,7 @@ function Viewer() {
                 {metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}
               </dd>
               <dt>RTT</dt>
-              <dd>{metrics ? `${metrics.rttMs} ms` : "—"}</dd>
+              <dd>{metrics?.rttMs == null ? "—" : `${metrics.rttMs} ms`}</dd>
               <dt>Route</dt>
               <dd>{metrics?.route ?? "unknown"}</dd>
             </dl>

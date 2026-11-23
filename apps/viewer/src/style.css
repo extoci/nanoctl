@@ -532,6 +532,18 @@ kbd {
   position: relative;
   overflow: hidden;
 }
+.sound-prompt {
+  position: absolute;
+  top: max(12px, env(safe-area-inset-top));
+  left: max(12px, env(safe-area-inset-left));
+  display: flex;
+  gap: 4px;
+}
+.sound-prompt button {
+  min-width: 44px;
+  min-height: 44px;
+  background: #192332;
+}
 .stage.scale-original {
   overflow: auto;
   display: grid;
