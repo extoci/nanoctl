@@ -1,17 +1,25 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
+import { attachWebCodecsVideo } from "./webcodecs-video";
 
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
 const originalMediaStream = globalThis.MediaStream;
 const originalNavigator = globalThis.navigator;
+const originalVideoDecoder = (globalThis as { VideoDecoder?: unknown }).VideoDecoder;
+const originalEncodedVideoChunk = (globalThis as { EncodedVideoChunk?: unknown }).EncodedVideoChunk;
+const originalMediaStreamTrackGenerator = (globalThis as { MediaStreamTrackGenerator?: unknown })
+  .MediaStreamTrackGenerator;
 
 afterEach(() => {
   defineGlobal("window", originalWindow);
   defineGlobal("document", originalDocument);
   defineGlobal("MediaStream", originalMediaStream);
   defineGlobal("navigator", originalNavigator);
+  defineGlobal("VideoDecoder", originalVideoDecoder);
+  defineGlobal("EncodedVideoChunk", originalEncodedVideoChunk);
+  defineGlobal("MediaStreamTrackGenerator", originalMediaStreamTrackGenerator);
 });
 
 describe("remote session lifecycle", () => {
@@ -732,6 +740,105 @@ class FakePeer {
     this.signalingState = "closed";
   }
 }
+
+describe("webcodecs video gating and teardown", () => {
+  test("only creates WebCodecs encoded streams when H.264 is explicitly chosen", async () => {
+    installBrowserGlobals(() => 0);
+    defineGlobal("VideoDecoder", class FakeVideoDecoder {});
+    for (const codecChoice of ["auto", "av1", "hevc", "h264"] as const) {
+      let createEncodedStreamsCalls = 0;
+      const peer = new FakePeer();
+      peer.addTransceiver = (kind: string, init: RTCRtpTransceiverInit) => {
+        peer.transceivers.push([kind, init.direction]);
+        return {
+          receiver: {
+            createEncodedStreams: () => {
+              createEncodedStreamsCalls += 1;
+              return {
+                readable: new ReadableStream(),
+                writable: new WritableStream(),
+              };
+            },
+          },
+        } as unknown as RTCRtpTransceiver;
+      };
+      const video = new FakeVideo();
+      const controller = new RemoteSessionController({
+        sessionId: `session-${codecChoice}`,
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        codecChoice,
+        video: video as unknown as HTMLVideoElement,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(createEncodedStreamsCalls).toBe(codecChoice === "h264" ? 1 : 0);
+      await controller.stop("done", false);
+    }
+  });
+
+  test("webcodecs teardown does not clear an unowned video srcObject", async () => {
+    installBrowserGlobals(() => 0);
+    let decoderError: ((error: Error) => void) | null = null;
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      constructor(init: { error: (error: Error) => void }) {
+        decoderError = init.error;
+      }
+      configure() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    let readableController: ReadableStreamDefaultController<unknown> | null = null;
+    const readable = new ReadableStream({
+      start(controller) {
+        readableController = controller;
+      },
+    });
+    const writable = new WritableStream();
+    let teardownNotified = 0;
+    const handle = attachWebCodecsVideo(
+      { readable, writable } as unknown as Parameters<typeof attachWebCodecsVideo>[0],
+      video as unknown as HTMLVideoElement,
+      () => {
+        teardownNotified += 1;
+      },
+    );
+
+    const liveStream = new FakeMediaStream();
+    video.srcObject = liveStream;
+    readableController!.enqueue({
+      type: "key",
+      timestamp: 0,
+      data: new Uint8Array([0, 0, 0, 1, 0x65, 0x01]).buffer,
+      getMetadata: () => ({ rtpTimestamp: 0 }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(decoderError).not.toBeNull();
+    decoderError!(new Error("Decoding error"));
+
+    expect(video.srcObject).toBe(liveStream);
+    expect(teardownNotified).toBe(1);
+    handle.drop();
+  });
+});
 
 describe("wheel normalization", () => {
   test("keeps fine-grained trackpad deltas and normalizes delta modes", () => {

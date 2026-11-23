@@ -64,7 +64,7 @@ function containsIdr(annexB: Uint8Array): boolean {
 interface VideoSink {
   canvas: HTMLCanvasElement;
   feed(data: Uint8Array, isKey: boolean, timestampUs: number): void;
-  teardown(): void;
+  teardown(notify?: boolean): void;
   stats(): { decoded: number; dropped: number };
 }
 
@@ -73,7 +73,7 @@ interface VideoTrackGeneratorLike {
   writable: WritableStream<VideoFrame>;
 }
 
-function createVideoSink(video: HTMLVideoElement): VideoSink {
+function createVideoSink(video: HTMLVideoElement, onTeardown?: () => void): VideoSink {
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
   // buffer and the costly software canvas composite. Fall back to a 2D canvas
@@ -93,11 +93,13 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
     generator = null;
   }
   const writer = generator?.writable.getWriter() ?? null;
+  let generatorStream: MediaStream | null = null;
   if (generator) {
     // Older builds expose `.track`; current Chrome makes the generator itself
     // a MediaStreamTrack subclass.
     const track = generator.track ?? (generator as unknown as MediaStreamTrack);
-    video.srcObject = new MediaStream([track]);
+    generatorStream = new MediaStream([track]);
+    video.srcObject = generatorStream;
     void video.play().catch(() => {});
   }
   let canvas: HTMLCanvasElement | null = null;
@@ -155,7 +157,7 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
       },
       error: (error) => {
         console.warn("webcodecs video decoder error", error);
-        teardown();
+        teardown(true);
       },
     });
     try {
@@ -167,7 +169,7 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
       decoder = next;
     } catch (error) {
       console.warn("webcodecs video configure failed", error);
-      teardown();
+      teardown(true);
     }
   };
 
@@ -242,7 +244,7 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
     }
   };
 
-  const teardown = () => {
+  const teardown = (notify = false) => {
     if (closed) return;
     closed = true;
     try {
@@ -251,9 +253,12 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
     if (generator) {
       void writer?.close().catch(() => {});
       (generator.track ?? (generator as unknown as MediaStreamTrack)).stop();
-      if (video.srcObject instanceof MediaStream) video.srcObject = null;
+      if (generatorStream && video.srcObject === generatorStream) {
+        video.srcObject = null;
+      }
     }
     canvas?.remove();
+    if (notify) onTeardown?.();
   };
 
   return {
@@ -267,8 +272,9 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
 export function attachWebCodecsVideo(
   streams: EncodedStreams,
   video: HTMLVideoElement,
+  onTeardown?: () => void,
 ): WebCodecsVideoHandle {
-  const sink = createVideoSink(video);
+  const sink = createVideoSink(video, onTeardown);
   const wrappedTransform = new TransformStream<EncodedVideoFrameLike, EncodedVideoFrameLike>({
     transform: (frame, controller) => {
       try {
@@ -285,8 +291,8 @@ export function attachWebCodecsVideo(
   streams.readable
     .pipeThrough(wrappedTransform)
     .pipeTo(streams.writable)
-    .catch(() => sink.teardown());
-  return { canvas: sink.canvas, drop: sink.teardown, stats: sink.stats };
+    .catch(() => sink.teardown(true));
+  return { canvas: sink.canvas, drop: () => sink.teardown(false), stats: sink.stats };
 }
 
 /**
@@ -297,8 +303,9 @@ export function attachDataChannelVideo(
   channel: RTCDataChannel,
   idrChannel: RTCDataChannel | null,
   video: HTMLVideoElement,
+  onTeardown?: () => void,
 ): WebCodecsVideoHandle {
-  const sink = createVideoSink(video);
+  const sink = createVideoSink(video, onTeardown);
   // Wire format: [u32 seq][u8 flags][annex-b au]. Deltas ride the unordered,
   // unreliable channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
@@ -437,7 +444,7 @@ export function attachDataChannelVideo(
   };
   channel.onmessage = onFrame;
   if (idrChannel) idrChannel.onmessage = onFrame;
-  channel.onclose = () => sink.teardown();
-  if (idrChannel) idrChannel.onclose = () => sink.teardown();
-  return { canvas: sink.canvas, drop: sink.teardown, stats: sink.stats };
+  channel.onclose = () => sink.teardown(true);
+  if (idrChannel) idrChannel.onclose = () => sink.teardown(true);
+  return { canvas: sink.canvas, drop: () => sink.teardown(false), stats: sink.stats };
 }
