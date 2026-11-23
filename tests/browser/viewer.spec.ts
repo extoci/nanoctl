@@ -142,6 +142,37 @@ test("an unpaced 200-character key burst reaches native input in order", async (
   }
 });
 
+test("enabled input retains keyboard focus after video clicks", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
+  await page.addInitScript(() => {
+    const send = RTCDataChannel.prototype.send;
+    (window as unknown as { injected: string[] }).injected = [];
+    RTCDataChannel.prototype.send = function (data: unknown) {
+      (window as unknown as { injected: string[] }).injected.push(String(data));
+      return Reflect.apply(send, this, [data]);
+    };
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  for (let i = 0; i < 2; i++) {
+    await page.locator("video").click();
+    await expect(page.locator("video")).toBeFocused();
+    await page.keyboard.press("Space");
+  }
+  expect(
+    await page.evaluate(() =>
+      (window as unknown as { injected: string[] }).injected
+        .map((data) => JSON.parse(data))
+        .filter((data) => data.type === "key"),
+    ),
+  ).toEqual(
+    Array.from({ length: 2 }, () => [
+      { type: "key", action: "down", code: "Space", key: " ", modifiers: 0, repeat: false },
+      { type: "key", action: "up", code: "Space", key: " ", modifiers: 0, repeat: false },
+    ]).flat(),
+  );
+});
+
 test("disabled input stays off across repeated video clicks", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
   await page.addInitScript(() => {

@@ -125,3 +125,14 @@ text is not echoed back. The browser writes host text when focused, retaining on
 pending text otherwise. It reads local text on paste and focus/visibility regain, suppressing
 echoes. Clipboard permissions and a secure browser context are required; denied browser APIs
 are silently ignored. A remote paste shortcut sends local clipboard text before its key event.
+
+### Gamepads
+
+When `capabilities.gamepad` is true, an opted-in viewer with control permission sends
+`{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel.
+Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
+slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
+are signed 16-bit values with positive Y up. Each message is a full snapshot; the
+host unplugs slots not present. An empty snapshot detaches all pads. The viewer sends
+changes and a 500 ms keepalive while forwarding; after 2 seconds without a snapshot
+the host neutralizes the current pads. Channel or session teardown unplugs them.

@@ -14,6 +14,7 @@ const initial: RemoteSessionSnapshot = {
   reconnectAttempt: 0,
   iceGeneration: 0,
   inputEnabled: false,
+  gamepadEnabled: false,
   firstFrameReceived: false,
   metrics: null,
 };
@@ -340,6 +341,31 @@ function Viewer() {
           >
             {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
           </button>
+          {info?.remoteInput && (info.platform === "windows" || info.capabilities.gamepad) && (
+            <button
+              aria-pressed={snapshot.gamepadEnabled}
+              disabled={
+                !info.capabilities.gamepad ||
+                typeof navigator.getGamepads !== "function" ||
+                !snapshot.inputEnabled ||
+                !live
+              }
+              title={
+                !info.capabilities.gamepad
+                  ? "Install ViGEmBus on the Windows host and restart nanoctl"
+                  : typeof navigator.getGamepads !== "function"
+                    ? "Use a browser with Gamepad API support over HTTPS"
+                    : "Pair a controller with this device, then press a controller button"
+              }
+              onClick={() =>
+                transport.current?.controller?.setGamepadEnabled(!snapshot.gamepadEnabled)
+              }
+            >
+              {!info.capabilities.gamepad
+                ? "Gamepad unavailable"
+                : `Gamepad ${snapshot.gamepadEnabled ? "on" : "off"}`}
+            </button>
+          )}
           <button aria-pressed={showStats} onClick={() => setShowStats(!showStats)}>
             Stats
           </button>

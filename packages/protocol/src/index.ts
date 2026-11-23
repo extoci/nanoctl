@@ -119,6 +119,17 @@ export type SignalPayload =
     }
   | { readonly type: "end"; readonly reason: string };
 
+export type GamepadReport = readonly [
+  slot: number,
+  buttons: number,
+  leftTrigger: number,
+  rightTrigger: number,
+  leftX: number,
+  leftY: number,
+  rightX: number,
+  rightY: number,
+];
+
 export type ControlMessage =
   | {
       readonly type: "pointer";
@@ -138,6 +149,7 @@ export type ControlMessage =
       readonly repeat: boolean;
     }
   | { readonly type: "display"; readonly displayId: string }
+  | { readonly type: "gamepad"; readonly pads: readonly GamepadReport[] }
   | { readonly type: "release" }
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }
@@ -155,6 +167,7 @@ export type DeviceCapabilities = {
   readonly systemAudio: boolean;
   /** Whether the agent can accept remote input in this capability state. */
   readonly remoteInput?: boolean;
+  readonly gamepad?: boolean;
   readonly ready?: boolean;
   readonly readiness?: ReadinessState;
 };

@@ -6,6 +6,8 @@ mod audio;
 mod clipboard;
 mod config;
 #[cfg(feature = "media")]
+mod gamepad;
+#[cfg(feature = "media")]
 mod input;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod linux_encoder;
