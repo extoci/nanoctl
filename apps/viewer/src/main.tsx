@@ -31,6 +31,7 @@ const initial: RemoteSessionSnapshot = {
   gamepadStatus: "waiting",
   firstFrameReceived: false,
   metrics: null,
+  inputBlocked: 0,
 };
 type KeyboardLock = {
   lock: (keys?: string[]) => Promise<void>;
@@ -252,6 +253,13 @@ function Viewer() {
     };
   }, [snapshot.inputEnabled]);
 
+  useEffect(() => {
+    if (snapshot.inputBlocked > 0)
+      setNotice(
+        "The host refused mouse and keyboard input. On Windows this happens while an administrator window, a UAC prompt or the lock screen is in front.",
+      );
+  }, [snapshot.inputBlocked]);
+
   const terminal = status === "error" || status === "replaced" || status === "disconnected";
   const live = status === "online" && snapshot.phase === "connected" && snapshot.firstFrameReceived;
   const label = terminal
@@ -427,7 +435,11 @@ function Viewer() {
         aria-expanded={panelOpen}
         aria-controls="session-panel"
         title="Session options"
-        onClick={() => setPanelOpen(!panelOpen)}
+        onClick={(event) => {
+          setPanelOpen(!panelOpen);
+          if (panelOpen && inputReady && event.detail > 0)
+            videoRef.current?.focus({ preventScroll: true });
+        }}
       >
         <span className={quality ? `quality-dot ${quality}` : "status-dot"} aria-hidden="true" />
         <span aria-hidden="true">{panelOpen ? "›" : "‹"}</span>

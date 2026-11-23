@@ -175,6 +175,28 @@ test("enabled input retains keyboard focus after video clicks", async ({ page })
       { type: "key", action: "up", code: "Space", key: " ", modifiers: 0, repeat: false },
     ]).flat(),
   );
+
+  await openPanel(page);
+  await closePanel(page);
+  await expect(page.locator("video")).toBeFocused();
+  await page.keyboard.press("a");
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { injected: string[] }).injected
+          .map((data) => JSON.parse(data))
+          .filter((data) => data.type === "key" && data.code === "KeyA")
+          .map((data) => data.action),
+      ),
+    )
+    .toEqual(["down", "up"]);
+
+  const tab = page.getByRole("button", { name: "Session options" });
+  await tab.press("Enter");
+  await expect(tab).toHaveAttribute("aria-expanded", "true");
+  await tab.press("Enter");
+  await expect(tab).toHaveAttribute("aria-expanded", "false");
+  await expect(tab).toBeFocused();
 });
 
 test("disabled input stays off across repeated video clicks", async ({ page }) => {
