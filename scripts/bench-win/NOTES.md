@@ -60,6 +60,17 @@ Agent == Sunshine in CPU/RSS. Client side: Chrome viewer is ~2.7x
 Moonlight's RSS (browser overhead — a Tauri/egui client would erase it);
 Moonlight's native client burns 43% CPU vs agent's ~21%.
 
+## Bandwidth (same recursive-mirror scene, 1600x1200)
+
+| stream             | wire rate                                                      |
+| ------------------ | -------------------------------------------------------------- |
+| Sunshine+Moonlight | 14.99 Mbps (Sunshine log: configured streaming bitrate)        |
+| nanoctl DC-video   | ~1.3 Mbps (agent bytes_sent/send_kbps, VBR — content-adaptive) |
+
+~11.5x less wire data. Caveat: Moonlight's figure is its configured
+target bitrate — Sunshine pads toward it; nanoctl's is measured output
+on a mostly-static desktop, so the gap shrinks on high-motion content.
+
 ## Server per-frame costs (agent.log pipeline statistics, /frames_encoded)
 
 - backend_ns (OpenH264): was ~25ms -> ~10ms (max_slice_len 8000 +
