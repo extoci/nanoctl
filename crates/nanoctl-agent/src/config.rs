@@ -152,8 +152,8 @@ impl AgentConfig {
         if self.tailnet.port == 0 {
             bail!("tailnet.port must not be zero");
         }
-        if !matches!(self.quality.max_fps, 30 | 60 | 90 | 120) {
-            bail!("quality.max_fps must be 30, 60, 90, or 120");
+        if !(24..=240).contains(&self.quality.max_fps) {
+            bail!("quality.max_fps must be between 24 and 240");
         }
         if !(500..=100_000).contains(&self.quality.max_bitrate_kbps) {
             bail!("quality.max_bitrate_kbps must be between 500 and 100000");

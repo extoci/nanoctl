@@ -344,6 +344,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
         host.video_track(),
         host.keyframe_requests(),
         host.link_feedback(),
+        host.viewer_limits(),
         host.display_selection(),
         host.display_selection_feedback_sender(),
         VideoQuality {
