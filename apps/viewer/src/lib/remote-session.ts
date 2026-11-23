@@ -12,6 +12,12 @@ import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
+import {
+  attachWebCodecsVideo,
+  createVideoEncodedStreams,
+  supportsWebCodecsVideo,
+  type WebCodecsVideoHandle,
+} from "./webcodecs-video";
 import { normalizedPosition, videoGeometry } from "./touch-input";
 
 export type RemoteSessionPhase =
@@ -114,6 +120,11 @@ export class RemoteSessionController {
   private readonly pendingEndOfCandidates = new Map<number, string>();
 
   private peer: RTCPeerConnection | null = null;
+  private webCodecsVideo: WebCodecsVideoHandle | null = null;
+  private pendingEncodedStreams: {
+    readable: ReadableStream;
+    writable: WritableStream;
+  } | null = null;
   private pointerChannel: RTCDataChannel | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private clipboardChannel: RTCDataChannel | null = null;
@@ -459,6 +470,9 @@ export class RemoteSessionController {
         peer.close();
       }
       this.peer = null;
+      this.webCodecsVideo?.drop();
+      this.webCodecsVideo = null;
+      this.pendingEncodedStreams = null;
       const stream = this.options.video.srcObject;
       if (stream instanceof MediaStream) {
         for (const track of stream.getTracks()) track.stop();
@@ -534,7 +548,16 @@ export class RemoteSessionController {
       this.publishSnapshot();
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
-    peer.addTransceiver("video", { direction: "recvonly" });
+    const videoTransceiver = peer.addTransceiver("video", {
+      direction: "recvonly",
+    });
+    // Chrome only allows encoded streams before any RTP arrives, so the
+    // transform must be created here — before negotiation — not in ontrack.
+    this.pendingEncodedStreams = supportsWebCodecsVideo(videoTransceiver.receiver)
+      ? (createVideoEncodedStreams(
+          videoTransceiver.receiver,
+        ) as { readable: ReadableStream; writable: WritableStream } | null)
+      : null;
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
@@ -553,6 +576,12 @@ export class RemoteSessionController {
           this.options.onAudioTrackChange?.();
         }
         return;
+      }
+      if (this.pendingEncodedStreams && !this.webCodecsVideo) {
+        const encoded = this.pendingEncodedStreams as Parameters<
+          typeof attachWebCodecsVideo
+        >[0];
+        this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video);
       }
       const stream = streams[0] ?? new MediaStream([track]);
       this.options.video.srcObject = stream;
