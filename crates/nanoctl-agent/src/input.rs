@@ -6,6 +6,10 @@ use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Se
 use serde::Deserialize;
 use xcap::Monitor;
 
+#[cfg(target_os = "linux")]
+#[path = "x11_text.rs"]
+mod x11_text;
+
 #[derive(Clone, Copy)]
 pub enum InputLane {
     Reliable,
@@ -153,6 +157,13 @@ impl InputController {
                 Ok(None)
             }
             ControlMessage::Text { text } => {
+                #[cfg(target_os = "linux")]
+                if std::env::var_os("DISPLAY").is_some()
+                    && std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
+                {
+                    x11_text::inject(&text)?;
+                    return Ok(None);
+                }
                 self.enigo.text(&text)?;
                 Ok(None)
             }
@@ -332,6 +343,84 @@ mod tests {
     use super::*;
     use crate::rtc::MAX_CONTROL_MESSAGE_BYTES;
     use proptest::prelude::*;
+    #[cfg(target_os = "linux")]
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "run on a disposable X11 display with xvfb-run"]
+    fn times_unicode_text_commit_on_x11() {
+        for (label, text, bound) in [
+            (
+                "ASCII/Latin",
+                "AbC xyz 123!? "
+                    .chars()
+                    .cycle()
+                    .take(200)
+                    .collect::<String>(),
+                300,
+            ),
+            (
+                "mixed Unicode",
+                "Hello 日本語 café 🙂! ".chars().cycle().take(200).collect(),
+                300,
+            ),
+            (
+                "distinct CJK",
+                (0x4e00..0x4ec8)
+                    .map(|code| char::from_u32(code).unwrap())
+                    .collect(),
+                3000,
+            ),
+        ] {
+            let mut input = InputController::new().unwrap();
+            let started = Instant::now();
+            input.enigo.text(&text).unwrap();
+            println!("legacy 200-character {label}: {:?}", started.elapsed());
+            drop(input);
+            let mut input = InputController::new().unwrap();
+            let (connection, _) = x11rb::connect(None).unwrap();
+            x11rb::protocol::xkb::use_extension(&connection, 1, 0)
+                .unwrap()
+                .reply()
+                .unwrap();
+            let first = connection.setup().min_keycode;
+            let count = connection.setup().max_keycode - first + 1;
+            let before = connection
+                .get_keyboard_mapping(first, count)
+                .unwrap()
+                .reply()
+                .unwrap();
+            let message =
+                serde_json::to_vec(&serde_json::json!({"type":"text", "text":text})).unwrap();
+            let started = Instant::now();
+            input.dispatch(&message, InputLane::Reliable).unwrap();
+            let elapsed = started.elapsed();
+            println!("batched 200-character {label}: {elapsed:?}");
+            let after = connection
+                .get_keyboard_mapping(first, count)
+                .unwrap()
+                .reply()
+                .unwrap();
+            assert_eq!(before.keysyms_per_keycode, after.keysyms_per_keycode);
+            assert_eq!(before.keysyms, after.keysyms);
+            assert!(elapsed < Duration::from_millis(bound), "{elapsed:?}");
+            if label == "ASCII/Latin" {
+                input.enigo.key(Key::Control, Direction::Press).unwrap();
+                let before = x11rb::protocol::xkb::get_state(&connection, 256)
+                    .unwrap()
+                    .reply()
+                    .unwrap();
+                input.dispatch(&message, InputLane::Reliable).unwrap();
+                let after = x11rb::protocol::xkb::get_state(&connection, 256)
+                    .unwrap()
+                    .reply()
+                    .unwrap();
+                assert_eq!(before.base_mods, after.base_mods);
+                input.enigo.key(Key::Control, Direction::Release).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn coordinates_are_bounded() {
