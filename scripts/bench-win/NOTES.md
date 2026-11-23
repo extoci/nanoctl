@@ -56,6 +56,9 @@ Key findings:
 | Moonlight (client)                | 43.0               | ~147 MB           |
 | nanoctl viewer (Chrome, 10 procs) | —                  | ~400 MB           |
 
+5-min sustained sample (calmer scene): agent 11.6% CPU, RSS avg 103 MB,
+peak 158 MB.
+
 Agent == Sunshine in CPU/RSS. Client side: Chrome viewer is ~2.7x
 Moonlight's RSS (browser overhead — a Tauri/egui client would erase it);
 Moonlight's native client burns 43% CPU vs agent's ~21%.
