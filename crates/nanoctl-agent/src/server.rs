@@ -33,6 +33,8 @@ type Active = Option<(watch::Sender<String>, tokio::task::JoinHandle<()>)>;
 pub struct ServerState {
     hosts: Mutex<Option<(std::time::Instant, Vec<tailnet::Peer>)>>,
     pub config: AgentConfig,
+    #[cfg(all(feature = "rtc", feature = "embedded-tailnet"))]
+    embedded: Option<Arc<crate::embedded::EmbeddedTailnet>>,
     tailnet: Arc<dyn Tailnet>,
     node: RwLock<Node>,
     active: Mutex<Active>,
@@ -49,11 +51,29 @@ impl ServerState {
         Arc::new(Self {
             hosts: Mutex::new(None),
             config,
+            #[cfg(all(feature = "rtc", feature = "embedded-tailnet"))]
+            embedded: None,
             tailnet,
             node: RwLock::new(Node::default()),
             active: Mutex::new(None),
             stopping: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[cfg(feature = "embedded-tailnet")]
+    pub fn new_embedded(
+        config: AgentConfig,
+        net: Arc<crate::embedded::EmbeddedTailnet>,
+    ) -> Arc<Self> {
+        let state = Self::new(config, net.clone());
+        #[cfg(all(feature = "rtc", feature = "embedded-tailnet"))]
+        {
+            let mut state = state;
+            Arc::get_mut(&mut state).unwrap().embedded = Some(net);
+            state
+        }
+        #[cfg(not(feature = "rtc"))]
+        state
     }
 
     pub async fn stop(&self) {
@@ -229,20 +249,14 @@ fn host_url(node: &Node, port: u16, tls: bool) -> String {
     }
 }
 
-async fn probe_peer(peer: tailnet::Peer, port: u16) -> Option<tailnet::Peer> {
+async fn probe_peer(net: &dyn Tailnet, peer: tailnet::Peer, port: u16) -> Option<tailnet::Peer> {
     if !peer.online {
         return None;
     }
     let ip = *peer.ips.first()?;
-    matches!(
-        tokio::time::timeout(
-            Duration::from_millis(400),
-            tokio::net::TcpStream::connect(SocketAddr::new(ip, port))
-        )
-        .await,
-        Ok(Ok(_))
-    )
-    .then_some(peer)
+    net.reachable(SocketAddr::new(ip, port))
+        .await
+        .then_some(peer)
 }
 
 async fn hosts(
@@ -269,7 +283,7 @@ async fn hosts(
                     !p.ips.iter().any(|ip| node.ips.contains(ip))
                         && (node.dns_name.is_empty() || p.dns_name != node.dns_name)
                 })
-                .map(|p| probe_peer(p, state.config.tailnet.port));
+                .map(|p| probe_peer(state.tailnet.as_ref(), p, state.config.tailnet.port));
             let mut peers: Vec<_> = futures_util::future::join_all(probes)
                 .await
                 .into_iter()
@@ -423,6 +437,8 @@ async fn session(
     let (outgoing, mut messages) = tokio::sync::mpsc::channel::<Value>(64);
     #[cfg(feature = "rtc")]
     let mut peer: Option<crate::rtc::HostPeer> = None;
+    #[cfg(all(feature = "rtc", feature = "embedded-tailnet"))]
+    let mut ice = None;
     #[cfg(feature = "media")]
     let mut media: Option<crate::media::VideoPipeline> = None;
     #[cfg(feature = "media")]
@@ -476,12 +492,28 @@ async fn session(
                     let result = if let Some(peer) = &peer {
                         peer.add_signal(&serialized, &id, sequence).await
                     } else if crate::rtc::is_offer_for_session(&serialized, &id) {
+                        #[cfg(feature = "embedded-tailnet")]
+                        let settings = if let Some(net) = &state.embedded {
+                            match net.ice_transport() {
+                                Ok(transport) => {
+                                    let settings = transport.settings();
+                                    ice = Some(transport);
+                                    Some(settings)
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "embedded WebRTC transport unavailable");
+                                    break "connection-failed".into();
+                                }
+                            }
+                        } else { None };
+                        #[cfg(not(feature = "embedded-tailnet"))]
+                        let settings = None;
                         match crate::rtc::HostPeer::answer_with_host_epoch(
                             outgoing.clone(), id.clone(), &serialized, Vec::new(),
                             webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
                             crate::rtc::host_epoch_seed(), state.config.features.remote_input && control,
                             state.config.features.clipboard && state.config.features.remote_input && control,
-                            state.config.features.system_audio).await {
+                            state.config.features.system_audio, settings).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
                                 { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }
@@ -516,8 +548,59 @@ async fn session(
         #[cfg(feature = "media")]
         crate::media::release_session_memory().await;
     }
+    #[cfg(all(feature = "rtc", feature = "embedded-tailnet"))]
+    if let Some(ice) = ice {
+        ice.close().await;
+    }
     let _ = send(&mut socket, json!({"type":"end","reason":reason})).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
+}
+
+#[cfg(feature = "embedded-tailnet")]
+pub async fn serve_embedded(
+    state: Arc<ServerState>,
+    net: Arc<crate::embedded::EmbeddedTailnet>,
+    listener: tokio::net::TcpListener,
+    mut helper: crate::embedded::Helper,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    async fn peer_from_bridge(
+        State(net): State<Arc<crate::embedded::EmbeddedTailnet>>,
+        mut request: axum::extract::Request,
+        next: Next,
+    ) -> Response {
+        let Some(peer) = net.peer(request.headers()) else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        request.headers_mut().remove(crate::embedded::BRIDGE_HEADER);
+        request.headers_mut().remove(crate::embedded::PEER_HEADER);
+        request.extensions_mut().insert(ConnectInfo(peer));
+        next.run(request).await
+    }
+
+    let tls = state.config.tailnet.tls == crate::config::TlsMode::Auto;
+    let app =
+        router(state.clone(), tls).layer(middleware::from_fn_with_state(net, peer_from_bridge));
+    let mut server = std::pin::pin!(async { axum::serve(listener, app).await });
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut online = false;
+    let result = loop {
+        tokio::select! {
+            _ = shutdown.changed() => break Ok(()),
+            result = &mut server => break result.map_err(Into::into),
+            result = helper.wait() => break result,
+            _ = interval.tick() => {
+                let node = state.tailnet.status().await;
+                if let Ok(node) = &node && !online {
+                    tracing::info!(dns = %node.dns_name, "embedded Tailscale listener ready");
+                }
+                online = node.is_ok();
+                *state.node.write().await = node.unwrap_or_default();
+            }
+        }
+    };
+    helper.stop().await;
+    result
 }
 
 pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -654,12 +737,21 @@ mod tests {
             online: true,
             ..Default::default()
         };
-        assert!(super::probe_peer(peer.clone(), port).await.is_some());
+        let net = crate::tailnet::real(&AgentConfig::default().tailnet);
+        assert!(
+            super::probe_peer(net.as_ref(), peer.clone(), port)
+                .await
+                .is_some()
+        );
         peer.online = false;
-        assert!(super::probe_peer(peer.clone(), port).await.is_none());
+        assert!(
+            super::probe_peer(net.as_ref(), peer.clone(), port)
+                .await
+                .is_none()
+        );
         peer.online = true;
         drop(listener);
-        assert!(super::probe_peer(peer, port).await.is_none());
+        assert!(super::probe_peer(net.as_ref(), peer, port).await.is_none());
     }
 
     #[tokio::test]

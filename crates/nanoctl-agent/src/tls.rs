@@ -77,7 +77,7 @@ fn directory() -> Result<PathBuf> {
         .join("tls"))
 }
 
-fn private(path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn private(path: &Path, directory: bool) -> Result<()> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         bail!("TLS path must not be a symlink");
     }

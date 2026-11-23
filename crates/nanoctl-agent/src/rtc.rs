@@ -434,6 +434,7 @@ impl HostPeer {
         allow_remote_input: bool,
         allow_clipboard: bool,
         allow_audio: bool,
+        settings: Option<SettingEngine>,
     ) -> Result<Self> {
         Self::answer_with_publisher(
             SignalPublisher::websocket(sender),
@@ -445,6 +446,7 @@ impl HostPeer {
             allow_remote_input,
             allow_clipboard,
             allow_audio,
+            settings,
         )
         .await
     }
@@ -460,6 +462,7 @@ impl HostPeer {
         allow_remote_input: bool,
         allow_clipboard: bool,
         allow_audio: bool,
+        settings: Option<SettingEngine>,
     ) -> Result<Self> {
         let (offer, initial_generation, controller_epoch) =
             parse_offer(serialized_offer, &session_id)?;
@@ -480,15 +483,18 @@ impl HostPeer {
             None,
         )?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
-        let mut settings = SettingEngine::default();
-        let dev_loopback = crate::server::dev_user().is_some();
-        if matches!(publisher.inner, SignalPublisherInner::WebSocket(_)) {
-            settings.set_include_loopback_candidate(dev_loopback);
-            settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
-            settings.set_ip_filter(Box::new(move |ip| {
-                crate::tailnet::is_tailnet_ip(ip) || (dev_loopback && ip.is_loopback())
-            }));
-        }
+        let settings = settings.unwrap_or_else(|| {
+            let mut settings = SettingEngine::default();
+            let dev_loopback = crate::server::dev_user().is_some();
+            if matches!(publisher.inner, SignalPublisherInner::WebSocket(_)) {
+                settings.set_include_loopback_candidate(dev_loopback);
+                settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+                settings.set_ip_filter(Box::new(move |ip| {
+                    crate::tailnet::is_tailnet_ip(ip) || (dev_loopback && ip.is_loopback())
+                }));
+            }
+            settings
+        });
         let api = APIBuilder::new()
             .with_setting_engine(settings)
             .with_media_engine(media_engine)
@@ -1689,6 +1695,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .await;
 
@@ -1757,6 +1764,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .await
         .unwrap();

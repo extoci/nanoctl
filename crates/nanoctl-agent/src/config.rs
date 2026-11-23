@@ -28,6 +28,7 @@ pub struct QualityConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TailnetConfig {
+    pub backend: TailnetBackend,
     pub discover_peers: bool,
     pub port: u16,
     pub allow_users: Vec<String>,
@@ -36,6 +37,15 @@ pub struct TailnetConfig {
     pub serve_loopback: bool,
     pub tls: TlsMode,
     pub tailscale_cli: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TailnetBackend {
+    #[default]
+    Auto,
+    System,
+    Embedded,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,6 +109,7 @@ impl Default for QualityConfig {
 impl Default for TailnetConfig {
     fn default() -> Self {
         Self {
+            backend: TailnetBackend::Auto,
             discover_peers: true,
             port: 7337,
             allow_users: Vec::new(),
@@ -150,6 +161,14 @@ impl AgentConfig {
     pub fn validate(&self) -> Result<()> {
         if self.tailnet.port == 0 {
             bail!("tailnet.port must not be zero");
+        }
+        if self.tailnet.backend == TailnetBackend::Embedded {
+            if !cfg!(feature = "embedded-tailnet") {
+                bail!("this build does not include embedded Tailscale");
+            }
+            if self.tailnet.serve_loopback || self.tailnet.tailscale_cli.is_some() {
+                bail!("the embedded backend cannot use serve_loopback or tailscale_cli");
+            }
         }
         if !matches!(self.quality.max_fps, 30 | 60 | 90 | 120) {
             bail!("quality.max_fps must be 30, 60, 90, or 120");

@@ -10,10 +10,33 @@ pub async fn run(
     let Some(control) = ServiceControl::acquire()? else {
         return Ok(());
     };
-    let state =
-        crate::server::ServerState::new(config.clone(), crate::tailnet::real(&config.tailnet));
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let server = tokio::spawn(crate::server::serve(state.clone(), receiver));
+    let mut server;
+    let state;
+    #[cfg(feature = "embedded-tailnet")]
+    let embedded = crate::tailnet::uses_embedded(&config.tailnet);
+    #[cfg(not(feature = "embedded-tailnet"))]
+    let embedded = false;
+    if embedded {
+        #[cfg(feature = "embedded-tailnet")]
+        {
+            let (net, listener, helper) = crate::embedded::start(&config.tailnet).await?;
+            state = crate::server::ServerState::new_embedded(config, net.clone());
+            server = tokio::spawn(crate::server::serve_embedded(
+                state.clone(),
+                net,
+                listener,
+                helper,
+                receiver,
+            ));
+        }
+        #[cfg(not(feature = "embedded-tailnet"))]
+        unreachable!();
+    } else {
+        let net = crate::tailnet::real(&config.tailnet);
+        state = crate::server::ServerState::new(config, net);
+        server = tokio::spawn(crate::server::serve(state.clone(), receiver));
+    }
     let _ready = ready_file
         .map(|path| ReadyFile::create(path, ready_token.as_deref()))
         .transpose()?;
@@ -22,6 +45,10 @@ pub async fn run(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = interval.tick() => { if control.take_stop_request()? { break; } }
+            result = &mut server => {
+                state.stop().await;
+                return result?;
+            }
         }
     }
     shutdown.send_replace(true);

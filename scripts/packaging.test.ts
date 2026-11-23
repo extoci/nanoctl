@@ -371,8 +371,8 @@ describe("one-command Windows installer", () => {
     const installer = await Bun.file(join(repository, "install.ps1")).text();
     const helper = await Bun.file(join(repository, "packaging/tailnet.ps1")).text();
     expect(installer).toContain(helper.trim());
-    expect(helper).toContain("https://tailscale.com/download");
-    expect(helper).toContain('BackendState -ne "Running"');
+    expect(helper).not.toContain("Get-Command tailscale");
+    expect(helper).toContain("Run nanoctl url to finish Tailscale sign-in");
     expect(helper).toContain('"/delete:$($Matches[1]).dev.nanoctl.agent"');
     expect(helper).toContain("& $BinaryPath --config $ConfigPath url");
     for (const path of [

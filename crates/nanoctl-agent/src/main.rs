@@ -5,6 +5,8 @@ mod audio;
 #[cfg(feature = "media")]
 mod clipboard;
 mod config;
+#[cfg(feature = "embedded-tailnet")]
+mod embedded;
 #[cfg(feature = "media")]
 mod gamepad;
 #[cfg(feature = "media")]
@@ -106,6 +108,9 @@ enum Command {
     Paths,
     /// Print this host's tailnet viewer URLs.
     Url,
+    /// Print license notices for the bundled Tailscale backend.
+    #[cfg(feature = "embedded-tailnet")]
+    Licenses,
     /// Verify a signed update manifest and print the artifact for this executable.
     VerifyUpdate {
         manifest: PathBuf,
@@ -236,8 +241,23 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Paths => {
             println!("config={}", config_path.display());
         }
+        #[cfg(feature = "embedded-tailnet")]
+        Command::Licenses => {
+            print!(
+                "{}",
+                include_str!(concat!(env!("OUT_DIR"), "/tsnet-notices.txt"))
+            );
+        }
         Command::Url => {
             let config = AgentConfig::load_or_default(&config_path)?;
+            #[cfg(feature = "embedded-tailnet")]
+            if tailnet::uses_embedded(&config.tailnet) {
+                let (node, https) = embedded::inspect(&config.tailnet)?;
+                for url in tls::urls(&node, config.tailnet.port, https) {
+                    println!("{url}");
+                }
+                return Ok(());
+            }
             let node = tailnet::real(&config.tailnet).status().await?;
             let tls = tls::inspect(&config.tailnet, &node);
             if tls.config.is_none() && config.tailnet.tls == config::TlsMode::Auto {

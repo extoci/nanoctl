@@ -22,23 +22,14 @@ function Remove-LegacyCredential {
 
 function Show-TailnetUrl {
   param([string]$BinaryPath, [string]$ConfigPath)
-  $tailscale = Get-Command tailscale -ErrorAction SilentlyContinue
-  $tailscalePath = if ($tailscale) { $tailscale.Source } else {
-    Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-  }
   try {
-    $status = & $tailscalePath status --json 2>$null | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $status.BackendState -ne "Running") {
-      throw "Tailscale is not running."
-    }
+    $ErrorActionPreference = "Continue"
+    $urlOutput = & $BinaryPath --config $ConfigPath url 2>&1
+    $exitCode = $LASTEXITCODE
+    $urlOutput | ForEach-Object { Write-Host $_ }
+    if ($exitCode -ne 0) { throw "URL unavailable." }
   } catch {
-    Write-Warning "Install/start Tailscale and sign in: https://tailscale.com/download"
-  }
-  try {
-    & $BinaryPath --config $ConfigPath url
-    if ($LASTEXITCODE -ne 0) { throw "URL unavailable." }
-  } catch {
-    Write-Warning "URL unavailable yet; run nanoctl url after Tailscale is running."
+    Write-Warning "Run nanoctl url to finish Tailscale sign-in or nanoctl doctor to diagnose the connection."
   }
 }
 

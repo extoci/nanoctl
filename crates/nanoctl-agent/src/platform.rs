@@ -210,38 +210,39 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
             "invalid; run nanoctl config and inspect service logs".into()
         },
     });
-    let found = crate::tailnet::CliTailnet::discover(&config.tailnet);
-    checks.push(DoctorCheck {
-        name: "tailscale CLI",
-        ok: found.is_ok(),
-        detail: match &found {
-            Ok(_) => "found".into(),
-            Err(error) => error.to_string(),
-        },
-    });
-    let status = crate::tailnet::real(&config.tailnet).status().await;
-    if let Ok(node) = &status {
-        let tls = crate::tls::inspect(&config.tailnet, node);
+    let status = async {
+        #[cfg(feature = "embedded-tailnet")]
+        if crate::tailnet::uses_embedded(&config.tailnet) {
+            return crate::embedded::inspect(&config.tailnet);
+        }
+        let found = crate::tailnet::CliTailnet::discover(&config.tailnet);
+        checks.push(DoctorCheck {
+            name: "tailscale CLI",
+            ok: found.is_ok(),
+            detail: match &found {
+                Ok(_) => "found".into(),
+                Err(error) => error.to_string(),
+            },
+        });
+        let node = crate::tailnet::real(&config.tailnet).status().await?;
+        let tls = crate::tls::inspect(&config.tailnet, &node);
         checks.push(DoctorCheck {
             name: "TLS",
             ok: true,
             detail: tls.detail,
         });
+        Ok((node, tls.config.is_some()))
     }
+    .await;
     checks.push(DoctorCheck {
         name: "tailnet",
         ok: status.is_ok(),
         detail: match status {
-            Ok(node) => format!(
+            Ok((node, https)) => format!(
                 "running; IPs={:?}; MagicDNS={}; open {}",
                 node.ips,
                 node.dns_name,
-                crate::tls::urls(
-                    &node,
-                    config.tailnet.port,
-                    crate::tls::inspect(&config.tailnet, &node).config.is_some()
-                )
-                .join(" ")
+                crate::tls::urls(&node, config.tailnet.port, https).join(" ")
             ),
             Err(error) => error.to_string(),
         },

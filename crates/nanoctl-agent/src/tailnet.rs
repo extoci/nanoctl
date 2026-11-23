@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+#[cfg(feature = "embedded-tailnet")]
+use crate::config::TailnetBackend;
 use crate::config::TailnetConfig;
 
 pub const CAPABILITY: &str = "extoci.lol/cap/nanoctl";
@@ -53,6 +55,16 @@ pub trait Tailnet: Send + Sync {
     }
     async fn status(&self) -> Result<Node>;
     async fn whois(&self, peer: SocketAddr) -> Result<Identity>;
+    async fn reachable(&self, addr: SocketAddr) -> bool {
+        matches!(
+            tokio::time::timeout(
+                Duration::from_millis(400),
+                tokio::net::TcpStream::connect(addr)
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
     async fn cert(&self, _: &str, _: &std::path::Path, _: &std::path::Path) -> Result<()> {
         bail!("certificate issuance is unavailable");
     }
@@ -371,6 +383,20 @@ pub fn real(config: &TailnetConfig) -> Arc<dyn Tailnet> {
         config: config.clone(),
         cli: Mutex::new(None),
     })
+}
+
+#[cfg(feature = "embedded-tailnet")]
+pub fn uses_embedded(config: &TailnetConfig) -> bool {
+    match config.backend {
+        TailnetBackend::Embedded => true,
+        TailnetBackend::System => false,
+        TailnetBackend::Auto => {
+            crate::server::dev_user().is_none()
+                && !config.serve_loopback
+                && config.tailscale_cli.is_none()
+                && CliTailnet::discover(config).is_err()
+        }
+    }
 }
 
 pub fn urls(node: &Node, port: u16) -> Vec<String> {

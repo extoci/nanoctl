@@ -139,6 +139,8 @@ jobs:
       matrix:
         os: [macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
+    env:
+      AGENT_FEATURES: ${{ matrix.os == 'windows-2025' && 'media,embedded-tailnet' || 'media' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -148,13 +150,30 @@ jobs:
         with:
           toolchain: 1.96.1
           components: clippy
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        if: runner.os == 'Windows'
+        with:
+          go-version-file: crates/nanoctl-tsnet/go.mod
+          cache-dependency-path: crates/nanoctl-tsnet/go.sum
+      - name: Test the embedded relay with a local mock tailnet
+        if: runner.os == 'Windows'
+        working-directory: crates/nanoctl-tsnet
+        env:
+          CGO_ENABLED: "0"
+        run: go test -mod=readonly ./...
       - run: bun install --frozen-lockfile
       - run: bun run build:viewer
-      - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
-      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - run: cargo clippy --all-targets --features "${{ env.AGENT_FEATURES }}" --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - run: cargo test --features "${{ env.AGENT_FEATURES }}" --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Build release media binary
         if: github.event_name != 'push' || github.ref != 'refs/heads/master'
-        run: cargo build --release --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+        run: cargo build --release --features "${{ env.AGENT_FEATURES }}" --manifest-path crates/nanoctl-agent/Cargo.toml
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Windows' && github.event_name == 'pull_request'
+        with:
+          name: nanoctl-windows-x64-preview
+          path: crates/nanoctl-agent/target/release/nanoctl.exe
+          if-no-files-found: error
 
   release-candidate:
     # This is the single artifact-producing build for a master commit. The tag workflow promotes
@@ -189,6 +208,8 @@ jobs:
             architecture: arm64
             binary: nanoctl.exe
     runs-on: ${{ matrix.runner }}
+    env:
+      AGENT_FEATURES: ${{ matrix.platform == 'windows' && 'media,embedded-tailnet' || 'media' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -199,6 +220,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        if: matrix.platform == 'windows'
+        with:
+          go-version-file: crates/nanoctl-tsnet/go.mod
+          cache-dependency-path: crates/nanoctl-tsnet/go.sum
       - name: Install Linux media dependencies
         if: matrix.platform == 'linux'
         shell: bash
@@ -208,7 +234,7 @@ jobs:
             clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev \
             libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
             libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev cmake nasm pkg-config
-      - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - run: cargo build --release --locked --features "${{ env.AGENT_FEATURES }}" --manifest-path crates/nanoctl-agent/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'
         shell: bash

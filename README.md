@@ -16,8 +16,9 @@ WebRTC carries video and input between your browser and the host.
 
 ## Get started
 
-1. [Install Tailscale](https://tailscale.com/download) on the host and controller device,
-   sign into your tailnet, and leave Tailscale running.
+1. [Install Tailscale](https://tailscale.com/download) on the controller device and sign in.
+   Linux and macOS hosts also need the Tailscale app. Windows nanoctl releases can
+   [join the tailnet directly](docs/SETUP.md#embedded-tailscale-on-windows) without it.
 2. Run the nanoctl installer as the host's interactive desktop user:
 
    **Linux / macOS**
@@ -32,7 +33,8 @@ WebRTC carries video and input between your browser and the host.
    irm https://github.com/extoci/nanoctl/releases/latest/download/install.ps1 | iex
    ```
 
-3. Open the printed URL from a browser on your tailnet, normally
+3. If nanoctl prints a Tailscale sign-in link, open it, sign into the same tailnet,
+   then run `nanoctl url` again. Open the viewer URL on the controller device, normally
    `https://<host>.<tailnet>.ts.net:7337/`.
 
 During prereleases, use the install script from the selected release and set
@@ -42,9 +44,9 @@ restores the previous installation. Existing config is preserved and legacy cred
 are removed best-effort.
 
 Enable HTTPS certificates in the **Tailscale admin console → DNS → HTTPS Certificates**.
-The agent runs `tailscale cert` automatically, privately stores and renews the certificate,
-and serves native HTTPS. If issuance is unavailable, it warns and falls back to HTTP
-over the encrypted tailnet. Some browser APIs then require HTTPS. See [setup](docs/SETUP.md).
+The agent obtains its certificate automatically. With system Tailscale, it falls back to HTTP
+over the encrypted tailnet if issuance fails. Embedded Tailscale requires a certificate by
+default. Some browser APIs require HTTPS. See [setup](docs/SETUP.md#https).
 
 ## Access
 
