@@ -9,6 +9,7 @@ import {
   type SignalPayload,
 } from "@nanoctl/protocol";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
+import { ClipboardSync } from "./clipboard-sync";
 import { videoRates, type VideoSample } from "./video-rates";
 
 export type RemoteSessionPhase =
@@ -59,7 +60,10 @@ export type RemoteSessionOptions = {
   displays: readonly DisplayInfo[];
   iceServers: readonly RTCIceServer[];
   video: HTMLVideoElement;
+  audio?: HTMLAudioElement;
+  systemAudioEnabled?: boolean;
   remoteInputEnabled?: boolean;
+  clipboardEnabled?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
   preferences?: { inputEnabled: boolean; displayId?: string };
@@ -104,6 +108,16 @@ export class RemoteSessionController {
   private peer: RTCPeerConnection | null = null;
   private pointerChannel: RTCDataChannel | null = null;
   private controlChannel: RTCDataChannel | null = null;
+  private clipboardChannel: RTCDataChannel | null = null;
+  private clipboard: ClipboardSync | null = null;
+  private keyQueue: Promise<void> = Promise.resolve();
+  private readonly onClipboardFocus = () => {
+    void this.clipboard?.focus();
+  };
+  private readonly onPaste = (event: ClipboardEvent) => {
+    if (event.clipboardData && this.inputEnabled)
+      this.clipboard?.local(event.clipboardData.getData("text/plain"));
+  };
   private phase: RemoteSessionPhase = "negotiating";
   private reason: string | undefined;
   private reconnectAttempt = 0;
@@ -143,6 +157,7 @@ export class RemoteSessionController {
   private readonly onWindowBlur = () => this.releaseInput();
   private readonly onVisibilityChange = () => {
     if (document.visibilityState === "hidden") this.releaseInput();
+    else this.onClipboardFocus();
   };
   private readonly onPageHide = (event: PageTransitionEvent) => {
     // A persisted page may return from the back-forward cache with its React tree intact. Release
@@ -347,6 +362,13 @@ export class RemoteSessionController {
         this.options.video.removeEventListener("loadeddata", this.onVideoLoadedData);
         this.pointerChannel?.close();
         this.controlChannel?.close();
+        this.clipboardChannel?.close();
+        this.clipboardChannel = null;
+        this.clipboard = null;
+        if (this.options.audio) {
+          this.options.audio.pause();
+          this.options.audio.srcObject = null;
+        }
         this.pointerChannel = null;
         this.controlChannel = null;
         peer.close();
@@ -377,6 +399,26 @@ export class RemoteSessionController {
   }
 
   private attachPeer(peer: RTCPeerConnection, lifecycle: number): void {
+    if (this.options.clipboardEnabled && this.remoteInputAllowed) {
+      const channel = peer.createDataChannel("nanoctl.clipboard.v1", { ordered: true });
+      this.clipboardChannel = channel;
+      this.clipboard = new ClipboardSync({
+        focused: () => this.clipboardChannel === channel && document.hasFocus(),
+        read: () => navigator.clipboard.readText(),
+        write: (text) => navigator.clipboard.writeText(text),
+        send: (message) => {
+          if (this.clipboardChannel !== channel || channel.readyState !== "open") return false;
+          try {
+            channel.send(message);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      });
+      channel.onmessage = (event) => this.clipboard?.receive(event.data);
+      channel.onopen = this.onClipboardFocus;
+    }
     this.pointerChannel = peer.createDataChannel("nanoctl.pointer.v1", {
       ordered: false,
       maxRetransmits: 0,
@@ -398,6 +440,7 @@ export class RemoteSessionController {
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
     peer.addTransceiver("video", { direction: "recvonly" });
+    if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
       if ("jitterBufferTarget" in receiver) {
@@ -405,6 +448,16 @@ export class RemoteSessionController {
       }
       if ("playoutDelayHint" in receiver) {
         (receiver as RTCRtpReceiver & { playoutDelayHint?: number }).playoutDelayHint = 0;
+      }
+      if ("jitterBufferTarget" in receiver) {
+        (receiver as RTCRtpReceiver & { jitterBufferTarget?: number }).jitterBufferTarget = 0;
+      }
+      if (track.kind === "audio") {
+        if (this.options.audio && this.options.systemAudioEnabled) {
+          this.options.audio.srcObject = new MediaStream([track]);
+          void this.options.audio.play().catch(() => {});
+        }
+        return;
       }
       const stream = streams[0] ?? new MediaStream([track]);
       this.options.video.srcObject = stream;
@@ -490,6 +543,8 @@ export class RemoteSessionController {
     video.addEventListener("keyup", this.onKey);
     window.addEventListener("keydown", this.onEmergencyShortcut, true);
     window.addEventListener("blur", this.onWindowBlur);
+    window.addEventListener("focus", this.onClipboardFocus);
+    window.addEventListener("paste", this.onPaste);
     document.addEventListener("visibilitychange", this.onVisibilityChange);
     window.addEventListener("pagehide", this.onPageHide);
     window.addEventListener("pageshow", this.onPageShow);
@@ -508,6 +563,8 @@ export class RemoteSessionController {
     video.removeEventListener("keyup", this.onKey);
     window.removeEventListener("keydown", this.onEmergencyShortcut, true);
     window.removeEventListener("blur", this.onWindowBlur);
+    window.removeEventListener("focus", this.onClipboardFocus);
+    window.removeEventListener("paste", this.onPaste);
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     window.removeEventListener("pagehide", this.onPageHide);
     window.removeEventListener("pageshow", this.onPageShow);
@@ -557,7 +614,7 @@ export class RemoteSessionController {
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
     event.preventDefault();
-    this.sendControl({
+    const message: ControlMessage = {
       type: "key",
       action: event.type === "keydown" ? "down" : "up",
       code: event.code,
@@ -568,6 +625,15 @@ export class RemoteSessionController {
         (Number(event.altKey) << 2) |
         (Number(event.metaKey) << 3),
       repeat: event.repeat,
+    };
+    if (!this.clipboard) {
+      this.sendControl(message);
+      return;
+    }
+    this.keyQueue = this.keyQueue.then(async () => {
+      if (event.type === "keydown" && event.code === "KeyV" && (event.ctrlKey || event.metaKey))
+        await this.clipboard?.focus();
+      if (this.inputEnabled) this.sendControl(message);
     });
   };
 

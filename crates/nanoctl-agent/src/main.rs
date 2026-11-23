@@ -1,5 +1,9 @@
 #[cfg_attr(not(feature = "media"), allow(dead_code))]
 mod adaptive;
+#[cfg(feature = "media")]
+mod audio;
+#[cfg(feature = "media")]
+mod clipboard;
 mod config;
 #[cfg(feature = "media")]
 mod input;
@@ -11,6 +15,8 @@ mod macos_encoder;
 mod media;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod media_bench;
+#[cfg(all(feature = "media", target_os = "linux"))]
+mod nvenc_encoder;
 mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;
