@@ -307,12 +307,13 @@ kbd {
   color: #a8b8cc;
 }
 .stats {
+  --stats-width: 220px;
   position: absolute;
   top: 16px;
   right: 16px;
   display: grid;
   gap: 10px;
-  width: 220px;
+  width: var(--stats-width);
   padding: 16px;
   background: #0e1621eb;
   border: 1px solid #34455b;
@@ -324,7 +325,10 @@ kbd {
   transition: right 0.2s ease;
 }
 .panel-open .stats {
-  right: calc(var(--session-panel-width) + 16px);
+  right: max(
+    8px,
+    min(calc(var(--session-panel-width) + 16px), calc(100% - var(--stats-width) - 8px))
+  );
 }
 .stats span {
   display: flex;
@@ -508,7 +512,7 @@ kbd {
   .stats {
     top: 8px;
     right: 8px;
-    width: min(200px, 55%);
+    --stats-width: min(200px, 55%);
     max-height: 60%;
     overflow-y: auto;
     gap: 5px;
