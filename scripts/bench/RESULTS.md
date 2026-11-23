@@ -118,8 +118,12 @@ hardware-codec validation. Host CPU uses one core=100%; CPU/RSS exclude browsers
 clients, Xvfb and detector. Quality is matched-ROI gray-luma, not full-color or
 matched-bitrate quality. Nanoctl bitrate is video-RTP payload, excluding transport
 and WireGuard overhead. Native x264 on macOS/Windows remains unverified. The
-measurements precede the subsequent integration of master's new viewer/audio/
-hardware features; that integrated tree is not a newly measured candidate.
+measurements precede integration of master's viewer/audio/hardware features.
+After qualification, the branch was rebased onto PR #18 head `8a024e2`, including
+the mobile viewer work. Software selection was adapted to its `FrameEncoder`
+interface and checked with feature-on/off tests and a feature-on release build.
+There was no post-integration paired rerun; that tree is not a newly measured
+candidate.
 
 # Follow-up: gradient attribution and validated QP14
 

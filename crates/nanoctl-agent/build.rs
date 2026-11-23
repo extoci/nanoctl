@@ -38,6 +38,7 @@ fn main() {
             .std("c11")
             .compile("nanoctl_nvenc");
     }
+
     let root =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../apps/viewer/dist");
     println!("cargo:rerun-if-changed={}", root.display());
