@@ -1,12 +1,50 @@
 use crate::{config::AgentConfig, service_control::ServiceControl};
 use anyhow::{Context, Result};
-use std::{path::PathBuf, time::Duration};
+use std::{future::Future, path::PathBuf, time::Duration};
 
 pub async fn run(
     config: AgentConfig,
     control: ServiceControl,
     ready_file: Option<PathBuf>,
     ready_token: Option<String>,
+) -> Result<()> {
+    run_until(config, ready_file, ready_token, async {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("cannot listen for Ctrl+C").map(|()| "Ctrl+C"),
+            result = wait_for_stop_request(&control) => result,
+        }
+    })
+    .await
+}
+
+pub(crate) async fn wait_for_stop_request(control: &ServiceControl) -> Result<&'static str> {
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        interval.tick().await;
+        if control.take_stop_request()? {
+            return Ok("stop request");
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn run_worker(config: AgentConfig) -> Result<()> {
+    let mut interrupt = tokio::signal::windows::ctrl_c().context("cannot listen for Ctrl+C")?;
+    let parent = crate::supervisor::parent_shutdown()?;
+    run_until(config, None, None, async {
+        tokio::select! {
+            _ = interrupt.recv() => Ok("Ctrl+C"),
+            result = parent => result.context("supervisor shutdown pipe stopped").map(|()| "supervisor"),
+        }
+    })
+    .await
+}
+
+async fn run_until(
+    config: AgentConfig,
+    ready_file: Option<PathBuf>,
+    ready_token: Option<String>,
+    shutdown_requested: impl Future<Output = Result<&'static str>>,
 ) -> Result<()> {
     let state =
         crate::server::ServerState::new(config.clone(), crate::tailnet::real(&config.tailnet));
@@ -15,16 +53,15 @@ pub async fn run(
     let _ready = ready_file
         .map(|path| ReadyFile::create(path, ready_token.as_deref()))
         .transpose()?;
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            _ = interval.tick() => { if control.take_stop_request()? { break; } }
-        }
+    let result = shutdown_requested.await;
+    if let Ok(reason) = &result {
+        tracing::info!(reason, "agent shutdown requested");
     }
     shutdown.send_replace(true);
     state.stop().await;
-    server.await??;
+    let server_result = server.await;
+    result?;
+    server_result??;
     Ok(())
 }
 

@@ -527,7 +527,7 @@ function Viewer() {
                 {metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}
               </dd>
               <dt>RTT</dt>
-              <dd>{metrics ? `${metrics.rttMs} ms` : "—"}</dd>
+              <dd>{metrics?.rttMs == null ? "—" : `${metrics.rttMs} ms`}</dd>
               <dt>Route</dt>
               <dd>{metrics?.route ?? "unknown"}</dd>
             </dl>

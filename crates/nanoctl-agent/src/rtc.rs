@@ -51,7 +51,7 @@ fn reception_report_sample(
     let ticks = compact_ntp
         .wrapping_sub(report.last_sender_report)
         .wrapping_sub(report.delay);
-    let rtt = (report.last_sender_report != 0 && ticks <= 10 * 65_536)
+    let rtt = (report.last_sender_report != 0 && (1..=10 * 65_536).contains(&ticks))
         .then(|| Duration::from_secs_f64(f64::from(ticks) / 65_536.0));
     Some(LinkSample {
         fraction_lost: f64::from(report.fraction_lost) / 256.0,
@@ -1414,6 +1414,7 @@ mod tests {
             (0, 0, 65_536),
             (2 * 65_536, 0, 65_536),
             (65_536, 2 * 65_536, 2 * 65_536),
+            (65_536, 0, 65_536),
             (65_536, 0, 11 * 65_536 + 1),
         ] {
             let report = super::ReceptionReport {
@@ -1435,7 +1436,6 @@ mod tests {
         let at = std::time::Instant::now();
         for (last_sender_report, delay, now, expected_ms) in [
             (u32::MAX - 65_535, 32_768, 0, 500),
-            (65_536, 0, 65_536, 0),
             (65_536, 0, 11 * 65_536, 10_000),
         ] {
             let report = super::ReceptionReport {
@@ -1450,6 +1450,36 @@ mod tests {
                 Some(std::time::Duration::from_millis(expected_ms))
             );
             assert_eq!(sample.fraction_lost, 0.0);
+        }
+    }
+
+    #[test]
+    fn missing_feedback_and_zero_rtt_do_not_lower_the_initial_rate() {
+        let start = std::time::Instant::now();
+        let mut controller = crate::adaptive::RateController::new(24_000, 60);
+        let initial = controller.decision();
+        for second in 0..=30 {
+            let at = start + Duration::from_secs(second);
+            controller.update_sender(3_000.0, false, at);
+            if second < 5 {
+                assert_eq!(controller.decision(), initial);
+                continue;
+            }
+            let (last_sender_report, ticks) = match second {
+                5 => (0, 65_536),
+                6 => (65_536, 0),
+                _ => (65_536, 2_621),
+            };
+            let report = super::ReceptionReport {
+                ssrc: 42,
+                last_sender_report,
+                ..Default::default()
+            };
+            let sample =
+                super::reception_report_sample(&report, 42, None, 65_536 + ticks, at).unwrap();
+            controller.observe(sample);
+            assert!(controller.decision().bitrate_kbps >= initial.bitrate_kbps);
+            assert_eq!(controller.decision().fps, initial.fps);
         }
     }
 

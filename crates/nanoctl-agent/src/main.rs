@@ -25,6 +25,8 @@ mod rtc;
 mod server;
 mod service;
 mod service_control;
+#[cfg(any(windows, test))]
+mod supervisor;
 mod tailnet;
 mod terminal;
 mod tls;
@@ -65,6 +67,10 @@ struct Cli {
     /// Append service diagnostics to this file instead of the process console.
     #[arg(long, global = true)]
     log_file: Option<PathBuf>,
+
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    supervised_worker: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -226,8 +232,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Run => {
             let config = AgentConfig::load_or_default(&config_path)?;
             config.validate()?;
+            #[cfg(windows)]
+            if cli.supervised_worker {
+                return service::run_worker(config).await;
+            }
             match service_control::ServiceControl::acquire()? {
                 service_control::StartOutcome::Acquired(control) => {
+                    #[cfg(windows)]
+                    if cli.ready_file.is_none() && cli.ready_token.is_none() {
+                        return supervisor::run(control).await;
+                    }
                     service::run(config, control, cli.ready_file, cli.ready_token).await?;
                 }
                 service_control::StartOutcome::AlreadyRunning => {
@@ -388,11 +402,11 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn report_error(error: &anyhow::Error, log_file: Option<&Path>) {
+fn append_diagnostic(log_file: Option<&Path>, message: std::fmt::Arguments<'_>) {
     if let Some(path) = log_file
         && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
     {
-        let _ = writeln!(file, "nanoctl command failed: {error:#}");
+        let _ = writeln!(file, "{message}");
     }
 }
 
@@ -400,16 +414,29 @@ fn report_error(error: &anyhow::Error, log_file: Option<&Path>) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let log_file = cli.log_file.clone();
+    if let Some(path) = log_file.clone() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            append_diagnostic(Some(&path), format_args!("{panic}"));
+            previous_hook(panic);
+        }));
+    }
     if let Err(error) = init_logging(
         log_file.as_deref(),
         matches!(cli.command, Command::Url { .. }),
     ) {
-        report_error(&error, log_file.as_deref());
+        append_diagnostic(
+            log_file.as_deref(),
+            format_args!("nanoctl command failed: {error:#}"),
+        );
         return Err(error);
     }
     let result = run(cli).await;
     if let Err(error) = &result {
-        report_error(error, log_file.as_deref());
+        append_diagnostic(
+            log_file.as_deref(),
+            format_args!("nanoctl command failed: {error:#}"),
+        );
     }
     result
 }

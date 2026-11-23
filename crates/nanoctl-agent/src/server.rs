@@ -29,14 +29,21 @@ use crate::{
 
 include!(concat!(env!("OUT_DIR"), "/viewer.rs"));
 
-type Active = Option<(watch::Sender<String>, tokio::task::JoinHandle<()>)>;
+type ActiveSession = (watch::Sender<String>, tokio::task::JoinHandle<()>);
+
+async fn stop_session((stop, task): ActiveSession, reason: &'static str) {
+    stop.send_replace(reason.into());
+    if let Err(error) = task.await {
+        tracing::warn!(%error, reason, "viewer session task failed");
+    }
+}
 
 pub struct ServerState {
     hosts: Mutex<Option<(std::time::Instant, Vec<tailnet::Peer>)>>,
     pub config: AgentConfig,
     tailnet: Arc<dyn Tailnet>,
     node: RwLock<Node>,
-    active: Mutex<Active>,
+    active: Mutex<Option<ActiveSession>>,
     stopping: std::sync::atomic::AtomicBool,
 }
 
@@ -60,9 +67,8 @@ impl ServerState {
     pub async fn stop(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Some((stop, task)) = self.active.lock().await.take() {
-            stop.send_replace("shutdown".into());
-            let _ = task.await;
+        if let Some(active) = self.active.lock().await.take() {
+            stop_session(active, "shutdown").await;
         }
     }
 
@@ -379,9 +385,8 @@ async fn connect(
             if state.stopping.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            if let Some((stop, task)) = active.take() {
-                stop.send_replace("replaced".into());
-                let _ = task.await;
+            if let Some(previous) = active.take() {
+                stop_session(previous, "replaced").await;
             }
             let (stop, receiver) = watch::channel(String::new());
             let session_state = state.clone();
@@ -513,7 +518,9 @@ async fn session(
         if reason == "connection-failed" || reason == "media-failed" {
             let _ = peer.fail(&reason).await;
         }
-        let _ = peer.close().await;
+        if let Err(error) = peer.close().await {
+            tracing::warn!(%error, reason, "WebRTC peer teardown failed");
+        }
         drop(peer);
         #[cfg(feature = "media")]
         crate::media::release_session_memory().await;
@@ -932,7 +939,28 @@ mod tests {
                 .unwrap()["type"],
             "hello"
         );
+        {
+            let mut active = state.active.lock().await;
+            let (stop, task) = active.take().unwrap();
+            *active = Some((
+                stop,
+                tokio::spawn(async move {
+                    task.await.unwrap();
+                    panic!("injected viewer teardown panic");
+                }),
+            ));
+        }
         second.close(None).await.unwrap();
+        let (mut third, _) = tokio_tungstenite::connect_async(request()).await.unwrap();
+        let hello = tokio::time::timeout(Duration::from_secs(10), third.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(hello.to_text().unwrap()).unwrap()["type"],
+            "hello"
+        );
         state.stop().await;
         controller.close().await.unwrap();
         server.abort();
