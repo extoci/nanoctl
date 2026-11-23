@@ -276,6 +276,7 @@ pub async fn doctor(config: &AgentConfig) -> DoctorReport {
     checks.push(capture_check());
     checks.push(encoder_check(config.quality.encoder));
     checks.push(input_check());
+    checks.push(audio_check(config.features.system_audio));
     DoctorReport {
         ready: checks.iter().all(|check| check.ok),
         checks,
@@ -327,6 +328,34 @@ fn capture_check() -> DoctorCheck {
             "media backend not compiled; build with --features media ({})",
             platform_capture_guidance()
         ),
+    }
+}
+
+/// Informational: missing host audio never makes the agent unready.
+fn audio_check(enabled: bool) -> DoctorCheck {
+    let detail = if !enabled {
+        "disabled by features.system_audio = false".to_string()
+    } else {
+        #[cfg(all(feature = "media", target_os = "windows"))]
+        {
+            match crate::audio::outputs().len() {
+                0 => "enabled; no output device to capture".to_string(),
+                count => format!("enabled; {count} output device(s)"),
+            }
+        }
+        #[cfg(not(all(feature = "media", target_os = "windows")))]
+        {
+            if system_audio_available(true) {
+                "enabled".to_string()
+            } else {
+                "enabled; not available on this host".to_string()
+            }
+        }
+    };
+    DoctorCheck {
+        name: "audio",
+        ok: true,
+        detail,
     }
 }
 
