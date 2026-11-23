@@ -94,6 +94,10 @@ fn encoder() -> Result<opus::Encoder> {
     let mut encoder =
         opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::LowDelay)?;
     encoder.set_bitrate(opus::Bitrate::Bits(128_000))?;
+    // Discontinuous transmission: silence sends a tiny comfort-noise frame
+    // instead of a full 128kbps encode. A muted desktop stops paying for
+    // audio it never had.
+    encoder.set_dtx(true)?;
     Ok(encoder)
 }
 
