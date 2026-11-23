@@ -140,6 +140,8 @@ test("measures video and input through the real agent", async ({ page, browser }
     const startMs = await page.evaluate(() => performance.now());
     const video = page.locator("video");
     await video.focus();
+    // Playwright input goes to the headless viewer; OS input must go to the headed marker.
+    await host.bringToFront();
     for (let i = 1; i <= numInputs; i++) {
       const nextMs = await page.evaluate((gap) => performance.now() + gap, 181 + ((i * 43) % 193));
       await page.waitForFunction((time) => performance.now() >= time, nextMs);
