@@ -26,6 +26,7 @@ mod server;
 mod service;
 mod service_control;
 mod tailnet;
+mod terminal;
 mod tls;
 mod update;
 #[cfg(all(feature = "media", target_os = "windows"))]
@@ -36,7 +37,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ColorChoice, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::AgentConfig;
@@ -45,7 +46,8 @@ use crate::config::AgentConfig;
 #[command(
     name = "nanoctl",
     version,
-    about = "Headless nanoctl remote desktop agent"
+    about = "Headless nanoctl remote desktop agent",
+    color = if terminal::supports_styling() { ColorChoice::Auto } else { ColorChoice::Never }
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -158,6 +160,7 @@ fn init_logging(log_file: Option<&Path>) -> Result<()> {
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter())
+            .with_ansi(terminal::supports_styling())
             .compact()
             .init();
     }
