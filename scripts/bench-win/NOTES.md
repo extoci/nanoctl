@@ -74,6 +74,13 @@ Moonlight's native client burns 43% CPU vs agent's ~21%.
 target bitrate — Sunshine pads toward it; nanoctl's is measured output
 on a mostly-static desktop, so the gap shrinks on high-motion content.
 
+## Input-to-photon (click through the viewer)
+
+benchwin's band counts WM_LBUTTONDOWN in its marker; clicking the streamed
+band through the viewer produced an increment visible in the client's
+displayed frame at lag 34ms — same pipeline lag as G2G, plus <=1 band
+repaint (~35-50ms total on this composite-bound VM).
+
 ## Server per-frame costs (agent.log pipeline statistics, /frames_encoded)
 
 - backend_ns (OpenH264): was ~25ms -> ~10ms (max_slice_len 8000 +
