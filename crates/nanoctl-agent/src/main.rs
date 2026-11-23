@@ -19,6 +19,8 @@ mod macos_encoder;
 mod media;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod media_bench;
+#[cfg(any(all(feature = "media", target_os = "windows"), test))]
+mod nv12;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod nvenc_encoder;
 mod platform;
