@@ -26,6 +26,17 @@ fn collect(root: &Path, path: &Path, entries: &mut Vec<String>) {
 }
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var_os("CARGO_FEATURE_MEDIA").is_some()
+    {
+        println!("cargo:rerun-if-changed=src/nvenc.c");
+        println!("cargo:rustc-link-lib=dl");
+        cc::Build::new()
+            .file("src/nvenc.c")
+            .std("c11")
+            .compile("nanoctl_nvenc");
+    }
+
     let root =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../apps/viewer/dist");
     println!("cargo:rerun-if-changed={}", root.display());

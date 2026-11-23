@@ -9,14 +9,28 @@ description = "Headless nanoctl remote desktop agent"
 default = []
 capture = [
   "dep:apple-cf",
+  "dep:fast_image_resize",
   "dep:cros-codecs",
   "dep:cros-libva",
   "dep:openh264",
+  "dep:openh264-sys2",
   "dep:videotoolbox",
   "dep:windows",
   "dep:xcap",
+  "dep:xcb",
+  "dep:libc",
 ]
-media = ["capture", "dep:enigo", "dep:rtcp", "rtc"]
+media = [
+  "capture",
+  "dep:arboard",
+  "dep:cpal",
+  "dep:enigo",
+  "dep:opus",
+  "dep:rtcp",
+  "dep:x11rb",
+  "dep:xkeysym",
+  "rtc",
+]
 rtc = ["dep:interceptor", "dep:webrtc"]
 
 [[bin]]
@@ -25,6 +39,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+arboard = { version = "3.6", optional = true }
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 async-trait = "0.1"
@@ -62,11 +77,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.24", default-features = false, features = ["v4"] }
 openh264 = { version = "0.9.7", optional = true }
+openh264-sys2 = { version = "0.9.7", optional = true }
+opus = { version = "0.4", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1.7", features = ["damage"], optional = true }
+libc = { version = "0.2", optional = true }
+x11rb = { version = "0.13", features = ["xkb", "xtest"], optional = true }
+xkeysym = { version = "0.2", optional = true }
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
 cros-libva = { version = "0.0.12", optional = true }
 
@@ -77,12 +98,20 @@ videotoolbox = { version = "0.18.1", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+cpal = { version = "0.16", optional = true }
+fast_image_resize = { version = "6.2", default-features = false, features = [
+  "std",
+  "only_u8x4",
+], optional = true }
 windows = { version = "0.62.2", features = [
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
   "Win32_System_Ole",
   "Win32_System_Variant",
 ], optional = true }
+
+[build-dependencies]
+cc = "1.2"
 
 [dev-dependencies]
 proptest = "1.11.0"

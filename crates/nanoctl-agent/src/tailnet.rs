@@ -27,6 +27,17 @@ pub struct Node {
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Peer {
+    pub host_name: String,
+    pub dns_name: String,
+    pub ips: Vec<IpAddr>,
+    pub os: String,
+    pub online: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Identity {
     pub login: String,
     pub display_name: String,
@@ -37,6 +48,9 @@ pub struct Identity {
 
 #[async_trait]
 pub trait Tailnet: Send + Sync {
+    async fn peers(&self) -> Result<Vec<Peer>> {
+        Ok(Vec::new())
+    }
     async fn status(&self) -> Result<Node>;
     async fn whois(&self, peer: SocketAddr) -> Result<Identity>;
     async fn cert(&self, _: &str, _: &std::path::Path, _: &std::path::Path) -> Result<()> {
@@ -102,6 +116,9 @@ impl CliTailnet {
 
 #[async_trait]
 impl Tailnet for CliTailnet {
+    async fn peers(&self) -> Result<Vec<Peer>> {
+        parse_peers(self.command(&["status", "--json"]).await?)
+    }
     async fn cert(&self, dns: &str, cert: &std::path::Path, key: &std::path::Path) -> Result<()> {
         crate::tls::validate_dns_name(dns)?;
         let output = tokio::time::timeout(
@@ -226,6 +243,44 @@ pub fn parse_status(value: Value) -> Result<Node> {
     })
 }
 
+pub fn parse_peers(value: Value) -> Result<Vec<Peer>> {
+    #[derive(Deserialize)]
+    struct RawPeer {
+        #[serde(flatten)]
+        node: StatusNode,
+        #[serde(rename = "OS", default)]
+        os: String,
+        #[serde(rename = "Online", default)]
+        online: bool,
+    }
+    let peers: HashMap<String, RawPeer> = serde_json::from_value(
+        value
+            .get("Peer")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )?;
+    Ok(peers
+        .into_values()
+        .filter_map(|peer| {
+            let ips: Vec<_> = peer
+                .node
+                .ips
+                .into_iter()
+                .filter(|ip| is_tailnet_ip(*ip))
+                .collect();
+            (!ips.is_empty()).then(|| Peer {
+                host_name: peer.node.host_name,
+                dns_name: peer.node.dns_name.trim_end_matches('.').to_owned(),
+                ips,
+                os: peer.os,
+                online: peer.online,
+                tags: peer.node.tags,
+            })
+        })
+        .collect())
+}
+
 pub fn parse_whois(value: Value) -> Result<Identity> {
     let profile: Profile = serde_json::from_value(
         value
@@ -297,6 +352,9 @@ impl LazyTailnet {
 
 #[async_trait]
 impl Tailnet for LazyTailnet {
+    async fn peers(&self) -> Result<Vec<Peer>> {
+        self.cli().await?.peers().await
+    }
     async fn cert(&self, dns: &str, cert: &std::path::Path, key: &std::path::Path) -> Result<()> {
         self.cli().await?.cert(dns, cert, key).await
     }
@@ -348,6 +406,21 @@ impl Tailnet for FakeTailnet {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn peer_samples() {
+        assert!(parse_peers(json!({"Peer":null})).unwrap().is_empty());
+        let peers = parse_peers(json!({"Peer": {
+            "key:one":{"HostName":"desktop","DNSName":"desktop.tail.ts.net.","TailscaleIPs":["100.64.1.2","192.168.1.2"],"OS":"linux","Online":false,"Tags":["tag:desktop"]},
+            "key:two":{"HostName":"invalid","TailscaleIPs":["192.168.1.3"],"Tags":null}
+        }})).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].dns_name, "desktop.tail.ts.net");
+        assert_eq!(peers[0].ips.len(), 1);
+        assert!(!peers[0].online);
+        assert_eq!(peers[0].tags, ["tag:desktop"]);
+        assert!(parse_peers(json!({"Peer": []})).is_err());
+    }
 
     #[test]
     fn status_and_whois_samples() {
