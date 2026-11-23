@@ -174,6 +174,7 @@ export type DeviceCapabilities = {
   readonly clipboard: boolean;
   /** One-way host output audio; independent of permission to control the host. */
   readonly systemAudio: boolean;
+  readonly audioOutputs?: readonly AudioOutput[];
   /** Whether the agent can accept remote input in this capability state. */
   readonly remoteInput?: boolean;
   readonly gamepad?: boolean;
@@ -199,6 +200,18 @@ export type DisplayInfo = {
   readonly primary: boolean;
 };
 
+export type AudioOutput = {
+  readonly id: string;
+  readonly name: string;
+  readonly isDefault: boolean;
+};
+
+export type AudioOutputState = {
+  readonly type: "audio-outputs";
+  readonly outputs: readonly AudioOutput[];
+  readonly selectedId: string | null;
+};
+
 export type VideoCodec = "h264" | "vp9" | "av1";
 
 export type HostInfo = {
@@ -218,13 +231,18 @@ export type HostInfo = {
   };
 };
 
-export type AgentClientMessage =
+type AgentCommonMessage =
   | { readonly type: "signal"; readonly envelope: SignalEnvelope }
   | { readonly type: "end"; readonly reason: string };
 
+export type AgentClientMessage =
+  | AgentCommonMessage
+  | { readonly type: "select-audio-output"; readonly outputId: string | null };
+
 export type AgentServerMessage =
   | { readonly type: "hello"; readonly sessionId: string; readonly host: HostInfo }
-  | AgentClientMessage;
+  | AgentCommonMessage
+  | AudioOutputState;
 
 export function assertHostInfo(value: unknown): asserts value is HostInfo {
   if (
@@ -236,6 +254,8 @@ export function assertHostInfo(value: unknown): asserts value is HostInfo {
     !Array.isArray(value.displays) ||
     !value.displays.every(isDisplayInfo) ||
     !isRecord(value.capabilities) ||
+    (value.capabilities.audioOutputs !== undefined &&
+      !isAudioOutputList(value.capabilities.audioOutputs)) ||
     !Array.isArray(value.capabilities.displays) ||
     !value.capabilities.displays.every(isDisplayInfo) ||
     !isRecord(value.viewer) ||
@@ -266,9 +286,33 @@ export function parseAgentMessage(value: unknown): AgentServerMessage {
     case "end":
       if (!isBoundedString(value.reason, 1, 512)) throw new Error("invalid end reason");
       return { type: "end", reason: value.reason };
+    case "audio-outputs": {
+      const { outputs, selectedId } = value;
+      if (
+        !isAudioOutputList(outputs) ||
+        (selectedId !== null &&
+          (typeof selectedId !== "string" || !outputs.some((output) => output.id === selectedId)))
+      ) {
+        throw new Error("invalid audio outputs");
+      }
+      return { type: "audio-outputs", outputs, selectedId };
+    }
     default:
       throw new Error("unknown agent message");
   }
+}
+
+function isAudioOutputList(value: unknown): value is AudioOutput[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (output) =>
+        isRecord(output) &&
+        isBoundedString(output.id, 1, 128) &&
+        typeof output.name === "string" &&
+        typeof output.isDefault === "boolean",
+    )
+  );
 }
 
 function isDisplayInfo(value: unknown): value is DisplayInfo {

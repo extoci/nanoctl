@@ -33,6 +33,9 @@ pub struct Capabilities {
     gamepad: bool,
     clipboard: bool,
     system_audio: bool,
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_outputs: Option<Vec<crate::audio::AudioOutput>>,
     displays: Vec<DisplayCapability>,
 }
 
@@ -100,6 +103,8 @@ pub fn capabilities(
     } else {
         "ready"
     };
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let audio_outputs = audio_outputs(system_audio_enabled);
     Capabilities {
         protocol_version: 2,
         platform: PLATFORM,
@@ -119,6 +124,13 @@ pub fn capabilities(
         remote_input: remote_input_enabled && input,
         gamepad: gamepad_available(remote_input_enabled && input),
         clipboard: clipboard_available(clipboard_enabled && remote_input_enabled && input),
+        #[cfg(all(feature = "media", target_os = "windows"))]
+        system_audio: audio_outputs
+            .as_ref()
+            .is_some_and(|outputs| !outputs.is_empty()),
+        #[cfg(all(feature = "media", target_os = "windows"))]
+        audio_outputs,
+        #[cfg(not(all(feature = "media", target_os = "windows")))]
         system_audio: system_audio_available(system_audio_enabled),
         displays,
     }
@@ -148,6 +160,12 @@ fn clipboard_available(enabled: bool) -> bool {
     }
 }
 
+#[cfg(all(feature = "media", target_os = "windows"))]
+fn audio_outputs(enabled: bool) -> Option<Vec<crate::audio::AudioOutput>> {
+    enabled.then(crate::audio::outputs)
+}
+
+#[cfg(not(all(feature = "media", target_os = "windows")))]
 fn system_audio_available(enabled: bool) -> bool {
     #[cfg(feature = "media")]
     {
@@ -381,6 +399,9 @@ fn platform_input_guidance() -> &'static str {
 mod audio_tests {
     #[test]
     fn disabled_audio_is_never_advertised() {
+        #[cfg(all(feature = "media", target_os = "windows"))]
+        assert!(super::audio_outputs(false).is_none());
+        #[cfg(not(all(feature = "media", target_os = "windows")))]
         assert!(!super::system_audio_available(false));
         #[cfg(any(not(feature = "media"), target_os = "macos"))]
         assert!(!super::system_audio_available(true));

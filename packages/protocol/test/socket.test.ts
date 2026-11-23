@@ -22,6 +22,21 @@ test("audio capability is independent of viewer control permission", () => {
   expect(parseAgentMessage(message)).toEqual(message);
   expect(audioHost.viewer.mayControl).toBe(false);
 });
+test("accepts Windows audio output announcements and rejects invalid selections", () => {
+  const outputs = [{ id: "1", name: "Speakers", isDefault: true }];
+  const message = { type: "audio-outputs", outputs, selectedId: "1" };
+  expect(parseAgentMessage(message)).toEqual(message);
+  const systemDefault = { type: "audio-outputs", outputs: [], selectedId: null };
+  expect(parseAgentMessage(systemDefault)).toEqual(systemDefault);
+  expect(() => parseAgentMessage({ ...message, selectedId: "missing" })).toThrow();
+  expect(() => parseAgentMessage({ ...message, outputs: [{ id: "1" }] })).toThrow();
+  expect(() =>
+    assertHostInfo({ ...host, capabilities: { ...host.capabilities, audioOutputs: outputs } }),
+  ).not.toThrow();
+  expect(() =>
+    assertHostInfo({ ...host, capabilities: { ...host.capabilities, audioOutputs: "invalid" } }),
+  ).toThrow();
+});
 test("accepts signal objects and end reasons", () => {
   const message = {
     type: "signal",
