@@ -30,33 +30,61 @@ async function screenshot(page: Page, name: string) {
 test("mobile layout, reachable touch targets, keyboard focus and persisted mode", async ({
   page,
 }) => {
-  if (process.env.NANOCTL_BROWSER_MEDIA !== "1") {
-    // RTC-only hosts advertise view-only; exercise the keyboard UI without native injection.
-    await page.routeWebSocket("**/v1/connect", (socket) => {
-      const server = socket.connectToServer();
-      server.onMessage((data) => {
-        const message = JSON.parse(String(data));
-        if (message.type === "hello") message.host.remoteInput = true;
-        socket.send(JSON.stringify(message));
-      });
+  await page.route("**/v1/hosts", (route) =>
+    route.fulfill({
+      json: {
+        self: { hostName: "Current desktop", dnsName: "desktop.test", url: "https://desktop.test" },
+        hosts: [
+          {
+            hostName: "Another desktop",
+            dnsName: "other.test",
+            url: "https://other.test",
+            os: "linux",
+            online: true,
+          },
+        ],
+      },
+    }),
+  );
+  await page.routeWebSocket("**/v1/connect", (socket) => {
+    const server = socket.connectToServer();
+    server.onMessage((data) => {
+      const message = JSON.parse(String(data));
+      if (message.type === "hello") {
+        if (process.env.NANOCTL_BROWSER_MEDIA !== "1") message.host.remoteInput = true;
+        message.host.hostName = "A very long desktop host name for mobile layout";
+        message.host.capabilities.systemAudio = true;
+        message.host.capabilities.clipboard = true;
+      }
+      socket.send(JSON.stringify(message));
     });
-  }
+  });
+  await page.setViewportSize({ width: 412, height: 915 });
   await page.goto("/");
   await openPanel(page);
   await expect(page.getByRole("button", { name: "Input on", exact: true })).toBeEnabled();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
+  await expect(page.getByRole("button", { name: "Enable sound" })).toBeVisible();
+  await expect(page.locator(".panel-head")).toContainText("Clipboard sync on");
+  const picker = page.getByRole("button", { name: "Choose host" });
+  await expect(picker).toBeVisible();
+  await picker.click();
+  await expect(page.getByRole("group", { name: "Tailnet hosts" })).toBeVisible();
   const buttons = page.locator(".session-panel button");
   for (const button of await buttons.all()) {
     await button.scrollIntoViewIfNeeded();
     const box = await button.boundingBox();
     expect(box?.height).toBeGreaterThanOrEqual(44);
+    expect(box?.width).toBeGreaterThanOrEqual(44);
     expect(box!.x).toBeGreaterThanOrEqual(0);
     expect(box!.x + box!.width).toBeLessThanOrEqual(
       await page.evaluate(() => window.innerWidth + 1),
     );
   }
+  await screenshot(page, "pixel7-picker-audio-clipboard.png");
+  await picker.click();
   const keyboard = page.getByRole("button", { name: "Keyboard", exact: true });
   await keyboard.click();
   await expect(page.getByRole("textbox", { name: "Remote keyboard" })).toBeFocused();

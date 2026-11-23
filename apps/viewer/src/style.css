@@ -441,6 +441,23 @@ kbd {
   .host {
     padding-left: 10px;
     gap: 2px;
+    flex: 1;
+  }
+  .host-trigger {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .host-options {
+    position: fixed;
+    left: 10px;
+    right: 10px;
+    top: 76px;
+    min-width: 0;
+  }
+  .host-options button {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .host strong {
     white-space: nowrap;
@@ -448,6 +465,11 @@ kbd {
   }
   .host span {
     font-size: 10px;
+  }
+  .host > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .stage {
     touch-action: none;
