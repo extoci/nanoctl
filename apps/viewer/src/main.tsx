@@ -14,7 +14,13 @@ import {
 } from "./lib/video-codec";
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
-import { comboMessages, connectSteps, connectionQuality, keyCombos } from "./lib/session-ui";
+import {
+  comboMessages,
+  connectSteps,
+  connectionQuality,
+  formatBitrate,
+  keyCombos,
+} from "./lib/session-ui";
 
 const initial: RemoteSessionSnapshot = {
   phase: "negotiating",
@@ -326,11 +332,20 @@ function Viewer() {
               Frame rate <b>{metrics?.fps == null ? "—" : `${metrics.fps.toFixed(1)} fps`}</b>
             </span>
             <span>
-              Bitrate{" "}
-              <b>{metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}</b>
+              Bitrate <b>{formatBitrate(metrics?.bitrateKbps ?? null)}</b>
             </span>
             <span>
               RTT <b>{metrics?.rttMs == null ? "—" : `${metrics.rttMs} ms`}</b>
+            </span>
+            <span>
+              Jitter <b>{metrics?.jitterMs == null ? "—" : `${metrics.jitterMs.toFixed(1)} ms`}</b>
+            </span>
+            <span>
+              Packet loss{" "}
+              <b>{metrics?.lossPercent == null ? "—" : `${metrics.lossPercent.toFixed(1)}%`}</b>
+            </span>
+            <span>
+              Dropped frames <b>{metrics?.framesDropped ?? "—"}</b>
             </span>
             <span>
               Route <b>{metrics?.route ?? "unknown"}</b>
