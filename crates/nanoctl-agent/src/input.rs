@@ -54,12 +54,12 @@ mod win_send {
 
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn SendInput(inputs: *const Input, size: i32) -> u32;
+        fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
         fn GetSystemMetrics(index: i32) -> i32;
     }
 
     fn send(input: Input) -> Result<()> {
-        let sent = unsafe { SendInput(&input, std::mem::size_of::<Input>() as i32) };
+        let sent = unsafe { SendInput(1, &input, std::mem::size_of::<Input>() as i32) };
         anyhow::ensure!(sent == 1, "SendInput rejected the mouse event");
         Ok(())
     }
