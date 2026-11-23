@@ -611,6 +611,7 @@ impl HostPeer {
                 if input.is_none() {
                     return Box::pin(async {});
                 }
+                let reliable = channel.label() == "nanoctl.control.v1";
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
                     "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
@@ -643,6 +644,7 @@ impl HostPeer {
                                     && let Ok(mut input) = input.lock()
                                 {
                                     input.release_all();
+                                    input.revoke_gamepads();
                                 }
                             });
                         }
@@ -655,6 +657,9 @@ impl HostPeer {
                             && let Ok(mut input) = input.lock()
                         {
                             input.release_all();
+                            if reliable {
+                                input.revoke_gamepads();
+                            }
                         }
                     })
                 }));
@@ -1262,6 +1267,11 @@ fn spawn_input_worker(
                     }
                 }
             }
+        }
+        if matches!(lane, crate::input::InputLane::Reliable)
+            && let Ok(mut input) = input.lock()
+        {
+            input.revoke_gamepads();
         }
     })
 }

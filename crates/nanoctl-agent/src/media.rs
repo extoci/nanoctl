@@ -2242,8 +2242,12 @@ mod tests {
             if frame == 10 {
                 encoder.set_bitrate(250).unwrap();
             }
-            let view =
-                xcap::image::ImageBuffer::from_raw(256, 128, image.as_raw().as_slice()).unwrap();
+            let view = super::RgbaFrame::from_raw(
+                image.width(),
+                image.height(),
+                image.as_raw().as_slice(),
+            )
+            .unwrap();
             let encoded = encoder.encode(&view).unwrap();
             if frame < 10 {
                 before_bytes += encoded.bytes.len();

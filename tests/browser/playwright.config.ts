@@ -21,6 +21,12 @@ if (!process.env.NANOCTL_BROWSER_PORT) {
 }
 const baseURL = `http://127.0.0.1:${process.env.NANOCTL_BROWSER_PORT}`;
 const latency = process.env.NANOCTL_BROWSER_LATENCY === "1";
+if (process.env.NANOCTL_BROWSER_MEDIA === "1" && !latency)
+  process.env.NANOCTL_DEV_GAMEPAD_REPORTS ??= join(
+    homedir(),
+    ".cache",
+    `nanoctl-browser-gamepads-${process.pid}-${Date.now()}.log`,
+  );
 
 export default defineConfig({
   tsconfig: "./tsconfig.json",

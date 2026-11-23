@@ -9,6 +9,7 @@ description = "Headless nanoctl remote desktop agent"
 default = []
 capture = [
   "dep:apple-cf",
+  "dep:fast_image_resize",
   "dep:block2",
   "dep:dispatch2",
   "dep:objc2",
@@ -17,7 +18,6 @@ capture = [
   "dep:objc2-core-video",
   "dep:objc2-foundation",
   "dep:objc2-screen-capture-kit",
-  "dep:fast_image_resize",
   "dep:cros-codecs",
   "dep:cros-libva",
   "dep:openh264",
@@ -35,6 +35,7 @@ media = [
   "dep:enigo",
   "dep:opus",
   "dep:rtcp",
+  "dep:vigem-client",
   "dep:x11rb",
   "dep:xkeysym",
   "rtc",
@@ -141,6 +142,7 @@ fast_image_resize = { version = "6.2", default-features = false, features = [
   "std",
   "only_u8x4",
 ], optional = true }
+vigem-client = { version = "0.1.4", optional = true }
 windows = { version = "0.62.2", features = [
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
