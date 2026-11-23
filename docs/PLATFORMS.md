@@ -85,7 +85,7 @@ a decoder, HEVC; Safari decodes HEVC and, on M3/A17 or newer, AV1.
 
 ## Frame rate and bitrate
 
-`[quality] max_fps` (24–240, default 60) and `max_bitrate_kbps` are the host's ceilings.
+`[quality] max_fps` (24–240; the default 0 follows the primary display's refresh rate, or 60 when unknown) and `max_bitrate_kbps` are the host's ceilings.
 The adaptive controller stays below both. It ramps bitrate from the link estimate and
 lowers frame rate only when bitrate drops below 2.5 Mbps.
 The viewer's Frame rate and Bitrate buttons send `{"type":"quality","maxFps":30,

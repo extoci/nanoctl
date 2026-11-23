@@ -114,7 +114,7 @@ pub(crate) fn spawn_media(
         peer.display_selection_feedback_sender(),
         crate::media::VideoQuality {
             max_bitrate_kbps: config.quality.max_bitrate_kbps,
-            max_fps: config.quality.max_fps,
+            max_fps: crate::media::effective_max_fps(config.quality.max_fps),
             max_width: config.quality.max_width,
             max_height: config.quality.max_height,
             latency_mode: config.quality.latency_mode,

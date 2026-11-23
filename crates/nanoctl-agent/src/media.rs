@@ -1732,7 +1732,34 @@ impl MediaSmokeReport {
     }
 }
 
+/// `quality.max_fps = 0` follows the primary display's refresh rate, so 120, 144 and 240 Hz
+/// monitors stream at their native rate; 60 when the platform does not report one.
+pub fn effective_max_fps(configured: u16) -> u16 {
+    if configured != 0 {
+        return configured;
+    }
+    Monitor::all()
+        .ok()
+        .and_then(|monitors| {
+            let monitor = monitors
+                .iter()
+                .find(|monitor| monitor.is_primary().unwrap_or(false))
+                .or_else(|| monitors.first())?;
+            monitor.frequency().ok()
+        })
+        .and_then(refresh_to_fps)
+        .unwrap_or(60)
+}
+
+fn refresh_to_fps(hz: f32) -> Option<u16> {
+    (hz.is_finite() && hz >= 23.5).then(|| (hz.round() as u16).clamp(24, 240))
+}
+
 pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeReport> {
+    let quality = &QualityConfig {
+        max_fps: effective_max_fps(quality.max_fps),
+        ..quality.clone()
+    };
     if !(1..=3_600).contains(&seconds) {
         bail!("media smoke duration must be between 1 and 3600 seconds");
     }
@@ -3004,6 +3031,16 @@ mod tests {
         assert_eq!(bitrate_target(3_000, 5_000, 250, 8_000), Some(5_000));
         assert_eq!(bitrate_target(4_000, 100, 250, 8_000), Some(250));
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
+    }
+
+    #[test]
+    fn display_refresh_rates_map_to_frame_rate_caps() {
+        assert_eq!(super::refresh_to_fps(59.94), Some(60));
+        assert_eq!(super::refresh_to_fps(143.9), Some(144));
+        assert_eq!(super::refresh_to_fps(360.0), Some(240));
+        assert_eq!(super::refresh_to_fps(0.0), None);
+        assert_eq!(super::refresh_to_fps(f32::NAN), None);
+        assert_eq!(super::effective_max_fps(90), 90);
     }
 
     const TEST_SETTINGS: EncoderSettings = EncoderSettings {
