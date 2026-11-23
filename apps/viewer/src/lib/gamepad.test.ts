@@ -10,6 +10,7 @@ function pad(index: number, mapping: GamepadMappingType = "standard") {
       value: button === 6 ? 0.5 : button === 7 ? 1 : 0,
     })),
     connected: true,
+    id: "Xbox Wireless Controller",
     index,
     mapping,
   };
@@ -39,6 +40,36 @@ test("maps standard controls and sends snapshots on change or keepalive", () => 
     state,
     { type: "gamepad", pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
     { type: "gamepad", pads: [] },
+  ]);
+});
+
+test.each([
+  "DualSense Wireless Controller Extended Gamepad",
+  "DualShock 4 Wireless Controller",
+  "DUALSHOCK4",
+  "Wireless Controller",
+  "Wireless Controller Extended Gamepad",
+  "054c device (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)",
+  "PlayStation Controller",
+])("identifies %s as a DualShock 4 target", (id) => {
+  const messages: unknown[] = [];
+  const gamepad = new GamepadForwarder((message) => Boolean(messages.push(message)));
+  const controller = { ...pad(10), id };
+  gamepad.sample([controller], 0);
+  gamepad.sample(
+    [
+      {
+        ...controller,
+        buttons: [...controller.buttons, { pressed: true, touched: false, value: 1 }],
+      },
+    ],
+    1,
+  );
+  const reports = [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]];
+  const extra = { slot: 0, leftTriggerPressed: true, rightTriggerPressed: false };
+  expect(messages).toEqual([
+    { type: "gamepad", pads: reports, dualShock4: [{ ...extra, touchpadPressed: false }] },
+    { type: "gamepad", pads: reports, dualShock4: [{ ...extra, touchpadPressed: true }] },
   ]);
 });
 

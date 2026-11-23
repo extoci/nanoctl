@@ -19,7 +19,19 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
                   value: i === 0 ? 1 : i === 6 ? 0.5 : 0,
                 })),
                 connected: true,
+                id: "Xbox Wireless Controller",
                 index: 0,
+                mapping: "standard",
+              },
+              {
+                axes: [0.5, -1, 0, 0],
+                buttons: Array.from({ length: 18 }, (_, i) => ({
+                  pressed: [0, 6, 8, 9, 12, 15, 16, 17].includes(i),
+                  value: i === 6 ? 0.5 : 0,
+                })),
+                connected: true,
+                id: "DualSense Wireless Controller Extended Gamepad",
+                index: 1,
                 mapping: "standard",
               },
             ]
@@ -36,14 +48,18 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
   await expect(gamepad).toBeEnabled();
   expect(await events()).toBe("");
   await gamepad.click();
-  await expect(page.getByText(/Controller detected. Windows games see/)).toBeVisible();
+  await expect(page.getByText(/Controller detected.*DualShock 4.*Xbox 360/)).toBeVisible();
+  await expect.poll(events).toContain("0 attached xbox360");
   await expect.poll(events).toContain("0 4096 128 0 16384 32767 0 0");
+  await expect.poll(events).toContain("1 attached dualShock4");
+  await expect.poll(events).toContain("1 dualShock4 13345 3 128 0 192 0 128 128");
   await page.evaluate(() => {
     (window as unknown as { fake: { controllerAttached: boolean } }).fake.controllerAttached =
       false;
   });
   await expect.poll(events).toContain("0 detached");
   await expect(page.getByText(/Waiting for a controller/)).toBeVisible();
+  await expect.poll(events).toContain("1 detached");
   await page.evaluate(() => {
     (window as unknown as { fake: { controllerAttached: boolean } }).fake.controllerAttached = true;
   });

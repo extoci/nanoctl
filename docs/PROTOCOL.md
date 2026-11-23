@@ -132,7 +132,12 @@ When `capabilities.gamepad` is true, an opted-in viewer with control permission 
 `{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel.
 Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
 slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
-are signed 16-bit values with positive Y up. Each message is a full snapshot; the
-host unplugs slots not present. An empty snapshot detaches all pads. The viewer sends
+are signed 16-bit values with positive Y up. For PlayStation controllers, the viewer adds
+an optional `dualShock4` array to the snapshot with one
+`{"slot":0,"leftTriggerPressed":false,"rightTriggerPressed":false,"touchpadPressed":false}`
+entry per PlayStation pad. The host presents those slots as DualShock 4 controllers and
+all other slots as Xbox 360 controllers. The original `pads` entries are unchanged, so
+older hosts can ignore the extension. Each message is a full snapshot; the host unplugs
+slots not present. An empty snapshot detaches all pads. The viewer sends
 changes and a 500 ms keepalive while forwarding; after 2 seconds without a snapshot
 the host neutralizes the current pads. Channel or session teardown unplugs them.

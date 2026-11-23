@@ -435,7 +435,7 @@ function Viewer() {
                 : !gamepadAvailable
                   ? "Open the HTTPS viewer link in a browser with gamepad support."
                   : snapshot.gamepadStatus === "connected"
-                    ? "Controller detected. Windows games see an Xbox 360 controller."
+                    ? "Controller detected. Windows sees recognized PlayStation controllers as DualShock 4 and other controllers as Xbox 360."
                     : snapshot.gamepadStatus === "unsupported"
                       ? "Controller detected, but this browser doesn’t support its standard mapping."
                       : snapshot.gamepadEnabled
