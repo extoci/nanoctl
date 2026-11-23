@@ -80,13 +80,13 @@ on a mostly-static desktop, so the gap shrinks on high-motion content.
 Y+U+V PSNR vs the I420 the encoder consumed (p05 = worst tail). Measured
 the QP-floor frontier at 1600x1200 responsiveness, 20s each:
 
-| qp_min | kbps | PSNR p50 | PSNR p05 |
-| ------ | ---- | -------- | -------- |
-| 14 (was default) | 606 | 50.8 | 49.2 |
-| 22               | 486 | 49.9 | 48.5 |
-| 24               | 416 | 48.5 | 47.2 |
-| 26               | 363-370 | 47.1 | 46.2 |
-| 30               | 373 | 45.0 | 45.0 |
+| qp_min           | kbps    | PSNR p50 | PSNR p05 |
+| ---------------- | ------- | -------- | -------- |
+| 14 (was default) | 606     | 50.8     | 49.2     |
+| 22               | 486     | 49.9     | 48.5     |
+| 24               | 416     | 48.5     | 47.2     |
+| 26               | 363-370 | 47.1     | 46.2     |
+| 30               | 373     | 45.0     | 45.0     |
 
 qp_min=26 ships for Responsiveness: **-39% bits** (606->370kbps) while
 the worst tail stays >=46dB — well above the ~40dB transparent threshold;
