@@ -4,6 +4,8 @@ mod adaptive;
 mod audio;
 #[cfg(feature = "media")]
 mod clipboard;
+#[cfg(feature = "rtc")]
+mod codec;
 mod config;
 #[cfg(feature = "media")]
 mod gamepad;

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
 #[cfg(feature = "media")]
@@ -12,7 +13,7 @@ use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 #[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
@@ -152,6 +153,8 @@ pub struct HostPeer {
     input_revoked: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    video_codec: VideoCodec,
 }
 
 #[derive(Clone)]
@@ -470,6 +473,12 @@ impl HostPeer {
         {
             anyhow::bail!("peer epoch is invalid");
         }
+        let negotiated = crate::codec::negotiate(
+            &offer,
+            &crate::codec::host_codecs(),
+            crate::codec::host_preference(),
+        );
+        tracing::info!(codec = negotiated.codec.id(), "negotiated video codec");
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         media_engine.register_header_extension(
@@ -697,12 +706,20 @@ impl HostPeer {
         }
         let video = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
+                mime_type: match negotiated.codec {
+                    VideoCodec::H264 => MIME_TYPE_H264,
+                    VideoCodec::Hevc => MIME_TYPE_HEVC,
+                    VideoCodec::Av1 => MIME_TYPE_AV1,
+                }
+                .to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
-                sdp_fmtp_line: format!(
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE_LEVEL_ID}"
-                ),
+                sdp_fmtp_line: match negotiated.codec {
+                    VideoCodec::H264 => format!(
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE_LEVEL_ID}"
+                    ),
+                    VideoCodec::Hevc | VideoCodec::Av1 => negotiated.offered_fmtp.clone(),
+                },
                 rtcp_feedback: vec![
                     RTCPFeedback {
                         typ: "nack".to_owned(),
@@ -945,6 +962,7 @@ impl HostPeer {
             #[cfg(feature = "media")]
             input_revoked,
             video,
+            video_codec: negotiated.codec,
         })
     }
 
@@ -1145,6 +1163,10 @@ impl HostPeer {
     }
 
     #[cfg(feature = "media")]
+    pub fn video_codec(&self) -> VideoCodec {
+        self.video_codec
+    }
+
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
     }

@@ -353,6 +353,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
             max_height: 1080,
             latency_mode: LatencyMode::Balanced,
             encoder_preference: EncoderPreference::Software,
+            codec: crate::codec::VideoCodec::H264,
         },
     );
     tokio::time::sleep(Duration::from_secs(5)).await;

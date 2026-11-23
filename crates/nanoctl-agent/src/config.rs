@@ -60,6 +60,7 @@ pub enum CodecPreference {
     #[default]
     Auto,
     H264,
+    Hevc,
     Vp9,
     Av1,
 }
@@ -162,11 +163,8 @@ impl AgentConfig {
         {
             bail!("quality resolution limits are outside the supported range");
         }
-        if !matches!(
-            self.quality.codec,
-            CodecPreference::Auto | CodecPreference::H264
-        ) {
-            bail!("this v2 build supports only quality.codec = auto or h264");
+        if matches!(self.quality.codec, CodecPreference::Vp9) {
+            bail!("quality.codec must be auto, h264, hevc or av1");
         }
         Ok(())
     }

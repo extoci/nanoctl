@@ -54,6 +54,13 @@ impl ServerState {
                 "DANGER: NANOCTL_DEV_LOOPBACK_USER enabled: loopback authentication and loopback ICE are trusted. DEVELOPMENT ONLY."
             );
         }
+        #[cfg(feature = "rtc")]
+        crate::codec::set_host_preference(config.quality.codec);
+        #[cfg(all(feature = "media", not(test)))]
+        {
+            let preference = config.quality.encoder;
+            std::thread::spawn(move || crate::media::ensure_codecs_probed(preference));
+        }
         Arc::new(Self {
             hosts: Mutex::new(None),
             config,

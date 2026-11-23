@@ -2711,8 +2711,8 @@ dependencies = [
 name = "nanoctl-agent"
 version = "3.0.0-alpha.1"
 dependencies = [
- "anyhow",
  "anstyle-query",
+ "anyhow",
  "apple-cf",
  "arboard",
  "async-trait",
