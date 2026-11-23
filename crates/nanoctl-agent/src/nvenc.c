@@ -102,7 +102,7 @@ static int supports_codec(NanoNvenc *h, GUID guid) {
     return 0;
 }
 
-static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t width, uint32_t height,
+static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, uint32_t width, uint32_t height,
                               uint32_t bitrate, uint32_t fps, uint32_t quality,
                               char *error, size_t len) {
     GUID codec_id;
@@ -139,13 +139,17 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t width, uint
     h->config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
     rate_control(&h->config.rcParams, bitrate, fps);
     if (codec == NANO_CODEC_H264) {
-        h->config.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+        /* High with frameIntervalP = 1 is Constrained High: CABAC and 8x8 transforms, no
+         * B-frames. Baseline/CAVLC only when the browser did not offer High. */
+        h->config.profileGUID =
+            h264_high ? NV_ENC_H264_PROFILE_HIGH_GUID : NV_ENC_H264_PROFILE_BASELINE_GUID;
         NV_ENC_CONFIG_H264 *h264 = &h->config.encodeCodecConfig.h264Config;
         h264->idrPeriod = h->config.gopLength;
         h264->chromaFormatIDC = 1;
         h264->repeatSPSPPS = 1;
         h264->disableSPSPPS = 0;
-        h264->entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+        h264->entropyCodingMode = h264_high ? NV_ENC_H264_ENTROPY_CODING_MODE_CABAC
+                                            : NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
     } else if (codec == NANO_CODEC_HEVC) {
         h->config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
         NV_ENC_CONFIG_HEVC *hevc = &h->config.encodeCodecConfig.hevcConfig;
@@ -202,7 +206,7 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t width, uint
     return 0;
 }
 
-NanoNvenc *nanoctl_nvenc_open(uint32_t codec, uint32_t width, uint32_t height, uint32_t bitrate,
+NanoNvenc *nanoctl_nvenc_open(uint32_t codec, uint32_t h264_high, uint32_t width, uint32_t height, uint32_t bitrate,
                              uint32_t fps, uint32_t quality, char *error, size_t len) {
     NanoNvenc *h = calloc(1, sizeof(*h));
     if (!h) {
@@ -265,7 +269,7 @@ NanoNvenc *nanoctl_nvenc_open(uint32_t codec, uint32_t width, uint32_t height, u
             continue;
         }
         h->context = context;
-        int initialized = initialize_session(h, codec, width, height, bitrate, fps, quality, error, len);
+        int initialized = initialize_session(h, codec, h264_high, width, height, bitrate, fps, quality, error, len);
         if (initialized != 0)
             destroy_session(h);
         CUcontext popped;

@@ -69,7 +69,6 @@ const MAX_ICE_GENERATION: u64 = 1_000_000;
 // Level 5.2 is the highest H.264 level supported by the configured 4K60 release envelope. The
 // WebRTC matcher treats the level byte asymmetrically, so this remains compatible with Chromium's
 // lower-level offer while no longer advertising a 720p30 ceiling for a 4K-capable sender.
-const H264_PROFILE_LEVEL_ID: &str = "42e034";
 #[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 #[cfg(any(feature = "media", test))]
@@ -157,6 +156,8 @@ pub struct HostPeer {
     video: Arc<TrackLocalStaticSample>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video_codec: VideoCodec,
+    #[cfg(feature = "media")]
+    h264_high: bool,
 }
 
 #[derive(Clone)]
@@ -742,7 +743,8 @@ impl HostPeer {
                 channels: 0,
                 sdp_fmtp_line: match negotiated.codec {
                     VideoCodec::H264 => format!(
-                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE_LEVEL_ID}"
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
+                        negotiated.h264_profile_level_id()
                     ),
                     VideoCodec::Hevc | VideoCodec::Av1 => negotiated.offered_fmtp.clone(),
                 },
@@ -991,6 +993,8 @@ impl HostPeer {
             input_revoked,
             video,
             video_codec: negotiated.codec,
+            #[cfg(feature = "media")]
+            h264_high: negotiated.h264_high,
         })
     }
 
@@ -1188,6 +1192,11 @@ impl HostPeer {
     pub fn revoke_input(&self) {
         self.input_revoked.store(true, Ordering::Release);
         let _ = self.input_shutdown.send(true);
+    }
+
+    #[cfg(feature = "media")]
+    pub fn h264_high(&self) -> bool {
+        self.h264_high
     }
 
     #[cfg(feature = "media")]

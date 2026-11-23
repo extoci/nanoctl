@@ -169,6 +169,7 @@ impl Drop for ActivatedTransformGuard {
 }
 
 pub struct WindowsEncoder {
+    h264_high: bool,
     _runtime: MediaFoundationRuntime,
     codec: VideoCodec,
     active: Option<ActiveEncoder>,
@@ -194,6 +195,7 @@ impl Drop for WindowsEncoder {
 impl WindowsEncoder {
     pub fn with_codec(
         codec: VideoCodec,
+        h264_high: bool,
         bitrate_kbps: u32,
         max_fps: u16,
         _latency_mode: LatencyMode,
@@ -203,6 +205,7 @@ impl WindowsEncoder {
         let mut encoder = Self {
             _runtime: runtime,
             codec,
+            h264_high,
             active: None,
             bitrate_kbps,
             max_fps,
@@ -384,12 +387,15 @@ impl WindowsEncoder {
             unsafe {
                 let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
                 let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &ui4_variant(0));
+                if self.codec == VideoCodec::H264 && self.h264_high {
+                    let _ = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &low_latency);
+                }
             }
         }
         let events: IMFMediaEventGenerator = transform
             .cast()
             .context("hardware MFT has no asynchronous event interface")?;
-        let (subtype, profile) = output_format(self.codec);
+        let (subtype, profile) = output_format(self.codec, self.h264_high);
         let output = create_video_type(
             &subtype,
             width,
@@ -455,8 +461,9 @@ impl WindowsEncoder {
     }
 }
 
-fn output_format(codec: VideoCodec) -> (windows::core::GUID, u32) {
+fn output_format(codec: VideoCodec, h264_high: bool) -> (windows::core::GUID, u32) {
     match codec {
+        VideoCodec::H264 if h264_high => (MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32),
         VideoCodec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_Base.0 as u32),
         VideoCodec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
         VideoCodec::Av1 => (MFVideoFormat_AV1, eAVEncAV1VProfile_Main_420_8.0 as u32),
@@ -500,7 +507,7 @@ fn enumerate_hardware_encoders(codec: VideoCodec) -> Result<Vec<IMFActivate>> {
     };
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: output_format(codec).0,
+        guidSubtype: output_format(codec, false).0,
     };
     let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut activations: *mut Option<IMFActivate> = ptr::null_mut();

@@ -120,6 +120,7 @@ pub(crate) fn spawn_media(
             latency_mode: config.quality.latency_mode,
             encoder_preference: config.quality.encoder,
             codec: peer.video_codec(),
+            h264_high: peer.h264_high(),
         },
     )
 }
