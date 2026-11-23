@@ -498,6 +498,11 @@ async fn main() -> Result<()> {
             previous_hook(panic);
         }));
     }
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        diagnostics::append(format_args!("nanoctl: {panic}"));
+        previous_hook(panic);
+    }));
     if let Err(error) = init_logging(log_file.as_deref(), &cli.command) {
         append_diagnostic(
             log_file.as_deref(),
@@ -507,6 +512,7 @@ async fn main() -> Result<()> {
     }
     let result = run(cli).await;
     if let Err(error) = &result {
+        diagnostics::append(format_args!("nanoctl: command failed: {error:#}"));
         append_diagnostic(
             log_file.as_deref(),
             format_args!("nanoctl command failed: {error:#}"),
