@@ -504,7 +504,6 @@ struct SoftwareEncoder {
     dimensions: Option<(u32, u32)>,
     yuv: Option<I420Frame>,
     color_convert_ns: u64,
-    slices_patched: bool,
 }
 
 struct I420Frame {
@@ -1177,7 +1176,6 @@ impl SoftwareEncoder {
             dimensions: None,
             yuv: None,
             color_convert_ns: 0,
-            slices_patched: false,
         })
     }
 }
@@ -1240,7 +1238,6 @@ impl FrameEncoder for SoftwareEncoder {
             self.encoder = create_encoder(self.bitrate_kbps, self.max_fps, self.latency_mode)?;
             self.yuv = None;
             self.dimensions = Some(dimensions);
-            self.slices_patched = false;
         }
         let dimensions = (dimensions.0 as usize, dimensions.1 as usize);
         let color_started = Instant::now();
@@ -1260,12 +1257,6 @@ impl FrameEncoder for SoftwareEncoder {
             .encode(yuv)
             .context("H.264 encode failed")?
             .to_vec();
-        if !self.slices_patched {
-            self.slices_patched = true;
-            if let Err(error) = force_fixed_slices(&mut self.encoder) {
-                tracing::warn!(%error, "fixed-slice encode unavailable");
-            }
-        }
         if tracing::enabled!(target: "nanoctl::encoder", tracing::Level::DEBUG)
             && let Ok(statistics) = encoder_statistics(&mut self.encoder)
         {
@@ -1422,39 +1413,12 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .complexity(complexity)
         .skip_frames(skip_frames)
         // Slice-parallel encode: OpenH264 only uses encoder threads when the
-        // frame is cut into slices, which SIZELIMITED does at ~8KB each.
-        .max_slice_len(8_000)
+        // frame is cut into slices. A ~1.5KB cap splits even small deltas
+        // (~6-9KB) across the encode threads; tiny frames stay single-slice.
+        .max_slice_len(1_500)
         .num_threads(encode_threads());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
-}
-
-/// Forces a fixed slice count once the encoder has produced its first frame:
-/// SIZELIMITED slices only parallelize frames larger than ~8KB, which leaves
-/// most deltas single-threaded. Reading the live params back via GetOption is
-/// the only way to flip the mode without clobbering the configured bitrate,
-/// resolution, and rate control.
-fn force_fixed_slices(encoder: &mut Encoder) -> Result<()> {
-    let mut params = openh264_sys2::SEncParamExt::default();
-    unsafe {
-        if encoder.raw_api().get_option(
-            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
-            std::ptr::addr_of_mut!(params).cast(),
-        ) != 0
-        {
-            bail!("failed to read encoder params");
-        }
-        params.sSpatialLayers[0].sSliceArgument.uiSliceMode = openh264_sys2::SM_FIXEDSLCNUM_SLICE;
-        params.sSpatialLayers[0].sSliceArgument.uiSliceNum = u32::from(encode_threads());
-        if encoder.raw_api().set_option(
-            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
-            std::ptr::addr_of_mut!(params).cast(),
-        ) != 0
-        {
-            bail!("failed to set fixed-slice encoder params");
-        }
-    }
-    Ok(())
 }
 
 pub fn probe_encoder(preference: EncoderPreference) -> Result<(&'static str, &'static str)> {
@@ -2824,7 +2788,11 @@ mod tests {
             assert_eq!(bitrate.iBitrate, target as i32 * 1_000);
             let next = encoder.encode(&image).unwrap();
             let types = annex_b_nal_types(&next.bytes).unwrap();
-            assert!(types.contains(&1));
+            assert!(
+                types.contains(&1),
+                "types={types:?} bytes={}",
+                next.bytes.len()
+            );
             assert!(!types.contains(&5));
         }
     }

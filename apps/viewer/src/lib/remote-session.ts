@@ -587,9 +587,10 @@ export class RemoteSessionController {
     // Chrome only allows encoded streams before any RTP arrives, so the
     // transform must be created here — before negotiation — not in ontrack.
     this.pendingEncodedStreams = supportsWebCodecsVideo(this.videoTransceiver.receiver)
-      ? (createVideoEncodedStreams(
-          this.videoTransceiver.receiver,
-        ) as { readable: ReadableStream; writable: WritableStream } | null)
+      ? (createVideoEncodedStreams(this.videoTransceiver.receiver) as {
+          readable: ReadableStream;
+          writable: WritableStream;
+        } | null)
       : null;
     // True low-latency path: raw AUs over an unreliable data channel feed
     // WebCodecs directly — no jitter buffer anywhere. The wire format is
@@ -635,9 +636,7 @@ export class RemoteSessionController {
       // The transform tap sits behind Chrome's jitter buffer anyway, so
       // only use it when the data-channel path did not attach.
       if (this.pendingEncodedStreams && !this.webCodecsVideo) {
-        const encoded = this.pendingEncodedStreams as Parameters<
-          typeof attachWebCodecsVideo
-        >[0];
+        const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
         this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video);
       }
       const stream = streams[0] ?? new MediaStream([track]);

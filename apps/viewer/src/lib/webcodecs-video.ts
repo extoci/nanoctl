@@ -39,13 +39,13 @@ export function supportsWebCodecsVideo(receiver: RTCRtpReceiver): boolean {
  * traffic, so this must be called on the recvonly transceiver's receiver
  * right after addTransceiver — before negotiation, not in ontrack.
  */
-export function createVideoEncodedStreams(
-  receiver: RTCRtpReceiver,
-): EncodedStreams | null {
+export function createVideoEncodedStreams(receiver: RTCRtpReceiver): EncodedStreams | null {
   try {
     return (
-      receiver as RTCRtpReceiver & { createEncodedStreams?: () => EncodedStreams }
-    ).createEncodedStreams?.() ?? null;
+      (
+        receiver as RTCRtpReceiver & { createEncodedStreams?: () => EncodedStreams }
+      ).createEncodedStreams?.() ?? null
+    );
   } catch {
     return null;
   }
@@ -96,8 +96,7 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
   if (generator) {
     // Older builds expose `.track`; current Chrome makes the generator itself
     // a MediaStreamTrack subclass.
-    const track =
-      generator.track ?? (generator as unknown as MediaStreamTrack);
+    const track = generator.track ?? (generator as unknown as MediaStreamTrack);
     video.srcObject = new MediaStream([track]);
     void video.play().catch(() => {});
   }
@@ -125,9 +124,7 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
         const nal = annexB[i + 3]!;
         if ((nal & 0x1f) === 7 && i + 7 < annexB.length) {
           const hex = (b: number) => b.toString(16).padStart(2, "0");
-          codec = `avc1.${hex(annexB[i + 4]!)}${hex(annexB[i + 5]!)}${hex(
-            annexB[i + 6]!,
-          )}`;
+          codec = `avc1.${hex(annexB[i + 4]!)}${hex(annexB[i + 5]!)}${hex(annexB[i + 6]!)}`;
           break;
         }
       }
@@ -145,10 +142,7 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
         }
         try {
           if (ctx && canvas) {
-            if (
-              canvas.width !== frame.displayWidth ||
-              canvas.height !== frame.displayHeight
-            ) {
+            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
               canvas.width = frame.displayWidth;
               canvas.height = frame.displayHeight;
             }
@@ -262,7 +256,12 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
     canvas?.remove();
   };
 
-  return { canvas: canvas ?? video.ownerDocument.createElement("canvas"), feed, teardown, stats: () => ({ decoded, dropped }) };
+  return {
+    canvas: canvas ?? video.ownerDocument.createElement("canvas"),
+    feed,
+    teardown,
+    stats: () => ({ decoded, dropped }),
+  };
 }
 
 export function attachWebCodecsVideo(
@@ -283,9 +282,10 @@ export function attachWebCodecsVideo(
       controller.enqueue(frame);
     },
   });
-  streams.readable.pipeThrough(wrappedTransform).pipeTo(streams.writable).catch(
-    () => sink.teardown(),
-  );
+  streams.readable
+    .pipeThrough(wrappedTransform)
+    .pipeTo(streams.writable)
+    .catch(() => sink.teardown());
   return { canvas: sink.canvas, drop: sink.teardown, stats: sink.stats };
 }
 
@@ -306,22 +306,24 @@ export function attachDataChannelVideo(
   let expectedSeq: number | null = null;
   let waitingForKey = true;
   let kfRequestedAt = 0;
-  const dbg = ((window as unknown as { __dcv?: Record<string, number | boolean | string> }).__dcv ??=
-    { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
+  const dbg = ((
+    window as unknown as { __dcv?: Record<string, number | boolean | string> }
+  ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
   dbg.waitingForKey = true;
-  const pending = new Map<number, { isKey: boolean; parts: number; got: Uint8Array[]; n: number }>();
+  const pending = new Map<
+    number,
+    { isKey: boolean; parts: number; got: Uint8Array[]; n: number }
+  >();
   const reordered = new Map<number, { au: Uint8Array; isKey: boolean }>();
   const onFrame = (event: MessageEvent) => {
     try {
-      const data =
-        event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
+      const data = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
       if (!data || data.length < 18) {
         dbg.nonArrayBuffer = (dbg.nonArrayBuffer as number) + 1;
         return;
       }
       dbg.msgs = (dbg.msgs as number) + 1;
-      const seq =
-        data[0]! | (data[1]! << 8) | (data[2]! << 16) | (data[3]! << 24);
+      const seq = data[0]! | (data[1]! << 8) | (data[2]! << 16) | (data[3]! << 24);
       const isKey = (data[4]! & 1) !== 0;
       const part = data[5]! | (data[6]! << 8);
       const parts = data[7]! | (data[8]! << 8);
