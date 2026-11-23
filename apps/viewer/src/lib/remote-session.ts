@@ -700,8 +700,8 @@ export class RemoteSessionController {
       type: "pointer",
       action: "wheel",
       ...position,
-      deltaX: clampWheel(event.deltaX),
-      deltaY: clampWheel(event.deltaY),
+      deltaX: wheelPixels(event.deltaX, event.deltaMode),
+      deltaY: wheelPixels(event.deltaY, event.deltaMode),
     });
   };
 
@@ -1329,9 +1329,15 @@ export class RemoteSessionController {
   }
 }
 
-function clampWheel(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(-20, Math.min(20, value));
+/**
+ * Normalizes a wheel delta to CSS pixels. Trackpads emit fine-grained
+ * deltas that must not be rounded away, and line/page delta modes need
+ * conversion before the host can map pixels to wheel units.
+ */
+export function wheelPixels(delta: number, deltaMode: number): number {
+  if (!Number.isFinite(delta)) return 0;
+  const pixels = deltaMode === 1 ? (delta * 100) / 3 : deltaMode === 2 ? delta * 800 : delta;
+  return Math.max(-4_000, Math.min(4_000, pixels));
 }
 
 function safeSequenceSeed(): number {
