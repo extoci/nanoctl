@@ -235,7 +235,7 @@ impl FrameEncoder for WindowsEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, image: &xcap::image::RgbaImage) -> Result<EncodedFrame> {
+    fn encode(&mut self, image: &crate::media::RgbaFrame<'_>) -> Result<EncodedFrame> {
         let width = image.width();
         let height = image.height();
         let dimensions_changed = self
