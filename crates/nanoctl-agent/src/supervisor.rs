@@ -62,7 +62,7 @@ async fn supervise(
                 let status = match timeout(SHUTDOWN_TIMEOUT, worker.wait()).await {
                     Ok(result) => result,
                     Err(_) => {
-                        tracing::warn!(reason, "agent worker did not stop in time; terminating it");
+                        tracing::warn!(target: "nanoctl::status", reason, "Agent worker did not stop in time; terminating it");
                         worker.start_kill().context("cannot terminate the agent worker")?;
                         worker.wait().await
                     }
@@ -75,7 +75,11 @@ async fn supervise(
         if started.elapsed() >= STABLE_RUN {
             backoff = INITIAL_BACKOFF;
         }
-        tracing::warn!(%status, code = status.code(), delay_seconds = backoff.as_secs(), "agent worker exited without a shutdown request; restarting after backoff");
+        if backoff == INITIAL_BACKOFF {
+            tracing::warn!(target: "nanoctl::status", %status, code = status.code(), delay_seconds = backoff.as_secs(), "Agent worker exited unexpectedly; restarting");
+        } else {
+            tracing::warn!(%status, code = status.code(), delay_seconds = backoff.as_secs(), "Agent worker exited unexpectedly; restarting");
+        }
         tokio::select! {
             biased;
             result = &mut stop => {

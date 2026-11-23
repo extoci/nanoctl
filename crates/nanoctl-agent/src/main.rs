@@ -41,7 +41,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::config::AgentConfig;
 
@@ -88,7 +93,11 @@ enum Command {
         json: bool,
     },
     /// Start the agent in this terminal, or show the viewer URL if it is already running.
-    Run,
+    Run {
+        /// Show detailed diagnostics instead of the short run status.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Stop the running agent gracefully.
     Stop,
     /// Check configuration, Tailscale, capture, and input readiness.
@@ -149,9 +158,36 @@ enum Command {
     CommitUpdate,
 }
 
-fn init_logging(log_file: Option<&Path>, diagnostics_to_stderr: bool) -> Result<()> {
-    let filter =
-        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("nanoctl=info"));
+fn quiet_console<W>(writer: W) -> impl tracing::Subscriber
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .compact()
+            .with_filter(
+                Targets::new()
+                    .with_target("nanoctl", LevelFilter::ERROR)
+                    .with_target("nanoctl::status", LevelFilter::INFO),
+            ),
+    )
+}
+
+fn init_logging(log_file: Option<&Path>, command: &Command) -> Result<()> {
+    let env_filter = EnvFilter::try_from_default_env().ok();
+    if log_file.is_none()
+        && env_filter.is_none()
+        && matches!(command, Command::Run { verbose: false })
+    {
+        quiet_console(std::io::stdout).init();
+        return Ok(());
+    }
+    let filter = env_filter.unwrap_or_else(|| EnvFilter::new("nanoctl=info"));
     if let Some(path) = log_file {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -163,17 +199,17 @@ fn init_logging(log_file: Option<&Path>, diagnostics_to_stderr: bool) -> Result<
             .open(path)
             .with_context(|| format!("cannot open log file {}", path.display()))?;
         tracing_subscriber::fmt()
-            .with_env_filter(filter())
+            .with_env_filter(filter)
             .with_ansi(false)
             .with_writer(file)
             .compact()
             .init();
     } else {
         let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter())
+            .with_env_filter(filter)
             .with_ansi(terminal::supports_styling())
             .compact();
-        if diagnostics_to_stderr {
+        if matches!(command, Command::Url { .. }) {
             subscriber.with_writer(std::io::stderr).init();
         } else {
             subscriber.init();
@@ -229,7 +265,7 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = cli.config.unwrap_or(AgentConfig::default_path()?);
 
     match cli.command {
-        Command::Run => {
+        Command::Run { .. } => {
             let config = AgentConfig::load_or_default(&config_path)?;
             config.validate()?;
             #[cfg(windows)]
@@ -238,6 +274,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             match service_control::ServiceControl::acquire()? {
                 service_control::StartOutcome::Acquired(control) => {
+                    tracing::info!(target: "nanoctl::status", "nanoctl {} starting", env!("CARGO_PKG_VERSION"));
                     #[cfg(windows)]
                     if cli.ready_file.is_none() && cli.ready_token.is_none() {
                         return supervisor::run(control).await;
@@ -421,10 +458,7 @@ async fn main() -> Result<()> {
             previous_hook(panic);
         }));
     }
-    if let Err(error) = init_logging(
-        log_file.as_deref(),
-        matches!(cli.command, Command::Url { .. }),
-    ) {
+    if let Err(error) = init_logging(log_file.as_deref(), &cli.command) {
         append_diagnostic(
             log_file.as_deref(),
             format_args!("nanoctl command failed: {error:#}"),
@@ -439,4 +473,55 @@ async fn main() -> Result<()> {
         );
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn run_diagnostics_are_opt_in() {
+        for (args, verbose) in [
+            (vec!["nanoctl", "run"], false),
+            (vec!["nanoctl", "run", "-v"], true),
+            (vec!["nanoctl", "run", "--verbose"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Command::Run { verbose: value } if value == verbose));
+        }
+    }
+
+    #[test]
+    fn quiet_console_prints_only_plain_status_and_agent_errors() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = quiet_console({
+            let output = Arc::clone(&output);
+            move || SharedOutput(Arc::clone(&output))
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "nanoctl::rtc", "video REMB");
+            tracing::warn!(target: "nanoctl::media", "frame discarded");
+            tracing::debug!(target: "nanoctl::status", "debug details");
+            tracing::info!(target: "nanoctl::status", "Viewer connected");
+            tracing::warn!(target: "nanoctl::status", "Waiting for Tailscale");
+            tracing::error!(target: "nanoctl::service", "Agent failed");
+        });
+        assert_eq!(
+            *output.lock().unwrap(),
+            b"Viewer connected\nWaiting for Tailscale\nAgent failed\n"
+        );
+    }
+
+    struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 }
