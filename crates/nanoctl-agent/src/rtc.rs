@@ -560,6 +560,7 @@ impl HostPeer {
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
             let (pointer_sender, pointer_receiver) = tokio::sync::watch::channel(None);
+            let blocked_notices = InputBlockedNotices::default();
             if let Some(input) = &input {
                 input_tasks.push(spawn_input_worker(
                     InputReceiver::Reliable(control_receiver),
@@ -569,6 +570,7 @@ impl HostPeer {
                     Some(display_selection_feedback_receiver),
                     input_shutdown_receiver.clone(),
                     input_revoked.clone(),
+                    blocked_notices.clone(),
                 ));
                 input_tasks.push(spawn_input_worker(
                     InputReceiver::Motion(pointer_receiver),
@@ -578,6 +580,7 @@ impl HostPeer {
                     None,
                     input_shutdown_receiver,
                     input_revoked.clone(),
+                    blocked_notices.clone(),
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
@@ -621,6 +624,9 @@ impl HostPeer {
                     return Box::pin(async {});
                 }
                 let reliable = channel.label() == "nanoctl.control.v1";
+                if reliable {
+                    blocked_notices.attach(&channel);
+                }
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
                     "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
@@ -763,7 +769,7 @@ impl HostPeer {
             let mut remb_kbps = None;
             let mut latest_sample: Option<LinkSample> = None;
             while let Ok((packets, _attributes)) = sender.read_rtcp().await {
-                let at = Instant::now();
+                let at = std::time::Instant::now();
                 let compact_ntp = (unix2ntp(SystemTime::now()) >> 16) as u32;
                 #[cfg(feature = "media")]
                 {
@@ -1197,6 +1203,53 @@ impl HostPeer {
 }
 
 #[cfg(feature = "media")]
+const INPUT_BLOCKED_NOTICE: &str = r#"{"type":"inputBlocked"}"#;
+#[cfg(feature = "media")]
+const INPUT_BLOCKED_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "media")]
+/// Tells the viewer when the host OS refuses injected input (for example Windows UIPI while an
+/// elevated window, UAC prompt or the lock screen is in front), at most once per interval.
+#[derive(Clone, Default)]
+struct InputBlockedNotices(Arc<std::sync::Mutex<InputBlockedState>>);
+
+#[cfg(feature = "media")]
+#[derive(Default)]
+struct InputBlockedState {
+    channel: Option<std::sync::Weak<RTCDataChannel>>,
+    last_sent: Option<Instant>,
+}
+
+#[cfg(feature = "media")]
+impl InputBlockedNotices {
+    fn attach(&self, channel: &Arc<RTCDataChannel>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.channel = Some(Arc::downgrade(channel));
+        }
+    }
+
+    fn notify(&self) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if state
+            .last_sent
+            .is_some_and(|sent| sent.elapsed() < INPUT_BLOCKED_NOTICE_INTERVAL)
+        {
+            return;
+        }
+        let Some(channel) = state.channel.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        state.last_sent = Some(Instant::now());
+        tokio::spawn(async move {
+            let _ = channel.send_text(INPUT_BLOCKED_NOTICE.to_owned()).await;
+        });
+    }
+}
+
+#[cfg(feature = "media")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_input_worker(
     mut receiver: InputReceiver,
     input: Arc<std::sync::Mutex<crate::input::InputController>>,
@@ -1205,6 +1258,7 @@ fn spawn_input_worker(
     mut display_selection_feedback: Option<tokio::sync::watch::Receiver<String>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     input_revoked: Arc<AtomicBool>,
+    blocked_notices: InputBlockedNotices,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1285,7 +1339,12 @@ fn spawn_input_worker(
                             }
                         }
                         Ok(Ok(None)) => {}
-                        Ok(Err(error)) => tracing::warn!(error = %error, "control message rejected"),
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %error, "control message rejected");
+                            if error.downcast_ref::<enigo::InputError>().is_some() {
+                                blocked_notices.notify();
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(error = %error, "input worker stopped unexpectedly");
                             break;
