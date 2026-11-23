@@ -1962,9 +1962,9 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedFrame, EncodedFrameSlot, EncoderBackend, LatestFrame, SoftwareEncoder,
-        VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b, await_video_delivery,
-        bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
+        EncodedFrame, EncodedFrameSlot, EncoderBackend, LatestFrame, SoftwareEncoder, TimingSample,
+        TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b,
+        await_video_delivery, bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
