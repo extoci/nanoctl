@@ -1401,7 +1401,10 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
-        .usage_type(UsageType::CameraVideoRealTime)
+        // Screen-content mode tunes OpenH264's rate control for desktop
+        // captures (mostly-static regions, sharp text edges) instead of
+        // camera footage, buying quality per bit on remote desktops.
+        .usage_type(UsageType::ScreenContentRealTime)
         .vui(
             VuiConfig::srgb()
                 .full_range(false)
@@ -3583,7 +3586,7 @@ mod tests {
             assert_eq!(result, 0);
             assert_eq!((params.iMinQp, params.iMaxQp), (14, 51));
             assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
-            assert_eq!(params.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
+            assert_eq!(params.iUsageType, openh264_sys2::SCREEN_CONTENT_REAL_TIME);
             let layer = &params.sSpatialLayers[0];
             assert!(layer.bVideoSignalTypePresent);
             assert!(layer.bColorDescriptionPresent);
