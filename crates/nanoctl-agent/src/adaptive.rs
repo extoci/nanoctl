@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 const RTT_WINDOW: Duration = Duration::from_secs(30);
 const REFRESH_DELAY: Duration = Duration::from_millis(250);
+const SLOW_PROBE_GAIN: f64 = 1.08;
 pub const IDLE_KEEPALIVE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
@@ -118,9 +119,10 @@ impl RateController {
             .filter(|remb| Some(*remb) != self.last_remb);
         self.last_remb = sample.remb_kbps.or(self.last_remb);
         let loss = sample.fraction_lost.clamp(0.0, 1.0);
+        let previous_report = self.last_loss_report;
         let fresh_report = sample
             .receiver_report_at
-            .is_some_and(|at| self.last_loss_report.is_none_or(|last| at > last));
+            .is_some_and(|at| previous_report.is_none_or(|last| at > last));
         if fresh_report {
             self.last_loss_report = sample.receiver_report_at;
             self.high_loss_reports = if loss > 0.1 && !self.app_limited {
@@ -221,15 +223,23 @@ impl RateController {
                     self.rate += step * elapsed.min(2.0);
                 }
             } else {
-                let startup = self.rate < f64::from(self.ceiling) * 0.75
-                    && self.clean_since.is_some_and(|since| {
-                        sample.at.duration_since(since) >= Duration::from_secs(3)
-                    });
-                self.rate *= if startup {
-                    Self::probe_gain(sample.rtt).powf(elapsed.min(2.0))
+                let slow_elapsed = if sample.rtt.is_some() {
+                    elapsed.min(2.0)
                 } else {
-                    1.08_f64.powf(elapsed)
+                    elapsed
                 };
+                self.rate *= SLOW_PROBE_GAIN.powf(slow_elapsed);
+                if fresh_report
+                    && !queued
+                    && clean_for >= Duration::from_secs(3)
+                    && let Some((previous, current)) =
+                        previous_report.zip(sample.receiver_report_at)
+                {
+                    let gain = Self::probe_gain(sample.rtt);
+                    let clean_gain = SLOW_PROBE_GAIN + (gain - SLOW_PROBE_GAIN) * 1.5;
+                    let report_elapsed = current.duration_since(previous).as_secs_f64().min(2.0);
+                    self.rate *= (clean_gain / SLOW_PROBE_GAIN).powf(report_elapsed);
+                }
             }
         }
         if delay_cut {
@@ -273,6 +283,8 @@ impl RateController {
         let decision = self.decision();
         let delta = decision.bitrate_kbps.abs_diff(self.reported.bitrate_kbps) as f64;
         let changed = decision.fps != self.reported.fps
+            || (decision.bitrate_kbps == self.ceiling
+                && self.reported.bitrate_kbps != self.ceiling)
             || delta >= (self.reported.bitrate_kbps as f64 * 0.1).max(1.0);
         if changed || loss_cut || delay_cut || remb_cut {
             let reason = if remb_cut {
@@ -317,8 +329,8 @@ impl RateController {
     }
 
     fn probe_gain(rtt: Option<Duration>) -> f64 {
-        rtt.map_or(1.08, |rtt| {
-            (1.0 + 0.004 / rtt.as_secs_f64().max(0.001)).clamp(1.08, 1.5)
+        rtt.map_or(SLOW_PROBE_GAIN, |rtt| {
+            (1.0 + 0.004 / rtt.as_secs_f64().max(0.001)).clamp(SLOW_PROBE_GAIN, 1.5)
         })
     }
 }
@@ -540,6 +552,79 @@ mod tests {
     }
 
     #[test]
+    fn clean_feedback_reaches_a_fifty_megabit_ceiling() {
+        let now = Instant::now();
+        let mut controller = RateController::new(50_000, 60);
+        assert_eq!(controller.decision().bitrate_kbps, 4_000);
+        let mut ceiling_at = None;
+        for second in 0..=14 {
+            let mut input = sample(now + Duration::from_secs(second), 0.0);
+            input.rtt = Some(Duration::from_millis(20));
+            if let Some(decision) = controller.observe(input)
+                && decision.bitrate_kbps == 50_000
+            {
+                assert!(ceiling_at.replace(second).is_none());
+                assert_eq!(decision.fps, 60);
+            }
+        }
+        assert!(ceiling_at.is_some_and(|second| second <= 13));
+    }
+
+    #[test]
+    fn remb_copies_neither_accelerate_nor_starve_fresh_clean_probes() {
+        let now = Instant::now();
+        let mut fresh_only = RateController::new(24_000, 60);
+        let mut interleaved = RateController::new(24_000, 60);
+        for second in 0..=4 {
+            let mut input = sample(now + Duration::from_secs(second), 0.0);
+            input.rtt = Some(Duration::from_millis(20));
+            fresh_only.observe(input);
+            interleaved.observe(input);
+            assert_eq!(fresh_only.decision(), interleaved.decision());
+            if second < 4 {
+                let before = interleaved.decision().bitrate_kbps;
+                input.at += Duration::from_millis(500);
+                input.remb_kbps = Some(500 + second as u32);
+                interleaved.observe(input);
+                let after = interleaved.decision().bitrate_kbps;
+                assert!(f64::from(after) <= (f64::from(before) + 1.0) * SLOW_PROBE_GAIN.sqrt());
+            }
+        }
+    }
+
+    #[test]
+    fn clean_measured_probe_limits_the_growth_after_feedback_goes_quiet() {
+        let now = Instant::now();
+        let mut controller = RateController::new(50_000, 60);
+        for second in [0, 20] {
+            let mut input = sample(now + Duration::from_secs(second), 0.0);
+            input.rtt = Some(Duration::from_millis(1));
+            controller.observe(input);
+        }
+        assert_eq!(controller.decision().bitrate_kbps, 11_696);
+    }
+
+    #[test]
+    fn ceiling_is_reported_once_even_when_the_final_increase_is_small() {
+        let now = Instant::now();
+        let mut controller = RateController::new(24_000, 60);
+        controller.rate = 23_900.0;
+        controller.reported = controller.decision();
+        assert_eq!(controller.observe(sample(now, 0.0)), None);
+        assert_eq!(
+            controller.observe(sample(now + Duration::from_secs(1), 0.0)),
+            Some(RateDecision {
+                bitrate_kbps: 24_000,
+                fps: 60,
+            })
+        );
+        assert_eq!(
+            controller.observe(sample(now + Duration::from_secs(2), 0.0)),
+            None
+        );
+    }
+
+    #[test]
     fn delay_cut_is_throttled_and_baseline_expires() {
         let now = Instant::now();
         let mut controller = RateController::new(8_000, 60);
@@ -690,6 +775,7 @@ mod tests {
         controller.observe(input);
         for second in 1..=7 {
             input.at = now + Duration::from_secs(second);
+            input.receiver_report_at = Some(input.at);
             controller.update_sender(4_000.0, false, input.at);
             controller.observe(input);
         }
@@ -885,24 +971,39 @@ mod tests {
         assert!(controller.decision().bitrate_kbps > 2_000);
     }
 
-    #[test]
-    fn delay_feedback_bounds_queue_and_recovers_on_a_two_megabit_link() {
+    fn two_megabit_link(ceiling: u32, baseline_rtt: Duration) -> (f64, u32) {
         let now = Instant::now();
-        let mut controller = RateController::new(8_000, 60);
+        let mut controller = RateController::new(ceiling, 60);
         let mut applied = controller.decision().bitrate_kbps;
         let mut queued_kbits = 0.0_f64;
         let mut max_queue = 0.0_f64;
         for second in 0..60 {
             let mut input = sample(now + Duration::from_secs(second), 0.0);
-            input.rtt = Some(Duration::from_secs_f64(0.08 + queued_kbits / 2_000.0));
+            input.rtt = Some(baseline_rtt + Duration::from_secs_f64(queued_kbits / 2_000.0));
             if let Some(decision) = controller.observe(input) {
                 applied = decision.bitrate_kbps;
             }
             queued_kbits = (queued_kbits + f64::from(applied) - 2_000.0).max(0.0);
             max_queue = max_queue.max(queued_kbits);
         }
-        assert!(max_queue / 2_000.0 < 0.5);
+        (max_queue / 2_000.0, applied)
+    }
+
+    #[test]
+    fn delay_feedback_bounds_queue_and_recovers_on_a_two_megabit_link() {
+        let (max_queue, applied) = two_megabit_link(8_000, Duration::from_millis(80));
+        assert!(max_queue < 0.5);
         assert!((1_000..=2_200).contains(&applied));
+    }
+
+    #[test]
+    fn raising_the_ceiling_does_not_add_queue_on_a_two_megabit_link() {
+        for rtt in [Duration::from_millis(20), Duration::from_millis(80)] {
+            let previous = two_megabit_link(24_000, rtt);
+            let higher = two_megabit_link(50_000, rtt);
+            assert_eq!(higher, previous);
+            assert!((1_000..=2_200).contains(&higher.1));
+        }
     }
 
     #[test]

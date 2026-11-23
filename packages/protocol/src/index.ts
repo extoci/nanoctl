@@ -149,7 +149,16 @@ export type ControlMessage =
       readonly repeat: boolean;
     }
   | { readonly type: "display"; readonly displayId: string }
-  | { readonly type: "gamepad"; readonly pads: readonly GamepadReport[] }
+  | {
+      readonly type: "gamepad";
+      readonly pads: readonly GamepadReport[];
+      readonly dualShock4?: readonly {
+        readonly slot: number;
+        readonly leftTriggerPressed: boolean;
+        readonly rightTriggerPressed: boolean;
+        readonly touchpadPressed: boolean;
+      }[];
+    }
   | { readonly type: "release" }
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }

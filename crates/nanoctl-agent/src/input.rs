@@ -53,9 +53,7 @@ enum ControlMessage {
         text: String,
     },
     Ping,
-    Gamepad {
-        pads: crate::gamepad::Snapshot,
-    },
+    Gamepad(crate::gamepad::Snapshot),
     Display {
         #[serde(rename = "displayId")]
         display_id: String,
@@ -136,7 +134,7 @@ impl InputController {
             &message,
             ControlMessage::Ping
                 | ControlMessage::Release
-                | ControlMessage::Gamepad { .. }
+                | ControlMessage::Gamepad(_)
                 | ControlMessage::Unsupported
         ) {
             self.last_physical_input = Instant::now();
@@ -178,9 +176,9 @@ impl InputController {
                 Ok(None)
             }
             ControlMessage::Ping => Ok(None),
-            ControlMessage::Gamepad { pads } => {
+            ControlMessage::Gamepad(snapshot) => {
                 if !self.gamepads_revoked {
-                    self.gamepads.update(pads)?;
+                    self.gamepads.update(snapshot)?;
                 }
                 Ok(None)
             }

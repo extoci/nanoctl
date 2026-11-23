@@ -5,7 +5,16 @@ const XINPUT_BUTTONS = [
   0x0002, 0x0004, 0x0008, 0x0400,
 ];
 const KEEPALIVE_MS = 500;
-type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "index" | "mapping">;
+type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
+type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
+type DualShock4Pad = NonNullable<GamepadMessage["dualShock4"]>[number];
+
+function isPlayStation(id: string): boolean {
+  return (
+    /\b(?:dualsense|dualshock\s*4?|playstation)\b|\bvendor:\s*054c\b/i.test(id) ||
+    /^wireless controller(?: extended gamepad| gamepad)?$/i.test(id.trim())
+  );
+}
 
 function clamp(value: number | undefined, min: number, max: number): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -39,12 +48,10 @@ function report(pad: InputPad, slot: number): GamepadReport {
 export class GamepadForwarder {
   private readonly slots: (number | undefined)[] = Array.from({ length: 4 });
   private sentSlots = new Set<number>();
-  private lastSent = "[]";
+  private lastSent = JSON.stringify({ type: "gamepad", pads: [] });
   private sentAt = -Infinity;
 
-  constructor(
-    private readonly send: (message: Extract<ControlMessage, { type: "gamepad" }>) => boolean,
-  ) {}
+  constructor(private readonly send: (message: GamepadMessage) => boolean) {}
 
   sample(pads: ArrayLike<InputPad | null>, now: number): void {
     const available = new Map<number, InputPad>();
@@ -64,21 +71,32 @@ export class GamepadForwarder {
       this.slots[free] = index;
     }
     const reports: GamepadReport[] = [];
+    const dualShock4: DualShock4Pad[] = [];
     this.slots.forEach((index, slot) => {
       const pad = index === undefined ? undefined : available.get(index);
-      if (pad) reports.push(report(pad, slot));
+      if (!pad) return;
+      reports.push(report(pad, slot));
+      if (isPlayStation(pad.id)) {
+        dualShock4.push({
+          slot,
+          leftTriggerPressed: pad.buttons[6]?.pressed ?? false,
+          rightTriggerPressed: pad.buttons[7]?.pressed ?? false,
+          touchpadPressed: pad.buttons[17]?.pressed ?? false,
+        });
+      }
     });
-    this.flush(reports, now);
+    this.flush({ type: "gamepad", pads: reports, ...(dualShock4.length && { dualShock4 }) }, now);
   }
 
   release(): void {
-    this.flush([], 0);
+    this.flush({ type: "gamepad", pads: [] }, 0);
   }
 
-  private flush(pads: GamepadReport[], now: number): void {
-    const state = JSON.stringify(pads);
+  private flush(message: GamepadMessage, now: number): void {
+    const { pads } = message;
+    const state = JSON.stringify(message);
     if (state === this.lastSent && (!pads.length || now - this.sentAt < KEEPALIVE_MS)) return;
-    if (this.send({ type: "gamepad", pads })) {
+    if (this.send(message)) {
       this.lastSent = state;
       this.sentSlots = new Set(pads.map(([slot]) => slot));
       this.sentAt = now;

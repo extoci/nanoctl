@@ -32,7 +32,7 @@ DISPLAY=:97 NANOCTL_DEV_LOOPBACK_USER=dev@example.com \
 HOST_PID=$!
 VIEWER_URL=http://127.0.0.1:7338 \
 RUNTIME_PATHS="$PWD/crates/nanoctl-agent/target/release/nanoctl" \
-BITRATE_NOTE='24 Mbps default max; measured inbound RTP in raw.webRtcStats' \
+BITRATE_NOTE='50 Mbps default max; measured inbound RTP in raw.webRtcStats' \
   bun scripts/bench/run.ts nanoctl :97 :94 "$HOST_PID" "$HOME/bench-results"
 ```
 
@@ -185,7 +185,7 @@ BITRATE_NOTE='defaults: 1/8/40 Mbps min/start/max, software x264, 60 fps' \
 # After screen-relay finishes, repeat nanoctl using its HOST_PID and :97 source.
 VIEWER_URL=http://127.0.0.1:7338 RUNTIME_PATHS="$HOME/bench-runtime/nanoctl" \
 RUNTIME_EXCLUDES='Other OS files, Xvfb, browsers, toolchain, caches; linked ELF runtime libraries included' \
-BITRATE_NOTE='default 24 Mbps max; received RTP in raw.webRtcStats' \
+BITRATE_NOTE='default 50 Mbps max; received RTP in raw.webRtcStats' \
   bun scripts/bench/run.ts nanoctl :97 :94 "$HOST_PID" "$HOME/bench-results" --repeat 5
 ```
 

@@ -1456,6 +1456,14 @@ impl EncodedFrameSlot {
     }
 }
 
+struct EncodedFrameProducer(Arc<EncodedFrameSlot>);
+
+impl Drop for EncodedFrameProducer {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 fn is_idr(bytes: &[u8]) -> bool {
     let mut offset = 0_usize;
     while offset + 3 < bytes.len() {
@@ -1775,16 +1783,19 @@ impl VideoPipeline {
         // Tokio cannot cancel a blocking thread after it has entered native code. Awaiting the
         // task is what makes close→reopen release the old native capture and encoder resources
         // before the next session starts.
-        if let Err(error) = self.task.await {
-            tracing::warn!(error = %error, "video pipeline task stopped unexpectedly");
+        if let Err(error) = self.finish().await {
+            tracing::warn!(error = %error, "video pipeline stopped with an error");
         }
-        self.stats.log();
     }
 
     pub(crate) async fn finish(self) -> Result<()> {
-        self.task
+        let result = self
+            .task
             .await
-            .context("video pipeline task stopped unexpectedly")?
+            .context("video pipeline task stopped unexpectedly")
+            .and_then(|result| result);
+        self.stats.log();
+        result
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -1859,10 +1870,11 @@ pub fn spawn_video(
         let encoded_slot = Arc::new(EncodedFrameSlot::new());
         let (delivery_recovery, mut delivery_recovery_requests) =
             tokio::sync::watch::channel(0_u64);
-        let producer_slot = encoded_slot.clone();
+        let producer_slot = EncodedFrameProducer(encoded_slot.clone());
         let producer_stopped = worker_stopped.clone();
         let producer_stats = writer_stats.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+            let producer_slot = producer_slot;
             #[cfg(target_os = "linux")]
             producer_stats.producer_tid.store(
                 std::fs::read_link("/proc/thread-self")
@@ -1871,7 +1883,7 @@ pub fn spawn_video(
                     .unwrap_or_default(),
                 Ordering::Relaxed,
             );
-            let result = (|| -> Result<()> {
+            (|| -> Result<()> {
                 let mut encoder = CaptureEncoder::primary(
                     initial.bitrate_kbps,
                     quality.max_fps,
@@ -2075,14 +2087,12 @@ pub fn spawn_video(
                     if keepalive {
                         producer_stats.keepalives.fetch_add(1, Ordering::Relaxed);
                     }
-                    if !producer_slot.replace(frame) {
+                    if !producer_slot.0.replace(frame) {
                         break;
                     }
                 }
                 Ok(())
-            })();
-            producer_slot.close();
-            result
+            })()
         });
         let mut stop_rx = stop_rx;
         let mut previous_written = None;
@@ -2267,6 +2277,23 @@ mod tests {
         pipeline.stop().await;
 
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn capture_worker_panic_closes_the_encoded_frame_slot() {
+        let slot = std::sync::Arc::new(super::EncodedFrameSlot::new());
+        let producer = super::EncodedFrameProducer(slot.clone());
+        let worker = tokio::task::spawn_blocking(move || {
+            let _producer = producer;
+            panic!("injected capture worker panic");
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), slot.take())
+                .await
+                .expect("slot should close after capture worker stops")
+                .is_none()
+        );
+        assert!(worker.await.unwrap_err().is_panic());
     }
 
     #[tokio::test]
