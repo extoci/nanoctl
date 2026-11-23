@@ -469,7 +469,8 @@ const HARDWARE_BACKENDS: &[HardwareBackend] = &[
     hardware_backend!(
         "videotoolbox",
         "VideoToolbox",
-        crate::macos_encoder::MacOsEncoder
+        crate::macos_encoder::MacOsEncoder,
+        codecs: [H264]
     ),
     #[cfg(target_os = "windows")]
     hardware_backend!(

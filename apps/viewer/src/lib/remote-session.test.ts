@@ -149,9 +149,7 @@ describe("remote session lifecycle", () => {
       await controller.start();
       expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(!!mayControl && !!remoteInput);
       if (mayControl && remoteInput) {
-        video.dispatchEvent(
-          Object.assign(new Event("keydown"), { code: "KeyV", key: "v", ctrlKey: true }),
-        );
+        pressKey("keydown", video, { code: "KeyV", key: "v", ctrlKey: true });
         await flushSignals();
         expect(peer.sent.map(([label]) => label)).toEqual([
           "nanoctl.clipboard.v1",
@@ -210,9 +208,7 @@ describe("remote session lifecycle", () => {
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
     expect(video.focused).toBe(true);
     expect(channel.sent).toEqual([]);
-    video.dispatchEvent(
-      Object.assign(new Event("keydown"), { code: "Space", key: " ", repeat: false }),
-    );
+    pressKey("keydown", video, { code: "Space", key: " ", repeat: false });
     expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
       type: "key",
       action: "down",
@@ -230,13 +226,74 @@ describe("remote session lifecycle", () => {
     controller.setInputEnabled(false);
     channel.sent = [];
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
-    video.dispatchEvent(Object.assign(new Event("keydown"), { code: "Space", key: " " }));
+    pressKey("keydown", video, { code: "Space", key: " " });
     expect(channel.sent).toEqual([]);
     channel.readyState = "closed";
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 1 }));
     expect(channel.sent).toEqual([]);
     await controller.stop();
   });
+  test("keys reach the host from the video or page but not from panel controls", async () => {
+    installBrowserGlobals();
+    const body = {};
+    Object.assign(globalThis.document, { body });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    channel.sent = [];
+    pressKey("keydown", { tagName: "BUTTON" }, { code: "Space", key: " " });
+    pressKey("keydown", body, { code: "Tab", key: "Tab" });
+    expect(channel.sent).toEqual([]);
+    for (const [target, code] of [
+      [video, "KeyA"],
+      [body, "KeyB"],
+    ] as const) {
+      pressKey("keydown", target, { code, key: code.at(-1)!.toLowerCase() });
+      expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({ type: "key", code });
+    }
+    channel.sent = [];
+    pressKey("keyup", { tagName: "BUTTON" }, { code: "KeyC", key: "c" });
+    expect(channel.sent).toEqual([]);
+    pressKey("keydown", body, { code: "ShiftLeft", key: "Shift", shiftKey: true });
+    pressKey("keyup", { tagName: "BUTTON" }, { code: "ShiftLeft", key: "Shift" });
+    expect(channel.sent.map((data) => JSON.parse(data).action)).toEqual(["down", "up"]);
+    await controller.stop();
+  });
+
+  test("counts host input-blocked notices on the control channel", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const snapshots: number[] = [];
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: new FakeVideo() as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: (snapshot) => snapshots.push(snapshot.inputBlocked),
+    });
+    await controller.start();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    for (const data of ["not json", '{"type":"other"}', '{"type":"inputBlocked"}'])
+      channel.onmessage?.({ data } as MessageEvent);
+    expect(controller.snapshot.inputBlocked).toBe(1);
+    expect(snapshots.at(-1)).toBe(1);
+    await controller.stop();
+  });
+
   test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
     installBrowserGlobals();
     const preferences = { inputEnabled: true, displayId: "secondary" };
@@ -537,13 +594,28 @@ async function flushSignals(): Promise<void> {
   await Promise.resolve();
 }
 
+const windowListeners = new Map<string, Set<(event: Event) => void>>();
+
+/** Delivers a key event to window listeners as if it bubbled up from `target`. */
+function pressKey(type: string, target: unknown, properties: object): void {
+  const event = Object.assign(new Event(type, { cancelable: true }), properties);
+  Object.defineProperty(event, "target", { value: target });
+  for (const listener of windowListeners.get(type) ?? []) listener(event);
+}
+
 function installBrowserGlobals(setInterval?: (callback: () => void) => number): void {
+  windowListeners.clear();
   const eventTarget = {
     addEventListener: () => {},
     removeEventListener: () => {},
   };
   defineGlobal("window", {
-    ...eventTarget,
+    addEventListener: (type: string, listener: (event: Event) => void) => {
+      if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+      windowListeners.get(type)!.add(listener);
+    },
+    removeEventListener: (type: string, listener: (event: Event) => void) =>
+      windowListeners.get(type)?.delete(listener),
     setInterval: setInterval ?? globalThis.setInterval.bind(globalThis),
     clearInterval: globalThis.clearInterval.bind(globalThis),
     setTimeout: globalThis.setTimeout.bind(globalThis),
@@ -595,6 +667,7 @@ class FakeDataChannel {
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
+  onmessage: ((event: MessageEvent) => void) | null = null;
 
   send(message: string): void {
     this.sent.push(message);
