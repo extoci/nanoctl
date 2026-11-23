@@ -405,6 +405,7 @@ pub(crate) trait FrameEncoder {
 #[derive(Clone, Copy)]
 struct EncoderSettings {
     codec: VideoCodec,
+    h264_high: bool,
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
@@ -428,6 +429,7 @@ macro_rules! hardware_backend {
             open: |settings, dimensions| {
                 Ok(Box::new(<$encoder>::with_codec(
                     settings.codec,
+                    settings.h264_high,
                     settings.bitrate_kbps,
                     settings.max_fps,
                     settings.latency_mode,
@@ -467,7 +469,8 @@ const HARDWARE_BACKENDS: &[HardwareBackend] = &[
     hardware_backend!(
         "videotoolbox",
         "VideoToolbox",
-        crate::macos_encoder::MacOsEncoder
+        crate::macos_encoder::MacOsEncoder,
+        codecs: [H264]
     ),
     #[cfg(target_os = "windows")]
     hardware_backend!(
@@ -597,6 +600,7 @@ impl CaptureEncoder {
         latency_mode: LatencyMode,
         encoder_preference: EncoderPreference,
         codec: VideoCodec,
+        h264_high: bool,
         stats: Arc<PipelineStats>,
     ) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
@@ -618,6 +622,7 @@ impl CaptureEncoder {
         );
         let encoder = EncoderBackend::new_for_codec(
             codec,
+            h264_high,
             encoder_preference,
             max_bitrate_kbps,
             max_fps,
@@ -796,6 +801,7 @@ impl EncoderBackend {
     ) -> Result<Self> {
         Self::new_for_codec(
             VideoCodec::H264,
+            false,
             preference,
             bitrate_kbps,
             max_fps,
@@ -806,6 +812,7 @@ impl EncoderBackend {
 
     fn new_for_codec(
         codec: VideoCodec,
+        h264_high: bool,
         preference: EncoderPreference,
         bitrate_kbps: u32,
         max_fps: u16,
@@ -816,6 +823,7 @@ impl EncoderBackend {
             preference,
             EncoderSettings {
                 codec,
+                h264_high,
                 bitrate_kbps,
                 max_fps,
                 latency_mode,
@@ -950,6 +958,7 @@ impl EncoderBackend {
     ) -> Result<Self> {
         let settings = EncoderSettings {
             codec: VideoCodec::H264,
+            h264_high: false,
             bitrate_kbps,
             max_fps,
             latency_mode,
@@ -1369,6 +1378,7 @@ pub fn probe_codecs(preference: EncoderPreference) -> Vec<VideoCodec> {
         for codec in [VideoCodec::Av1, VideoCodec::Hevc] {
             match EncoderBackend::new_for_codec(
                 codec,
+                false,
                 EncoderPreference::Hardware,
                 1_000,
                 30,
@@ -1734,6 +1744,7 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         quality.latency_mode,
         quality.encoder,
         VideoCodec::H264,
+        false,
         Arc::default(),
     )?;
     let started_unix_seconds = crate::update::unix_time_now()?;
@@ -1834,6 +1845,7 @@ pub struct VideoQuality {
     pub latency_mode: LatencyMode,
     pub encoder_preference: EncoderPreference,
     pub codec: VideoCodec,
+    pub h264_high: bool,
 }
 
 /// Owns both halves of the capture pipeline so shutdown can wait for the blocking worker to
@@ -1963,6 +1975,7 @@ pub fn spawn_video(
                     quality.latency_mode,
                     quality.encoder_preference,
                     quality.codec,
+                    quality.h264_high,
                     producer_stats.clone(),
                 )?;
                 let mut keyframe_requests = keyframe_requests;
@@ -2995,6 +3008,7 @@ mod tests {
 
     const TEST_SETTINGS: EncoderSettings = EncoderSettings {
         codec: crate::codec::VideoCodec::H264,
+        h264_high: false,
         bitrate_kbps: 4_000,
         max_fps: 30,
         latency_mode: LatencyMode::Balanced,

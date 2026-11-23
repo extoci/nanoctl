@@ -103,6 +103,9 @@ pub struct NegotiatedCodec {
     pub codec: VideoCodec,
     /// The browser's fmtp parameters for the selected payload type, when it sent any.
     pub offered_fmtp: String,
+    /// The browser accepts H.264 High (profile_idc 100) for this payload, so hardware encoders
+    /// can use CABAC and 8x8 transforms. Baseline output from software fallbacks still decodes.
+    pub h264_high: bool,
 }
 
 /// Selects the sender codec from a browser offer. The browser lists payload types in its
@@ -127,10 +130,7 @@ pub fn negotiate(
         .filter(|offer| usable(offer.codec))
         .or_else(|| offered.iter().find(|offer| usable(offer.codec)))
         .cloned()
-        .unwrap_or(NegotiatedCodec {
-            codec: VideoCodec::H264,
-            offered_fmtp: String::new(),
-        })
+        .unwrap_or_else(NegotiatedCodec::default_h264)
 }
 
 fn offered_video_codecs(sdp: &str) -> Vec<NegotiatedCodec> {
@@ -188,18 +188,55 @@ fn offered_video_codecs(sdp: &str) -> Vec<NegotiatedCodec> {
         {
             continue;
         }
-        if offered
-            .iter()
-            .any(|existing: &NegotiatedCodec| existing.codec == codec)
+        let h264_high = codec == VideoCodec::H264 && offers_h264_high(parameters);
+        if let Some(existing) = offered
+            .iter_mut()
+            .find(|existing: &&mut NegotiatedCodec| existing.codec == codec)
         {
+            // Prefer the browser's High payload over its Baseline ones for the same codec.
+            if h264_high && !existing.h264_high {
+                existing.offered_fmtp = parameters.to_owned();
+                existing.h264_high = true;
+            }
             continue;
         }
         offered.push(NegotiatedCodec {
             codec,
             offered_fmtp: parameters.to_owned(),
+            h264_high,
         });
     }
     offered
+}
+
+impl NegotiatedCodec {
+    fn default_h264() -> Self {
+        Self {
+            codec: VideoCodec::H264,
+            offered_fmtp: String::new(),
+            h264_high: false,
+        }
+    }
+
+    /// The answer echoes the offered profile_idc/profile-iop bytes so webrtc-rs matches the
+    /// payload, with level 5.2 for 4K. Baseline output is decodable under every H.264 profile.
+    pub fn h264_profile_level_id(&self) -> String {
+        fmtp_value(&self.offered_fmtp, "profile-level-id")
+            .filter(|value| value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map_or_else(|| "42e034".to_owned(), |value| format!("{}34", &value[..4]))
+    }
+}
+
+fn fmtp_value<'a>(parameters: &'a str, key: &str) -> Option<&'a str> {
+    parameters.split(';').find_map(|parameter| {
+        let mut pair = parameter.splitn(2, '=');
+        (pair.next().map(str::trim) == Some(key)).then(|| pair.next().map(str::trim))?
+    })
+}
+
+fn offers_h264_high(parameters: &str) -> bool {
+    fmtp_value(parameters, "profile-level-id")
+        .is_some_and(|value| value.len() == 6 && value[..2].eq_ignore_ascii_case("64"))
 }
 
 /// A missing parameter means the codec's default, which is the value nanoctl emits.
@@ -382,6 +419,34 @@ pub fn validate_initial_access_unit(codec: VideoCodec, bytes: &[u8]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefers_the_offered_h264_high_payload() {
+        let offer = "m=video 9 UDP/TLS/RTP/SAVPF 102 103 104\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+a=rtpmap:103 H264/90000\r\n\
+a=fmtp:103 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=640c1f\r\n\
+a=rtpmap:104 H264/90000\r\n\
+a=fmtp:104 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f\r\n";
+        let chosen = negotiate(offer, &[VideoCodec::H264], CodecPreference::Auto);
+        assert_eq!(chosen.codec, VideoCodec::H264);
+        assert!(chosen.h264_high);
+        assert!(chosen.offered_fmtp.contains("640c1f"));
+        assert!(chosen.offered_fmtp.contains("packetization-mode=1"));
+        assert_eq!(chosen.h264_profile_level_id(), "640c34");
+
+        let baseline_only = "m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
+a=rtpmap:102 H264/90000\r\n\
+a=fmtp:102 packetization-mode=1;profile-level-id=42e01f\r\n";
+        let baseline = negotiate(baseline_only, &[VideoCodec::H264], CodecPreference::Auto);
+        assert!(!baseline.h264_high);
+        assert_eq!(baseline.h264_profile_level_id(), "42e034");
+        assert_eq!(
+            NegotiatedCodec::default_h264().h264_profile_level_id(),
+            "42e034"
+        );
+    }
 
     const CHROME_OFFER: &str = "v=0\r\n\
 o=- 1 2 IN IP4 127.0.0.1\r\n\
