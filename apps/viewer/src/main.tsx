@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { ControlMessage, HostInfo } from "@nanoctl/protocol";
-import type { RemoteSessionSnapshot } from "./lib/remote-session";
+import type { QualityLimits, RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
@@ -52,6 +52,22 @@ function Viewer() {
     }
   });
   const codecChoiceRef = useRef(codecChoice);
+  const [qualityLimits, setQualityLimitsState] = useState<QualityLimits>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("quality-limits") ?? "{}") as QualityLimits;
+    } catch {
+      return {};
+    }
+  });
+  const qualityLimitsRef = useRef(qualityLimits);
+  const setQualityLimits = (next: QualityLimits) => {
+    qualityLimitsRef.current = next;
+    setQualityLimitsState(next);
+    try {
+      localStorage.setItem("quality-limits", JSON.stringify(next));
+    } catch {}
+    transport.current?.controller?.setQualityLimits(next);
+  };
   const setCodecChoice = (next: CodecChoice) => {
     codecChoiceRef.current = next;
     setCodecChoiceState(next);
@@ -175,6 +191,7 @@ function Viewer() {
       },
       onSnapshot: setSnapshot,
       codecChoice: () => codecChoiceRef.current,
+      qualityLimits: () => qualityLimitsRef.current,
       onStatus: (next, message) => {
         setStatus(next);
         setDetail(message ?? "");
@@ -484,6 +501,32 @@ function Viewer() {
               </div>
             </>
           )}
+          <h2>Frame rate</h2>
+          <div className="row" role="group" aria-label="Maximum frame rate">
+            {[undefined, 60, 30].map((fps) => (
+              <button
+                key={fps ?? "max"}
+                aria-pressed={qualityLimits.maxFps === fps}
+                disabled={terminal}
+                onClick={() => setQualityLimits({ ...qualityLimits, maxFps: fps })}
+              >
+                {fps ? `${fps} fps` : "Max"}
+              </button>
+            ))}
+          </div>
+          <h2>Bitrate</h2>
+          <div className="row" role="group" aria-label="Maximum bitrate">
+            {[undefined, 20_000, 10_000, 5_000].map((kbps) => (
+              <button
+                key={kbps ?? "max"}
+                aria-pressed={qualityLimits.maxBitrateKbps === kbps}
+                disabled={terminal}
+                onClick={() => setQualityLimits({ ...qualityLimits, maxBitrateKbps: kbps })}
+              >
+                {kbps ? `${kbps / 1_000} Mbps` : "Max"}
+              </button>
+            ))}
+          </div>
           <h2>Input</h2>
           <div className="row">
             <button

@@ -83,6 +83,17 @@ that codec is withdrawn for the rest of the process and the next session negotia
 Browser decode support varies: Chromium-based browsers decode AV1 and, on hardware with
 a decoder, HEVC; Safari decodes HEVC and, on M3/A17 or newer, AV1.
 
+## Frame rate and bitrate
+
+`[quality] max_fps` (24–240, default 60) and `max_bitrate_kbps` are the host's ceilings.
+The adaptive controller stays below both. It ramps bitrate from the link estimate and
+lowers frame rate only when bitrate drops below 2.5 Mbps.
+The viewer's Frame rate and Bitrate buttons send `{"type":"quality","maxFps":30,
+"maxBitrateKbps":10000}` on the reliable control channel. These caps apply live without
+renegotiating, also apply in view-only sessions, and are clamped to the host ceilings.
+"Max" removes the viewer cap. macOS capture follows the display refresh rate (up to
+240 Hz) instead of a fixed 60 Hz.
+
 ## Browser and HTTPS
 
 Use a current WebRTC browser; automated coverage is Chromium.

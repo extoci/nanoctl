@@ -63,6 +63,8 @@ export type HostSignalRow = {
   envelope: string;
 };
 
+export type QualityLimits = { maxFps?: number; maxBitrateKbps?: number };
+
 export type RemoteSessionOptions = {
   sessionId: string;
   controllerEpoch: string;
@@ -81,6 +83,7 @@ export type RemoteSessionOptions = {
   /** Codecs the host can encode; the viewer orders its offer so the host picks the best one. */
   videoCodecs?: readonly VideoCodec[];
   codecChoice?: CodecChoice;
+  qualityLimits?: QualityLimits;
   operations: RemoteSessionOperations;
   getIceServers?: () => Promise<readonly RTCIceServer[]>;
   revalidateController?: () => Promise<{
@@ -171,6 +174,7 @@ export class RemoteSessionController {
   private readonly offerCompletionWaiters = new Map<number, () => void>();
   private metrics: RemoteSessionMetrics | null = null;
   private videoTransceiver: RTCRtpTransceiver | null = null;
+  private qualityLimits: QualityLimits = {};
   private codecPreferencesApplied = false;
   private previousDecode: { id: string; time: number; frames: number } | null = null;
 
@@ -227,6 +231,7 @@ export class RemoteSessionController {
   };
 
   constructor(options: RemoteSessionOptions) {
+    this.qualityLimits = { ...options.qualityLimits };
     this.options = options;
     this.preferences = options.preferences ?? { inputEnabled: true };
     this.controllerEpoch = options.controllerEpoch;
@@ -360,6 +365,12 @@ export class RemoteSessionController {
     this.gamepadFrame = null;
     this.gamepadStatus = "waiting";
     this.gamepad.release();
+  }
+
+  /** Applies live without renegotiation; the host clamps to its configured maximums. */
+  setQualityLimits(limits: QualityLimits): boolean {
+    this.qualityLimits = { ...limits };
+    return this.sendControl({ type: "quality", ...this.qualityLimits });
   }
 
   selectDisplay(displayId: string): boolean {
@@ -529,6 +540,8 @@ export class RemoteSessionController {
       const displayId = this.preferences.displayId;
       if (displayId && this.displays.some((display) => display.id === displayId))
         this.sendControl({ type: "display", displayId });
+      if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
+        this.sendControl({ type: "quality", ...this.qualityLimits });
       this.publishSnapshot();
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
