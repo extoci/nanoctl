@@ -50,7 +50,7 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(config: AgentConfig, tailnet: Arc<dyn Tailnet>) -> Arc<Self> {
         if dev_user().is_some() {
-            tracing::warn!(
+            tracing::warn!(target: "nanoctl::status",
                 "DANGER: NANOCTL_DEV_LOOPBACK_USER enabled: loopback authentication and loopback ICE are trusted. DEVELOPMENT ONLY."
             );
         }
@@ -427,6 +427,7 @@ async fn session(
     {
         return;
     }
+    tracing::info!(target: "nanoctl::status", "Viewer connected");
     let (outgoing, mut messages) = tokio::sync::mpsc::channel::<Value>(64);
     #[cfg(feature = "rtc")]
     let mut peer: Option<crate::rtc::HostPeer> = None;
@@ -527,6 +528,7 @@ async fn session(
     }
     let _ = send(&mut socket, json!({"type":"end","reason":reason})).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
+    tracing::info!(target: "nanoctl::status", %reason, "Viewer disconnected");
 }
 
 async fn bind_listener(
@@ -564,6 +566,8 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
     let mut cert_node = String::new();
     let mut cert_checked = None::<tokio::time::Instant>;
     let mut announced_url = None;
+    let mut waiting_for_tailscale = false;
+    let mut waiting_for_listener = false;
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
@@ -573,6 +577,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
         let mut wanted = HashSet::new();
         match state.tailnet.status().await {
             Ok(node) => {
+                waiting_for_tailscale = false;
                 wanted.extend(node.ips.iter().copied());
                 if cert_node != node.dns_name
                     || cert_checked.is_none_or(|checked| {
@@ -586,7 +591,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
                     if result.config.is_none()
                         && state.config.tailnet.tls != crate::config::TlsMode::Off
                     {
-                        tracing::warn!("{}", result.detail);
+                        tracing::warn!(target: "nanoctl::status", "{}", result.detail);
                     }
                     match (&tls_config, result.config) {
                         (Some(current), Some(config)) => current.reload_from_config(config),
@@ -608,7 +613,12 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
                 *state.node.write().await = node;
             }
             Err(error) => {
-                tracing::warn!(%error, "waiting for Tailscale");
+                if waiting_for_tailscale {
+                    tracing::warn!(%error, "Waiting for Tailscale");
+                } else {
+                    tracing::warn!(target: "nanoctl::status", %error, "Waiting for Tailscale");
+                    waiting_for_tailscale = true;
+                }
                 *state.node.write().await = Node::default();
             }
         }
@@ -630,6 +640,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
         unavailable_ipv6.retain(|ip| wanted.contains(ip));
         let mut wanted = wanted.into_iter().collect::<Vec<_>>();
         wanted.sort_unstable_by_key(IpAddr::is_ipv6);
+        let needs_listener = !wanted.is_empty();
         for ip in wanted {
             if listeners.contains_key(&ip) {
                 continue;
@@ -681,6 +692,11 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
             });
             listeners.insert(ip, (stop, task));
         }
+        let retrying_bind = needs_listener && listeners.is_empty();
+        if retrying_bind && !waiting_for_listener {
+            tracing::warn!(target: "nanoctl::status", port = state.config.tailnet.port, "Could not open a viewer listener; retrying");
+        }
+        waiting_for_listener = retrying_bind;
         let node = state.node.read().await;
         let url = node
             .ips
@@ -690,7 +706,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
             .flatten();
         if url != announced_url {
             if let Some(url) = &url {
-                tracing::info!("Open on a device connected to Tailscale: {url}");
+                tracing::info!(target: "nanoctl::status", "Open on a device connected to Tailscale: {url}");
             }
             announced_url = url;
         }

@@ -20,6 +20,12 @@ still starting. `nanoctl stop` stops the agent; `nanoctl run` starts it in the
 current PowerShell window until you press Ctrl+C or stop it from another window.
 If it is already running, `nanoctl run` just shows the link.
 
+By default, a foreground run prints short, plain-text status messages: the viewer
+link when ready, viewer connections and disconnections, and important problems.
+For detailed console diagnostics, use `nanoctl run --verbose` (or `-v`), or set
+`RUST_LOG` to a tracing filter. To capture diagnostics in a file instead of the
+console, use `nanoctl run --log-file <path>`.
+
 ## HTTPS
 
 Enable **DNS → HTTPS Certificates** in the Tailscale admin console and use MagicDNS.

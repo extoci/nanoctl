@@ -55,7 +55,7 @@ async fn run_until(
         .transpose()?;
     let result = shutdown_requested.await;
     if let Ok(reason) = &result {
-        tracing::info!(reason, "agent shutdown requested");
+        tracing::info!(target: "nanoctl::status", reason, "Agent shutting down");
     }
     shutdown.send_replace(true);
     state.stop().await;
