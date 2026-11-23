@@ -507,39 +507,89 @@ impl I420Frame {
         }
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
-        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
-            *y = ((66 * u16::from(pixel[0])
-                + 129 * u16::from(pixel[1])
-                + 25 * u16::from(pixel[2])
-                + 4224)
-                >> 8) as u8;
+        let row_pairs = self.height / 2;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4);
+        if threads <= 1 || row_pairs < 8 {
+            read_rgba_rows(rgba, self.width, 0..row_pairs, y, u, v);
+            return Ok(());
         }
-        for ((rows, u), v) in rgba
-            .chunks_exact(self.width * 8)
-            .zip(u.chunks_exact_mut(self.width / 2))
-            .zip(v.chunks_exact_mut(self.width / 2))
-        {
-            let (top, bottom) = rows.split_at(self.width * 4);
-            for (((top, bottom), u), v) in top
-                .chunks_exact(8)
-                .zip(bottom.chunks_exact(8))
-                .zip(u)
-                .zip(v)
-            {
-                let average = |channel| {
-                    (u16::from(top[channel])
-                        + u16::from(top[channel + 4])
-                        + u16::from(bottom[channel])
-                        + u16::from(bottom[channel + 4])
-                        + 2)
-                        >> 2
-                };
-                let (r, g, b) = (average(0), average(1), average(2));
-                *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
-                *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
+        let per = row_pairs.div_ceil(threads) & !1;
+        let uv_width = self.width / 2;
+        std::thread::scope(|scope| {
+            let mut y_rest: &mut [u8] = y;
+            let mut u_rest: &mut [u8] = u;
+            let mut v_rest: &mut [u8] = v;
+            let mut start = 0usize;
+            while start < row_pairs {
+                let end = (start + per).min(row_pairs);
+                let take = (end - start) * uv_width;
+                let (y_part, y_tail) = y_rest.split_at_mut((end - start) * self.width * 2);
+                let (u_part, u_tail) = u_rest.split_at_mut(take);
+                let (v_part, v_tail) = v_rest.split_at_mut(take);
+                y_rest = y_tail;
+                u_rest = u_tail;
+                v_rest = v_tail;
+                let width = self.width;
+                let range = start..end;
+                scope.spawn(move || {
+                    read_rgba_rows(rgba, width, range, y_part, u_part, v_part);
+                });
+                start = end;
             }
-        }
+        });
         Ok(())
+    }
+}
+
+#[inline]
+fn rgba_to_y(pixel: &[u8]) -> u8 {
+    ((66 * u16::from(pixel[0]) + 129 * u16::from(pixel[1]) + 25 * u16::from(pixel[2]) + 4224) >> 8)
+        as u8
+}
+
+/// Convert a band of row-pairs (2 source rows each) of RGBA into I420 planes.
+fn read_rgba_rows(
+    rgba: &[u8],
+    width: usize,
+    row_pairs: std::ops::Range<usize>,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+) {
+    let pair_stride = width * 8;
+    let start = row_pairs.start * pair_stride;
+    let end = row_pairs.end * pair_stride;
+    for (((rows, y_rows), u), v) in rgba[start..end]
+        .chunks_exact(pair_stride)
+        .zip(y.chunks_exact_mut(width * 2))
+        .zip(u.chunks_exact_mut(width / 2))
+        .zip(v.chunks_exact_mut(width / 2))
+    {
+        for (pixel, y) in rows.chunks_exact(4).zip(y_rows.iter_mut()) {
+            *y = rgba_to_y(pixel);
+        }
+        let (top, bottom) = rows.split_at(width * 4);
+        for (((top, bottom), u), v) in top
+            .chunks_exact(8)
+            .zip(bottom.chunks_exact(8))
+            .zip(u)
+            .zip(v)
+        {
+            let average = |channel| {
+                (u16::from(top[channel])
+                    + u16::from(top[channel + 4])
+                    + u16::from(bottom[channel])
+                    + u16::from(bottom[channel + 4])
+                    + 2)
+                    >> 2
+            };
+            let (r, g, b) = (average(0), average(1), average(2));
+            *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
+            *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
+        }
     }
 }
 
@@ -1260,6 +1310,14 @@ fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<Started
     ))
 }
 
+// Slice-parallel OpenH264: encode latency dominates the software path, and
+// frame latency matters more than the last few percent of compression here.
+fn encode_threads() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4) as u16)
+        .unwrap_or(2)
+}
+
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
     let (complexity, skip_frames) = match latency_mode {
         LatencyMode::Responsiveness => (Complexity::Low, true),
@@ -1280,7 +1338,11 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         // A zero minimum is OpenH264's sentinel for its lossy 26–35 screen default.
         .qp(QpRange::new(14, 51))
         .complexity(complexity)
-        .skip_frames(skip_frames);
+        .skip_frames(skip_frames)
+        // Slice-parallel encode: OpenH264 only uses encoder threads when the
+        // frame is cut into slices, which SIZELIMITED does at ~8KB each.
+        .max_slice_len(8_000)
+        .num_threads(encode_threads());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
 }
