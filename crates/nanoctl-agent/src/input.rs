@@ -347,6 +347,23 @@ fn map_key(code: &str, value: &str) -> Option<Key> {
         "End" => Some(Key::End),
         "PageUp" => Some(Key::PageUp),
         "PageDown" => Some(Key::PageDown),
+        "F1" => Some(Key::F1),
+        "F2" => Some(Key::F2),
+        "F3" => Some(Key::F3),
+        "F4" => Some(Key::F4),
+        "F5" => Some(Key::F5),
+        "F6" => Some(Key::F6),
+        "F7" => Some(Key::F7),
+        "F8" => Some(Key::F8),
+        "F9" => Some(Key::F9),
+        "F10" => Some(Key::F10),
+        "F11" => Some(Key::F11),
+        "F12" => Some(Key::F12),
+        "CapsLock" => Some(Key::CapsLock),
+        #[cfg(not(target_os = "macos"))]
+        "PrintScreen" => Some(Key::PrintScr),
+        #[cfg(not(target_os = "macos"))]
+        "Insert" => Some(Key::Insert),
         "ShiftLeft" | "ShiftRight" => Some(Key::Shift),
         "ControlLeft" | "ControlRight" => Some(Key::Control),
         "AltLeft" | "AltRight" => Some(Key::Alt),
@@ -365,6 +382,17 @@ mod tests {
     use super::*;
     use crate::rtc::MAX_CONTROL_MESSAGE_BYTES;
     use proptest::prelude::*;
+
+    #[test]
+    fn maps_function_and_system_keys() {
+        assert!(matches!(map_key("F4", "F4"), Some(Key::F4)));
+        assert!(matches!(map_key("F12", "F12"), Some(Key::F12)));
+        #[cfg(not(target_os = "macos"))]
+        assert!(matches!(
+            map_key("PrintScreen", "PrintScreen"),
+            Some(Key::PrintScr)
+        ));
+    }
     #[cfg(target_os = "linux")]
     use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
 

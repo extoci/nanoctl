@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import { openPanel } from "./panel";
 
 test("forwards gamepad reports only while enabled and detaches on disconnect", async ({ page }) => {
   const reports = process.env.NANOCTL_DEV_GAMEPAD_REPORTS;
@@ -29,6 +30,7 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
     Object.defineProperty(navigator, "getGamepads", { value: () => fake.getGamepads() });
   });
   await page.goto("/");
+  await openPanel(page);
   await expect(page.getByTestId("connection-state")).toHaveText("Live");
   const gamepad = page.getByRole("button", { name: "Gamepad off" });
   await expect(gamepad).toBeEnabled();

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { copyFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { closePanel, openPanel } from "./panel";
 
 test("host picker lists tailnet machines and supports keyboard", async ({ page }, testInfo) => {
   await page.route("**/v1/hosts", (route) =>
@@ -33,6 +34,7 @@ test("host picker lists tailnet machines and supports keyboard", async ({ page }
     }),
   );
   await page.goto("/");
+  await openPanel(page);
   const picker = page.getByRole("button", { name: "Choose host" });
   await expect(picker).toContainText("(3)");
   const directory = join(homedir(), "picker-shots");
@@ -96,7 +98,9 @@ test("an unpaced 200-character key burst reaches native input in order", async (
           );
       }
     }, text);
-    await expect(target.getByRole("textbox")).toHaveValue(text, { timeout: 5000 });
+    await expect(target.getByRole("textbox")).toHaveValue(text, {
+      timeout: 5000,
+    });
     let expected = text;
     const commitText = async (label: string, commit: string, timeout: number) => {
       const started = performance.now();
@@ -185,7 +189,9 @@ test("disabled input stays off across repeated video clicks", async ({ page }) =
   });
   await page.goto("/");
   await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  await openPanel(page);
   await page.getByRole("button", { name: "Input on", exact: true }).click();
+  await closePanel(page);
   await page.evaluate(() => {
     (window as unknown as { injected: string[] }).injected = [];
   });
@@ -195,11 +201,14 @@ test("disabled input stays off across repeated video clicks", async ({ page }) =
     const pid = Number(await readFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE!, "utf8"));
     process.kill(pid, "SIGUSR2");
     await expect(page.getByTestId("connection-state")).toHaveText("Reconnecting");
-    await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+    await expect(page.getByTestId("connection-state")).toHaveText("Live", {
+      timeout: 30_000,
+    });
     await page.locator("video").click();
     await page.locator("video").click();
     await page.keyboard.press("a");
   }
+  await openPanel(page);
   await expect(page.getByRole("button", { name: "Input off", exact: true })).toHaveAttribute(
     "aria-pressed",
     "false",
@@ -223,7 +232,9 @@ test("graceful host shutdown and restart recovers automatically", async ({ page 
   const pid = Number(await readFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE!, "utf8"));
   process.kill(pid, "SIGUSR2");
   await expect(page.getByTestId("connection-state")).toHaveText("Reconnecting");
-  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", {
+    timeout: 30_000,
+  });
 });
 
 test("embedded viewer authenticates and negotiates under its CSP", async ({
@@ -252,8 +263,10 @@ test("embedded viewer authenticates and negotiates under its CSP", async ({
   expect(response?.headers()["content-security-policy"]).toContain("script-src 'self'");
   expect(response?.headers()["content-security-policy"]).not.toContain("unsafe-eval");
   await expect(page).toHaveTitle(`${info.hostName} · nanoctl`);
-  await expect(page.getByText(info.hostName, { exact: true })).toBeVisible();
-  await expect(page.getByText("dev@example.com", { exact: true })).toBeVisible();
+  await openPanel(page);
+  const head = page.locator(".panel-head");
+  await expect(head.getByText(info.hostName, { exact: true })).toBeVisible();
+  await expect(head.getByText("dev@example.com", { exact: true })).toBeVisible();
   await expect
     .poll(() =>
       frames.some((frame) => {
@@ -277,6 +290,7 @@ test("embedded viewer authenticates and negotiates under its CSP", async ({
   } else if (info.displays.length === 0) {
     await expect(page.getByText(/The host has no displays/)).toBeVisible();
   }
+  await openPanel(page);
   await page.getByRole("button", { name: "Stats", exact: true }).click();
   await expect(page.getByLabel("Connection statistics")).toContainText("RTT");
   if (process.env.NANOCTL_BROWSER_MEDIA === "1") {
@@ -348,4 +362,63 @@ test("unsupported browsers get an actionable error", async ({ page }) => {
   });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: /Browser unsupported/ })).toBeVisible();
+});
+
+test("session panel sends shortcuts, switches scale and disconnects cleanly", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
+  await page.addInitScript(() => {
+    const send = RTCDataChannel.prototype.send;
+    (window as unknown as { injected: string[] }).injected = [];
+    RTCDataChannel.prototype.send = function (data: unknown) {
+      (window as unknown as { injected: string[] }).injected.push(String(data));
+      return Reflect.apply(send, this, [data]);
+    };
+  });
+  const directory = join(homedir(), "crd-shots");
+  await mkdir(directory, { recursive: true });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  await page.screenshot({ path: join(directory, "1-live-fullbleed.png") });
+  await openPanel(page);
+  await page.getByRole("button", { name: "Stats", exact: true }).click();
+  await page.screenshot({ path: join(directory, "2-session-panel.png") });
+  await page.evaluate(() => {
+    (window as unknown as { injected: string[] }).injected = [];
+  });
+  await page.getByRole("group", { name: "Send keys" }).getByRole("button").first().click();
+  await expect
+    .poll(async () =>
+      (await page.evaluate(() => (window as unknown as { injected: string[] }).injected))
+        .map((data) => JSON.parse(data))
+        .filter((m) => m.type === "key")
+        .map((m) => `${m.action}:${m.code}`),
+    )
+    .toEqual(["down:AltLeft", "down:Tab", "up:Tab", "up:AltLeft"]);
+  await page.getByRole("button", { name: "Shrink to fit", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Original size", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  const size = await page
+    .locator("video")
+    .evaluate((v) => [(v as HTMLVideoElement).clientWidth, (v as HTMLVideoElement).videoWidth]);
+  expect(size[0]).toBe(size[1]);
+  await page.getByRole("button", { name: "Original size", exact: true }).click();
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "You ended the session." })).toBeVisible();
+  await expect(page.getByTestId("connection-state")).toHaveAttribute("data-phase", "disconnected");
+  await page.screenshot({ path: join(directory, "3-disconnected.png") });
+  await page.getByRole("button", { name: "Reconnect", exact: true }).click();
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+});
+
+test("a closed session panel is out of the tab order", async ({ page }) => {
+  await page.goto("/");
+  await openPanel(page);
+  await closePanel(page);
+  for (let i = 0; i < 6; i++) await page.keyboard.press("Tab");
+  expect(
+    await page.evaluate(() => Boolean(document.activeElement?.closest(".session-panel"))),
+  ).toBe(false);
+  expect(await page.evaluate(() => document.querySelector(".viewer")!.scrollLeft)).toBe(0);
 });
