@@ -42,6 +42,8 @@ export type RemoteSessionSnapshot = {
   gamepadStatus: GamepadStatus;
   firstFrameReceived: boolean;
   metrics: RemoteSessionMetrics | null;
+  /** Increments each time the host reports that its OS refused injected input. */
+  inputBlocked: number;
 };
 
 export type RemoteSessionOperations = {
@@ -141,6 +143,7 @@ export class RemoteSessionController {
   private pendingHostRestartGeneration: number | null = null;
   private lifecycleGeneration = 0;
   private inputEnabled = false;
+  private inputBlocked = 0;
   private readonly preferences: { inputEnabled: boolean; displayId?: string };
   private firstFrameReceived = false;
   private stopPromise: Promise<void> | null = null;
@@ -239,6 +242,7 @@ export class RemoteSessionController {
       gamepadStatus: this.gamepadStatus,
       firstFrameReceived: this.firstFrameReceived,
       metrics: this.metrics,
+      inputBlocked: this.inputBlocked,
     };
   }
 
@@ -510,6 +514,16 @@ export class RemoteSessionController {
       this.preferences.inputEnabled &&
       this.remoteInputAllowed &&
       this.controlChannel.readyState === "open";
+    this.controlChannel.onmessage = (event) => {
+      if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
+      try {
+        if ((JSON.parse(event.data) as { type?: unknown }).type !== "inputBlocked") return;
+      } catch {
+        return;
+      }
+      this.inputBlocked += 1;
+      this.publishSnapshot();
+    };
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
       this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
@@ -619,8 +633,8 @@ export class RemoteSessionController {
     video.addEventListener("lostpointercapture", this.onLostPointerCapture);
     video.addEventListener("wheel", this.onWheel, { passive: false });
     video.addEventListener("contextmenu", this.onContextMenu);
-    video.addEventListener("keydown", this.onKey);
-    video.addEventListener("keyup", this.onKey);
+    window.addEventListener("keydown", this.onKey);
+    window.addEventListener("keyup", this.onKey);
     window.addEventListener("keydown", this.onEmergencyShortcut, true);
     window.addEventListener("blur", this.onWindowBlur);
     window.addEventListener("focus", this.onClipboardFocus);
@@ -639,8 +653,8 @@ export class RemoteSessionController {
     video.removeEventListener("lostpointercapture", this.onLostPointerCapture);
     video.removeEventListener("wheel", this.onWheel);
     video.removeEventListener("contextmenu", this.onContextMenu);
-    video.removeEventListener("keydown", this.onKey);
-    video.removeEventListener("keyup", this.onKey);
+    window.removeEventListener("keydown", this.onKey);
+    window.removeEventListener("keyup", this.onKey);
     window.removeEventListener("keydown", this.onEmergencyShortcut, true);
     window.removeEventListener("blur", this.onWindowBlur);
     window.removeEventListener("focus", this.onClipboardFocus);
@@ -696,6 +710,14 @@ export class RemoteSessionController {
 
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
+    // Keys go to the host while the video or nothing in particular has focus; panel controls keep theirs.
+    const target = event.target;
+    if (
+      target !== this.options.video &&
+      target !== document.body &&
+      target !== document.documentElement
+    )
+      return;
     event.preventDefault();
     const message: ControlMessage = {
       type: "key",
