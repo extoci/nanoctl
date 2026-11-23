@@ -437,6 +437,18 @@ async fn session(
     tracing::info!(target: "nanoctl::status", "Viewer connected");
     let (outgoing, mut messages) = tokio::sync::mpsc::channel::<Value>(64);
     #[cfg(feature = "rtc")]
+    let (audio_output, _) = watch::channel(None);
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let mut audio_selection = state
+        .config
+        .features
+        .system_audio
+        .then(crate::audio::OutputSelection::default);
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let mut last_audio_message = None;
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let mut reports_audio_outputs = false;
+    #[cfg(feature = "rtc")]
     let mut peer: Option<crate::rtc::HostPeer> = None;
     #[cfg(feature = "media")]
     let mut media: Option<crate::media::VideoPipeline> = None;
@@ -454,6 +466,15 @@ async fn session(
                 if let Some(message) = message && send(&mut socket, message).await.is_err() { break "disconnected".into(); }
             }
             _ = tick.tick() => {
+                #[cfg(all(feature = "media", target_os = "windows"))]
+                if let Some(selection) = &mut audio_selection {
+                    selection.refresh(crate::audio::outputs());
+                    let message = audio_output_state(selection, &audio_output);
+                    if reports_audio_outputs && last_audio_message.as_ref() != Some(&message) {
+                        if send(&mut socket, message.clone()).await.is_err() { break "disconnected".into(); }
+                        last_audio_message = Some(message);
+                    }
+                }
                 #[cfg(feature = "media")]
                 if media.as_ref().is_some_and(|media| media.is_finished()) {
                     if let Some(finished) = media.take() && let Err(error) = finished.finish().await {
@@ -479,6 +500,23 @@ async fn session(
                 };
                 let message: Value = match serde_json::from_str(&text) { Ok(value) => value, Err(_) => break "invalid-message".into() };
                 if message["type"] == "end" { break "viewer-ended".into(); }
+                #[cfg(all(feature = "media", target_os = "windows"))]
+                if message["type"] == "select-audio-output" {
+                    if let Some(selection) = &mut audio_selection {
+                        let requested = match message.get("outputId") {
+                            Some(Value::Null) => None,
+                            Some(Value::String(id)) => Some(id.as_str()),
+                            _ => break "invalid-message".into(),
+                        };
+                        selection.refresh(crate::audio::outputs());
+                        selection.select(requested);
+                        reports_audio_outputs = true;
+                        let message = audio_output_state(selection, &audio_output);
+                        if send(&mut socket, message.clone()).await.is_err() { break "disconnected".into(); }
+                        last_audio_message = Some(message);
+                    }
+                    continue;
+                }
                 if message["type"] != "signal" || !message["envelope"].is_object() { break "invalid-message".into(); }
                 #[cfg(not(feature = "rtc"))]
                 { let _ = &outgoing; break "rtc-unavailable".into(); }
@@ -496,7 +534,7 @@ async fn session(
                             webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
                             crate::rtc::host_epoch_seed(), state.config.features.remote_input && control,
                             state.config.features.clipboard && state.config.features.remote_input && control,
-                            state.config.features.system_audio).await {
+                            state.config.features.system_audio.then(|| audio_output.subscribe())).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
                                 { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }
@@ -536,6 +574,22 @@ async fn session(
     let _ = send(&mut socket, json!({"type":"end","reason":reason})).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
     tracing::info!(target: "nanoctl::status", %reason, "Viewer disconnected");
+}
+
+#[cfg(all(feature = "media", target_os = "windows"))]
+fn audio_output_state(
+    selection: &crate::audio::OutputSelection,
+    output: &watch::Sender<Option<String>>,
+) -> Value {
+    let effective = selection.effective();
+    output.send_if_modified(|current| {
+        if *current == effective {
+            return false;
+        }
+        *current = effective;
+        true
+    });
+    json!({"type":"audio-outputs","outputs":selection.outputs,"selectedId":selection.selected})
 }
 
 async fn bind_listener(
