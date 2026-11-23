@@ -33,10 +33,21 @@ test("iPhone session options explain standalone launch in a narrow viewport", as
     Object.defineProperty(document, "fullscreenEnabled", { value: false });
   });
   await page.setViewportSize({ width: 375, height: 667 });
+  await page.routeWebSocket("**/v1/connect", () => {});
   await page.goto("/");
   const tab = page.getByRole("button", { name: "Session options" });
-  expect((await tab.boundingBox())?.width).toBeGreaterThanOrEqual(44);
+  const card = page.locator(".status-card");
+  await expect(card).toBeVisible();
+  const tabBounds = (await tab.boundingBox())!;
+  const cardBounds = (await card.boundingBox())!;
+  expect(tabBounds.width).toBeGreaterThanOrEqual(44);
+  expect(cardBounds.x + cardBounds.width).toBeLessThanOrEqual(tabBounds.x);
   await openPanel(page);
+  await expect(page.getByRole("complementary", { name: "Session panel" })).toHaveCSS(
+    "background-color",
+    "rgb(16, 23, 33)",
+  );
+  await expect(card).toBeHidden();
   await expect(page.getByText(/Safari’s Share button, then Add to Home Screen/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Fullscreen", exact: true })).toHaveCount(0);
   await expect(page.getByText(/Slide to move the pointer/)).toBeVisible();
@@ -48,6 +59,8 @@ test("iPhone session options explain standalone launch in a narrow viewport", as
     "/app-icon.png",
   );
   expect((await page.request.get("/app-icon.png")).ok()).toBe(true);
+  await closePanel(page);
+  await expect(card).toBeVisible();
 });
 
 test("mobile layout, reachable touch targets, keyboard focus and persisted mode", async ({

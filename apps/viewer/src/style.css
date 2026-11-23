@@ -659,6 +659,18 @@ kbd {
   .panel-tab {
     opacity: 0.9;
   }
+  .viewer .overlay {
+    padding-inline-end: calc(12px + var(--panel-tab-width));
+  }
+  .viewer.scale-original .overlay {
+    padding-inline-end: calc(28px + var(--panel-tab-width));
+  }
+  .panel-open .overlay {
+    visibility: hidden;
+  }
+  .session-panel {
+    background: #101721;
+  }
 }
 .session-panel .row button,
 .session-panel .disconnect {
