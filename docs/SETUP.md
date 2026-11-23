@@ -40,6 +40,7 @@ allow_users = ["alice@example.com"]
 allow_tags = []
 # Only enable on single-user machines when fronted by tailscale serve.
 serve_loopback = false
+discover_peers = true # Probe online tailnet peers for the viewer host picker
 # tailscale_cli = "/custom/path/to/tailscale"
 
 [features]

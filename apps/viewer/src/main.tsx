@@ -5,6 +5,7 @@ import type { RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { setSoundEnabled } from "./lib/sound";
 import "./style.css";
+import { HostPicker } from "./lib/host-picker";
 
 const initial: RemoteSessionSnapshot = {
   phase: "negotiating",
@@ -142,7 +143,7 @@ function Viewer() {
           n<span>nanoctl</span>
         </div>
         <div className="host">
-          <strong>{info?.hostName || "Remote desktop"}</strong>
+          <HostPicker name={info?.hostName || "Remote desktop"} />
           <span>
             {info?.platform ?? "Tailnet connection"} <i>·</i>{" "}
             {info?.remoteInput ? "Control" : "View only"}

@@ -28,6 +28,7 @@ pub struct QualityConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TailnetConfig {
+    pub discover_peers: bool,
     pub port: u16,
     pub allow_users: Vec<String>,
     pub allow_tags: Vec<String>,
@@ -98,6 +99,7 @@ impl Default for QualityConfig {
 impl Default for TailnetConfig {
     fn default() -> Self {
         Self {
+            discover_peers: true,
             port: 7337,
             allow_users: Vec::new(),
             allow_tags: Vec::new(),
@@ -192,6 +194,9 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "device_id = 'old'\ncontrol_plane_url = 'https://old.example'\n[network]\nheartbeat_seconds = 30\n").unwrap();
         assert_eq!(AgentConfig::load(&path).unwrap().tailnet.port, 7337);
+        assert!(AgentConfig::load(&path).unwrap().tailnet.discover_peers);
+        fs::write(&path, "[tailnet]\ndiscover_peers = false\n").unwrap();
+        assert!(!AgentConfig::load(&path).unwrap().tailnet.discover_peers);
     }
 
     #[test]

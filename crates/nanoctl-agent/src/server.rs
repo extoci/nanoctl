@@ -31,6 +31,7 @@ include!(concat!(env!("OUT_DIR"), "/viewer.rs"));
 type Active = Option<(watch::Sender<String>, tokio::task::JoinHandle<()>)>;
 
 pub struct ServerState {
+    hosts: Mutex<Option<(std::time::Instant, Vec<tailnet::Peer>)>>,
     pub config: AgentConfig,
     tailnet: Arc<dyn Tailnet>,
     node: RwLock<Node>,
@@ -46,6 +47,7 @@ impl ServerState {
             );
         }
         Arc::new(Self {
+            hosts: Mutex::new(None),
             config,
             tailnet,
             node: RwLock::new(Node::default()),
@@ -192,6 +194,7 @@ pub fn valid_origin(headers: &HeaderMap, tls: bool, serve: bool) -> bool {
 pub fn router(state: Arc<ServerState>, tls: bool) -> Router {
     Router::new()
         .route("/v1/info", get(info))
+        .route("/v1/hosts", get(hosts))
         .route("/v1/connect", get(connect))
         .fallback(get(asset))
         .with_state(state)
@@ -212,6 +215,101 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
 
 fn forbidden(error: anyhow::Error) -> Response {
     (StatusCode::FORBIDDEN, format!("{error}\n")).into_response()
+}
+
+fn host_url(node: &Node, port: u16, tls: bool) -> String {
+    let url = tailnet::urls(node, port)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    if tls {
+        url.replacen("http://", "https://", 1)
+    } else {
+        url
+    }
+}
+
+async fn probe_peer(peer: tailnet::Peer, port: u16) -> Option<tailnet::Peer> {
+    if !peer.online {
+        return None;
+    }
+    let ip = *peer.ips.first()?;
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(400),
+            tokio::net::TcpStream::connect(SocketAddr::new(ip, port))
+        )
+        .await,
+        Ok(Ok(_))
+    )
+    .then_some(peer)
+}
+
+async fn hosts(
+    State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(tls): Extension<bool>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = state.authenticate(peer, &headers, false, tls).await {
+        return forbidden(error);
+    }
+    let node = state.node.read().await.clone();
+    let mut discovered = Vec::new();
+    if state.config.tailnet.discover_peers {
+        let mut cache = state.hosts.lock().await;
+        if cache
+            .as_ref()
+            .is_none_or(|(time, _)| time.elapsed() >= Duration::from_secs(15))
+        {
+            let peers = state.tailnet.peers().await.unwrap_or_default();
+            let probes = peers
+                .into_iter()
+                .filter(|p| {
+                    !p.ips.iter().any(|ip| node.ips.contains(ip))
+                        && (node.dns_name.is_empty() || p.dns_name != node.dns_name)
+                })
+                .map(|p| probe_peer(p, state.config.tailnet.port));
+            let mut peers: Vec<_> = futures_util::future::join_all(probes)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            peers.sort_by(|a, b| a.host_name.cmp(&b.host_name));
+            *cache = Some((std::time::Instant::now(), peers));
+        }
+        discovered = cache.as_ref().unwrap().1.clone();
+    }
+    let hosts: Vec<_> = discovered
+        .into_iter()
+        .map(|p| {
+            let url = host_url(
+                &Node {
+                    dns_name: p.dns_name.clone(),
+                    ips: p.ips,
+                    ..Default::default()
+                },
+                state.config.tailnet.port,
+                tls,
+            );
+            json!({
+                "hostName": p.host_name,
+                "dnsName": p.dns_name,
+                "os": p.os,
+                "online": p.online,
+                "url": url,
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "self": {
+            "hostName": node.host_name,
+            "dnsName": node.dns_name,
+            "url": host_url(&node, state.config.tailnet.port, tls),
+        },
+        "hosts": hosts,
+    }))
+    .into_response()
 }
 
 async fn info(
@@ -545,6 +643,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn peer_probe_connects_and_skips_offline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut peer = crate::tailnet::Peer {
+            ips: vec!["127.0.0.1".parse().unwrap()],
+            online: true,
+            ..Default::default()
+        };
+        assert!(super::probe_peer(peer.clone(), port).await.is_some());
+        peer.online = false;
+        assert!(super::probe_peer(peer.clone(), port).await.is_none());
+        peer.online = true;
+        drop(listener);
+        assert!(super::probe_peer(peer, port).await.is_none());
+    }
+
+    #[tokio::test]
     async fn view_only_info_never_advertises_clipboard() {
         for (remote_input, control) in [(false, true), (true, false), (false, false)] {
             let mut config = AgentConfig::default();
@@ -621,6 +736,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info["viewer"]["mayControl"], true);
+        let denied = client
+            .get(format!("http://{addr}/v1/hosts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let hosts: Value = client
+            .get(format!("http://{addr}/v1/hosts"))
+            .header("Tailscale-User-Login", "owner@example.com")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(hosts["hosts"], json!([]));
+        assert_eq!(hosts["self"]["url"], "http://100.64.1.2:7337/");
+        assert!(hosts["self"]["hostName"].is_string());
         let request = || {
             let mut request = format!("ws://{addr}/v1/connect")
                 .into_client_request()
