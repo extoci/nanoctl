@@ -9,8 +9,9 @@ use std::ptr;
 use std::slice;
 use std::time::{Duration, Instant};
 
+use crate::codec::VideoCodec;
 use crate::config::LatencyMode;
-use crate::media::{EncodedFrame, FrameEncoder, annex_b_nal_types};
+use crate::media::{EncodedFrame, FrameEncoder};
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Media::MediaFoundation::*;
@@ -168,7 +169,9 @@ impl Drop for ActivatedTransformGuard {
 }
 
 pub struct WindowsEncoder {
+    h264_high: bool,
     _runtime: MediaFoundationRuntime,
+    codec: VideoCodec,
     active: Option<ActiveEncoder>,
     bitrate_kbps: u32,
     max_fps: u16,
@@ -190,7 +193,9 @@ impl Drop for WindowsEncoder {
 }
 
 impl WindowsEncoder {
-    pub fn new(
+    pub fn with_codec(
+        codec: VideoCodec,
+        h264_high: bool,
         bitrate_kbps: u32,
         max_fps: u16,
         _latency_mode: LatencyMode,
@@ -199,6 +204,8 @@ impl WindowsEncoder {
         let runtime = MediaFoundationRuntime::start()?;
         let mut encoder = Self {
             _runtime: runtime,
+            codec,
+            h264_high,
             active: None,
             bitrate_kbps,
             max_fps,
@@ -258,7 +265,7 @@ impl FrameEncoder for WindowsEncoder {
             }
             self.force_keyframe = false;
         }
-        rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
+        crate::nv12::rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
         let duration = 10_000_000_i64 / i64::from(self.max_fps);
         let sample = create_input_sample(&self.nv12, self.timestamp, duration)?;
         self.timestamp = self.timestamp.saturating_add(duration);
@@ -279,15 +286,15 @@ impl FrameEncoder for WindowsEncoder {
         }
         active.needs_input = false;
         let mut bytes = wait_for_output(active, deadline)?;
-        validate_annex_b(&bytes)?;
-        if std::mem::take(&mut active.first_access_unit) {
-            let types = annex_b_nal_types(&bytes)?;
-            if !(types.contains(&7) && types.contains(&8))
-                && let Some(mut headers) = sequence_header(&active.transform)
-            {
-                headers.append(&mut bytes);
-                bytes = headers;
-            }
+        if self.codec != VideoCodec::Av1 {
+            validate_annex_b(&bytes)?;
+        }
+        if std::mem::take(&mut active.first_access_unit)
+            && !crate::codec::has_parameter_sets(self.codec, &bytes)
+            && let Some(mut headers) = sequence_header(self.codec, &active.transform)
+        {
+            headers.append(&mut bytes);
+            bytes = headers;
         }
         Ok(EncodedFrame {
             bytes,
@@ -312,10 +319,13 @@ impl WindowsEncoder {
 
     fn create_active(&self, width: u32, height: u32) -> Result<ActiveEncoder> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            bail!("Media Foundation H.264 dimensions must be non-zero and even");
+            bail!("Media Foundation encoder dimensions must be non-zero and even");
         }
-        let mut last_error = anyhow!("no NV12-to-H.264 hardware MFT is installed");
-        for activation in enumerate_hardware_encoders()? {
+        let mut last_error = anyhow!(
+            "no NV12-to-{} hardware MFT is installed",
+            self.codec.label()
+        );
+        for activation in enumerate_hardware_encoders(self.codec)? {
             // SAFETY: an enumerated encoder activation is valid on the current COM thread.
             let activated = unsafe { activation.ActivateObject::<IMFTransform>() };
             match activated {
@@ -330,7 +340,10 @@ impl WindowsEncoder {
                 Err(error) => last_error = error.into(),
             }
         }
-        Err(last_error).context("no hardware MFT accepted the H.264 settings")
+        Err(last_error).context(format!(
+            "no hardware MFT accepted the {} settings",
+            self.codec.label()
+        ))
     }
 
     fn configure_active(
@@ -374,13 +387,17 @@ impl WindowsEncoder {
             unsafe {
                 let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
                 let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &ui4_variant(0));
+                if self.codec == VideoCodec::H264 && self.h264_high {
+                    let _ = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &low_latency);
+                }
             }
         }
         let events: IMFMediaEventGenerator = transform
             .cast()
             .context("hardware MFT has no asynchronous event interface")?;
+        let (subtype, profile) = output_format(self.codec, self.h264_high);
         let output = create_video_type(
-            &MFVideoFormat_H264,
+            &subtype,
             width,
             height,
             self.max_fps,
@@ -390,13 +407,13 @@ impl WindowsEncoder {
         unsafe {
             output
                 .SetUINT32(&MF_MT_COMPRESSED, 1)
-                .context("cannot mark H.264 output as compressed")?;
+                .context("cannot mark encoder output as compressed")?;
             output
-                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
-                .context("cannot request H.264 baseline profile")?;
+                .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
+                .context("cannot request encoder profile")?;
             transform
                 .SetOutputType(0, &output, 0)
-                .context("hardware MFT rejected H.264 output settings")?;
+                .context("hardware MFT rejected encoder output settings")?;
         }
         let input = create_video_type(&MFVideoFormat_NV12, width, height, self.max_fps, None)?;
         // SAFETY: types are complete and stream IDs are zero for an encoder MFT.
@@ -444,7 +461,16 @@ impl WindowsEncoder {
     }
 }
 
-fn sequence_header(transform: &IMFTransform) -> Option<Vec<u8>> {
+fn output_format(codec: VideoCodec, h264_high: bool) -> (windows::core::GUID, u32) {
+    match codec {
+        VideoCodec::H264 if h264_high => (MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32),
+        VideoCodec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_Base.0 as u32),
+        VideoCodec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
+        VideoCodec::Av1 => (MFVideoFormat_AV1, eAVEncAV1VProfile_Main_420_8.0 as u32),
+    }
+}
+
+fn sequence_header(codec: VideoCodec, transform: &IMFTransform) -> Option<Vec<u8>> {
     // SAFETY: stream zero owns the output media type; GetBlob writes into the provided slice.
     unsafe {
         let media_type = transform.GetOutputCurrentType(0).ok()?;
@@ -456,8 +482,7 @@ fn sequence_header(transform: &IMFTransform) -> Option<Vec<u8>> {
         media_type
             .GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut bytes, None)
             .ok()?;
-        let types = annex_b_nal_types(&bytes).ok()?;
-        (types.contains(&7) && types.contains(&8)).then_some(bytes)
+        crate::codec::has_parameter_sets(codec, &bytes).then_some(bytes)
     }
 }
 
@@ -475,14 +500,14 @@ fn ui4_variant(value: u32) -> VARIANT {
     }
 }
 
-fn enumerate_hardware_encoders() -> Result<Vec<IMFActivate>> {
+fn enumerate_hardware_encoders(codec: VideoCodec) -> Result<Vec<IMFActivate>> {
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
     };
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: output_format(codec, false).0,
     };
     let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
     let mut activations: *mut Option<IMFActivate> = ptr::null_mut();
@@ -500,13 +525,13 @@ fn enumerate_hardware_encoders() -> Result<Vec<IMFActivate>> {
         .context("cannot enumerate Media Foundation hardware encoders")?;
     }
     if activations.is_null() {
-        bail!("no NV12-to-H.264 hardware MFT is installed");
+        bail!("no NV12-to-{} hardware MFT is installed", codec.label());
     }
     if count == 0 {
         unsafe {
             CoTaskMemFree(Some(activations.cast()));
         }
-        bail!("no NV12-to-H.264 hardware MFT is installed");
+        bail!("no NV12-to-{} hardware MFT is installed", codec.label());
     }
     // SAFETY: the successful call above returned exactly `count` slots. Taking each Option moves
     // ownership of its COM reference before the backing pointer array is freed.
@@ -690,78 +715,18 @@ fn validate_annex_b(bytes: &[u8]) -> Result<()> {
     if bytes.starts_with(&[0, 0, 1]) || bytes.starts_with(&[0, 0, 0, 1]) {
         Ok(())
     } else {
-        bail!("hardware MFT produced H.264 without Annex-B start codes")
+        bail!("hardware MFT produced output without Annex-B start codes")
     }
-}
-
-fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) -> Result<()> {
-    let width = width as usize;
-    let height = height as usize;
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        bail!("NV12 dimensions must be non-zero and even");
-    }
-    let pixels = width
-        .checked_mul(height)
-        .context("frame dimensions overflow")?;
-    if rgba.len() != pixels.checked_mul(4).context("RGBA frame size overflow")? {
-        bail!("RGBA frame length does not match its dimensions");
-    }
-    output.clear();
-    output.resize(pixels + pixels / 2, 0);
-    for row in 0..height {
-        for column in 0..width {
-            let offset = (row * width + column) * 4;
-            let r = i32::from(rgba[offset]);
-            let g = i32::from(rgba[offset + 1]);
-            let b = i32::from(rgba[offset + 2]);
-            output[row * width + column] =
-                (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
-        }
-    }
-    let uv_offset = pixels;
-    for row in (0..height).step_by(2) {
-        for column in (0..width).step_by(2) {
-            let mut r = 0_i32;
-            let mut g = 0_i32;
-            let mut b = 0_i32;
-            for y in 0..2 {
-                for x in 0..2 {
-                    let offset = ((row + y) * width + column + x) * 4;
-                    r += i32::from(rgba[offset]);
-                    g += i32::from(rgba[offset + 1]);
-                    b += i32::from(rgba[offset + 2]);
-                }
-            }
-            r /= 4;
-            g /= 4;
-            b /= 4;
-            let chroma = uv_offset + (row / 2) * width + column;
-            output[chroma] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-            output[chroma + 1] =
-                (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{rgba_to_nv12, validate_annex_b};
+    use super::validate_annex_b;
 
     #[test]
     fn validates_only_annex_b_access_units() {
         assert!(validate_annex_b(&[0, 0, 0, 1, 0x67]).is_ok());
         assert!(validate_annex_b(&[0, 0, 1, 0x65]).is_ok());
         assert!(validate_annex_b(&[0, 0, 0, 2, 0x65]).is_err());
-    }
-
-    #[test]
-    fn converts_rgba_to_nv12() {
-        let rgba = [
-            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
-        ];
-        let mut output = Vec::new();
-        rgba_to_nv12(&rgba, 2, 2, &mut output).unwrap();
-        assert_eq!(output, [16, 235, 16, 235, 128, 128]);
     }
 }

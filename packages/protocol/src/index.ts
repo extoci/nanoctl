@@ -150,6 +150,12 @@ export type ControlMessage =
     }
   | { readonly type: "display"; readonly displayId: string }
   | {
+      /** Viewer caps below the host's configured maximums; omitted fields mean the maximum. */
+      readonly type: "quality";
+      readonly maxFps?: number;
+      readonly maxBitrateKbps?: number;
+    }
+  | {
       readonly type: "gamepad";
       readonly pads: readonly GamepadReport[];
       readonly dualShock4?: readonly {
@@ -212,7 +218,7 @@ export type AudioOutputState = {
   readonly selectedId: string | null;
 };
 
-export type VideoCodec = "h264" | "vp9" | "av1";
+export type VideoCodec = "h264" | "hevc" | "vp9" | "av1";
 
 export type HostInfo = {
   readonly hostName: string;

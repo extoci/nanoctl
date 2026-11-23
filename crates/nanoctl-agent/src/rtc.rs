@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
 #[cfg(feature = "media")]
@@ -12,7 +13,7 @@ use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 #[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
@@ -68,7 +69,6 @@ const MAX_ICE_GENERATION: u64 = 1_000_000;
 // Level 5.2 is the highest H.264 level supported by the configured 4K60 release envelope. The
 // WebRTC matcher treats the level byte asymmetrically, so this remains compatible with Chromium's
 // lower-level offer while no longer advertising a 720p30 ceiling for a 4K-capable sender.
-const H264_PROFILE_LEVEL_ID: &str = "42e034";
 #[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 #[cfg(any(feature = "media", test))]
@@ -147,6 +147,8 @@ pub struct HostPeer {
     #[cfg(feature = "media")]
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
+    viewer_limits: tokio::sync::watch::Sender<crate::adaptive::ViewerLimits>,
+    #[cfg(feature = "media")]
     input_shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")]
     input_revoked: Arc<AtomicBool>,
@@ -156,6 +158,10 @@ pub struct HostPeer {
     /// units straight to WebCodecs, bypassing the track's jitter buffer.
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video_data_channel: Arc<DataChannelVideo>,
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    video_codec: VideoCodec,
+    #[cfg(feature = "media")]
+    h264_high: bool,
 }
 
 /// Viewer-created unreliable data channel carrying raw Annex-B access units
@@ -485,6 +491,12 @@ impl HostPeer {
         {
             anyhow::bail!("peer epoch is invalid");
         }
+        let negotiated = crate::codec::negotiate(
+            &offer,
+            &crate::codec::host_codecs(),
+            crate::codec::host_preference(),
+        );
+        tracing::info!(codec = negotiated.codec.id(), "negotiated video codec");
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         media_engine.register_header_extension(
@@ -521,6 +533,9 @@ impl HostPeer {
         );
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
+        #[cfg(feature = "media")]
+        let (viewer_limits, _) =
+            tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
         #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
             tokio::sync::watch::channel(String::new());
@@ -602,8 +617,10 @@ impl HostPeer {
             };
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
+            let viewer_limits_for_channel = viewer_limits.clone();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
+                let viewer_limits = viewer_limits_for_channel.clone();
                 let input_revoked = input_revoked_for_channel.clone();
                 if channel.label() == "nanoctl.video.v1"
                     || channel.label() == "nanoctl.video-idr.v1"
@@ -661,10 +678,22 @@ impl HostPeer {
                     }
                     return Box::pin(async {});
                 }
+                let reliable = channel.label() == "nanoctl.control.v1";
                 if input.is_none() {
+                    // View-only sessions still adjust stream quality.
+                    if reliable {
+                        channel.on_message(Box::new(move |message: DataChannelMessage| {
+                            if message.is_string
+                                && let Some(limits) =
+                                    crate::adaptive::ViewerLimits::parse(&message.data)
+                            {
+                                viewer_limits.send_replace(limits);
+                            }
+                            Box::pin(async {})
+                        }));
+                    }
                     return Box::pin(async {});
                 }
-                let reliable = channel.label() == "nanoctl.control.v1";
                 if reliable {
                     blocked_notices.attach(&channel);
                 }
@@ -676,6 +705,13 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
+                    if reliable
+                        && message.is_string
+                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
+                    {
+                        viewer_limits.send_replace(limits);
+                        return Box::pin(async {});
+                    }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
                     let sender = sender.clone();
@@ -756,12 +792,21 @@ impl HostPeer {
         }
         let video = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
+                mime_type: match negotiated.codec {
+                    VideoCodec::H264 => MIME_TYPE_H264,
+                    VideoCodec::Hevc => MIME_TYPE_HEVC,
+                    VideoCodec::Av1 => MIME_TYPE_AV1,
+                }
+                .to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
-                sdp_fmtp_line: format!(
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE_LEVEL_ID}"
-                ),
+                sdp_fmtp_line: match negotiated.codec {
+                    VideoCodec::H264 => format!(
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
+                        negotiated.h264_profile_level_id()
+                    ),
+                    VideoCodec::Hevc | VideoCodec::Av1 => negotiated.offered_fmtp.clone(),
+                },
                 rtcp_feedback: vec![
                     RTCPFeedback {
                         typ: "nack".to_owned(),
@@ -1000,11 +1045,16 @@ impl HostPeer {
             #[cfg(feature = "media")]
             display_selection_feedback,
             #[cfg(feature = "media")]
+            viewer_limits,
+            #[cfg(feature = "media")]
             input_shutdown,
             #[cfg(feature = "media")]
             input_revoked,
             video,
             video_data_channel,
+            video_codec: negotiated.codec,
+            #[cfg(feature = "media")]
+            h264_high: negotiated.h264_high,
         })
     }
 
@@ -1205,6 +1255,16 @@ impl HostPeer {
     }
 
     #[cfg(feature = "media")]
+    pub fn h264_high(&self) -> bool {
+        self.h264_high
+    }
+
+    #[cfg(feature = "media")]
+    pub fn video_codec(&self) -> VideoCodec {
+        self.video_codec
+    }
+
+    #[cfg(feature = "media")]
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
     }
@@ -1222,6 +1282,11 @@ impl HostPeer {
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub fn link_feedback(&self) -> tokio::sync::watch::Receiver<Option<LinkSample>> {
         self.link_feedback.subscribe()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn viewer_limits(&self) -> tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits> {
+        self.viewer_limits.subscribe()
     }
 
     #[cfg(feature = "media")]

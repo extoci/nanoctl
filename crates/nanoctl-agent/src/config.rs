@@ -60,6 +60,7 @@ pub enum CodecPreference {
     #[default]
     Auto,
     H264,
+    Hevc,
     Vp9,
     Av1,
 }
@@ -87,7 +88,7 @@ impl Default for QualityConfig {
         Self {
             codec: CodecPreference::Auto,
             encoder: EncoderPreference::Auto,
-            max_fps: 60,
+            max_fps: 0,
             max_bitrate_kbps: 50_000,
             max_width: 3840,
             max_height: 2160,
@@ -151,8 +152,8 @@ impl AgentConfig {
         if self.tailnet.port == 0 {
             bail!("tailnet.port must not be zero");
         }
-        if !matches!(self.quality.max_fps, 30 | 60 | 90 | 120) {
-            bail!("quality.max_fps must be 30, 60, 90, or 120");
+        if self.quality.max_fps != 0 && !(24..=240).contains(&self.quality.max_fps) {
+            bail!("quality.max_fps must be 0 (display refresh rate) or between 24 and 240");
         }
         if !(500..=100_000).contains(&self.quality.max_bitrate_kbps) {
             bail!("quality.max_bitrate_kbps must be between 500 and 100000");
@@ -162,11 +163,8 @@ impl AgentConfig {
         {
             bail!("quality resolution limits are outside the supported range");
         }
-        if !matches!(
-            self.quality.codec,
-            CodecPreference::Auto | CodecPreference::H264
-        ) {
-            bail!("this v2 build supports only quality.codec = auto or h264");
+        if matches!(self.quality.codec, CodecPreference::Vp9) {
+            bail!("quality.codec must be auto, h264, hevc or av1");
         }
         Ok(())
     }

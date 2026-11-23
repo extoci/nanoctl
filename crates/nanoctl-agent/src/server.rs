@@ -54,6 +54,13 @@ impl ServerState {
                 "DANGER: NANOCTL_DEV_LOOPBACK_USER enabled: loopback authentication and loopback ICE are trusted. DEVELOPMENT ONLY."
             );
         }
+        #[cfg(feature = "rtc")]
+        crate::codec::set_host_preference(config.quality.codec);
+        #[cfg(all(feature = "media", not(test)))]
+        {
+            let preference = config.quality.encoder;
+            std::thread::spawn(move || crate::media::ensure_codecs_probed(preference));
+        }
         Arc::new(Self {
             hosts: Mutex::new(None),
             config,
@@ -201,6 +208,7 @@ pub fn valid_origin(headers: &HeaderMap, tls: bool, serve: bool) -> bool {
 pub fn router(state: Arc<ServerState>, tls: bool) -> Router {
     Router::new()
         .route("/v1/info", get(info))
+        .route("/v1/debug", get(debug_report))
         .route("/v1/hosts", get(hosts))
         .route("/v1/connect", get(connect))
         .fallback(get(asset))
@@ -327,6 +335,28 @@ async fn info(
 ) -> Response {
     match state.authenticate(peer, &headers, false, tls).await {
         Ok((identity, control)) => axum::Json(state.info(&identity, control).await).into_response(),
+        Err(error) => forbidden(error),
+    }
+}
+
+/// The host half of the viewer's "Copy debug info", limited to viewers that may control.
+async fn debug_report(
+    State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(tls): Extension<bool>,
+    headers: HeaderMap,
+) -> Response {
+    match state.authenticate(peer, &headers, false, tls).await {
+        Ok((_, true)) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            crate::diagnostics::report(&state.config, None, crate::diagnostics::REPORT_LOG_LINES)
+                .await,
+        )
+            .into_response(),
+        Ok((identity, false)) => forbidden(anyhow::anyhow!(
+            "identity={}: the debug report requires control permission",
+            identity.login
+        )),
         Err(error) => forbidden(error),
     }
 }

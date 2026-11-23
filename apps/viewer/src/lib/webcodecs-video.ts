@@ -165,7 +165,11 @@ function createVideoSink(video: HTMLVideoElement): VideoSink {
       },
     });
     try {
-      next.configure({ codec, optimizeForLatency: true, latencyMode: "realtime" });
+      next.configure({
+        codec,
+        optimizeForLatency: true,
+        latencyMode: "realtime",
+      } as VideoDecoderConfig & { latencyMode: "realtime" });
       decoder = next;
     } catch (error) {
       console.warn("webcodecs video configure failed", error);

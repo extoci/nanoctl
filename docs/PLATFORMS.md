@@ -55,14 +55,48 @@ Legacy Linux keyutils credentials are invalidated best-effort when `keyctl` is a
 
 `quality.encoder = "auto"` (default) tries the native encoder first, then uses
 OpenH264 if hardware is unavailable or fails during encoding or reconfiguration.
-After a switch, the replacement starts with a new H.264 keyframe and stays active
+After a switch, the replacement starts with a new keyframe and stays active
 for that session. Set `"hardware"` to fail instead of using OpenH264, or
 `"software"` to skip hardware entirely. `nanoctl doctor` reports the selected
 backend at probe time; the media smoke report shows the backend that actually encoded.
 
+## Codec selection
+
+`quality.codec = "auto"` (default) streams the most efficient codec that the host can
+encode in hardware and the browser decodes in hardware: AV1, then HEVC, then H.264.
+The viewer orders its WebRTC offer from `MediaCapabilities.decodingInfo`, so a browser
+without a hardware AV1 decoder is not handed a 4K software AV1 decode. The viewer's
+**Video codec** buttons override this per browser (stored locally; switching reconnects).
+`"av1"`, `"hevc"` or `"h264"` in the config sets the host preference instead of the
+browser order. H.264 is always available through the software fallback.
+
+At startup the agent opens a short-lived native encoder for each advanced codec and only
+advertises codecs that opened (`capabilities.codecs`). If an AV1/HEVC encoder later fails,
+that codec is withdrawn for the rest of the process and the next session negotiates H.264.
+
+| Codec | Linux                                                   | Windows                                                                    | macOS                  |
+| ----- | ------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------- |
+| AV1   | NVENC (RTX 40 or newer; agent built with NVENC SDK 12+) | Media Foundation hardware MFT (RTX 40, Intel Arc, Radeon RX 7000 or newer) | —                      |
+| HEVC  | NVENC (GTX 900 or newer)                                | Media Foundation hardware MFT                                              | —                      |
+| H.264 | VA-API, NVENC, OpenH264/x264                            | Media Foundation, OpenH264                                                 | VideoToolbox, OpenH264 |
+
+Browser decode support varies: Chromium-based browsers decode AV1 and, on hardware with
+a decoder, HEVC; Safari decodes HEVC and, on M3/A17 or newer, AV1.
+
+## Frame rate and bitrate
+
+`[quality] max_fps` (24–240; the default 0 follows the primary display's refresh rate, or 60 when unknown) and `max_bitrate_kbps` are the host's ceilings.
+The adaptive controller stays below both. It ramps bitrate from the link estimate and
+lowers frame rate only when bitrate drops below 2.5 Mbps.
+The viewer's Frame rate and Bitrate buttons send `{"type":"quality","maxFps":30,
+"maxBitrateKbps":10000}` on the reliable control channel. These caps apply live without
+renegotiating, also apply in view-only sessions, and are clamped to the host ceilings.
+"Max" removes the viewer cap. macOS capture follows the display refresh rate (up to
+240 Hz) instead of a fixed 60 Hz.
+
 ## Browser and HTTPS
 
-Use a current WebRTC/H.264-capable browser; automated coverage is Chromium.
+Use a current WebRTC browser; automated coverage is Chromium.
 Native HTTPS uses `tailscale cert` after HTTPS is enabled in the tailnet admin console,
 with warned HTTP fallback if issuance fails. WireGuard encrypts either, but keyboard lock
 requires a supporting browser, secure context and fullscreen.

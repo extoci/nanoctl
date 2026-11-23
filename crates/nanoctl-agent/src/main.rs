@@ -4,7 +4,10 @@ mod adaptive;
 mod audio;
 #[cfg(feature = "media")]
 mod clipboard;
+#[cfg(feature = "rtc")]
+mod codec;
 mod config;
+mod diagnostics;
 #[cfg(feature = "media")]
 mod gamepad;
 #[cfg(feature = "media")]
@@ -17,6 +20,8 @@ mod macos_encoder;
 mod media;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod media_bench;
+#[cfg(any(all(feature = "media", target_os = "windows"), test))]
+mod nv12;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod nvenc_encoder;
 mod platform;
@@ -118,6 +123,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a paste-ready debug report: build, OS, doctor checks, encoders, displays,
+    /// redacted configuration and recent agent logs.
+    Debug {
+        /// Recent agent log lines to include.
+        #[arg(long, default_value_t = diagnostics::REPORT_LOG_LINES)]
+        lines: usize,
+        /// Also write the report to this file.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Print the effective redacted configuration.
     Config,
     /// Print the configuration path used by this invocation.
@@ -158,33 +173,44 @@ enum Command {
     CommitUpdate,
 }
 
+#[cfg(test)]
 fn quiet_console<W>(writer: W) -> impl tracing::Subscriber
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(writer)
-            .with_ansi(false)
-            .without_time()
-            .with_level(false)
-            .with_target(false)
-            .compact()
-            .with_filter(
-                Targets::new()
-                    .with_target("nanoctl", LevelFilter::ERROR)
-                    .with_target("nanoctl::status", LevelFilter::INFO),
-            ),
-    )
+    tracing_subscriber::registry().with(quiet_layer(writer))
+}
+
+fn quiet_layer<S, W>(writer: W) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .without_time()
+        .with_level(false)
+        .with_target(false)
+        .compact()
+        .with_filter(
+            Targets::new()
+                .with_target("nanoctl", LevelFilter::ERROR)
+                .with_target("nanoctl::status", LevelFilter::INFO),
+        )
 }
 
 fn init_logging(log_file: Option<&Path>, command: &Command) -> Result<()> {
+    let diagnostics = matches!(command, Command::Run { .. })
+        .then(diagnostics::layer)
+        .flatten();
+    let registry = tracing_subscriber::registry().with(diagnostics);
     let env_filter = EnvFilter::try_from_default_env().ok();
     if log_file.is_none()
         && env_filter.is_none()
         && matches!(command, Command::Run { verbose: false })
     {
-        quiet_console(std::io::stdout).init();
+        registry.with(quiet_layer(std::io::stdout)).init();
         return Ok(());
     }
     let filter = env_filter.unwrap_or_else(|| EnvFilter::new("nanoctl=info"));
@@ -198,21 +224,25 @@ fn init_logging(log_file: Option<&Path>, command: &Command) -> Result<()> {
             .append(true)
             .open(path)
             .with_context(|| format!("cannot open log file {}", path.display()))?;
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(file)
-            .compact()
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file)
+                    .compact()
+                    .with_filter(filter),
+            )
             .init();
     } else {
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        let layer = tracing_subscriber::fmt::layer()
             .with_ansi(terminal::supports_styling())
             .compact();
         if matches!(command, Command::Url { .. }) {
-            subscriber.with_writer(std::io::stderr).init();
+            registry
+                .with(layer.with_writer(std::io::stderr).with_filter(filter))
+                .init();
         } else {
-            subscriber.init();
+            registry.with(layer.with_filter(filter)).init();
         }
     }
     Ok(())
@@ -343,6 +373,16 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{report}");
+            }
+        }
+        Command::Debug { lines, output } => {
+            let config = AgentConfig::load_or_default(&config_path)?;
+            let report = diagnostics::report(&config, Some(&config_path), lines).await;
+            print!("{report}");
+            if let Some(path) = output {
+                std::fs::write(&path, &report)
+                    .with_context(|| format!("cannot write {}", path.display()))?;
+                eprintln!("Debug report written to {}", path.display());
             }
         }
         Command::Config => {

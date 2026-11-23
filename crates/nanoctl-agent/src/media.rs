@@ -46,6 +46,7 @@ pub(crate) mod trace;
 mod macos_capture;
 
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
+use crate::codec::{VideoCodec, is_keyframe};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
 
@@ -404,6 +405,8 @@ pub(crate) trait FrameEncoder {
 
 #[derive(Clone, Copy)]
 struct EncoderSettings {
+    codec: VideoCodec,
+    h264_high: bool,
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
@@ -414,14 +417,33 @@ type OpenEncoder = fn(EncoderSettings, (u32, u32)) -> Result<Box<dyn FrameEncode
 struct HardwareBackend {
     id: &'static str,
     name: &'static str,
+    codecs: &'static [VideoCodec],
     open: OpenEncoder,
 }
 
 macro_rules! hardware_backend {
+    ($id:literal, $name:literal, $encoder:path, codecs: [$($codec:ident),+]) => {
+        HardwareBackend {
+            id: $id,
+            name: $name,
+            codecs: &[$(VideoCodec::$codec),+],
+            open: |settings, dimensions| {
+                Ok(Box::new(<$encoder>::with_codec(
+                    settings.codec,
+                    settings.h264_high,
+                    settings.bitrate_kbps,
+                    settings.max_fps,
+                    settings.latency_mode,
+                    dimensions,
+                )?))
+            },
+        }
+    };
     ($id:literal, $name:literal, $encoder:path) => {
         HardwareBackend {
             id: $id,
             name: $name,
+            codecs: &[VideoCodec::H264],
             open: |settings, dimensions| {
                 Ok(Box::new(<$encoder>::new(
                     settings.bitrate_kbps,
@@ -438,18 +460,25 @@ const HARDWARE_BACKENDS: &[HardwareBackend] = &[
     #[cfg(target_os = "linux")]
     hardware_backend!("vaapi", "VA-API", crate::linux_encoder::LinuxEncoder),
     #[cfg(target_os = "linux")]
-    hardware_backend!("nvenc", "NVENC", crate::nvenc_encoder::NvencEncoder),
+    hardware_backend!(
+        "nvenc",
+        "NVENC",
+        crate::nvenc_encoder::NvencEncoder,
+        codecs: [H264, Hevc, Av1]
+    ),
     #[cfg(target_os = "macos")]
     hardware_backend!(
         "videotoolbox",
         "VideoToolbox",
-        crate::macos_encoder::MacOsEncoder
+        crate::macos_encoder::MacOsEncoder,
+        codecs: [H264]
     ),
     #[cfg(target_os = "windows")]
     hardware_backend!(
         "media-foundation",
         "Media Foundation hardware MFT",
-        crate::windows_encoder::WindowsEncoder
+        crate::windows_encoder::WindowsEncoder,
+        codecs: [H264, Hevc, Av1]
     ),
 ];
 
@@ -614,6 +643,7 @@ impl YUVSource for I420Frame {
 }
 
 impl CaptureEncoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn primary(
         max_bitrate_kbps: u32,
         max_fps: u16,
@@ -621,6 +651,8 @@ impl CaptureEncoder {
         max_height: u32,
         latency_mode: LatencyMode,
         encoder_preference: EncoderPreference,
+        codec: VideoCodec,
+        h264_high: bool,
         stats: Arc<PipelineStats>,
     ) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
@@ -640,7 +672,9 @@ impl CaptureEncoder {
             max_width,
             max_height,
         );
-        let encoder = EncoderBackend::new(
+        let encoder = EncoderBackend::new_for_codec(
+            codec,
+            h264_high,
             encoder_preference,
             max_bitrate_kbps,
             max_fps,
@@ -817,9 +851,31 @@ impl EncoderBackend {
         latency_mode: LatencyMode,
         probe_dimensions: (u32, u32),
     ) -> Result<Self> {
+        Self::new_for_codec(
+            VideoCodec::H264,
+            false,
+            preference,
+            bitrate_kbps,
+            max_fps,
+            latency_mode,
+            probe_dimensions,
+        )
+    }
+
+    fn new_for_codec(
+        codec: VideoCodec,
+        h264_high: bool,
+        preference: EncoderPreference,
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        probe_dimensions: (u32, u32),
+    ) -> Result<Self> {
         Self::with_hardware(
             preference,
             EncoderSettings {
+                codec,
+                h264_high,
                 bitrate_kbps,
                 max_fps,
                 latency_mode,
@@ -837,7 +893,9 @@ impl EncoderBackend {
     ) -> Result<Self> {
         let mut backend = Self {
             active: None,
-            remaining_hardware: if matches!(preference, EncoderPreference::Software) {
+            remaining_hardware: if matches!(preference, EncoderPreference::Software)
+                && settings.codec == VideoCodec::H264
+            {
                 &[]
             } else {
                 hardware
@@ -855,6 +913,9 @@ impl EncoderBackend {
         self.active.take();
         while let Some((hardware, remaining)) = self.remaining_hardware.split_first() {
             self.remaining_hardware = remaining;
+            if !hardware.codecs.contains(&self.settings.codec) {
+                continue;
+            }
             match (hardware.open)(self.settings, self.dimensions) {
                 Ok(encoder) => {
                     self.active = Some(ActiveEncoder {
@@ -869,6 +930,18 @@ impl EncoderBackend {
                     last_error = Some(error.context(hardware.name));
                 }
             }
+        }
+        let codec = self.settings.codec;
+        if codec != VideoCodec::H264 {
+            // Only native encoders produce HEVC and AV1. Withdraw the codec so the next
+            // negotiation falls back to H.264 instead of repeating this failure.
+            crate::codec::withdraw_host_codec(codec);
+            return Err(last_error
+                .unwrap_or_else(|| anyhow!("no native {} encoder was compiled", codec.label())))
+            .context(format!(
+                "{} requires a hardware encoder but no usable backend remains",
+                codec.label()
+            ));
         }
         if matches!(self.preference, EncoderPreference::Hardware) {
             return Err(
@@ -936,6 +1009,8 @@ impl EncoderBackend {
         dimensions: (u32, u32),
     ) -> Result<Self> {
         let settings = EncoderSettings {
+            codec: VideoCodec::H264,
+            h264_high: false,
             bitrate_kbps,
             max_fps,
             latency_mode,
@@ -962,13 +1037,13 @@ impl EncoderBackend {
         ) else {
             return Ok(false);
         };
-        let active = self.active.as_mut().context("no active H.264 encoder")?;
+        let active = self.active.as_mut().context("no active video encoder")?;
         self.settings.bitrate_kbps = target_kbps;
         if let Err(error) = active.encoder.set_bitrate(target_kbps) {
             let Some(hardware) = active.hardware else {
                 return Err(error);
             };
-            tracing::warn!(backend = hardware.name, %error, "hardware bitrate change failed; switching H.264 backend");
+            tracing::warn!(backend = hardware.name, %error, "hardware bitrate change failed; switching encoder backend");
             self.activate_next(Some(error.context(hardware.name)))?;
         }
         Ok(true)
@@ -995,13 +1070,10 @@ impl EncoderBackend {
         }
         self.dimensions = image.dimensions();
         loop {
-            let active = self.active.as_mut().context("no active H.264 encoder")?;
+            let active = self.active.as_mut().context("no active video encoder")?;
             let encoded = active.encoder.encode(image).and_then(|frame| {
                 if active.needs_initial_idr {
-                    let types = annex_b_nal_types(&frame.bytes)?;
-                    if ![5, 7, 8].iter().all(|nal| types.contains(nal)) {
-                        bail!("first H.264 access unit did not contain IDR, SPS and PPS");
-                    }
+                    crate::codec::validate_initial_access_unit(self.settings.codec, &frame.bytes)?;
                     active.needs_initial_idr = false;
                 }
                 Ok(frame)
@@ -1012,7 +1084,7 @@ impl EncoderBackend {
                     let Some(hardware) = active.hardware else {
                         return Err(error);
                     };
-                    tracing::warn!(backend = hardware.name, %error, "hardware encode failed; switching H.264 backend");
+                    tracing::warn!(backend = hardware.name, %error, "hardware encode failed; switching encoder backend");
                     self.activate_next(Some(error.context(hardware.name)))?;
                 }
             }
@@ -1390,6 +1462,48 @@ pub fn probe_encoder(preference: EncoderPreference) -> Result<(&'static str, &'s
     Ok((encoder.id(), encoder.name()))
 }
 
+/// Probes advanced codecs once per process; later calls reuse the recorded host codec set.
+pub fn ensure_codecs_probed(preference: EncoderPreference) {
+    static PROBED: std::sync::Once = std::sync::Once::new();
+    PROBED.call_once(|| {
+        probe_codecs(preference);
+    });
+}
+
+/// Opens a short-lived native encoder for each advanced codec and records which ones this
+/// host can produce. H.264 is always included because a software fallback backs it.
+pub fn probe_codecs(preference: EncoderPreference) -> Vec<VideoCodec> {
+    let mut codecs = Vec::new();
+    if !matches!(preference, EncoderPreference::Software) {
+        for codec in [VideoCodec::Av1, VideoCodec::Hevc] {
+            match EncoderBackend::new_for_codec(
+                codec,
+                false,
+                EncoderPreference::Hardware,
+                1_000,
+                30,
+                LatencyMode::Balanced,
+                (1_280, 720),
+            ) {
+                Ok(encoder) => {
+                    tracing::info!(
+                        codec = codec.id(),
+                        backend = encoder.id(),
+                        "hardware encoder available"
+                    );
+                    codecs.push(codec);
+                }
+                Err(error) => {
+                    tracing::debug!(codec = codec.id(), %error, "hardware encoder unavailable")
+                }
+            }
+        }
+    }
+    codecs.push(VideoCodec::H264);
+    crate::codec::set_host_codecs(&codecs);
+    codecs
+}
+
 pub(crate) fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Option<u32> {
     let target = estimate.clamp(floor, ceiling);
     (target != current).then_some(target)
@@ -1473,6 +1587,7 @@ pub struct EncodedFrame {
 /// shape for remote desktop video: keeping an obsolete frame adds latency and can discard the
 /// IDR requested for recovery.
 struct EncodedFrameSlot {
+    codec: VideoCodec,
     frame: Mutex<Option<EncodedFrame>>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
@@ -1480,8 +1595,14 @@ struct EncodedFrameSlot {
 }
 
 impl EncodedFrameSlot {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_codec(VideoCodec::H264)
+    }
+
+    fn with_codec(codec: VideoCodec) -> Self {
         Self {
+            codec,
             frame: Mutex::new(None),
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
@@ -1502,10 +1623,10 @@ impl EncodedFrameSlot {
         // Never overwrite a recovery keyframe with a delta frame. The consumer may be briefly
         // backpressured while Chromium requests an IDR; dropping that IDR would leave the peer
         // waiting for the next periodic keyframe and turn a transient loss into visible outage.
-        let incoming_is_keyframe = is_idr(&frame.bytes);
+        let incoming_is_keyframe = is_keyframe(self.codec, &frame.bytes);
         if slot
             .as_ref()
-            .is_some_and(|current| is_idr(&current.bytes) && !incoming_is_keyframe)
+            .is_some_and(|current| is_keyframe(self.codec, &current.bytes) && !incoming_is_keyframe)
         {
             self.record_drop();
             return true;
@@ -1564,31 +1685,9 @@ impl Drop for EncodedFrameProducer {
     }
 }
 
-fn is_idr(bytes: &[u8]) -> bool {
-    let mut offset = 0_usize;
-    while offset + 3 < bytes.len() {
-        let start_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            offset += 1;
-            continue;
-        };
-        let Some(&header) = bytes.get(offset + start_length) else {
-            return false;
-        };
-        match header & 0x1f {
-            5 => return true,
-            1..=4 => return false,
-            _ => offset += start_length + 1,
-        }
-    }
-    false
-}
-
 #[derive(Default)]
 struct ReferenceRecovery {
+    codec: VideoCodec,
     pending: bool,
 }
 
@@ -1607,7 +1706,7 @@ impl ReferenceRecovery {
         if !self.pending {
             return true;
         }
-        if !is_idr(bytes) {
+        if !is_keyframe(self.codec, bytes) {
             return false;
         }
         // A drop beside an already queued IDR can affect frames encoded after that IDR.
@@ -1733,7 +1832,34 @@ impl MediaSmokeReport {
     }
 }
 
+/// `quality.max_fps = 0` follows the primary display's refresh rate, so 120, 144 and 240 Hz
+/// monitors stream at their native rate; 60 when the platform does not report one.
+pub fn effective_max_fps(configured: u16) -> u16 {
+    if configured != 0 {
+        return configured;
+    }
+    Monitor::all()
+        .ok()
+        .and_then(|monitors| {
+            let monitor = monitors
+                .iter()
+                .find(|monitor| monitor.is_primary().unwrap_or(false))
+                .or_else(|| monitors.first())?;
+            monitor.frequency().ok()
+        })
+        .and_then(refresh_to_fps)
+        .unwrap_or(60)
+}
+
+fn refresh_to_fps(hz: f32) -> Option<u16> {
+    (hz.is_finite() && hz >= 23.5).then(|| (hz.round() as u16).clamp(24, 240))
+}
+
 pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeReport> {
+    let quality = &QualityConfig {
+        max_fps: effective_max_fps(quality.max_fps),
+        ..quality.clone()
+    };
     if !(1..=3_600).contains(&seconds) {
         bail!("media smoke duration must be between 1 and 3600 seconds");
     }
@@ -1744,6 +1870,8 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         quality.max_height,
         quality.latency_mode,
         quality.encoder,
+        VideoCodec::H264,
+        false,
         Arc::default(),
     )?;
     let started_unix_seconds = crate::update::unix_time_now()?;
@@ -1829,31 +1957,10 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
 }
 
 pub(crate) fn annex_b_nal_types(bytes: &[u8]) -> Result<Vec<u8>> {
-    if bytes.len() > 32 * 1024 * 1024 {
-        bail!("H.264 access unit exceeds the size limit");
-    }
-    let mut types = Vec::new();
-    let mut offset = 0_usize;
-    while offset + 3 < bytes.len() {
-        let start_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            offset += 1;
-            continue;
-        };
-        let header = offset + start_length;
-        let byte = *bytes
-            .get(header)
-            .context("H.264 access unit ends after a start code")?;
-        types.push(byte & 0x1f);
-        offset = header + 1;
-    }
-    if types.is_empty() {
-        bail!("H.264 access unit contains no Annex-B NAL units");
-    }
-    Ok(types)
+    Ok(crate::codec::annex_b_nal_headers(bytes)?
+        .into_iter()
+        .map(|header| header & 0x1f)
+        .collect())
 }
 
 #[derive(Clone, Copy)]
@@ -1864,6 +1971,8 @@ pub struct VideoQuality {
     pub max_height: u32,
     pub latency_mode: LatencyMode,
     pub encoder_preference: EncoderPreference,
+    pub codec: VideoCodec,
+    pub h264_high: bool,
 }
 
 /// Owns both halves of the capture pipeline so shutdown can wait for the blocking worker to
@@ -1961,11 +2070,13 @@ fn au_contains_idr(data: &[u8]) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
     video_data_channel: Arc<crate::rtc::DataChannelVideo>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
@@ -1982,7 +2093,7 @@ pub fn spawn_video(
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker_stopped = stopped.clone();
     let task = tokio::spawn(async move {
-        let encoded_slot = Arc::new(EncodedFrameSlot::new());
+        let encoded_slot = Arc::new(EncodedFrameSlot::with_codec(quality.codec));
         let (delivery_recovery, mut delivery_recovery_requests) =
             tokio::sync::watch::channel(0_u64);
         let producer_slot = EncodedFrameProducer(encoded_slot.clone());
@@ -2006,10 +2117,14 @@ pub fn spawn_video(
                     quality.max_height,
                     quality.latency_mode,
                     quality.encoder_preference,
+                    quality.codec,
+                    quality.h264_high,
                     producer_stats.clone(),
                 )?;
                 let mut keyframe_requests = keyframe_requests;
                 let mut link_feedback = link_feedback;
+                let mut viewer_limits = viewer_limits;
+                let mut bitrate_ceiling = quality.max_bitrate_kbps;
                 let mut display_selection = display_selection;
                 let display_selection_feedback = display_selection_feedback;
                 let mut controller = controller;
@@ -2066,10 +2181,22 @@ pub fn spawn_video(
                         && let Some(sample) = *link_feedback.borrow_and_update()
                         && let Some(decision) = controller.observe(sample)
                     {
-                        encoder.apply_bitrate_estimate(
-                            decision.bitrate_kbps,
-                            quality.max_bitrate_kbps,
-                        )?;
+                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
+                        fps = decision.fps;
+                        pacer.set_fps(fps);
+                        forced_keyframe |= scale.update(decision.bitrate_kbps);
+                        producer_stats
+                            .target_kbps
+                            .store(decision.bitrate_kbps, Ordering::Relaxed);
+                        producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                    }
+                    if viewer_limits.has_changed().unwrap_or(false) {
+                        let (ceiling, max_fps) = viewer_limits
+                            .borrow_and_update()
+                            .resolve(quality.max_bitrate_kbps, quality.max_fps);
+                        let decision = controller.set_limits(ceiling, max_fps);
+                        bitrate_ceiling = ceiling;
+                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
                         forced_keyframe |= scale.update(decision.bitrate_kbps);
@@ -2229,7 +2356,10 @@ pub fn spawn_video(
         let mut dc_seq = 0_u32;
         let mut dc_kf_seen = 0_u64;
         let mut dc_skips = 0_u64;
-        let mut reference_recovery = ReferenceRecovery::default();
+        let mut reference_recovery = ReferenceRecovery {
+            codec: quality.codec,
+            ..ReferenceRecovery::default()
+        };
         let mut write_result = Ok(());
         loop {
             tokio::select! {
@@ -3122,7 +3252,19 @@ mod tests {
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
     }
 
+    #[test]
+    fn display_refresh_rates_map_to_frame_rate_caps() {
+        assert_eq!(super::refresh_to_fps(59.94), Some(60));
+        assert_eq!(super::refresh_to_fps(143.9), Some(144));
+        assert_eq!(super::refresh_to_fps(360.0), Some(240));
+        assert_eq!(super::refresh_to_fps(0.0), None);
+        assert_eq!(super::refresh_to_fps(f32::NAN), None);
+        assert_eq!(super::effective_max_fps(90), 90);
+    }
+
     const TEST_SETTINGS: EncoderSettings = EncoderSettings {
+        codec: crate::codec::VideoCodec::H264,
+        h264_high: false,
         bitrate_kbps: 4_000,
         max_fps: 30,
         latency_mode: LatencyMode::Balanced,
@@ -3208,6 +3350,7 @@ mod tests {
     const FAILING_HARDWARE: HardwareBackend = HardwareBackend {
         id: "first",
         name: "First native backend",
+        codecs: &[crate::codec::VideoCodec::H264],
         open: |_, _| {
             Ok(Box::new(FakeHardware {
                 frames_left: 1,
@@ -3218,6 +3361,7 @@ mod tests {
     const ALTERNATE: HardwareBackend = HardwareBackend {
         id: "second",
         name: "Second native backend",
+        codecs: &[crate::codec::VideoCodec::H264],
         open: |_, _| {
             Ok(Box::new(FakeHardware {
                 frames_left: 1,
@@ -3243,6 +3387,7 @@ mod tests {
         const MISSING: &[HardwareBackend] = &[HardwareBackend {
             id: "missing",
             name: "Unavailable native backend",
+            codecs: &[crate::codec::VideoCodec::H264],
             open: |_, _| anyhow::bail!("simulated missing driver"),
         }];
         let open = |preference| {
@@ -3256,6 +3401,7 @@ mod tests {
         const NEVER_OPEN: &[HardwareBackend] = &[HardwareBackend {
             id: "never",
             name: "Forbidden native backend",
+            codecs: &[crate::codec::VideoCodec::H264],
             open: |_, _| panic!("software mode probed a hardware driver"),
         }];
         let software = EncoderBackend::with_hardware(
@@ -3307,6 +3453,7 @@ mod tests {
         const NO_HEADERS: &[HardwareBackend] = &[HardwareBackend {
             id: "no-headers",
             name: "Native backend without headers",
+            codecs: &[crate::codec::VideoCodec::H264],
             open: |_, _| {
                 Ok(Box::new(FakeHardware {
                     frames_left: 1,

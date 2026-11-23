@@ -1,14 +1,32 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { AudioOutputState, ControlMessage, HostInfo } from "@nanoctl/protocol";
-import type { RemoteSessionSnapshot } from "./lib/remote-session";
+import type { QualityLimits, RemoteSessionSnapshot } from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
 import { SoundPlayback, type SoundState } from "./lib/sound";
+import {
+  CODEC_CHOICES,
+  loadCodecChoice,
+  saveCodecChoice,
+  type CodecChoice,
+} from "./lib/video-codec";
 import "./style.css";
 import { HostPicker } from "./lib/host-picker";
-import { comboMessages, connectSteps, connectionQuality, keyCombos } from "./lib/session-ui";
+import {
+  buildDebugReport,
+  fetchHostReport,
+  recordDebugEvent,
+  recordMetrics,
+} from "./lib/debug-report";
+import {
+  comboMessages,
+  connectSteps,
+  connectionQuality,
+  formatBitrate,
+  keyCombos,
+} from "./lib/session-ui";
 
 const initial: RemoteSessionSnapshot = {
   phase: "negotiating",
@@ -40,6 +58,39 @@ function Viewer() {
   const [detail, setDetail] = useState("");
   const [selectedDisplay, setSelectedDisplay] = useState("");
   const [showStats, setShowStats] = useState(false);
+  const [debugCopy, setDebugCopy] = useState("");
+  const [codecChoice, setCodecChoiceState] = useState<CodecChoice>(() => {
+    try {
+      return loadCodecChoice();
+    } catch {
+      return "auto";
+    }
+  });
+  const codecChoiceRef = useRef(codecChoice);
+  const [qualityLimits, setQualityLimitsState] = useState<QualityLimits>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("quality-limits") ?? "{}") as QualityLimits;
+    } catch {
+      return {};
+    }
+  });
+  const qualityLimitsRef = useRef(qualityLimits);
+  const setQualityLimits = (next: QualityLimits) => {
+    qualityLimitsRef.current = next;
+    setQualityLimitsState(next);
+    try {
+      localStorage.setItem("quality-limits", JSON.stringify(next));
+    } catch {}
+    transport.current?.controller?.setQualityLimits(next);
+  };
+  const setCodecChoice = (next: CodecChoice) => {
+    codecChoiceRef.current = next;
+    setCodecChoiceState(next);
+    try {
+      saveCodecChoice(next);
+    } catch {}
+    transport.current?.connect();
+  };
   const [fullscreen, setFullscreen] = useState(false);
   const [keyboardLocked, setKeyboardLocked] = useState(false);
   const [notice, setNotice] = useState("");
@@ -155,8 +206,14 @@ function Viewer() {
             : (host.displays.find((display) => display.primary)?.id ?? host.displays[0]?.id ?? ""),
         );
       },
-      onSnapshot: setSnapshot,
+      onSnapshot: (next) => {
+        if (next.metrics) recordMetrics(next.metrics);
+        setSnapshot(next);
+      },
+      codecChoice: () => codecChoiceRef.current,
+      qualityLimits: () => qualityLimitsRef.current,
       onStatus: (next, message) => {
+        recordDebugEvent(`socket ${next}`, message);
         setStatus(next);
         setDetail(message ?? "");
         if (next !== "online") setSnapshot(initial);
@@ -170,6 +227,45 @@ function Viewer() {
       transport.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    recordDebugEvent(
+      `session ${snapshot.phase}`,
+      [snapshot.reason, snapshot.reconnectAttempt ? `attempt ${snapshot.reconnectAttempt}` : ""]
+        .filter(Boolean)
+        .join("; "),
+    );
+  }, [snapshot.phase, snapshot.reason, snapshot.reconnectAttempt]);
+
+  useEffect(() => {
+    if (snapshot.firstFrameReceived) recordDebugEvent("first frame");
+  }, [snapshot.firstFrameReceived]);
+
+  const copyDebugInfo = async () => {
+    setDebugCopy("Collecting…");
+    const report = await buildDebugReport({
+      info,
+      snapshot,
+      socketStatus: status,
+      socketDetail: detail,
+      codecChoice,
+      hostReport: info?.viewer.mayControl
+        ? await fetchHostReport()
+        : "Host report requires control permission.",
+    });
+    try {
+      await navigator.clipboard.writeText(report);
+      setDebugCopy("Copied");
+    } catch {
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([report], { type: "text/markdown" }));
+      link.download = `nanoctl-debug-${new Date().toISOString().replaceAll(":", "-")}.md`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setDebugCopy("Downloaded");
+    }
+    setTimeout(() => setDebugCopy(""), 3_000);
+  };
 
   useEffect(() => {
     const keyboard = (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard;
@@ -294,14 +390,32 @@ function Viewer() {
               Frame rate <b>{metrics?.fps == null ? "—" : `${metrics.fps.toFixed(1)} fps`}</b>
             </span>
             <span>
-              Bitrate{" "}
-              <b>{metrics?.bitrateKbps == null ? "—" : `${metrics.bitrateKbps.toFixed(2)} kbps`}</b>
+              Bitrate <b>{formatBitrate(metrics?.bitrateKbps ?? null)}</b>
             </span>
             <span>
               RTT <b>{metrics?.rttMs == null ? "—" : `${metrics.rttMs} ms`}</b>
             </span>
             <span>
+              Jitter <b>{metrics?.jitterMs == null ? "—" : `${metrics.jitterMs.toFixed(1)} ms`}</b>
+            </span>
+            <span>
+              Packet loss{" "}
+              <b>{metrics?.lossPercent == null ? "—" : `${metrics.lossPercent.toFixed(1)}%`}</b>
+            </span>
+            <span>
+              Dropped frames <b>{metrics?.framesDropped ?? "—"}</b>
+            </span>
+            <span>
               Route <b>{metrics?.route ?? "unknown"}</b>
+            </span>
+            <span>
+              Codec <b>{metrics?.codec ?? "—"}</b>
+            </span>
+            <span>
+              Decoder <b>{metrics?.decoder ?? "—"}</b>
+            </span>
+            <span>
+              Decode <b>{metrics?.decodeMs == null ? "—" : `${metrics.decodeMs.toFixed(1)} ms`}</b>
             </span>
           </aside>
         )}
@@ -447,6 +561,54 @@ function Viewer() {
               </div>
             </>
           )}
+          {info && info.capabilities.codecs.length > 1 && (
+            <>
+              <h2>Video codec</h2>
+              <div className="row" role="group" aria-label="Video codec">
+                {CODEC_CHOICES.filter(
+                  (choice) =>
+                    choice.value === "auto" || info.capabilities.codecs.includes(choice.value),
+                ).map((choice) => (
+                  <button
+                    key={choice.value}
+                    aria-pressed={choice.value === codecChoice}
+                    disabled={terminal}
+                    onClick={() => {
+                      if (choice.value !== codecChoice) setCodecChoice(choice.value);
+                    }}
+                  >
+                    {choice.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          <h2>Frame rate</h2>
+          <div className="row" role="group" aria-label="Maximum frame rate">
+            {[undefined, 60, 30].map((fps) => (
+              <button
+                key={fps ?? "max"}
+                aria-pressed={qualityLimits.maxFps === fps}
+                disabled={terminal}
+                onClick={() => setQualityLimits({ ...qualityLimits, maxFps: fps })}
+              >
+                {fps ? `${fps} fps` : "Max"}
+              </button>
+            ))}
+          </div>
+          <h2>Bitrate</h2>
+          <div className="row" role="group" aria-label="Maximum bitrate">
+            {[undefined, 20_000, 10_000, 5_000].map((kbps) => (
+              <button
+                key={kbps ?? "max"}
+                aria-pressed={qualityLimits.maxBitrateKbps === kbps}
+                disabled={terminal}
+                onClick={() => setQualityLimits({ ...qualityLimits, maxBitrateKbps: kbps })}
+              >
+                {kbps ? `${kbps / 1_000} Mbps` : "Max"}
+              </button>
+            ))}
+          </div>
           <h2>Input</h2>
           <div className="row">
             <button
@@ -574,6 +736,9 @@ function Viewer() {
           <div className="row">
             <button aria-pressed={showStats} onClick={() => setShowStats(!showStats)}>
               Stats
+            </button>
+            <button onClick={() => void copyDebugInfo()} disabled={debugCopy === "Collecting…"}>
+              {debugCopy || "Copy debug info"}
             </button>
           </div>
           <button

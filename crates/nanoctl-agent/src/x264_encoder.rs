@@ -394,7 +394,10 @@ mod tests {
         backend.set_bitrate(1_000).unwrap();
         backend.force_keyframe();
         let recovered = backend.encode(&frame).unwrap();
-        assert!(super::super::is_idr(&recovered.bytes));
+        assert!(crate::codec::is_keyframe(
+            crate::codec::VideoCodec::H264,
+            &recovered.bytes
+        ));
         let mut decoder = openh264::decoder::Decoder::new().unwrap();
         assert!(decoder.decode(&recovered.bytes).unwrap().is_some());
     }
