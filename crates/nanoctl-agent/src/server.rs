@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -520,9 +521,37 @@ async fn session(
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
 }
 
+async fn bind_listener(
+    addr: SocketAddr,
+    ipv4_ready: bool,
+    unavailable_ipv6: &mut HashSet<IpAddr>,
+    bind: impl AsyncFnOnce(SocketAddr) -> io::Result<tokio::net::TcpListener>,
+) -> Option<tokio::net::TcpListener> {
+    let ip = addr.ip();
+    let can_skip = ip.is_ipv6() && ipv4_ready;
+    if !can_skip {
+        unavailable_ipv6.remove(&ip);
+    } else if unavailable_ipv6.contains(&ip) {
+        return None;
+    }
+    match bind(addr).await {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            if can_skip && error.kind() == io::ErrorKind::AddrNotAvailable {
+                unavailable_ipv6.insert(ip);
+                tracing::info!(%addr, %error, "skipping unavailable IPv6 listener; IPv4 is ready");
+            } else {
+                tracing::warn!(%addr, %error, "cannot bind tailnet listener; will retry");
+            }
+            None
+        }
+    }
+}
+
 pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let mut listeners =
         HashMap::<IpAddr, (axum_server::Handle<SocketAddr>, tokio::task::JoinHandle<()>)>::new();
+    let mut unavailable_ipv6 = HashSet::new();
     let mut tls_config: Option<axum_server::tls_rustls::RustlsConfig> = None;
     let mut cert_node = String::new();
     let mut cert_checked = None::<tokio::time::Instant>;
@@ -589,49 +618,59 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
                 let _ = task.await;
             }
         }
+        unavailable_ipv6.retain(|ip| wanted.contains(ip));
+        let mut wanted = wanted.into_iter().collect::<Vec<_>>();
+        wanted.sort_unstable_by_key(IpAddr::is_ipv6);
         for ip in wanted {
             if listeners.contains_key(&ip) {
                 continue;
             }
             let addr = SocketAddr::new(ip, state.config.tailnet.port);
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    let tls = if ip.is_loopback() {
-                        None
+            let ipv4_ready = ip.is_ipv6()
+                && listeners.iter().any(|(other, (_, task))| {
+                    other.is_ipv4()
+                        && other.is_loopback() == ip.is_loopback()
+                        && !task.is_finished()
+                });
+            let Some(listener) =
+                bind_listener(addr, ipv4_ready, &mut unavailable_ipv6, async |addr| {
+                    tokio::net::TcpListener::bind(addr).await
+                })
+                .await
+            else {
+                continue;
+            };
+            let tls = if ip.is_loopback() {
+                None
+            } else {
+                tls_config.clone()
+            };
+            tracing::info!(%addr, tls = tls.is_some(), "tailnet listener ready");
+            let app = router(state.clone(), tls.is_some());
+            let stop = axum_server::Handle::new();
+            let handle = stop.clone();
+            let listener = listener.into_std()?;
+            let task = tokio::spawn(async move {
+                let service = app.into_make_service_with_connect_info::<SocketAddr>();
+                let result: io::Result<()> = async {
+                    if let Some(tls) = tls {
+                        axum_server::from_tcp_rustls(listener, tls)?
+                            .handle(handle)
+                            .serve(service)
+                            .await
                     } else {
-                        tls_config.clone()
-                    };
-                    tracing::info!(%addr, tls = tls.is_some(), "tailnet listener ready");
-                    let app = router(state.clone(), tls.is_some());
-                    let stop = axum_server::Handle::new();
-                    let handle = stop.clone();
-                    let listener = listener.into_std()?;
-                    let task = tokio::spawn(async move {
-                        let service = app.into_make_service_with_connect_info::<SocketAddr>();
-                        let result: std::io::Result<()> = async {
-                            if let Some(tls) = tls {
-                                axum_server::from_tcp_rustls(listener, tls)?
-                                    .handle(handle)
-                                    .serve(service)
-                                    .await
-                            } else {
-                                axum_server::from_tcp(listener)?
-                                    .handle(handle)
-                                    .serve(service)
-                                    .await
-                            }
-                        }
-                        .await;
-                        if let Err(error) = result {
-                            tracing::warn!(%addr, %error, "listener stopped");
-                        }
-                    });
-                    listeners.insert(ip, (stop, task));
+                        axum_server::from_tcp(listener)?
+                            .handle(handle)
+                            .serve(service)
+                            .await
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%addr, %error, "cannot bind tailnet listener; will retry")
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(%addr, %error, "listener stopped");
                 }
-            }
+            });
+            listeners.insert(ip, (stop, task));
         }
     }
     for (_, (stop, task)) in listeners {
@@ -644,6 +683,45 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_ipv6_is_skipped_until_ipv4_is_lost() {
+        let addr = "[fd7a:115c:a1e0::1234]:7337".parse().unwrap();
+        let mut unavailable = HashSet::new();
+        let mut attempts = 0;
+        for ipv4_ready in [true, true, false, false, true, true] {
+            let listener = bind_listener(addr, ipv4_ready, &mut unavailable, async |_| {
+                attempts += 1;
+                Err(io::ErrorKind::AddrNotAvailable.into())
+            })
+            .await;
+            assert!(listener.is_none());
+            assert_eq!(unavailable.contains(&addr.ip()), ipv4_ready);
+        }
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn transient_and_ipv4_bind_errors_are_retried() {
+        for (addr, error) in [
+            ("[fd7a:115c:a1e0::1234]:7337", io::ErrorKind::AddrInUse),
+            ("100.102.202.1:7337", io::ErrorKind::AddrNotAvailable),
+        ] {
+            let addr = addr.parse().unwrap();
+            let mut unavailable = HashSet::new();
+            let mut attempts = 0;
+            for _ in 0..2 {
+                let listener = bind_listener(addr, true, &mut unavailable, async |_| {
+                    attempts += 1;
+                    Err(error.into())
+                })
+                .await;
+                assert!(listener.is_none());
+            }
+            assert!(unavailable.is_empty());
+            assert_eq!(attempts, 2);
+        }
+    }
 
     #[tokio::test]
     async fn peer_probe_connects_and_skips_offline() {
@@ -661,7 +739,6 @@ mod tests {
         drop(listener);
         assert!(super::probe_peer(peer, port).await.is_none());
     }
-
     #[tokio::test]
     async fn view_only_info_never_advertises_clipboard() {
         for (remote_input, control) in [(false, true), (true, false), (false, false)] {

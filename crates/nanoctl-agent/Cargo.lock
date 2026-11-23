@@ -2712,18 +2712,21 @@ name = "nanoctl-agent"
 version = "3.0.0-alpha.1"
 dependencies = [
  "anyhow",
+ "anstyle-query",
  "apple-cf",
  "arboard",
  "async-trait",
  "axum",
  "axum-server",
  "base64",
+ "block2",
  "cc",
  "clap",
  "cpal",
  "cros-codecs",
  "cros-libva",
  "directories",
+ "dispatch2",
  "ed25519-dalek",
  "enigo",
  "fast_image_resize",
@@ -2732,6 +2735,12 @@ dependencies = [
  "interceptor",
  "libc",
  "nanoctl-update",
+ "objc2",
+ "objc2-core-graphics",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation",
+ "objc2-screen-capture-kit",
  "openh264",
  "openh264-sys2",
  "opus",
@@ -3210,6 +3219,20 @@ checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
 dependencies = [
  "bitflags 2.13.1",
  "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-screen-capture-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74b7c5390f477482f001bc354d6571a70db7e4f8d5288e860c45521fbce11394"
+dependencies = [
+ "block2",
+ "dispatch2",
+ "objc2",
+ "objc2-core-graphics",
+ "objc2-core-media",
  "objc2-foundation",
 ]
 

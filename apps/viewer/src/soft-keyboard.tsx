@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ControlMessage } from "@nanoctl/protocol";
 import {
   inputMessages,
@@ -210,68 +211,74 @@ export function SoftKeyboard({
       >
         Keys
       </button>
-      <textarea
-        ref={field}
-        className="soft-keyboard-field"
-        aria-label="Remote keyboard"
-        disabled={!enabled}
-        autoCapitalize="off"
-        autoCorrect="off"
-        autoComplete="off"
-        spellCheck={false}
-        inputMode="text"
-        enterKeyHint="send"
-        onFocus={() => setOpen(true)}
-      />
-      {showKeys && enabled && (
-        <div
-          className="special-keys"
-          role="toolbar"
-          aria-label="Remote special keys"
-          style={{ bottom }}
-        >
-          {Object.keys(modifierKeys).map((key) => (
-            <button
-              key={key}
-              aria-pressed={sticky.state.has(key as Modifier)}
-              title={sticky.state.get(key as Modifier) ?? "Tap to latch; double tap to lock"}
-              onPointerDown={(e) => e.preventDefault()}
-              onClick={() => {
-                sticky.tap(key as Modifier, performance.now());
-                update();
-              }}
+      {createPortal(
+        <>
+          <textarea
+            ref={field}
+            className="soft-keyboard-field"
+            tabIndex={-1}
+            aria-label="Remote keyboard"
+            disabled={!enabled}
+            autoCapitalize="off"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
+            inputMode="text"
+            enterKeyHint="send"
+            onFocus={() => setOpen(true)}
+          />
+          {showKeys && enabled && (
+            <div
+              className="special-keys"
+              role="toolbar"
+              aria-label="Remote special keys"
+              style={{ bottom }}
             >
-              {key === "Control"
-                ? "Ctrl"
-                : key === "Meta"
-                  ? platform === "macos"
-                    ? "Cmd"
-                    : "Win"
-                  : key}
-              {sticky.state.get(key as Modifier) === "locked" ? " ●" : ""}
-            </button>
-          ))}
-          {specialKeys.map(([label, key]) => (
-            <button
-              key={key}
-              aria-label={key}
-              onPointerDown={(e) => e.preventDefault()}
-              onClick={() => {
-                sticky.dispatch(keyMessages(key, key, sticky.mask));
-                update();
-              }}
-            >
-              {label}
-            </button>
-          ))}
-          <button
-            aria-label="Hide special keys"
-            onPointerDown={(e) => e.preventDefault()}
-            onClick={() => setShowKeys(false)}
-          >
-            ×
-          </button>
-        </div>
+              {Object.keys(modifierKeys).map((key) => (
+                <button
+                  key={key}
+                  aria-pressed={sticky.state.has(key as Modifier)}
+                  title={sticky.state.get(key as Modifier) ?? "Tap to latch; double tap to lock"}
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    sticky.tap(key as Modifier, performance.now());
+                    update();
+                  }}
+                >
+                  {key === "Control"
+                    ? "Ctrl"
+                    : key === "Meta"
+                      ? platform === "macos"
+                        ? "Cmd"
+                        : "Win"
+                      : key}
+                  {sticky.state.get(key as Modifier) === "locked" ? " ●" : ""}
+                </button>
+              ))}
+              {specialKeys.map(([label, key]) => (
+                <button
+                  key={key}
+                  aria-label={key}
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    sticky.dispatch(keyMessages(key, key, sticky.mask));
+                    update();
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+              <button
+                aria-label="Hide special keys"
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => setShowKeys(false)}
+              >
+                ×
+              </button>
+            </div>
+          )}
+        </>,
+        document.body,
       )}
     </>
   );
