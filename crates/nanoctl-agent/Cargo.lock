@@ -2735,6 +2735,7 @@ dependencies = [
  "openh264",
  "openh264-sys2",
  "opus",
+ "pkg-config",
  "proptest",
  "rcgen",
  "reqwest",
