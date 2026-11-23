@@ -26,7 +26,7 @@ export type RemoteSessionMetrics = {
   resolution: string;
   fps: number | null;
   bitrateKbps: number | null;
-  rttMs: number;
+  rttMs: number | null;
   packetsLost: number;
   framesDropped: number;
   route: "direct" | "relay" | "unknown";
@@ -1197,7 +1197,7 @@ export class RemoteSessionController {
       const report = await peer.getStats();
       if (!this.isCurrent(lifecycle, peer)) return;
       let inbound: RTCStats | undefined;
-      let candidatePair: RTCStats | undefined;
+      const nominatedPairs: RTCStats[] = [];
       report.forEach((stats) => {
         if (
           stats.type === "inbound-rtp" &&
@@ -1210,7 +1210,7 @@ export class RemoteSessionController {
           statString(stats, "state") === "succeeded" &&
           statBoolean(stats, "nominated")
         ) {
-          candidatePair = stats;
+          nominatedPairs.push(stats);
         }
       });
       if (!inbound) return;
@@ -1226,16 +1226,33 @@ export class RemoteSessionController {
         statNumber(inbound, "framesPerSecond"),
       );
       this.previousVideoSample = sample;
-      const remoteCandidateId = candidatePair
-        ? statString(candidatePair, "remoteCandidateId")
-        : undefined;
-      const remoteCandidate = remoteCandidateId ? report.get(remoteCandidateId) : undefined;
+      const transportId = statString(inbound, "transportId");
+      const transport = transportId ? report.get(transportId) : undefined;
+      const selectedPairId = statString(transport, "selectedCandidatePairId");
+      const selectedPair = selectedPairId ? report.get(selectedPairId) : undefined;
+      const candidatePair =
+        selectedPair?.type === "candidate-pair"
+          ? selectedPair
+          : nominatedPairs.length === 1
+            ? nominatedPairs[0]
+            : undefined;
+      const localCandidateId = statString(candidatePair, "localCandidateId");
+      const remoteCandidateId = statString(candidatePair, "remoteCandidateId");
+      const localType = statString(
+        localCandidateId ? report.get(localCandidateId) : undefined,
+        "candidateType",
+      );
+      const remoteType = statString(
+        remoteCandidateId ? report.get(remoteCandidateId) : undefined,
+        "candidateType",
+      );
       const route =
-        statString(remoteCandidate, "candidateType") === "relay"
+        localType === "relay" || remoteType === "relay"
           ? "relay"
-          : remoteCandidate
+          : localType && remoteType
             ? "direct"
             : "unknown";
+      const rtt = statNumber(candidatePair, "currentRoundTripTime");
       this.metrics = {
         resolution:
           (statNumber(inbound, "frameWidth") ?? 0) > 0 &&
@@ -1243,7 +1260,7 @@ export class RemoteSessionController {
             ? `${statNumber(inbound, "frameWidth")}×${statNumber(inbound, "frameHeight")}`
             : "—",
         ...rates,
-        rttMs: Math.round((statNumber(candidatePair, "currentRoundTripTime") ?? 0) * 1_000),
+        rttMs: rtt !== undefined && rtt > 0 ? Math.round(rtt * 1_000) : null,
         packetsLost: Math.max(0, Math.round(statNumber(inbound, "packetsLost") ?? 0)),
         framesDropped: Math.max(0, Math.round(statNumber(inbound, "framesDropped") ?? 0)),
         route,
