@@ -309,3 +309,22 @@ bitrate +75% (slice boundaries kill compression) -> stays 2.
 Caveats: noise PSNR is CRF-quality-bound (~24dB either encoder; content
 is uncompressible, quality trade is the honest one). Shipping
 libx264.dll is GPL — packaging decision deferred.
+
+## x264 CRF sweep (cycle 13)
+
+`NANOCTL_X264_CRF` env added to the shim; default `f_rf_constant`
+12.0 -> **18.0** (overridable per-session). media-smoke sweep on the
+motion scene:
+
+| crf | kbps           | PSNR p50 / p05 |
+| --- | -------------- | -------------- |
+| 12  | 516            | 60.0 / 59.2    |
+| 15  | 583            | 58.8 / 58.2    |
+| 18  | 332-336 (-36%) | 56.5 / 56.1    |
+| 21  | 315 (-39%)     | 53.2 / 52.9    |
+
+Regression check at crf18: noise 57.5fps/11.0Mbps/24.3dB (unchanged —
+pure noise is VBV-bound, not CRF-bound), flash 58.1fps/562kbps/58.3dB,
+static **666->70kbps (-90%)** at 55.9dB. All p05 >= 55.9dB except noise
+(content-bound, identical at every CRF). 18 chosen over 21: nearly all
+the savings, +3dB margin.

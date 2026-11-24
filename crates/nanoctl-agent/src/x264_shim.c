@@ -111,7 +111,8 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     p.i_sync_lookahead = 0;
     p.rc.i_lookahead = 0;
     p.rc.i_rc_method = X264_RC_CRF;
-    p.rc.f_rf_constant = 12.0f;
+    const char *crf = getenv("NANOCTL_X264_CRF");
+    p.rc.f_rf_constant = crf && crf[0] ? (float)atof(crf) : 18.0f;
     p.rc.i_qp_min = 0;
     p.rc.i_qp_max = 51;
     p.rc.i_bitrate = kbps;
