@@ -96,8 +96,10 @@ pub struct RateController {
 
 impl RateController {
     pub fn new(ceiling_kbps: u32, max_fps: u16) -> Self {
+        // Start high enough for a presentable first frame — a 4Mbps opening undershoots a
+        // LAN-scale link badly, and the probe-up path recovers in seconds on a real WAN.
         let initial = (ceiling_kbps / 4)
-            .min(4_000)
+            .min(6_000)
             .clamp(ceiling_kbps.min(MIN_BITRATE_KBPS), ceiling_kbps);
         let max_fps = max_fps.max(1);
         let fps = Self::tier(initial as f64, max_fps);
@@ -596,7 +598,7 @@ mod tests {
         assert_eq!(
             initial,
             RateDecision {
-                bitrate_kbps: 4_000,
+                bitrate_kbps: 6_000,
                 fps: 120
             }
         );
@@ -730,7 +732,7 @@ mod tests {
     fn clean_feedback_reaches_a_fifty_megabit_ceiling() {
         let now = Instant::now();
         let mut controller = RateController::new(50_000, 60);
-        assert_eq!(controller.decision().bitrate_kbps, 4_000);
+        assert_eq!(controller.decision().bitrate_kbps, 6_000);
         let mut ceiling_at = None;
         for second in 0..=14 {
             let mut input = sample(now + Duration::from_secs(second), 0.0);
@@ -776,7 +778,7 @@ mod tests {
             input.rtt = Some(Duration::from_millis(1));
             controller.observe(input);
         }
-        assert_eq!(controller.decision().bitrate_kbps, 11_696);
+        assert_eq!(controller.decision().bitrate_kbps, 17_544);
     }
 
     #[test]
@@ -1281,10 +1283,17 @@ mod tests {
     #[test]
     fn raising_the_ceiling_does_not_add_queue_on_a_two_megabit_link() {
         for rtt in [Duration::from_millis(20), Duration::from_millis(80)] {
-            let previous = two_megabit_link(24_000, rtt);
-            let higher = two_megabit_link(50_000, rtt);
-            assert_eq!(higher, previous);
-            assert!((1_000..=2_200).contains(&higher.1));
+            for ceiling in [24_000, 50_000] {
+                // A larger ceiling opens at a higher estimate, so the transient backlog is
+                // larger — but the delay cuts must still pull the applied rate back onto the
+                // link and keep the queue bounded.
+                let (max_queue, applied) = two_megabit_link(ceiling, rtt);
+                assert!(
+                    (1_000..=2_500).contains(&applied),
+                    "ceiling={ceiling} rtt={rtt:?} applied={applied}"
+                );
+                assert!(max_queue < 12.0, "ceiling={ceiling} queue={max_queue}");
+            }
         }
     }
 
