@@ -115,6 +115,15 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
     private let displays = UIButton(type: .system)
     private let paste = UIButton(type: .system)
     private let surface = TouchSurface()
+    private let cursor = UIView()
+    private let touchModeControl = UISegmentedControl(items: TouchMode.allCases.map(\.label))
+    private lazy var gestures = TouchGestures(
+        mode: TouchMode(rawValue: UserDefaults.standard.string(forKey: "touchMode") ?? "") ?? .trackpad,
+        geometry: { [weak self] in self?.inputGeometry() },
+        send: { [weak self] event in
+            self?.desktop.session.sendPointer(x: event.x, y: event.y, action: event.action, button: event.button,
+                                              deltaX: event.deltaX, deltaY: event.deltaY)
+        })
     private let screen = UIView()
     private let fullBtn = UIButton(type: .system)
     private let exitFull = UIButton(type: .system)
@@ -203,7 +212,10 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         let buttons = UIStackView(arrangedSubviews: [audio, displays, paste, fullBtn])
         buttons.spacing = 8
         buttons.distribution = .fillEqually
-        let controls = UIStackView(arrangedSubviews: [codec, buttons])
+        touchModeControl.selectedSegmentIndex = gestures.mode == .direct ? 1 : 0
+        touchModeControl.addTarget(self, action: #selector(touchModeChanged), for: .valueChanged)
+        touchModeControl.accessibilityLabel = "Touch mode"
+        let controls = UIStackView(arrangedSubviews: [codec, touchModeControl, buttons])
         controls.axis = .vertical
         controls.spacing = 8
 
@@ -219,7 +231,20 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
             overlay.translatesAutoresizingMaskIntoConstraints = false
             screen.addSubview(overlay)
         }
-        surface.onPointer = { [weak self] point, action in self?.sendPointer(point, action: action) }
+        surface.gestures = gestures
+        gestures.onCursor = { [weak self] _ in self?.placeCursor() }
+        gestures.onZoom = { [weak self] zoom in
+            self?.video.transform = CGAffineTransform(translationX: zoom.offsetX, y: zoom.offsetY)
+                .scaledBy(x: zoom.scale, y: zoom.scale)
+            self?.placeCursor()
+        }
+        cursor.isUserInteractionEnabled = false
+        cursor.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        cursor.layer.cornerRadius = 8
+        cursor.layer.borderWidth = 2
+        cursor.layer.borderColor = UIColor.white.cgColor
+        cursor.backgroundColor = UIColor(red: 0.06, green: 0.09, blue: 0.13, alpha: 0.6)
+        screen.addSubview(cursor)
         NSLayoutConstraint.activate([video, surface].flatMap { overlay in
             [overlay.leadingAnchor.constraint(equalTo: screen.leadingAnchor),
              overlay.trailingAnchor.constraint(equalTo: screen.trailingAnchor),
@@ -271,12 +296,15 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         paste.isEnabled = session.host?.capabilities.clipboard == true
         space.isEnabled = session.inputReady
         surface.isUserInteractionEnabled = session.inputReady
+        if !session.inputReady { gestures.reset() }
+        if external { gestures.onZoom?(Zoom()); gestures.zoom = Zoom() }
         video.isHidden = external || !hasVideo
         UIApplication.shared.isIdleTimerDisabled = hasVideo
         video.show(hasVideo && !external && session.transport == .rtp ? desktop.mailbox : nil)
         video.show(pixels: hasVideo && !external && session.transport == .dataChannel ? session.pixelMailbox : nil)
         output.isHidden = hasVideo && !external
-        output.text = external ? "Video on external display\nTouch here to control the host" : "Remote video"
+        output.text = external ? "Video on the external display\nUse this screen as a trackpad" : "Remote video"
+        placeCursor()
         refreshGamepad()
     }
 
@@ -365,32 +393,65 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         present(sheet, animated: true)
     }
 
-    private func sendPointer(_ point: CGPoint, action: String) {
-        let area = usingExternal ? surface.bounds : video.inputArea
-        guard area.contains(point), !area.isEmpty else { return }
-        desktop.session.sendPointer(x: (point.x - area.minX) / area.width,
-                                    y: (point.y - area.minY) / area.height, action: action)
+    /// The letterboxed video rect in surface coordinates, including zoom.
+    private func inputGeometry() -> CGRect? {
+        let area = usingExternal ? surface.bounds : video.convert(video.inputArea, to: surface)
+        return area.isEmpty ? nil : area
+    }
+
+    private func placeCursor() {
+        cursor.isHidden = gestures.mode != .trackpad || usingExternal || !desktop.hasVideo
+            || !desktop.session.inputReady
+        guard !cursor.isHidden, let area = inputGeometry() else { return }
+        cursor.center = surface.convert(CGPoint(x: area.minX + gestures.cursor.x * area.width,
+                                                y: area.minY + gestures.cursor.y * area.height), to: screen)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        placeCursor()
+    }
+
+    @objc private func touchModeChanged() {
+        gestures.reset()
+        gestures.mode = touchModeControl.selectedSegmentIndex == 1 ? .direct : .trackpad
+        UserDefaults.standard.set(gestures.mode.rawValue, forKey: "touchMode")
+        placeCursor()
     }
 }
 
-private final class TouchSurface: UIView {
-    var onPointer: ((CGPoint, String) -> Void)?
+/// Raw multi-touch feed for `TouchGestures`; UIKit recognizers would delay
+/// or swallow the taps and holds the trackpad needs.
+final class TouchSurface: UIView {
+    var gestures: TouchGestures?
 
     init() {
         super.init(frame: .zero)
-        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(click(_:))))
-        addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(pan(_:))))
+        isMultipleTouchEnabled = true
     }
 
     required init?(coder: NSCoder) { nil }
 
-    @objc private func click(_ gesture: UITapGestureRecognizer) {
-        let point = gesture.location(in: self)
-        onPointer?(point, "down")
-        onPointer?(point, "up")
+    private func samples(_ touches: Set<UITouch>) -> [TouchSample] {
+        touches.map { touch in
+            let point = touch.location(in: self)
+            return TouchSample(id: ObjectIdentifier(touch).hashValue, x: point.x, y: point.y, t: touch.timestamp * 1000)
+        }
     }
 
-    @objc private func pan(_ gesture: UIPanGestureRecognizer) {
-        onPointer?(gesture.location(in: self), "move")
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        samples(touches).forEach { gestures?.down($0) }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        samples(touches).forEach { gestures?.move($0) }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        samples(touches).forEach { gestures?.up($0) }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        gestures?.cancel()
     }
 }
