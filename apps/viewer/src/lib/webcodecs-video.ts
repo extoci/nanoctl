@@ -437,6 +437,7 @@ export function attachDataChannelVideo(
         return;
       }
       dbg.msgs = (dbg.msgs as number) + 1;
+      dbg.bytes = ((dbg.bytes as number) || 0) + data.byteLength;
       if (dbg.firstMsgMs === undefined) {
         dbg.firstMsgMs = performance.now() - joinAt;
       }
