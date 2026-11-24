@@ -238,7 +238,9 @@ impl InputController {
                 anyhow::bail!("pointer motion must use the pointer channel");
             }
             (_, InputLane::PointerMotion) => {
-                anyhow::bail!("only pointer motion and gamepad reports are accepted on the pointer channel");
+                anyhow::bail!(
+                    "only pointer motion and gamepad reports are accepted on the pointer channel"
+                );
             }
             (_, InputLane::Reliable) => {}
         }
