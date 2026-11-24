@@ -76,13 +76,52 @@ const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 1024;
 #[derive(Clone)]
 enum InputSender {
     Reliable(tokio::sync::mpsc::Sender<Vec<u8>>),
-    Motion(tokio::sync::watch::Sender<Option<Vec<u8>>>),
+    Motion(MotionSlots<tokio::sync::watch::Sender<LatestReport>>),
 }
 
 #[cfg(any(feature = "media", test))]
 enum InputReceiver {
     Reliable(tokio::sync::mpsc::Receiver<Vec<u8>>),
-    Motion(tokio::sync::watch::Receiver<Option<Vec<u8>>>),
+    Motion(MotionSlots<tokio::sync::watch::Receiver<LatestReport>>),
+}
+
+#[cfg(any(feature = "media", test))]
+type LatestReport = Option<Vec<u8>>;
+
+/// The pointer lane keeps the latest report per kind: one shared slot would let a per-frame
+/// gamepad snapshot overwrite the pointer move sent in the same frame, and vice versa.
+#[cfg(any(feature = "media", test))]
+#[derive(Clone)]
+struct MotionSlots<T> {
+    pointer: T,
+    gamepad: T,
+}
+
+#[cfg(any(feature = "media", test))]
+fn motion_channel() -> (
+    MotionSlots<tokio::sync::watch::Sender<LatestReport>>,
+    MotionSlots<tokio::sync::watch::Receiver<LatestReport>>,
+) {
+    let (pointer, pointer_receiver) = tokio::sync::watch::channel(None);
+    let (gamepad, gamepad_receiver) = tokio::sync::watch::channel(None);
+    (
+        MotionSlots { pointer, gamepad },
+        MotionSlots {
+            pointer: pointer_receiver,
+            gamepad: gamepad_receiver,
+        },
+    )
+}
+
+#[cfg(any(feature = "media", test))]
+fn is_gamepad_report(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Kind<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<Kind>(bytes)
+        .is_ok_and(|message| message.kind.as_deref() == Some("gamepad"))
 }
 
 #[cfg(any(feature = "media", test))]
@@ -90,9 +129,18 @@ impl InputReceiver {
     async fn recv(&mut self) -> Option<Vec<u8>> {
         match self {
             Self::Reliable(receiver) => receiver.recv().await,
-            Self::Motion(receiver) => {
-                receiver.changed().await.ok()?;
-                receiver.borrow_and_update().clone()
+            Self::Motion(slots) => {
+                let gamepad = tokio::select! {
+                    changed = slots.pointer.changed() => changed.map(|()| false),
+                    changed = slots.gamepad.changed() => changed.map(|()| true),
+                }
+                .ok()?;
+                let slot = if gamepad {
+                    &mut slots.gamepad
+                } else {
+                    &mut slots.pointer
+                };
+                slot.borrow_and_update().clone()
             }
         }
     }
@@ -113,7 +161,14 @@ async fn admit_input_message(sender: &InputSender, bytes: Vec<u8>) -> InputAdmis
     }
     let accepted = match sender {
         InputSender::Reliable(sender) => sender.send(bytes).await.is_ok(),
-        InputSender::Motion(sender) => sender.send(Some(bytes)).is_ok(),
+        InputSender::Motion(slots) => {
+            let slot = if is_gamepad_report(&bytes) {
+                &slots.gamepad
+            } else {
+                &slots.pointer
+            };
+            slot.send(Some(bytes)).is_ok()
+        }
     };
     if accepted {
         InputAdmission::Accepted
@@ -675,7 +730,7 @@ impl HostPeer {
             }
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
-            let (pointer_sender, pointer_receiver) = tokio::sync::watch::channel(None);
+            let (pointer_sender, pointer_receiver) = motion_channel();
             let blocked_notices = InputBlockedNotices::default();
             if let Some(input) = &input {
                 input_tasks.push(spawn_input_worker(
@@ -2013,7 +2068,7 @@ mod tests {
 
     #[tokio::test]
     async fn pointer_motion_is_coalesced_to_the_latest_event() {
-        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (sender, receiver) = motion_channel();
         let sender = InputSender::Motion(sender);
         let mut receiver = InputReceiver::Motion(receiver);
         for index in 0_u32..500 {
@@ -2023,6 +2078,35 @@ mod tests {
             );
         }
         assert_eq!(receiver.recv().await.unwrap(), 499_u32.to_be_bytes());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn gamepad_snapshots_and_pointer_motion_coalesce_in_separate_slots() {
+        let (sender, receiver) = motion_channel();
+        let sender = InputSender::Motion(sender);
+        let mut receiver = InputReceiver::Motion(receiver);
+        let pointer = |x: u32| format!(r#"{{"type":"pointer","action":"move","x":0.{x},"y":0.5}}"#);
+        let gamepad = |x: u32| format!(r#"{{"type":"gamepad","pads":[[0,0,0,0,{x},0,0,0]]}}"#);
+        // Each viewer frame sends its pointer move just before the frame's gamepad poll.
+        for frame in 1_u32..=100 {
+            for message in [pointer(frame), gamepad(frame)] {
+                assert_eq!(
+                    admit_input_message(&sender, message.into_bytes()).await,
+                    InputAdmission::Accepted
+                );
+            }
+        }
+        let mut delivered = vec![
+            String::from_utf8(receiver.recv().await.unwrap()).unwrap(),
+            String::from_utf8(receiver.recv().await.unwrap()).unwrap(),
+        ];
+        delivered.sort();
+        assert_eq!(delivered, [gamepad(100), pointer(100)]);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
                 .await

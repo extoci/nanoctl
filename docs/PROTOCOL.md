@@ -151,7 +151,9 @@ are silently ignored. A remote paste shortcut sends local clipboard text before 
 When `capabilities.gamepad` is true, an opted-in viewer with control permission sends
 `{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel,
 or on the unordered pointer channel (`nanoctl.pointer.v1`) — snapshots carry full
-state, so the unordered lane drops stale reports instead of delaying fresh ones.
+state, so the unordered lane drops stale reports instead of delaying fresh ones. The
+host keeps the latest pointer move and the latest gamepad snapshot in separate slots,
+so a per-frame snapshot never replaces the pointer move sent in the same frame.
 Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
 slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
 are signed 16-bit values with positive Y up. For PlayStation controllers, the viewer adds
