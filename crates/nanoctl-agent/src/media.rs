@@ -2487,15 +2487,97 @@ pub fn spawn_video(
         let mut dc_backed_up = false;
         let mut dc_seq = 0_u32;
         let mut dc_kf_seen = 0_u64;
+        let mut dc_had_channel = false;
+        let mut dc_replay: Option<std::collections::VecDeque<Vec<u8>>> = None;
+        let mut dc_replay_served: Option<Instant> = None;
+        let mut replay_last_orig: Option<u32> = None;
+        let mut replay_last_new = 0_u32;
         let mut dc_skips = 0_u64;
         let mut reference_recovery = ReferenceRecovery {
             codec: quality.codec,
             ..ReferenceRecovery::default()
         };
         let mut write_result = Ok(());
+        let mut attach_poll = tokio::time::interval(Duration::from_millis(5));
+        attach_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = stats_tick.tick() => writer_stats.log(),
+                _ = attach_poll.tick() => {
+                    let video_channel = video_data_channel.channel.lock().unwrap().clone();
+                    let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
+                    let has_channel = video_channel.is_some() || idr_channel.is_some();
+                    if has_channel && !dc_had_channel {
+                        // A viewer just attached: replay the last keyframe and
+                        // the deltas that followed it so it sees a picture
+                        // immediately instead of waiting for a forced IDR.
+                        let replayed = video_data_channel
+                            .replay
+                            .lock()
+                            .unwrap()
+                            .snapshot()
+                            .map(|(idr, deltas)| {
+                                let mut queue = std::collections::VecDeque::new();
+                                queue.extend(idr);
+                                queue.extend(deltas);
+                                queue
+                            });
+                        if replayed.is_some() {
+                            tracing::info!("video data channel replaying stream to new viewer");
+                            dc_replay_served = Some(Instant::now());
+                        }
+                        dc_replay = replayed;
+                    }
+                    dc_had_channel = has_channel;
+                    if let Some(queue) = dc_replay.as_mut() {
+                        while let Some(mut msg) = queue.pop_front() {
+                            // Everything replays on the reliable channel: the
+                            // tail must arrive in order — an unordered delta
+                            // outrunning its keyframe makes the viewer drop
+                            // the keyframe as late and wait for the next one.
+                            let replay_channel =
+                                idr_channel.as_ref().or(video_channel.as_ref());
+                            let Some(channel) = replay_channel else {
+                                queue.clear();
+                                break;
+                            };
+                            for _ in 0..30 {
+                                if channel.buffered_amount().await <= 128 * 1024 {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            // Renumber into the live sequence and restamp the
+                            // send time so the replayed tail flows straight
+                            // into the frames that follow it. All parts of a
+                            // chunked access unit share one sequence number.
+                            let orig_seq = u32::from_le_bytes(msg[0..4].try_into().unwrap());
+                            let new_seq = if Some(orig_seq) == replay_last_orig {
+                                replay_last_new
+                            } else {
+                                let allocated = dc_seq;
+                                dc_seq = dc_seq.wrapping_add(1);
+                                replay_last_orig = Some(orig_seq);
+                                replay_last_new = allocated;
+                                allocated
+                            };
+                            msg[0..4].copy_from_slice(&new_seq.to_le_bytes());
+                            let replay_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or_default();
+                            msg[9..17].copy_from_slice(&replay_ms.to_le_bytes());
+                            if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                tracing::warn!(%error, "video data channel replay failed");
+                                queue.clear();
+                                break;
+                            }
+                        }
+                        if queue.is_empty() {
+                            dc_replay = None;
+                        }
+                    }
+                }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
                         break;
@@ -2527,92 +2609,101 @@ pub fn spawn_video(
                     let dc_kf = video_data_channel.keyframe_requests.load(Ordering::Relaxed);
                     if dc_kf != dc_kf_seen {
                         dc_kf_seen = dc_kf;
-                        delivery_recovery.send_modify(|generation| {
-                            *generation = generation.wrapping_add(1);
-                        });
+                        // A freshly served replay already gave the viewer a
+                        // complete stream, so its attach-time KF request is
+                        // satisfied: forcing another IDR now only congests the
+                        // association right behind the replayed keyframe.
+                        let replay_recent = dc_replay_served
+                            .is_some_and(|served| served.elapsed() < Duration::from_secs(1));
+                        if !replay_recent {
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
                     }
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
-                    if video_channel.is_some() || idr_channel.is_some() {
-                        // [u32 seq][u8 flags][annex-b au]; the viewer drops
-                        // post-gap deltas and asks for a keyframe on "KF".
-                        // Keyframes go over the reliable channel: they are
-                        // large and cannot survive partial reliability.
-                        let is_idr = au_contains_idr(&sample.data);
-                        // SCTP caps a message at ~64KiB, so large AUs are
-                        // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
-                        const CHUNK: usize = 48 * 1024;
-                        let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
-                        if is_idr {
-                            tracing::info!(
-                                dc_skips,
-                                "video data channel sending IDR seq={dc_seq} parts={parts}"
-                            );
-                        }
-                        let seq = dc_seq;
-                        dc_seq = dc_seq.wrapping_add(1);
-                        let sent_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or_default();
-                        let target = if is_idr {
-                            idr_channel.as_ref().or(video_channel.as_ref())
-                        } else {
-                            video_channel.as_ref()
-                        };
-                        if let Some(channel) = target {
-                            for part in 0..parts {
-                                let start = part as usize * CHUNK;
-                                let end = (start + CHUNK).min(sample.data.len());
-                                let mut msg = Vec::with_capacity(end - start + 17);
-                                msg.extend_from_slice(&seq.to_le_bytes());
-                                msg.push(u8::from(is_idr));
-                                msg.extend_from_slice(&part.to_le_bytes());
-                                msg.extend_from_slice(&parts.to_le_bytes());
-                                msg.extend_from_slice(&sent_ms.to_le_bytes());
-                                msg.extend_from_slice(&sample.data[start..end]);
-                                if is_idr {
-                                    // Pace IDR parts: bursting ~150KB into the
-                                    // association starves the congestion window
-                                    // and drops deltas on the sibling channel,
-                                    // which re-triggers keyframe requests.
-                                    for _ in 0..30 {
-                                        if channel.buffered_amount().await
-                                            <= 128 * 1024
-                                        {
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(1))
-                                            .await;
-                                    }
-                                    if let Err(error) =
-                                        channel.send(&Bytes::from(msg)).await
-                                    {
-                                        tracing::warn!(%error, "video data channel send failed");
-                                        dc_backed_up = true;
+                    // [u32 seq][u8 flags][annex-b au]; the viewer drops
+                    // post-gap deltas and asks for a keyframe on "KF".
+                    // Keyframes go over the reliable channel: they are
+                    // large and cannot survive partial reliability.
+                    let is_idr = au_contains_idr(&sample.data);
+                    // SCTP caps a message at ~64KiB, so large AUs are
+                    // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
+                    const CHUNK: usize = 48 * 1024;
+                    let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
+                    if is_idr {
+                        tracing::info!(
+                            dc_skips,
+                            "video data channel sending IDR seq={dc_seq} parts={parts}"
+                        );
+                    }
+                    let seq = dc_seq;
+                    dc_seq = dc_seq.wrapping_add(1);
+                    let sent_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default();
+                    // Messages are built even without an attached viewer so the
+                    // replay window stays warm for the next attach.
+                    let mut messages = Vec::with_capacity(parts as usize);
+                    for part in 0..parts {
+                        let start = part as usize * CHUNK;
+                        let end = (start + CHUNK).min(sample.data.len());
+                        let mut msg = Vec::with_capacity(end - start + 17);
+                        msg.extend_from_slice(&seq.to_le_bytes());
+                        msg.push(u8::from(is_idr));
+                        msg.extend_from_slice(&part.to_le_bytes());
+                        msg.extend_from_slice(&parts.to_le_bytes());
+                        msg.extend_from_slice(&sent_ms.to_le_bytes());
+                        msg.extend_from_slice(&sample.data[start..end]);
+                        video_data_channel
+                            .replay
+                            .lock()
+                            .unwrap()
+                            .push(is_idr, part, parts, &msg);
+                        messages.push(msg);
+                    }
+                    let target = if is_idr {
+                        idr_channel.as_ref().or(video_channel.as_ref())
+                    } else {
+                        video_channel.as_ref()
+                    };
+                    if let Some(channel) = target {
+                        for msg in messages {
+                            if is_idr {
+                                // Pace IDR parts: bursting ~150KB into the
+                                // association starves the congestion window
+                                // and drops deltas on the sibling channel,
+                                // which re-triggers keyframe requests.
+                                for _ in 0..30 {
+                                    if channel.buffered_amount().await <= 128 * 1024 {
                                         break;
                                     }
-                                    dc_backed_up = false;
-                                } else if channel.buffered_amount().await <= 64 * 1024
-                                {
-                                    if let Err(error) =
-                                        channel.send(&Bytes::from(msg)).await
-                                    {
-                                        tracing::warn!(%error, "video data channel send failed");
-                                        dc_backed_up = true;
-                                        break;
-                                    }
-                                    dc_backed_up = false;
-                                } else {
-                                    dc_skips += 1;
-                                    if !dc_backed_up {
-                                        dc_backed_up = true;
-                                        delivery_recovery.send_modify(|generation| {
-                                            *generation = generation.wrapping_add(1);
-                                        });
-                                    }
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                                if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                    tracing::warn!(%error, "video data channel send failed");
+                                    dc_backed_up = true;
                                     break;
                                 }
+                                dc_backed_up = false;
+                            } else if channel.buffered_amount().await <= 64 * 1024 {
+                                if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                    tracing::warn!(%error, "video data channel send failed");
+                                    dc_backed_up = true;
+                                    break;
+                                }
+                                dc_backed_up = false;
+                            } else {
+                                dc_skips += 1;
+                                if !dc_backed_up {
+                                    dc_backed_up = true;
+                                    delivery_recovery.send_modify(|generation| {
+                                        *generation = generation.wrapping_add(1);
+                                    });
+                                }
+                                break;
                             }
                         }
                     } else if dc_backed_up {

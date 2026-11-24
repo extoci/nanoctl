@@ -135,6 +135,22 @@ is idle). Agent-side proactive IDR on channel open was tried and reverted:
 it raced the viewer's own KF and emitted a duplicate ~150KB IDR that
 congested SCTP (+30-50ms joinMs).
 
+**Stream replay (ships).** The writer keeps a process-global, ~4MB replay
+window of the last complete keyframe plus every delta after it. A 5ms
+attach poll snapshots it and replays the tail over the reliable channel —
+ordered delivery is required, an unordered delta outrunning the keyframe
+makes the viewer drop it as "late" — with seq renumbered into the live
+stream. The attach-time `KF` is swallowed for 1s after a served replay so
+no duplicate IDR follows.
+
+| variant                           | joinMs (n=3)    |
+| --------------------------------- | --------------- |
+| cold attach (empty replay window) | ~127            |
+| **reattach (replayed tail)**      | **10.5 / 16.4** |
+
+~8x faster rejoins. The first-ever attach still waits for a fresh IDR
+because nothing has been encoded yet.
+
 ## Delivered fps under motion (`__dcv` counters, 30s windows)
 
 End-to-end decode delivery while the scrolling checkerboard covers the

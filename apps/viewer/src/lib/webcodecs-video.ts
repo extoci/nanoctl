@@ -321,6 +321,7 @@ export function attachDataChannelVideo(
   const joinAt = performance.now();
   dbg.joinAt = joinAt;
   delete dbg.joinMs;
+  delete dbg.firstMsgMs;
   // Ask for a keyframe immediately: without it the request only goes out
   // after the first delta arrives, and an idle producer can delay that.
   if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {
@@ -341,6 +342,9 @@ export function attachDataChannelVideo(
         return;
       }
       dbg.msgs = (dbg.msgs as number) + 1;
+      if (dbg.firstMsgMs === undefined) {
+        dbg.firstMsgMs = performance.now() - joinAt;
+      }
       const seq = data[0]! | (data[1]! << 8) | (data[2]! << 16) | (data[3]! << 24);
       const isKey = (data[4]! & 1) !== 0;
       const part = data[5]! | (data[6]! << 8);
