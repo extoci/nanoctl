@@ -2346,7 +2346,7 @@ pub fn prime_replay(
         msg.extend_from_slice(&parts.to_le_bytes());
         msg.extend_from_slice(&sent_ms.to_le_bytes());
         msg.extend_from_slice(&frame.bytes[start..end]);
-        messages.push(msg);
+        messages.push(Bytes::from(msg));
     }
     replay.lock().unwrap().seed(messages);
     Ok(())
@@ -2659,7 +2659,7 @@ pub fn spawn_video(
         let mut dc_seq = 0_u32;
         let mut dc_kf_seen = 0_u64;
         let mut dc_had_channel = false;
-        let mut dc_replay: Option<std::collections::VecDeque<Vec<u8>>> = None;
+        let mut dc_replay: Option<std::collections::VecDeque<Bytes>> = None;
         let mut dc_replay_served: Option<Instant> = None;
         let mut replay_last_orig: Option<u32> = None;
         let mut replay_last_new = 0_u32;
@@ -2702,7 +2702,7 @@ pub fn spawn_video(
                     }
                     dc_had_channel = has_channel;
                     if let Some(queue) = dc_replay.as_mut() {
-                        while let Some(mut msg) = queue.pop_front() {
+                        while let Some(msg) = queue.pop_front() {
                             // Everything replays on the reliable channel: the
                             // tail must arrive in order — an unordered delta
                             // outrunning its keyframe makes the viewer drop
@@ -2733,13 +2733,18 @@ pub fn spawn_video(
                                 replay_last_new = allocated;
                                 allocated
                             };
-                            msg[0..4].copy_from_slice(&new_seq.to_le_bytes());
+                            // Replay is the rare path, so only here pay for a
+                            // mutable copy with a renumbered/restamped header;
+                            // steady-state replay buffering shares the live
+                            // message allocation instead of copying it.
+                            let mut replay_msg = msg.to_vec();
+                            replay_msg[0..4].copy_from_slice(&new_seq.to_le_bytes());
                             let replay_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or_default();
-                            msg[9..17].copy_from_slice(&replay_ms.to_le_bytes());
-                            if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                            replay_msg[9..17].copy_from_slice(&replay_ms.to_le_bytes());
+                            if let Err(error) = channel.send(&Bytes::from(replay_msg)).await {
                                 tracing::warn!(%error, "video data channel replay failed");
                                 queue.clear();
                                 break;
@@ -2842,11 +2847,12 @@ pub fn spawn_video(
                         msg.extend_from_slice(&parts.to_le_bytes());
                         msg.extend_from_slice(&sent_ms.to_le_bytes());
                         msg.extend_from_slice(&sample.data[start..end]);
+                        let msg = Bytes::from(msg);
                         video_data_channel
                             .replay
                             .lock()
                             .unwrap()
-                            .push(is_idr, part, parts, &msg);
+                            .push(is_idr, part, parts, msg.clone());
                         messages.push(msg);
                     }
                     let target = if is_idr {
@@ -2868,14 +2874,14 @@ pub fn spawn_video(
                                     }
                                     tokio::time::sleep(Duration::from_millis(1)).await;
                                 }
-                                if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                if let Err(error) = channel.send(&msg).await {
                                     tracing::warn!(%error, "video data channel send failed");
                                     dc_backed_up = true;
                                     break;
                                 }
                                 dc_backed_up = false;
                             } else if channel.buffered_amount().await <= 64 * 1024 {
-                                if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                if let Err(error) = channel.send(&msg).await {
                                     tracing::warn!(%error, "video data channel send failed");
                                     dc_backed_up = true;
                                     break;
