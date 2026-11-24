@@ -881,6 +881,19 @@ impl CaptureEncoder {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("captured display dimensions must be non-zero and even");
         }
+        #[cfg(target_os = "windows")]
+        {
+            static DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if let Ok(path) = std::env::var("NANOCTL_DUMP_FRAME") {
+                if !path.is_empty() {
+                    let n = DUMPED.fetch_add(1, Ordering::Relaxed);
+                    if n < 3 {
+                        let p = path.replace(".png", &format!("{n}.png"));
+                        let _ = image.save(&p);
+                    }
+                }
+            }
+        }
         let encode_started = Instant::now();
         self.latest_frame.stats.preprocess_ns.fetch_add(
             encode_started.duration_since(preprocess_started).as_nanos() as u64,
@@ -1473,9 +1486,15 @@ fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<Started
 // Slice-parallel OpenH264: encode latency dominates the software path, and
 // frame latency matters more than the last few percent of compression here.
 fn encode_threads() -> u16 {
-    std::thread::available_parallelism()
-        .map(|n| n.get().min(4) as u16)
-        .unwrap_or(2)
+    std::env::var("NANOCTL_ENCODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|n| (1..=16).contains(n))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(4) as u16)
+                .unwrap_or(2)
+        })
 }
 
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
@@ -1883,6 +1902,13 @@ pub struct MediaSmokeReport {
     pub psnr_p50_db: Option<f64>,
     pub psnr_p05_db: Option<f64>,
     pub psnr_decoded_frames: u64,
+    /// Pulls that delivered a newly captured frame (vs a cached one) —
+    /// detects capture-pipeline stalls that flat AU sizes alone hide.
+    pub fresh_frames: u64,
+    /// Access-unit size percentiles (bytes) — exposes stale/delta collapse
+    /// that the bitrate average hides.
+    pub au_p50_bytes: u64,
+    pub au_max_bytes: u64,
     pub width: u32,
     pub height: u32,
     pub idr_frames: u64,
@@ -1980,6 +2006,8 @@ pub fn run_smoke(
     let mut sps_units = 0_u64;
     let mut pps_units = 0_u64;
     let mut dimensions = (0_u32, 0_u32);
+    let mut fresh_frames = 0_u64;
+    let mut au_sizes: Vec<u64> = Vec::new();
     let mut timing_samples = TimingSamples::default();
     while Instant::now() < deadline {
         let now = Instant::now();
@@ -1989,6 +2017,9 @@ pub fn run_smoke(
         next_frame = Instant::now() + frame_interval;
         let (frame, timing, fresh) =
             encoder.next_access_unit_with_timings(quality.max_width, quality.max_height)?;
+        if fresh {
+            fresh_frames += 1;
+        }
         timing_samples.observe(timing, fresh);
         if frame.bytes.is_empty() {
             continue;
@@ -2002,6 +2033,9 @@ pub fn run_smoke(
         encoded_bytes = encoded_bytes
             .checked_add(frame.bytes.len() as u64)
             .context("encoded byte counter overflow")?;
+        if au_sizes.len() < MAX_TIMING_SAMPLES {
+            au_sizes.push(frame.bytes.len() as u64);
+        }
         frames += 1;
         if dimensions == (0, 0) {
             dimensions = (frame.width, frame.height);
@@ -2054,6 +2088,12 @@ pub fn run_smoke(
             .as_ref()
             .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.05))),
         psnr_decoded_frames: psnr.map_or(0, |(d, _)| d),
+        fresh_frames,
+        au_p50_bytes: percentile_f64(
+            &au_sizes.iter().map(|size| *size as f64).collect::<Vec<_>>(),
+            0.50,
+        ) as u64,
+        au_max_bytes: au_sizes.iter().copied().max().unwrap_or(0),
         width: dimensions.0,
         height: dimensions.1,
         idr_frames,

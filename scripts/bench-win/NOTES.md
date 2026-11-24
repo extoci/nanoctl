@@ -254,3 +254,30 @@ microbench: 1103µs → 189µs/frame (−83%). media-smoke encode p50
 5.43→4.07ms (−25%), capture_to_encode 13.1→11.79ms. Bit-exact test
 relaxed to ±1 LSB — SIMD rounds chroma slightly differently; PSNR
 unchanged (45.9dB).
+
+## Motion-scene fidelity + worst-case encode (cycle 11)
+
+The ~330-900kbps media-smoke numbers seen under the scrolling
+checkerboard were NOT a capture bug — they are correct encoder output.
+AU-size instrumentation (`au_p50_bytes`/`au_max_bytes`, plus
+`fresh_frames` counting new-vs-cached pulls) and frame dumps
+(`NANOCTL_DUMP_FRAME=<path>` env on Windows) show:
+
+- 4px/tick uniform BitBlt scroll: ~650B deltas — OpenH264 ME codes the
+  whole zone as P_SKIP + one motion vector. Encoder doing its job.
+- Random flat 64px cells: ~1.1KB deltas — flat MBs code cheap.
+- Full-zone black<->white flash (`benchwin band --flash`): ~4.7KB deltas.
+- Per-pixel random noise (`benchwin band --noise`, two alternating DIB
+  fields): au_p50 44KB, **20.1 Mbps**, encode p50 **16.5ms**, p95 24ms —
+  the honest worst case; the 24 Mbps cap and the 60fps budget both bind.
+  Threads 4/6/8 identical (16.4-16.5ms) — CAVLC entropy coding is the
+  serial wall; slice-parallelism does not scale there.
+  `NANOCTL_ENCODE_THREADS=N` env overrides the encoder thread count for
+  future A/Bs; default stays 4.
+
+benchwin extras: `band --flash`/`--noise` scenes, `grab <png>` (WGC
+single-shot), `recgrab N` (stream-recorder content hashes + a PNG) —
+probes used to prove capture sees what the screen shows.
+Viewer: `__dcv` now exposes decode (submit->output) and present
+(output->composited rVFC) sums/max via `decodeSum/N/Max` and
+`presentSum/N/Max`.

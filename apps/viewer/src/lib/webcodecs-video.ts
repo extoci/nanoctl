@@ -120,6 +120,43 @@ function createVideoSink(
   let decoder: VideoDecoder | null = null;
   let decoded = 0;
   let dropped = 0;
+  // Decode latency probe: chunk timestampUs -> performance.now() at decode().
+  const decodeSubmit = new Map<number, number>();
+  // Present latency probe: decoder-output times keyed by frame timestamp.
+  // A track-generator video element reports mediaTime as seconds since the
+  // first frame, so firstOutTs + mediaTime*1e6 maps back to frame.timestamp.
+  const decodeOutput = new Map<number, number>();
+  let firstOutTs: number | undefined;
+  const armPresentProbe = () => {
+    if (typeof (video as { requestVideoFrameCallback?: unknown })
+        .requestVideoFrameCallback !== "function") {
+      return;
+    }
+    const onFrame = (now: number, meta: { mediaTime?: number }) => {
+      const dbg = ((window as unknown as { __dcv?: Record<string, unknown> })
+        .__dcv ??= {});
+      if (firstOutTs !== undefined && meta.mediaTime !== undefined) {
+        const stamp = firstOutTs + Math.round(meta.mediaTime * 1e6);
+        const out = decodeOutput.get(stamp);
+        if (out !== undefined) {
+          decodeOutput.delete(stamp);
+          const ms = now - out;
+          dbg.presentSum = ((dbg.presentSum as number) ?? 0) + ms;
+          dbg.presentN = ((dbg.presentN as number) ?? 0) + 1;
+          dbg.presentMax = Math.max((dbg.presentMax as number) ?? 0, ms);
+        }
+      }
+      if (!closed) {
+        (video as HTMLVideoElement & {
+          requestVideoFrameCallback: (cb: typeof onFrame) => void;
+        }).requestVideoFrameCallback(onFrame);
+      }
+    };
+    (video as HTMLVideoElement & {
+      requestVideoFrameCallback: (cb: typeof onFrame) => void;
+    }).requestVideoFrameCallback(onFrame);
+  };
+  armPresentProbe();
 
   const ensureDecoder = (annexB: Uint8Array) => {
     if (decoder || typeof VideoDecoder !== "function") return;
@@ -140,6 +177,22 @@ function createVideoSink(
         const dbg = (window as unknown as { __dcv?: Record<string, unknown> }).__dcv;
         if (dbg && joinAt !== undefined && dbg.firstDecodeMs === undefined) {
           dbg.firstDecodeMs = performance.now() - joinAt;
+        }
+        const submit = decodeSubmit.get(frame.timestamp);
+        if (submit !== undefined) {
+          decodeSubmit.delete(frame.timestamp);
+          const ms = performance.now() - submit;
+          if (dbg) {
+            dbg.decodeSum = ((dbg.decodeSum as number) ?? 0) + ms;
+            dbg.decodeN = ((dbg.decodeN as number) ?? 0) + 1;
+            dbg.decodeMax = Math.max((dbg.decodeMax as number) ?? 0, ms);
+          }
+        }
+        if (decodeSubmit.size > 64) decodeSubmit.clear();
+        if (firstOutTs === undefined) firstOutTs = frame.timestamp;
+        decodeOutput.set(frame.timestamp, performance.now());
+        if (decodeOutput.size > 256) {
+          decodeOutput.delete(decodeOutput.keys().next().value!);
         }
         if (writer) {
           decoded += 1;
@@ -240,6 +293,7 @@ function createVideoSink(
       return;
     }
     try {
+      decodeSubmit.set(timestampUs, performance.now());
       decoder.decode(
         new EncodedVideoChunk({
           type: isKey ? "key" : "delta",

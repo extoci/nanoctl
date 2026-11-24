@@ -282,6 +282,8 @@ static mut SEQ: u16 = 0;
 static mut INPUT_COUNT: u8 = 0;
 static mut TICK: u32 = 0;
 static mut MOTION: bool = false;
+static mut NOISE: bool = false;
+static mut FLASH: bool = false;
 static mut CLOCK_MODE: bool = false;
 
 fn clock_ms() -> u16 {
@@ -322,7 +324,78 @@ unsafe fn band_paint_dc(hwnd: HWND, dc: HDC) {
     cell.left = w - guard;
     cell.right = w;
     FillRect(dc, &cell, magenta);
-    if MOTION && h > 56 {
+    if FLASH && h > 56 {
+        // Whole-zone black↔white flash per tick — impossible for the encoder
+        // to motion-compensate; isolates "capture didn't see motion" from
+        // "encoder compressed motion to nothing".
+        let y0 = top + mh + 4;
+        let zone = RECT {
+            left: 0,
+            top: y0,
+            right: w,
+            bottom: h,
+        };
+        FillRect(dc, &zone, if TICK & 1 == 0 { black } else { white });
+    } else if NOISE && h > 56 {
+        // Per-pixel random noise, alternating two pre-generated DIBs each
+        // tick. Flat-color cells compress to ~1KB/AU (flat MBs); pixel-level
+        // noise cannot be motion-compensated or intra-predicted — the honest
+        // worst case for encode size and encode time.
+        let y0 = top + mh + 4;
+        let zone_w = w;
+        let zone_h = h - y0;
+        static mut NOISE_BITS: Option<Vec<Vec<u8>>> = None;
+        static mut NOISE_WH: (i32, i32) = (0, 0);
+        if NOISE_BITS.is_none() || NOISE_WH != (zone_w, zone_h) {
+            let mut fields = Vec::with_capacity(2);
+            for t in 0..2u64 {
+                let mut seed = 0x9E3779B97F4A7C15u64 ^ (t + 1);
+                let mut px = vec![0u8; (zone_w * zone_h * 3).max(0) as usize];
+                for chunk in px.chunks_mut(8) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    chunk.copy_from_slice(&seed.to_le_bytes()[..chunk.len()]);
+                }
+                fields.push(px);
+            }
+            NOISE_BITS = Some(fields);
+            NOISE_WH = (zone_w, zone_h);
+        }
+        let fields = NOISE_BITS.as_ref().unwrap();
+        let px = &fields[(TICK & 1) as usize];
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: zone_w,
+                biHeight: -zone_h, // top-down
+                biPlanes: 1,
+                biBitCount: 24,
+                biCompression: 0, // BI_RGB
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            ..Default::default()
+        };
+        let _ = StretchDIBits(
+            dc,
+            0,
+            y0,
+            zone_w,
+            zone_h,
+            0,
+            0,
+            zone_w,
+            zone_h,
+            Some(px.as_ptr() as *const _),
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    } else if MOTION && h > 56 {
         // Gaming-like motion: 16px checkerboard scrolled right 4px per paint
         // tick — uniform translation that motion estimation should predict,
         // so P-frames stay cheap only if ME actually works. The pattern is
@@ -337,6 +410,10 @@ unsafe fn band_paint_dc(hwnd: HWND, dc: HDC) {
         if TILE_BMP.is_none() || TILE_WH != (span, h - y0 + 64) {
             let mem = CreateCompatibleDC(Some(dc));
             let bmp = CreateCompatibleBitmap(dc, span, h - y0 + 64);
+            // Select the bitmap into the memory DC *before* filling it —
+            // otherwise the checkerboard lands on the DC's default 1x1
+            // bitmap and the blit below copies a blank surface.
+            let _stock = SelectObject(mem, bmp.into());
             let black = CreateSolidBrush(COLORREF(0));
             let white = CreateSolidBrush(COLORREF(0x00FFFFFF));
             let mut yy = 0i32;
@@ -432,6 +509,8 @@ fn cmd_band(args: &[String]) -> i32 {
     let toolwindow = !args.iter().any(|a| a == "--no-toolwindow");
     unsafe {
         MOTION = args.iter().any(|a| a == "--motion");
+        NOISE = args.iter().any(|a| a == "--noise");
+        FLASH = args.iter().any(|a| a == "--flash");
         CLOCK_MODE = args.iter().any(|a| a == "--clock");
     }
     let seconds = arg_int(args, "--seconds", 0);
@@ -815,6 +894,28 @@ fn main() {
             }
             0
         }
+        "grab" => {
+            let path = args.get(1).map(String::as_str).unwrap_or("grab.png");
+            match cmd_wgc_frame(path) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+        "recgrab" => {
+            // Pull one frame through the streaming recorder (the same path
+            // media-smoke uses) so capture-pipeline staleness is visible.
+            let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(5);
+            match cmd_wgc_recorder(n) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
         other => {
             eprintln!("unknown: {other}");
             2
@@ -823,8 +924,46 @@ fn main() {
     std::process::exit(code);
 }
 
-#[cfg(feature = "xcap-test")]
-fn _unused() {}
+fn cmd_wgc_recorder(n: u32) -> Result<(), String> {
+    use xcap::Monitor;
+    let monitors = Monitor::all().map_err(|e| e.to_string())?;
+    let m = monitors
+        .into_iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .ok_or("no monitor")?;
+    let (recorder, rx) = m.video_recorder().map_err(|e| e.to_string())?;
+    recorder.start().map_err(|e| e.to_string())?;
+    let mut hashes = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while hashes.len() < n as usize && std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(frame) => {
+                // Fingerprint only the checkerboard zone (below the 56px
+                // marker row), so marker updates alone can't explain changes.
+                let row_bytes = frame.width as usize * 4;
+                let start = row_bytes * 56;
+                let mut h: u64 = 1469598103934665603;
+                for (i, b) in frame.raw.iter().enumerate().skip(start) {
+                    if i % 97 == 0 {
+                        h = (h ^ u64::from(*b)).wrapping_mul(1099511628211);
+                    }
+                }
+                hashes.push(h);
+                if hashes.len() == 4 {
+                    if let Some(img) =
+                        image::RgbaImage::from_raw(frame.width, frame.height, frame.raw.clone())
+                    {
+                        let _ = img.save("C:\\Users\\Administrator\\bench\\recframe.png");
+                    }
+                }
+            }
+            Err(_) => hashes.push(0),
+        }
+    }
+    recorder.stop().map_err(|e| e.to_string())?;
+    println!("{:?}", hashes);
+    Ok(())
+}
 
 fn cmd_wgc_frame(path: &str) -> Result<(), String> {
     use xcap::Monitor;
