@@ -126,7 +126,9 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     p.vui.i_colmatrix = 6;
     p.vui.i_chroma_loc = 1;
     p.i_log_level = X264_LOG_WARNING;
-    if (context->param_apply_profile(&p, "baseline") < 0) goto fail;
+    const char *profile = getenv("NANOCTL_X264_PROFILE");
+    if (!profile || !profile[0]) profile = "baseline";
+    if (context->param_apply_profile(&p, profile) < 0) goto fail;
     context->encoder = context->encoder_open(&p);
     if (!context->encoder) goto fail;
     return context;

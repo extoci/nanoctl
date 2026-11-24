@@ -398,3 +398,22 @@ Live motion stream (~32fps delivered, 1600x1200), whole-process sums:
 MediaStreamTrackGenerator compositing is nearly free); 3x RSS — the
 browser tax a native client would erase. In-stream path under motion:
 transit 1.5ms, decode 1.16ms, present 12.4ms, 0 gaps/drops.
+
+## x264 profile sweep: baseline vs main/high (cycle 18)
+
+`NANOCTL_X264_PROFILE` env knob added (default `baseline`, i.e.
+CAVLC). CABAC profiles win big on realistic content but lose under
+worst-case noise:
+
+| scene  | profile            | kbps       | fps       | encode p50 | PSNR p50 |
+| ------ | ------------------ | ---------- | --------- | ---------- | -------- |
+| motion | baseline (default) | 235        | ~57       | 4.8ms      | 57.4dB   |
+| motion | high               | 170 (-28%) | 57.9      | 5.0ms      | 57.6dB   |
+| noise  | baseline           | 10,800     | 54.8      | 10.4ms     | 24.3dB   |
+| noise  | high               | 7,149      | 35.8 FAIL | ~14ms      | 24.2dB   |
+| noise  | main               | 7,440      | 37.3 FAIL | -          | 24.2dB   |
+| noise  | high+superfast     | 8,373      | 43.0 FAIL | -          | 24.1dB   |
+
+CABAC entropy coding under per-pixel noise costs ~35-40% fps even at
+superfast - unacceptable for particle-heavy game content, so baseline
+stays default. `-28%` bits available via env on CABAC-capable content.
