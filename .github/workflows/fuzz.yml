@@ -18,6 +18,7 @@ concurrency:
 jobs:
   update-envelope:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
@@ -33,7 +34,7 @@ jobs:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
       - name: Install pinned cargo-fuzz
-        run: cargo install --locked cargo-fuzz --version 0.13.2 --force
+        run: cargo install --locked --force cargo-fuzz --version 0.13.2
       - name: Fuzz signed update envelope parser
         working-directory: crates/nanoctl-agent
         env:

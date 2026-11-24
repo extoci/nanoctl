@@ -19,6 +19,7 @@ env:
 jobs:
   viewer:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -44,11 +45,12 @@ jobs:
       - run: bun run audit
 
   agent:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -76,11 +78,12 @@ jobs:
       - run: cargo test --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-check:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -137,8 +140,9 @@ jobs:
           }
 
   agent-media-linux:
-    # Match Linux release builds; cros-libva 0.0.12 does not compile with libva 2.23+.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Match Linux release builds; cros-libva 0.0.12 does not compile with libva 2.23+.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -163,6 +167,7 @@ jobs:
   agent-x264-linux:
     # GPL opt-in only; default/release jobs deliberately do not enable this feature.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -187,6 +192,7 @@ jobs:
 
   agent-x264-check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -212,6 +218,7 @@ jobs:
 
   agent-x264-package:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "64"
       CARGO_PROFILE_RELEASE_LTO: "false"
@@ -238,11 +245,12 @@ jobs:
       - run: cargo build --release --locked --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -270,11 +278,12 @@ jobs:
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-check:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -308,6 +317,8 @@ jobs:
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
 
   agent-media-package:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     # Master release candidates own the only exact-profile release build. This job keeps
     # optimized media packaging covered on PRs and non-release branches with a faster
     # release profile (more codegen units, no LTO) so it does not dominate CI time.
@@ -316,7 +327,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
-    runs-on: ${{ matrix.os }}
     env:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "64"
       CARGO_PROFILE_RELEASE_LTO: "false"
@@ -385,6 +395,7 @@ jobs:
             architecture: arm64
             binary: nanoctl.exe
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -446,6 +457,7 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
