@@ -724,3 +724,26 @@ The hello already carries the host info, so the serialized `/v1/info` fetch
 cost exactly one RTT on every connect and reconnect. It still runs (its 403
 body is the only verbatim refusal explanation): a socket that fails before
 hello waits for its outcome before retrying.
+
+## DXGI dirty-rect capture (cycle 37)
+
+Replaced the xcap DDAPI recorder (full-texture readback + full-frame memcmp
+every composite) with a custom `IDXGIOutputDuplication` path that honors
+`GetFrameDirtyRects`/`GetFrameMoveRects`: only dirty regions are copied
+GPU→staging→CPU, frames emit only when the desktop actually presented
+changes, and `backend_changed` carries the backend's own change verdict so
+the producer skips the full-frame memcmp entirely. `NANOCTL_DXGI_CAPTURE=0`
+restores the xcap path.
+
+A-B, same `band --clock` scene, adapt pinned off (single nanoctl proc):
+
+|               | xcap path      | DXGI dirty-rect |
+| ------------- | -------------- | --------------- |
+| Agent CPU     | 10.9%          | **6.1% (−44%)** |
+| fps / bitrate | 58.2 / 106kbps | 58.0 / 101kbps  |
+
+Worst case (`band --noise`, full-screen dirty every frame): 58.2fps /
+19.4Mbps / tier 0 — no regression vs the xcap path. Remaining known cost:
+`accum` still clones ~7.7MB per emit (~1% CPU); a generation-tracked buffer
+recycle could reclaim it later. On a real GPU box the compositor path is the
+same API — dirty rects should help even more where present rates are 144Hz+.

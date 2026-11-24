@@ -46,6 +46,10 @@ pub(crate) mod trace;
 #[path = "macos_capture.rs"]
 mod macos_capture;
 
+#[cfg(target_os = "windows")]
+#[path = "media_dxgi.rs"]
+mod media_dxgi;
+
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
 use crate::codec::{VideoCodec, is_keyframe};
 use crate::config::QualityConfig;
@@ -281,24 +285,37 @@ struct LatestFrame {
 struct CapturedFrame {
     frame: xcap::Frame,
     captured_at: Instant,
+    /// `Some(true)`/`Some(false)` when the capture backend itself knows whether
+    /// the pixels changed (e.g. DXGI dirty rects) — the expensive full-frame
+    /// memcmp is then skipped. `None` falls back to byte comparison.
+    backend_changed: Option<bool>,
 }
 
 impl CapturedFrame {
     fn differs_from(&self, previous: &Self) -> bool {
-        self.frame.width != previous.frame.width
-            || self.frame.height != previous.frame.height
-            || frame_changed(&previous.frame.raw, &self.frame.raw)
+        if self.frame.width != previous.frame.width || self.frame.height != previous.frame.height {
+            return true;
+        }
+        if let Some(changed) = self.backend_changed {
+            return changed;
+        }
+        frame_changed(&previous.frame.raw, &self.frame.raw)
     }
 }
 
 impl LatestFrame {
     fn replace(&self, frame: xcap::Frame) -> bool {
+        self.replace_hint(frame, None)
+    }
+
+    fn replace_hint(&self, frame: xcap::Frame, backend_changed: Option<bool>) -> bool {
         let Ok(mut slot) = self.slot.lock() else {
             return false;
         };
         let captured = Arc::new(CapturedFrame {
             frame,
             captured_at: Instant::now(),
+            backend_changed,
         });
         if let Ok(mut last) = self.last.lock() {
             *last = Some(captured.clone());
@@ -839,7 +856,9 @@ impl CaptureEncoder {
         max_width: u32,
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
-        let CapturedFrame { frame, captured_at } = captured;
+        let CapturedFrame {
+            frame, captured_at, ..
+        } = captured;
         #[cfg(target_os = "linux")]
         let trace_started = trace::now();
         let preprocess_started = Instant::now();
@@ -1423,6 +1442,15 @@ type StartedCapture = (
 );
 
 fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<StartedCapture> {
+    #[cfg(target_os = "windows")]
+    if !std::env::var("NANOCTL_DXGI_CAPTURE").is_ok_and(|v| v == "0" || v == "false") {
+        match media_dxgi::start(monitor, stats.clone()) {
+            Ok((latest, thread)) => return Ok((None, latest, Some(thread))),
+            Err(error) => {
+                tracing::debug!(%error, "DXGI duplication unavailable; retaining continuous capture")
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     match linux_damage::start(monitor, stats.clone()) {
         Ok((latest, thread)) => return Ok((None, latest, Some(thread))),
@@ -3295,6 +3323,7 @@ mod tests {
         let previous = super::CapturedFrame {
             frame: xcap::Frame::new(2, 2, vec![0; 16]),
             captured_at: now,
+            backend_changed: None,
         };
         let mut next = previous.clone();
         next.captured_at += Duration::from_secs(1);
@@ -3484,6 +3513,7 @@ mod tests {
         let mut captured = super::CapturedFrame {
             frame: xcap::Frame::new(64, 64, vec![128; 64 * 64 * 4]),
             captured_at: Instant::now() - Duration::from_secs(10),
+            backend_changed: None,
         };
         let (frame, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
         assert!(!frame.bytes.is_empty());

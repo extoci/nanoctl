@@ -149,6 +149,12 @@ fast_image_resize = { version = "6.2", default-features = false, features = [
 ], optional = true }
 vigem-client = { version = "0.1.4", features = ["unstable_ds4"], optional = true }
 windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
   "Win32_System_Ole",
