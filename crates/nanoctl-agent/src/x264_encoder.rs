@@ -352,7 +352,7 @@ mod tests {
                 (p.bitrate, p.buffer_kbit),
                 (4_000, (4_000 * frames + 59) / 60)
             );
-            assert_eq!((p.rc_method, p.crf_milli, p.qp_max), (1, 12_000, 51));
+            assert_eq!((p.rc_method, p.crf_milli, p.qp_max), (1, 18_000, 51));
             assert_eq!((p.csp, p.threads), (2, 2));
             assert_eq!((p.bframes, p.lookahead, p.sync_lookahead), (0, 0, 0));
             assert_eq!((p.cabac, p.transform8x8), (0, 0));
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(p.bitrate, encoder.bitrate_kbps as i32);
         assert!(p.bitrate < 4_000);
         assert_eq!(p.buffer_kbit, (p.bitrate * 4 + 59) / 60);
-        assert_eq!((p.crf_milli, p.qp_max), (12_000, 51));
+        assert_eq!((p.crf_milli, p.qp_max), (18_000, 51));
         assert!(
             !encoder
                 .apply_bitrate_estimate(encoder.bitrate_kbps, 8_000)
