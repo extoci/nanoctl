@@ -208,6 +208,11 @@ describe("remote session lifecycle", () => {
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
     expect(controlChannel.sent).toEqual([]);
+    channel.sent = [];
+    expect(controller.sendControl({ type: "gamepad", pads: [] })).toBe(true);
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toEqual({ type: "gamepad", pads: [] });
+    expect(channel.sent).toEqual([]);
+    controlChannel.sent = [];
 
     peer.connectionState = "disconnected";
     peer.onconnectionstatechange?.();
