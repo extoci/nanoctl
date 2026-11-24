@@ -15,7 +15,7 @@ enum CodecPreference: String, CaseIterable {
         switch self {
         case .auto: return "Auto"
         case .hevc: return "HEVC"
-        case .h264: return "H.264"
+        case .h264: return "H264"
         case .av1: return "AV1"
         }
     }
@@ -185,6 +185,7 @@ final class Session {
         old?.peer?.close()
         track = nil
         audioTrack = nil
+        statsLine = ""
         pixelMailbox.put(nil)
     }
 

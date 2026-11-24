@@ -1,9 +1,14 @@
-# nanoctl for iPhone (prototype)
+# nanoctl for iPhone
 
-The native viewer connects directly to an existing nanoctl agent. It receives H.264 over
-WebRTC and has basic touch pointer and gamepad input. It does not change the agent or
-the browser viewer. Audio, clipboard, display selection and automatic reconnect are not
-part of this prototype.
+The native viewer connects directly to an existing nanoctl agent. Video arrives over
+unordered/reliable WebRTC data channels (`nanoctl.video.v1`, `nanoctl.video-idr.v1`)
+and is hardware-decoded by VideoToolbox into Metal — bypassing the RTP jitter buffer
+for lower glass-to-glass latency. H.264 and HEVC take this path; other codecs (e.g.
+AV1) fall back to the classic RTP track decoded by libwebrtc. The app also handles
+Opus audio + mute, clipboard sync, display selection, touch/pointer, keyboard and
+gamepad input, ping keepalive, a stats overlay, and automatic reconnect. See
+`docs/PROTOCOL.md` for the wire format and the `video-transport`/`link-stats`
+control messages the agent understands.
 
 ## Build and connect
 

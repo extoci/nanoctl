@@ -163,6 +163,9 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         codec.selectedSegmentIndex = CodecPreference.allCases.firstIndex(of: desktop.session.codecPreference) ?? 0
         codec.addTarget(self, action: #selector(codecChanged), for: .valueChanged)
         codec.accessibilityLabel = "Video codec"
+        codec.apportionsSegmentWidthsByContent = true
+        codec.setContentCompressionResistancePriority(.required, for: .horizontal)
+        codec.setContentHuggingPriority(.required, for: .horizontal)
 
         audio.configuration = .tinted()
         audio.setTitle("Audio", for: .normal)
@@ -235,8 +238,9 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         toggle.setTitle(active ? "Disconnect" : "Connect", for: .normal)
         address.isEnabled = !active
         codec.isEnabled = !active
-        audio.isEnabled = session.host?.audioAvailable == true
-        audio.setTitle(session.audioEnabled ? "Audio: on" : "Audio: off", for: .normal)
+        let audioAvailable = session.host?.audioAvailable == true
+        audio.isEnabled = audioAvailable
+        audio.setTitle(audioAvailable ? (session.audioEnabled ? "Audio: on" : "Audio: off") : "Audio: n/a", for: .normal)
         let list = session.host?.displayList ?? []
         displays.isHidden = list.count < 2
         paste.isEnabled = session.host?.capabilities.clipboard == true
