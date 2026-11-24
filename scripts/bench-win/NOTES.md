@@ -504,3 +504,34 @@ runtime, not one static tuple. The sweeps define the policy table:
 - Debugging needed first: per-second time-series (fps/kbps/encode_ms)
   in media-smoke JSON + effective-param echo, so adaptation is
   observable and re-sweeps stay honest.
+
+## Adaptive encoder negotiation (cycle 24-25)
+
+Shipped: content-driven parameter negotiation for the x264 backend.
+`AdaptPolicy` (in `x264_encoder.rs`) watches per-frame encode_ns and AU
+bytes, promotes after ~150 easy frames under 30% encode budget / 50%
+VBV, demotes after ~20 stressed frames, drops straight to tier 0 on
+hard overload. Tier switches re-open the encoder (profile/ME can't
+reconfig) + force an IDR. Viewer `webcodecs-video.ts` re-configures
+the decoder when the in-band SPS profile changes between IDRs.
+Kill-switch: `NANOCTL_X264_ADAPT=0`; any env-pinned knob
+(PROFILE/ME/SUBME) is excluded from adaptation.
+
+| tier | params                   | when                  |
+| ---- | ------------------------ | --------------------- |
+| 0    | baseline / hex / subme 2 | default + stressed    |
+| 1    | + high (CABAC, 8x8)      | sustained easy window |
+| 2    | + umh                    | still easy at tier 1  |
+
+Measured (15s smokes; per-second tier in JSON makes it observable):
+
+- motion: promotes 0->1 @ ~4s, 1->2 @ ~7s, holds. Steady tier-2
+  seconds ~135kbps vs ~235 tier-0 (-42%), fps 58.2, encode p50
+  4.6ms, PSNR p05 56.5dB - same quality, ~2 extra IDRs total.
+- noise (worst case): stays tier 0, 0 switches, 55fps, 10.9Mbps,
+  encode p50 10.4ms - identical to the fixed baseline, zero
+  regression by construction (same params, EWMA overhead only).
+
+Observability: `x264_tier` per-second field + `x264_adapt_tier` /
+`x264_adapt_switches` top-level in smoke JSON; `tracing::info!` on
+every switch.
