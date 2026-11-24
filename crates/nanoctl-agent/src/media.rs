@@ -1872,6 +1872,17 @@ fn percentile_milliseconds(samples: &[u64], percentile: f64) -> f64 {
     samples[index.min(last)] as f64 / 1_000.0
 }
 
+/// Per-second smoke telemetry so transient stalls, adaptation swings and
+/// slow-start effects are visible in JSON instead of hiding in aggregates.
+#[derive(Debug, serde::Serialize)]
+pub struct SmokeSecond {
+    pub second: u64,
+    pub frames: u64,
+    pub bytes: u64,
+    pub encode_sum_milliseconds: f64,
+    pub encode_max_milliseconds: f64,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct MediaSmokeReport {
     pub schema_version: u8,
@@ -1914,6 +1925,9 @@ pub struct MediaSmokeReport {
     pub idr_frames: u64,
     pub sps_units: u64,
     pub pps_units: u64,
+    /// Per-second buckets: frames, bytes, and encode mean/max for that second.
+    /// Ordered by `second`; trailing partial second included.
+    pub per_second: Vec<SmokeSecond>,
 }
 
 impl MediaSmokeReport {
@@ -2009,6 +2023,12 @@ pub fn run_smoke(
     let mut fresh_frames = 0_u64;
     let mut au_sizes: Vec<u64> = Vec::new();
     let mut timing_samples = TimingSamples::default();
+    let mut per_second: Vec<SmokeSecond> = Vec::new();
+    let mut sec_index = started.elapsed().as_secs();
+    let mut sec_frames = 0_u64;
+    let mut sec_bytes = 0_u64;
+    let mut sec_encode_micros = 0_u128;
+    let mut sec_encode_max_micros = 0_u128;
     while Instant::now() < deadline {
         let now = Instant::now();
         if now < next_frame {
@@ -2020,10 +2040,28 @@ pub fn run_smoke(
         if fresh {
             fresh_frames += 1;
         }
+        sec_encode_micros += timing.encode.as_micros();
+        sec_encode_max_micros = sec_encode_max_micros.max(timing.encode.as_micros());
         timing_samples.observe(timing, fresh);
+        let second = started.elapsed().as_secs();
+        if second != sec_index {
+            per_second.push(SmokeSecond {
+                second: sec_index,
+                frames: sec_frames,
+                bytes: sec_bytes,
+                encode_sum_milliseconds: sec_encode_micros as f64 / 1_000.0,
+                encode_max_milliseconds: sec_encode_max_micros as f64 / 1_000.0,
+            });
+            sec_index = second;
+            sec_frames = 0;
+            sec_bytes = 0;
+            sec_encode_micros = 0;
+            sec_encode_max_micros = 0;
+        }
         if frame.bytes.is_empty() {
             continue;
         }
+        sec_bytes += frame.bytes.len() as u64;
         let nal_types = annex_b_nal_types(&frame.bytes)?;
         if nal_types.contains(&5) {
             idr_frames += 1;
@@ -2037,9 +2075,19 @@ pub fn run_smoke(
             au_sizes.push(frame.bytes.len() as u64);
         }
         frames += 1;
+        sec_frames += 1;
         if dimensions == (0, 0) {
             dimensions = (frame.width, frame.height);
         }
+    }
+    if sec_frames > 0 || sec_encode_micros > 0 {
+        per_second.push(SmokeSecond {
+            second: sec_index,
+            frames: sec_frames,
+            bytes: sec_bytes,
+            encode_sum_milliseconds: sec_encode_micros as f64 / 1_000.0,
+            encode_max_milliseconds: sec_encode_max_micros as f64 / 1_000.0,
+        });
     }
     let elapsed = started.elapsed();
     let elapsed_seconds = elapsed.as_secs_f64().max(f64::EPSILON);
@@ -2099,6 +2147,7 @@ pub fn run_smoke(
         idr_frames,
         sps_units,
         pps_units,
+        per_second,
     })
 }
 
