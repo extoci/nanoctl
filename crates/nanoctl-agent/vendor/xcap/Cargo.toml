@@ -51,34 +51,6 @@ wgc = [
 name = "xcap"
 path = "src/lib.rs"
 
-[[example]]
-name = "focused_window"
-path = "examples/focused_window.rs"
-
-[[example]]
-name = "monitor"
-path = "examples/monitor.rs"
-
-[[example]]
-name = "monitor_capture"
-path = "examples/monitor_capture.rs"
-
-[[example]]
-name = "monitor_record"
-path = "examples/monitor_record.rs"
-
-[[example]]
-name = "monitor_region_capture"
-path = "examples/monitor_region_capture.rs"
-
-[[example]]
-name = "window"
-path = "examples/window.rs"
-
-[[example]]
-name = "window_capture"
-path = "examples/window_capture.rs"
-
 [dependencies.image]
 version = "0.25"
 features = ["png"]
