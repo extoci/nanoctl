@@ -588,11 +588,16 @@ export class RemoteSessionController {
     this.codecPreferencesApplied = false;
     // Chrome only allows encoded streams before any RTP arrives, so the
     // transform must be created here — before negotiation — not in ontrack.
-    // The WebCodecs decode paths only handle Annex-B H.264; "auto" prefers
-    // AV1/HEVC, so gate both paths on an explicit H.264 codec choice.
+    // The WebCodecs decode paths only handle Annex-B H.264: an explicit
+    // H.264 choice engages them outright, and "auto" engages them only when
+    // the negotiated codec turns out to be H.264 (checked on the answer).
+    const h264Eligible =
+      this.options.codecChoice === undefined ||
+      this.options.codecChoice === "auto" ||
+      this.options.codecChoice === "h264";
     const receiver = this.videoTransceiver?.receiver as RTCRtpReceiver | undefined;
     this.pendingEncodedStreams =
-      this.options.codecChoice === "h264" && receiver && supportsWebCodecsVideo(receiver)
+      h264Eligible && receiver && supportsWebCodecsVideo(receiver)
         ? (createVideoEncodedStreams(receiver) as {
             readable: ReadableStream;
             writable: WritableStream;
@@ -606,24 +611,31 @@ export class RemoteSessionController {
       }
     };
     // True low-latency path: raw AUs over an unreliable data channel feed
-    // WebCodecs directly — no jitter buffer anywhere.
-    if (typeof VideoDecoder === "function" && this.options.codecChoice === "h264") {
+    // WebCodecs directly — no jitter buffer anywhere. The channels are
+    // created whenever the choice allows H.264, then kept only when the
+    // negotiated codec is H.264 — otherwise they close so the agent falls
+    // back to carrying the whole stream over RTP.
+    if (typeof VideoDecoder === "function" && h264Eligible) {
       const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
         ordered: false,
         maxRetransmits: 0,
       });
       const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
       videoChannel.onopen = () => {
-        if (this.isCurrent(lifecycle, peer)) {
-          // The data-channel path beats the jitter-buffered transform tap.
-          this.webCodecsVideo?.drop();
-          this.webCodecsVideo = attachDataChannelVideo(
-            videoChannel,
-            idrChannel,
-            this.options.video,
-            restoreRemoteVideo,
-          );
+        if (!this.isCurrent(lifecycle, peer)) return;
+        if (!negotiatedH264(peer)) {
+          videoChannel.close();
+          idrChannel.close();
+          return;
         }
+        // The data-channel path beats the jitter-buffered transform tap.
+        this.webCodecsVideo?.drop();
+        this.webCodecsVideo = attachDataChannelVideo(
+          videoChannel,
+          idrChannel,
+          this.options.video,
+          restoreRemoteVideo,
+        );
       };
     }
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
@@ -648,8 +660,9 @@ export class RemoteSessionController {
       const stream = streams[0] ?? new MediaStream([track]);
       this.remoteVideoStream = stream;
       // The transform tap sits behind Chrome's jitter buffer anyway, so
-      // only use it when the data-channel path did not attach.
-      if (this.pendingEncodedStreams && !this.webCodecsVideo) {
+      // only use it when the data-channel path did not attach — and only
+      // when the negotiated codec is H.264, which is all the tap decodes.
+      if (this.pendingEncodedStreams && !this.webCodecsVideo && negotiatedH264(peer)) {
         const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
         this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video, restoreRemoteVideo);
       }
@@ -1530,6 +1543,24 @@ export function createControllerEpoch(): string {
     return runtimeCrypto.randomUUID();
   }
   return `epoch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * True when the answer's video m-line resolves to H.264 — the codec the
+ * WebCodecs decode paths handle. Reads the first rtpmap in the video media
+ * section of the remote description; false when it is missing or unreadable
+ * (safe fallback: the RTP path keeps working untouched).
+ */
+function negotiatedH264(peer: RTCPeerConnection): boolean {
+  const sdp = peer.remoteDescription?.sdp;
+  if (!sdp) return false;
+  const start = sdp.indexOf("m=video");
+  if (start === -1) return false;
+  const videoSection = sdp.slice(start);
+  const end = videoSection.indexOf("\nm=", "m=video".length);
+  const section = end === -1 ? videoSection : videoSection.slice(0, end);
+  const codec = /a=rtpmap:\d+ ([A-Za-z0-9-]+)\//.exec(section)?.[1];
+  return codec?.toUpperCase() === "H264";
 }
 
 function statValue(stats: RTCStats | undefined, key: string): unknown {

@@ -618,6 +618,10 @@ impl HostPeer {
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
+            // The data-channel video path decodes Annex-B H.264 only; a viewer
+            // in "auto" may open the channels before negotiation decides the
+            // codec, so they are honoured solely when H.264 won.
+            let video_dc_codec_ok = negotiated.codec == crate::codec::VideoCodec::H264;
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let viewer_limits = viewer_limits_for_channel.clone();
@@ -625,6 +629,10 @@ impl HostPeer {
                 if channel.label() == "nanoctl.video.v1"
                     || channel.label() == "nanoctl.video-idr.v1"
                 {
+                    if !video_dc_codec_ok {
+                        tracing::info!("video data channel ignored: negotiated codec is not H.264");
+                        return Box::pin(async {});
+                    }
                     let is_idr = channel.label() == "nanoctl.video-idr.v1";
                     tracing::info!(idr = is_idr, "video data channel opened");
                     let slot = video_dc_for_channel.clone();
