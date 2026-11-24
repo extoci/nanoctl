@@ -2162,20 +2162,6 @@ pub(crate) async fn release_session_memory() {
     }
 }
 
-fn au_contains_idr(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 4 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            let nal_type = data[i + 3] & 0x1f;
-            if nal_type == 5 || nal_type == 7 {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
 /// Captures a single frame and encodes it as an IDR into the replay window so
 /// a viewer's very first attach is served a stream tail immediately instead
 /// of waiting for the new pipeline's first keyframe (~100ms cold). Runs on a
@@ -2260,6 +2246,7 @@ pub fn spawn_video(
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
     viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
+    video_transport: tokio::sync::watch::Receiver<crate::adaptive::VideoTransport>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
@@ -2696,7 +2683,7 @@ pub fn spawn_video(
                     }
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
-                    let is_idr = au_contains_idr(&sample.data);
+                    let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_live = video_channel.is_some();
                     if dc_live != dc_was_live {
                         dc_was_live = dc_live;

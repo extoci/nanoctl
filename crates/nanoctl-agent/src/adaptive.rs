@@ -72,6 +72,92 @@ impl ViewerLimits {
     }
 }
 
+/// Which video transports the viewer wants the host to write. `all` keeps the RTP track
+/// sending alongside the data-channel path; `data-channel` drops RTP once the
+/// `nanoctl.video.v1` / `nanoctl.video-idr.v1` channels are open, halving the payload
+/// bandwidth for viewers that decode the data channel directly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoTransport {
+    #[default]
+    All,
+    DataChannel,
+}
+
+impl VideoTransport {
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Envelope {
+            #[serde(rename = "type")]
+            kind: String,
+            prefer: Prefer,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum Prefer {
+            All,
+            DataChannel,
+        }
+        if !data
+            .windows(17)
+            .any(|window| window == b"\"video-transport\"")
+        {
+            return None;
+        }
+        let envelope: Envelope = serde_json::from_slice(data).ok()?;
+        (envelope.kind == "video-transport").then_some(match envelope.prefer {
+            Prefer::All => Self::All,
+            Prefer::DataChannel => Self::DataChannel,
+        })
+    }
+}
+
+/// A viewer-reported link measurement carried on the reliable control channel, used when
+/// the RTP video track is suppressed and no RTCP feedback exists. `rtt_ms` is the
+/// viewer's measured round-trip (e.g. control-channel ping) and `remb_kbps` the
+/// throughput it estimates the path sustains.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStats {
+    pub fraction_lost: f64,
+    pub rtt_ms: Option<f64>,
+    pub remb_kbps: Option<u32>,
+}
+
+impl LinkStats {
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(flatten)]
+            stats: LinkStats,
+        }
+        if !data.windows(12).any(|window| window == b"\"link-stats\"") {
+            return None;
+        }
+        let envelope: Envelope = serde_json::from_slice(data).ok()?;
+        (envelope.kind == "link-stats").then_some(envelope.stats)
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn sample(self) -> LinkSample {
+        let at = Instant::now();
+        LinkSample {
+            fraction_lost: self.fraction_lost,
+            rtt: self
+                .rtt_ms
+                .filter(|ms| ms.is_finite() && *ms >= 0.0)
+                .map(|ms| Duration::from_secs_f64(ms / 1_000.0)),
+            remb_kbps: self.remb_kbps,
+            at,
+            receiver_report_at: Some(at),
+        }
+    }
+}
+
 pub struct RateController {
     ceiling: u32,
     max_fps: u16,

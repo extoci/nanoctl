@@ -131,6 +131,7 @@ pub(crate) fn spawn_media(
         peer.keyframe_requests(),
         peer.link_feedback(),
         peer.viewer_limits(),
+        peer.video_transport(),
         peer.display_selection(),
         peer.display_selection_feedback_sender(),
         crate::media::VideoQuality {

@@ -146,6 +146,10 @@ pub struct HostPeer {
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
     viewer_limits: tokio::sync::watch::Sender<crate::adaptive::ViewerLimits>,
+    /// Viewer-preferred video transport: `data-channel` suppresses the RTP sample write
+    /// once the video data channels are open.
+    #[cfg(feature = "media")]
+    video_transport: tokio::sync::watch::Sender<crate::adaptive::VideoTransport>,
     #[cfg(feature = "media")]
     input_shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")]
@@ -624,6 +628,10 @@ impl HostPeer {
         let (viewer_limits, _) =
             tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
         #[cfg(feature = "media")]
+        let (video_transport, _) =
+            tokio::sync::watch::channel(crate::adaptive::VideoTransport::default());
+        let (link_feedback, _) = tokio::sync::watch::channel(None);
+        #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
             tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
@@ -707,10 +715,15 @@ impl HostPeer {
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
-            // The data-channel video path decodes Annex-B H.264 only; a viewer
-            // in "auto" may open the channels before negotiation decides the
-            // codec, so they are honoured solely when H.264 won.
-            let video_dc_codec_ok = negotiated.codec == crate::codec::VideoCodec::H264;
+            // The data-channel video path decodes Annex-B access units: the
+            // browser viewer handles H.264 and the iOS app adds HEVC via
+            // VideoToolbox. A viewer in "auto" may open the channels before
+            // negotiation decides the codec, so they are honoured solely when
+            // an Annex-B codec won (anything else, e.g. AV1, keeps RTP only).
+            let video_dc_codec_ok = matches!(
+                negotiated.codec,
+                crate::codec::VideoCodec::H264 | crate::codec::VideoCodec::Hevc
+            );
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let viewer_limits = viewer_limits_for_channel.clone();
@@ -719,7 +732,10 @@ impl HostPeer {
                     || channel.label() == "nanoctl.video-idr.v1"
                 {
                     if !video_dc_codec_ok {
-                        tracing::info!("video data channel ignored: negotiated codec is not H.264");
+                        tracing::info!(
+                            codec = negotiated.codec.id(),
+                            "video data channel ignored: negotiated codec is not Annex-B"
+                        );
                         return Box::pin(async {});
                     }
                     let is_idr = channel.label() == "nanoctl.video-idr.v1";
@@ -777,14 +793,25 @@ impl HostPeer {
                 }
                 let reliable = channel.label() == "nanoctl.control.v1";
                 if input.is_none() {
-                    // View-only sessions still adjust stream quality.
+                    // View-only sessions still adjust stream quality and transport.
                     if reliable {
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
-                            if message.is_string
-                                && let Some(limits) =
+                            if message.is_string {
+                                if let Some(limits) =
                                     crate::adaptive::ViewerLimits::parse(&message.data)
-                            {
-                                viewer_limits.send_replace(limits);
+                                {
+                                    viewer_limits.send_replace(limits);
+                                }
+                                if let Some(transport) =
+                                    crate::adaptive::VideoTransport::parse(&message.data)
+                                {
+                                    video_transport.send_replace(transport);
+                                }
+                                if let Some(stats) =
+                                    crate::adaptive::LinkStats::parse(&message.data)
+                                {
+                                    link_feedback.send_replace(Some(stats.sample()));
+                                }
                             }
                             Box::pin(async {})
                         }));
@@ -802,12 +829,21 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    if reliable
-                        && message.is_string
-                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
-                    {
-                        viewer_limits.send_replace(limits);
-                        return Box::pin(async {});
+                    if reliable && message.is_string {
+                        if let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data) {
+                            viewer_limits.send_replace(limits);
+                            return Box::pin(async {});
+                        }
+                        if let Some(transport) =
+                            crate::adaptive::VideoTransport::parse(&message.data)
+                        {
+                            video_transport.send_replace(transport);
+                            return Box::pin(async {});
+                        }
+                        if let Some(stats) = crate::adaptive::LinkStats::parse(&message.data) {
+                            link_feedback.send_replace(Some(stats.sample()));
+                            return Box::pin(async {});
+                        }
                     }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
@@ -931,7 +967,6 @@ impl HostPeer {
         let (keyframe_requests, _) = tokio::sync::watch::channel(0_u64);
         #[cfg(feature = "media")]
         let keyframe_feedback = keyframe_requests.clone();
-        let (link_feedback, _) = tokio::sync::watch::channel(None);
         let link_samples = link_feedback.clone();
         let video_ssrc = sender
             .get_parameters()
@@ -1165,6 +1200,8 @@ impl HostPeer {
             display_selection_feedback,
             #[cfg(feature = "media")]
             viewer_limits,
+            #[cfg(feature = "media")]
+            video_transport,
             #[cfg(feature = "media")]
             input_shutdown,
             #[cfg(feature = "media")]
@@ -1407,6 +1444,11 @@ impl HostPeer {
     #[cfg(feature = "media")]
     pub fn viewer_limits(&self) -> tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits> {
         self.viewer_limits.subscribe()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn video_transport(&self) -> tokio::sync::watch::Receiver<crate::adaptive::VideoTransport> {
+        self.video_transport.subscribe()
     }
 
     #[cfg(feature = "media")]

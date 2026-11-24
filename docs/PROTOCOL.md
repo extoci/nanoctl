@@ -97,6 +97,23 @@ underlying encrypted transport through DERP. Reliable control carries discrete c
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
 host input or clipboard access. System audio is available to view-only sessions too.
 
+### Video over data channel
+
+A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and
+`nanoctl.video-idr.v1` (reliable, ordered) to receive Annex-B access units directly,
+bypassing the RTP jitter buffer. Each message is
+`[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts][u64 sent_ms][payload chunk]`
+with all integers little-endian; `parts` splits large access units into ~48 KiB chunks.
+Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks
+the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
+video channel until a keyframe arrives. The video track keeps sending regardless, so the
+data channels add bandwidth on top of RTP unless the viewer sends
+`{"type":"video-transport","prefer":"data-channel"}` on the control channel — honored
+only while the video data channels are open. With RTP suppressed there is no RTCP
+feedback, so the viewer should report `{"type":"link-stats","fractionLost":0.02,
+"rttMs":14.5,"rembKbps":3200}` on the control channel to keep adaptive bitrate working.
+`"prefer":"all"` restores RTP delivery.
+
 ### System audio
 
 When `capabilities.systemAudio` is true, the viewer offers an additional recvonly audio

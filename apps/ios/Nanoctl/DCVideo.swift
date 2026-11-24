@@ -1,0 +1,185 @@
+import CoreVideo
+import Foundation
+
+/// Direct video delivery over `nanoctl.video.v1` / `nanoctl.video-idr.v1`:
+/// Annex-B access units with no jitter buffer. Mirrors
+/// `attachDataChannelVideo` in the browser viewer.
+///
+/// Wire format: `[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts]
+/// [u64 sent_ms][payload chunk]`, all little-endian. Deltas ride the unordered
+/// unreliable channel; keyframes ride the reliable IDR channel. A sequence gap
+/// breaks the reference chain: deltas after the gap are dropped and the viewer
+/// sends the text `KF` on the video channel until a keyframe arrives.
+final class DCVideoReceiver {
+    struct Stats {
+        var msgs = 0
+        var fed = 0
+        var gaps = 0
+        var kfRequests = 0
+        var late = 0
+        var transitMs = 0.0
+    }
+
+    private let window = 16
+    /// The codec SDP negotiation reported, used only when the stream itself
+    /// carries no parameter sets to sniff. SDP can lie (the answer may merely
+    /// mirror the offer's codec ordering); the bitstream does not.
+    private let codecHint: VTDecoder.Codec?
+    private var decoder: VTDecoder?
+    /// The codec actually detected on the wire, once identified.
+    private(set) var codec: VTDecoder.Codec?
+    /// Sends the `KF` text message on the video channel.
+    var requestKeyframe: () -> Void = {}
+    /// Latest decoded frame.
+    var onBuffer: (CVPixelBuffer) -> Void = { _ in }
+    /// Fires when the stream cannot be sniffed as H.264 or HEVC (e.g. AV1
+    /// negotiated while the data channels are still up) — the caller should
+    /// close the channels and fall back to the RTP path.
+    var onUnsupported: () -> Void = {}
+
+    private(set) var stats = Stats()
+    // Link-quality counters drained by `takeLinkStats`.
+    private var received = 0
+    private var lost = 0
+    private var undetectedKeys = 0
+
+    private var expectedSeq: UInt32?
+    private var waitingForKey = true
+    private var kfRequestedAt: CFAbsoluteTime = 0
+    private var pending: [UInt32: (isKey: Bool, parts: Int, got: [Data?], n: Int)] = [:]
+    private var reordered: [UInt32: (au: Data, isKey: Bool)] = [:]
+    private let queue = DispatchQueue(label: "nanoctl.dcvideo", qos: .userInteractive)
+
+    init(codec hint: VTDecoder.Codec? = nil) {
+        codecHint = hint
+    }
+
+    /// Queues a binary message from either video channel.
+    func receive(_ data: Data) {
+        queue.async { self.process(data) }
+    }
+
+    /// Rolling loss fraction plus the counters since the last call.
+    func takeLinkStats() -> (fractionLost: Double, transitMs: Double) {
+        var lost = 0
+        var received = 0
+        var transit = 0.0
+        queue.sync {
+            lost = self.lost
+            received = self.received
+            transit = stats.transitMs
+            self.lost = 0
+            self.received = 0
+        }
+        let total = lost + received
+        return (total > 0 ? Double(lost) / Double(total) : 0, transit)
+    }
+
+    var decodedCount: Int { decoder?.decoded ?? 0 }
+    var droppedCount: Int { decoder?.dropped ?? 0 }
+    var hasFaulted: Bool { (decoder?.faults ?? 0) > 0 }
+
+    private func onDecoderFault() {
+        waitingForKey = true
+        reordered.removeAll()
+    }
+
+    private func process(_ data: Data) {
+        guard data.count >= 17 else { return }
+        stats.msgs += 1
+        let seq = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+        let isKey = data[4] & 1 != 0
+        let part = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt16.self) })
+        let parts = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 7, as: UInt16.self) })
+        let sentMs = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 9, as: UInt64.self) }
+        stats.transitMs = Date().timeIntervalSince1970 * 1000 - Double(sentMs)
+        var chunk = data.subdata(in: 17..<data.count)
+
+        if parts > 1 {
+            var entry = pending[seq] ?? (isKey, parts, [Data?](repeating: nil, count: parts), 0)
+            if part >= parts { return }
+            if entry.got[part] == nil {
+                entry.got[part] = chunk
+                entry.n += 1
+            }
+            if entry.n < parts {
+                pending[seq] = entry
+                return
+            }
+            pending.removeValue(forKey: seq)
+            var joined = Data(capacity: entry.got.reduce(0) { $0 + ($1?.count ?? 0) })
+            for piece in entry.got.compactMap({ $0 }) { joined.append(piece) }
+            chunk = joined
+            // Drop stale partials that can never complete.
+            for key in pending.keys where Int32(bitPattern: seq &- key) > 0 {
+                pending.removeValue(forKey: key)
+            }
+        }
+
+        if expectedSeq == nil { expectedSeq = seq }
+        let diff = Int32(bitPattern: seq &- expectedSeq!)
+        if diff < 0 {
+            stats.late += 1
+            return
+        }
+        var deliverNow = diff == 0
+        if diff > 0, isKey, waitingForKey {
+            // A keyframe jumps the reorder window — missing seqs are lost.
+            deliverNow = true
+            lost += Int(diff)
+        } else if diff > 0 {
+            if isKey || !waitingForKey {
+                reordered[seq] = (chunk, isKey)
+            }
+            if reordered.count > window, !waitingForKey {
+                waitingForKey = true
+                stats.gaps += 1
+                lost += reordered.count + Int(diff)
+                reordered.removeAll()
+            }
+        }
+
+        if deliverNow { deliver(seq, au: chunk, isKey: isKey) }
+        while let expected = expectedSeq, let entry = reordered[expected] {
+            reordered.removeValue(forKey: expected)
+            deliver(expected, au: entry.au, isKey: entry.isKey)
+        }
+    }
+
+    private func deliver(_ seq: UInt32, au: Data, isKey: Bool) {
+        expectedSeq = seq &+ 1
+        if waitingForKey {
+            if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
+                kfRequestedAt = CFAbsoluteTimeGetCurrent()
+                stats.kfRequests += 1
+                requestKeyframe()
+            }
+            guard isKey else { return }
+            waitingForKey = false
+        }
+        received += 1
+        stats.fed += 1
+        guard let decoder = ensureDecoder(au) else { return }
+        decoder.decode(au, isKey: isKey, seq: seq)
+    }
+
+    /// The decoder is created from the first access unit that carries
+    /// parameter sets — the codec is whatever the bitstream says it is.
+    private func ensureDecoder(_ au: Data) -> VTDecoder? {
+        if let decoder { return decoder }
+        guard let detected = VTDecoder.detectCodec(au) else {
+            undetectedKeys += 1
+            if undetectedKeys > 4 {
+                undetectedKeys = -1
+                queue.async { [weak self] in self?.onUnsupported() }
+            }
+            return nil
+        }
+        let decoder = VTDecoder(codec: detected)
+        decoder.onFault = { [weak self] in self?.queue.async { self?.onDecoderFault() } }
+        decoder.onFrame = { [weak self] buffer in self?.onBuffer(buffer) }
+        codec = detected
+        self.decoder = decoder
+        return decoder
+    }
+}
