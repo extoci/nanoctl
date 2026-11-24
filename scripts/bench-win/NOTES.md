@@ -685,3 +685,22 @@ installed at all).
 Flash-scene adapt verification (same cycle): `band --flash` → tier 0, 0
 switches, ~1.1Mbps — policy correctly refuses promotion under byte-spiky
 content.
+
+## Sunshine matched-scene A-B (cycle 35)
+
+Moonlight CLI `stream 127.0.0.1 Desktop` against Sunshine on the same
+`band --motion` scene (pktmon can't count loopback bytes; figures are
+Sunshine's logged wire target + process sampling):
+
+|                  | Sunshine+Moonlight                        | nanoctl                                          |
+| ---------------- | ----------------------------------------- | ------------------------------------------------ |
+| Encoder          | libx264 software, High L4.2               | x264 software, adaptive tier (baseline→high+UMH) |
+| Wire bitrate     | fixed target 14,988 kbps                  | ~190 kbps adaptive (**~79x less**)               |
+| Server CPU / RSS | 13.8%, 105MB                              | ~8.6-13%, ~115MB                                 |
+| Client CPU / RSS | Moonlight 56.5% (FFmpeg sw decode), 129MB | Chrome viewer ~4%, ~466MB                        |
+
+Sunshine's CBR-ish target means its bitrate is content-independent — the gap
+is largest exactly where adaptivity pays (static/motion desktop). Under
+worst-case noise nanoctl still sends ~11.2Mbps < 15Mbps. Client-side the
+browser viewer costs 1/14th the CPU of Moonlight's software-decode path but
+~3.5x the RSS.

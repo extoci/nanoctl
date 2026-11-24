@@ -419,9 +419,8 @@ export class RemoteSessionController {
   }
 
   sendControl(payload: ControlMessage): boolean {
-    const lossyGamepadSnapshot = payload.type === "gamepad" && payload.pads.length > 0;
     const channel =
-      lossyGamepadSnapshot || (payload.type === "pointer" && payload.action === "move")
+      payload.type === "pointer" && payload.action === "move"
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;

@@ -1,5 +1,4 @@
-import { PROTOCOL_VERSION, type HostInfo } from "@nanoctl/protocol";
-import viewerPackage from "../../package.json";
+import type { HostInfo } from "@nanoctl/protocol";
 import type { RemoteSessionMetrics, RemoteSessionSnapshot } from "./remote-session";
 import { browserDecodeSupport, type DecodeSupport } from "./video-codec";
 
@@ -79,7 +78,6 @@ export async function buildDebugReport(input: DebugReportInput): Promise<string>
     "## Viewer",
     "",
     `- url: ${location.origin}${location.pathname}`,
-    `- viewer version: v${viewerPackage.version}; protocol: ${PROTOCOL_VERSION}`,
     `- user agent: ${navigator.userAgent}`,
     `- secure context: ${window.isSecureContext}`,
     `- screen: ${screen.width}×${screen.height} @${window.devicePixelRatio}x`,
