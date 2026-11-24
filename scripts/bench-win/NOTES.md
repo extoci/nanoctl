@@ -101,16 +101,22 @@ The band's `--motion` mode scrolls a 16px checkerboard 4px per paint tick
 across the full display — a uniform pan that motion estimation should
 predict, i.e. the gaming-like case (30s `media-smoke --psnr` runs):
 
-| config                     | kbps | PSNR p50 | PSNR p05 | encode p50 |
-| -------------------------- | ---- | -------- | -------- | ---------- |
-| Responsiveness (Low, qp26) | 315  | 51.8     | 51.6     | 6.4ms      |
-| Complexity::Medium, qp26   | 312  | 50.8     | 50.6     | 6.5ms      |
-| qp_min 30                  | 334  | 51.4     | 50.7     | 6.5ms      |
-| qp_min 34                  | 264  | 42.8     | 42.8     | 6.4ms      |
+| config                     | kbps   | PSNR p50 | PSNR p05 | encode p50 |
+| -------------------------- | ------ | -------- | -------- | ---------- |
+| Responsiveness (Low, qp26) | 315    | 51.8     | 51.6     | 6.4ms      |
+| Complexity::Medium, qp26   | 312    | 50.8     | 50.6     | 6.5ms      |
+| qp_min 30                  | 334    | 51.4     | 50.7     | 6.5ms      |
+| qp_min 34                  | 264    | 42.8     | 42.8     | 6.4ms      |
+| **SCD off (ships)**        | **83** | **59.0** | **57.9** | **5.3ms**  |
 
-Low+qp26 is the frontier's best point under motion too: Medium buys ~1%
-bits for -1dB, qp30 is dominated, qp34 trades -16% bits for -9dB. 57.5-58
-fps held throughout; capture_to_encode p50 ~14ms (composite-queue bound).
+`scene_change_detect` fired ~15 IDRs per 30s on the scrolling scene —
+each reset the reference chain at intra cost and dipped quality. Off:
+**-74% bits and +7dB under motion** (315->83kbps, 51.8->59.0 PSNR,
+encode 6.4->5.3ms), and the static scene is unchanged-or-better
+(116->103kbps, 1 IDR in 30s, PSNR 45.85 flat). Loss recovery is
+unaffected — forced keyframes ride the existing KF-request path; a real
+scene change just encodes as a large delta. The earlier "2.4x bitrate"
+rejection covered AQ/BGD/SCD all off together — AQ-off was the culprit.
 
 ## Join latency (channel attach -> first keyframe fed to the decoder)
 

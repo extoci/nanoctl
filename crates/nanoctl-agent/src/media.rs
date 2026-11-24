@@ -1541,6 +1541,7 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .qp(QpRange::new(qp_min, 51))
         .complexity(complexity)
         .skip_frames(skip_frames)
+        .scene_change_detect(false)
         // Slice-parallel encode: OpenH264 only uses encoder threads when the
         // frame is cut into slices. A ~1.5KB cap splits even small deltas
         // (~6-9KB) across the encode threads; tiny frames stay single-slice.
