@@ -108,6 +108,15 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     p.i_bframe = 0;
     p.i_keyint_max = X264_KEYINT_MAX_INFINITE;
     p.i_scenecut_threshold = 0;
+    const char *me = getenv("NANOCTL_X264_ME");
+    if (me && me[0]) {
+        p.analyse.i_me_method = !strcmp(me, "dia")   ? X264_ME_DIA
+                              : !strcmp(me, "hex")   ? X264_ME_HEX
+                              : !strcmp(me, "umh")   ? X264_ME_UMH
+                              : !strcmp(me, "esa")   ? X264_ME_ESA
+                              : !strcmp(me, "tesa")  ? X264_ME_TESA
+                                                   : p.analyse.i_me_method;
+    }
     p.i_sync_lookahead = 0;
     p.rc.i_lookahead = 0;
     p.rc.i_rc_method = X264_RC_CRF;

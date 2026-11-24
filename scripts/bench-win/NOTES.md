@@ -417,3 +417,26 @@ worst-case noise:
 CABAC entropy coding under per-pixel noise costs ~35-40% fps even at
 superfast - unacceptable for particle-heavy game content, so baseline
 stays default. `-28%` bits available via env on CABAC-capable content.
+
+## x264 motion-estimation sweep: hex vs umh (cycle 19)
+
+`NANOCTL_X264_ME` env knob added (dia/hex/umh/esa/tesa; default hex,
+the veryfast default). Better ME finds cheaper motion vectors:
+
+| scene  | me            | kbps         | fps  | encode p50 | PSNR   |
+| ------ | ------------- | ------------ | ---- | ---------- | ------ |
+| motion | hex (default) | 235          | ~57  | 4.8ms      | 57.4dB |
+| motion | umh           | 194 (-17%)   | 58.3 | ~5ms       | 57.4dB |
+| noise  | hex           | 10,800       | 54.8 | 10.4ms     | 24.3dB |
+| noise  | umh           | 9,501 (-12%) | 47.9 | 14.3ms     | 24.0dB |
+
+umh passes the noise worst-case but costs -13% fps and +3.9ms encode
+there - the ME search gets expensive exactly when MVs are random.
+Default stays hex; umh available via env when encode headroom exists.
+
+## Audio path: un-benchmarkable on this VM
+
+`system_audio` streams Opus LowDelay 48kHz stereo @128kbps via WASAPI
+loopback, but this headless box has no audio endpoint and the Windows
+Audio service cannot start (no render device). Audio latency/bitrate
+numbers need a box with a sound device (or a virtual audio driver).
