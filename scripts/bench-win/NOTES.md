@@ -661,3 +661,27 @@ within measurement noise. The initial attach replay burst (~400KB: latest
 keyframe + replayed deltas) is one-time and amortizes to nothing on any
 session longer than ~30s. Conclusion: smoke numbers are honest wire numbers;
 no hidden overhead in the live path.
+
+## Idle + install-size axes (cycle 34)
+
+Measured on this VM (8 logical CPUs):
+
+| Condition | nanoctl agent | Sunshine |
+|---|---|---|
+| Idle, no viewer | 0.0% CPU, pipeline fully stopped | 0.0% CPU, ~31MB RSS |
+| Streaming static desktop | ~8.6% CPU, ~115MB RSS | ~21% CPU, ~112MB RSS (earlier) |
+
+The streaming-static cost is xcap's Windows pull model (continuous frame
+readback at capture cadence; no dirty-rect events — Linux gets XDamage, macOS
+ScreenCaptureKit). The producer skips encode on unchanged frames; remaining
+cost is capture readback (~4.3ms) + compare (~0.9ms) per poll — platform floor
+on this backend.
+
+Install/runtime footprint: nanoctl agent = 20MB exe + 2MB libx264 = **22MB**,
+viewer = any browser (0 install). Sunshine = 96MB, Moonlight client = 103MB —
+total stack ~199MB vs ~22MB (**~9x lighter**, and the client side needs nothing
+installed at all).
+
+Flash-scene adapt verification (same cycle): `band --flash` → tier 0, 0
+switches, ~1.1Mbps — policy correctly refuses promotion under byte-spiky
+content.
