@@ -466,3 +466,10 @@ default 2 = veryfast). Worst-case fps vs bitrate trade:
 
 subme=1 wins +6% worst-case fps but pays +34% bits on realistic
 motion - keeps the cheap-MV cost where it hurts most. Default 2.
+
+## Sustained-load soak: 60s worst-case noise (cycle 22)
+
+media-smoke, per-pixel noise scene, 60s continuous: 3,498 frames @
+58.3fps, 11.5Mbps, encode p50 10.6ms / p95 12.9ms, passed.
+Encoder process RSS flat at ~91-96MB across the whole run - no growth
+or degradation under a full minute of worst-case load.
