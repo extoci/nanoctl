@@ -29,9 +29,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
+      # Shares the release-candidate cache key: this job runs the same
+      # `cargo run --release --locked --features media` build, so its dependency
+      # artifacts are identical and it should not recompile them from scratch.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: latency-${{ matrix.os }}
+          key: release-${{ matrix.os }}
           workspaces: crates/nanoctl-agent
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -50,15 +53,12 @@ jobs:
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
       - run: bun install --frozen-lockfile
-      - name: Refresh apt index
+      - uses: ./.github/actions/linux-media-deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update -o Acquire::Retries=10
-      - name: Install native Linux capture and desktop dependencies
-        if: runner.os == 'Linux'
-        shell: bash
-        run: >
-          sudo apt-get install -y -o Acquire::Retries=10
-          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config xauth xvfb
+        with:
+          cache-suffix: latency
+          extra-packages: xauth xvfb
+          save-cache: ${{ github.event_name != 'pull_request' }}
       - name: Install Chromium on Linux
         if: runner.os == 'Linux'
         run: bunx playwright install --with-deps chromium
