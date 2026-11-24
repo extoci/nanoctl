@@ -1,7 +1,8 @@
 name: coverage-guided fuzzing
 
 on:
-  pull_request:
+  # A 60s fuzz smoke on every PR only repeated the same corpus run; coverage is
+  # on master + the weekly schedule now.
   push:
     branches: [master, "rewrite/**"]
   schedule:

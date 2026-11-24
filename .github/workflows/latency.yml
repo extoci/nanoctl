@@ -1,9 +1,11 @@
 name: latency
 
 on:
-  pull_request:
+  # Latency is a tracking metric, not a gate: run it on master and on demand so
+  # PRs stop paying two extra legs (a release build + browser install each).
   push:
     branches: [master, "rewrite/**"]
+  workflow_dispatch:
 
 permissions:
   contents: read
