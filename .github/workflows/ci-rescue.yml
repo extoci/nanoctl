@@ -1,0 +1,30 @@
+name: ci-rescue
+
+# A cancelled master ci run (runner capacity flake, runner acquisition timeout)
+# produces no release-candidate artifacts, which leaves a later release tag with
+# nothing to promote — that is what killed the v3.0.0-alpha.4 release. Re-run a
+# cancelled master ci run once. Only master is covered: on pull_request branches
+# cancellations are usually intentional concurrency supersedes, and re-entering
+# the shared ci-<ref> concurrency group could cancel the newer run.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun:
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled'
+      && github.event.workflow_run.head_branch == 'master'
+      && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Re-run the cancelled ci run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run rerun -R "$GITHUB_REPOSITORY" "${{ github.event.workflow_run.id }}"
