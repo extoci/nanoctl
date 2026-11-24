@@ -91,6 +91,13 @@ jobs:
                     fi
                     rerun_requested="$latest_id"
                     ;;
+                  success)
+                    # The run completed between the two queries above; accept it
+                    # directly instead of failing the tag on the race.
+                    echo "Found successful CI run $latest_id for $GITHUB_SHA."
+                    echo "run_id=$latest_id" >>"$GITHUB_OUTPUT"
+                    exit 0
+                    ;;
                   *)
                     echo "The CI run for this commit ended with conclusion '$latest_conclusion': $latest_url" >&2
                     exit 1

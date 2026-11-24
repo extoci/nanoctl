@@ -14,7 +14,7 @@ Types and validators live in `packages/protocol`.
   {
     "hostName": "desktop",
     "platform": "linux",
-    "version": "3.0.0-alpha.4",
+    "version": "3.0.0-alpha.5",
     "displays": [
       {
         "id": "59",
@@ -97,6 +97,22 @@ underlying encrypted transport through DERP. Reliable control carries discrete c
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
 host input or clipboard access. System audio is available to view-only sessions too.
 
+### Video over data channel
+
+A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and
+`nanoctl.video-idr.v1` (reliable, ordered) to receive Annex-B access units directly,
+bypassing the RTP jitter buffer. Each message is
+`[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts][u64 sent_ms][payload chunk]`
+with all integers little-endian; `parts` splits large access units into ~48 KiB chunks.
+Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks
+the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
+video channel until a keyframe arrives. While `nanoctl.video.v1` is open the agent
+suppresses delta-frame writes on the RTP track automatically — a viewer decoding the
+data channel drops the RTP copy, so those samples are duplicate bandwidth. Keyframes
+still go to RTP, which keeps RTCP round-trip and loss reports meaningful for adaptive
+bitrate. When the video channel closes, the agent resumes full RTP delivery and forces
+a keyframe so the resumed track's reference chain is fresh.
+
 ### System audio
 
 When `capabilities.systemAudio` is true, the viewer offers an additional recvonly audio
@@ -133,7 +149,9 @@ are silently ignored. A remote paste shortcut sends local clipboard text before 
 ### Gamepads
 
 When `capabilities.gamepad` is true, an opted-in viewer with control permission sends
-`{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel.
+`{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel,
+or on the unordered pointer channel (`nanoctl.pointer.v1`) — snapshots carry full
+state, so the unordered lane drops stale reports instead of delaying fresh ones.
 Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
 slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
 are signed 16-bit values with positive Y up. For PlayStation controllers, the viewer adds

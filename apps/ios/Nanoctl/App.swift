@@ -23,6 +23,8 @@ final class Desktop {
         session.onChange = { [weak self] in self?.update() }
     }
 
+    var hasVideo: Bool { session.track != nil || session.transport == .dataChannel }
+
     func update() {
         if track !== session.track {
             track?.remove(mailbox)
@@ -31,7 +33,9 @@ final class Desktop {
             track?.add(mailbox)
         }
         phone?.update(external: external != nil)
+        let pixels = session.transport == .dataChannel ? session.pixelMailbox : nil
         external?.show(track == nil ? nil : mailbox)
+        external?.show(pixels: pixels)
     }
 }
 
@@ -76,6 +80,8 @@ final class ExternalScene: UIResponder, UIWindowSceneDelegate {
         let video = VideoView()
         controller.view = video
         let window = UIWindow(windowScene: scene)
+        // TVs overscan (crop the edges); scaling keeps the full frame visible.
+        window.screen.overscanCompensation = .scale
         window.rootViewController = controller
         window.isHidden = false
         self.window = window
@@ -101,10 +107,22 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
     private let state = UILabel()
     private let gamepad = UILabel()
     private let output = UILabel()
+    private let stats = UILabel()
     private let toggle = UIButton(type: .system)
     private let space = UIButton(type: .system)
+    private let codec = UISegmentedControl()
+    private let audio = UIButton(type: .system)
+    private let displays = UIButton(type: .system)
+    private let paste = UIButton(type: .system)
     private let surface = TouchSurface()
+    private let screen = UIView()
+    private let fullBtn = UIButton(type: .system)
+    private let exitFull = UIButton(type: .system)
+    private var stack: UIStackView!
     private var usingExternal = false
+    private var fullscreen = false
+
+    override var prefersStatusBarHidden: Bool { fullscreen }
 
     init(desktop: Desktop) {
         self.desktop = desktop
@@ -138,19 +156,62 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         space.setTitle("Space", for: .normal)
         space.addTarget(self, action: #selector(sendSpace), for: .touchUpInside)
 
-        for label in [state, gamepad, output] {
+        for label in [state, gamepad, output, stats] {
             label.font = .preferredFont(forTextStyle: .footnote)
             label.textColor = .secondaryLabel
             label.numberOfLines = 0
         }
         output.textAlignment = .center
+        stats.textColor = .white
+        stats.backgroundColor = UIColor.black.withAlphaComponent(0.5)
+        stats.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+
+        for (index, preference) in CodecPreference.allCases.enumerated() {
+            codec.insertSegment(withTitle: preference.label, at: index, animated: false)
+        }
+        codec.selectedSegmentIndex = CodecPreference.allCases.firstIndex(of: desktop.session.codecPreference) ?? 0
+        codec.addTarget(self, action: #selector(codecChanged), for: .valueChanged)
+        codec.accessibilityLabel = "Video codec"
+        codec.apportionsSegmentWidthsByContent = true
+        codec.setContentCompressionResistancePriority(.required, for: .horizontal)
+        codec.setContentHuggingPriority(.required, for: .horizontal)
+
+        audio.configuration = .tinted()
+        audio.setTitle("Audio", for: .normal)
+        audio.addTarget(self, action: #selector(toggleAudio), for: .touchUpInside)
+        displays.configuration = .tinted()
+        displays.setTitle("Display", for: .normal)
+        displays.addTarget(self, action: #selector(pickDisplay), for: .touchUpInside)
+        paste.configuration = .tinted()
+        paste.setTitle("Paste→host", for: .normal)
+        paste.addTarget(self, action: #selector(sendPaste), for: .touchUpInside)
+
+        fullBtn.configuration = .tinted()
+        fullBtn.setTitle("Full", for: .normal)
+        fullBtn.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
+        exitFull.configuration = .tinted()
+        exitFull.setTitle("\u{2715}", for: .normal)
+        exitFull.isHidden = true
+        exitFull.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
+        view.addSubview(exitFull)
+        exitFull.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            exitFull.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            exitFull.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
+        ])
+
+        let buttons = UIStackView(arrangedSubviews: [audio, displays, paste, fullBtn])
+        buttons.spacing = 8
+        buttons.distribution = .fillEqually
+        let controls = UIStackView(arrangedSubviews: [codec, buttons])
+        controls.axis = .vertical
+        controls.spacing = 8
 
         let row = UIStackView(arrangedSubviews: [address, toggle])
         row.spacing = 8
         toggle.setContentHuggingPriority(.required, for: .horizontal)
         toggle.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let screen = UIView()
         screen.backgroundColor = .secondarySystemBackground
         screen.clipsToBounds = true
         screen.layer.cornerRadius = 12
@@ -169,7 +230,14 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
              output.leadingAnchor.constraint(greaterThanOrEqualTo: screen.leadingAnchor, constant: 8),
              screen.heightAnchor.constraint(greaterThanOrEqualToConstant: 48)])
 
-        let stack = UIStackView(arrangedSubviews: [title, row, state, screen, gamepad, space])
+        stats.translatesAutoresizingMaskIntoConstraints = false
+        screen.addSubview(stats)
+        NSLayoutConstraint.activate([
+            stats.leadingAnchor.constraint(equalTo: screen.leadingAnchor, constant: 8),
+            stats.topAnchor.constraint(equalTo: screen.topAnchor, constant: 8),
+        ])
+
+        stack = UIStackView(arrangedSubviews: [title, row, state, screen, controls, gamepad, space])
         stack.axis = .vertical
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -187,16 +255,27 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         loadViewIfNeeded()
         usingExternal = external
         let session = desktop.session
-        let hasTrack = session.track != nil
+        let hasVideo = desktop.hasVideo
         state.text = session.state
+        stats.text = session.statsLine
+        stats.isHidden = session.statsLine.isEmpty
         let active = session.state == "Connecting…" || session.state.hasPrefix("Live ·")
         toggle.setTitle(active ? "Disconnect" : "Connect", for: .normal)
         address.isEnabled = !active
+        codec.isEnabled = !active
+        let audioAvailable = session.host?.audioAvailable == true
+        audio.isEnabled = audioAvailable
+        audio.setTitle(audioAvailable ? (session.audioEnabled ? "Audio: on" : "Audio: off") : "Audio: n/a", for: .normal)
+        let list = session.host?.displayList ?? []
+        displays.isHidden = list.count < 2
+        paste.isEnabled = session.host?.capabilities.clipboard == true
         space.isEnabled = session.inputReady
         surface.isUserInteractionEnabled = session.inputReady
-        video.isHidden = external || !hasTrack
-        video.show(hasTrack && !external ? desktop.mailbox : nil)
-        output.isHidden = hasTrack && !external
+        video.isHidden = external || !hasVideo
+        UIApplication.shared.isIdleTimerDisabled = hasVideo
+        video.show(hasVideo && !external && session.transport == .rtp ? desktop.mailbox : nil)
+        video.show(pixels: hasVideo && !external && session.transport == .dataChannel ? session.pixelMailbox : nil)
+        output.isHidden = hasVideo && !external
         output.text = external ? "Video on external display\nTouch here to control the host" : "Remote video"
         refreshGamepad()
     }
@@ -233,6 +312,57 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
 
     @objc private func sendSpace() {
         if desktop.session.sendKey(true) { desktop.session.sendKey(false) }
+    }
+
+    @objc private func codecChanged() {
+        let index = codec.selectedSegmentIndex
+        guard index >= 0 else { return }
+        desktop.session.codecPreference = CodecPreference.allCases[index]
+    }
+
+    @objc private func toggleFullscreen() {
+        fullscreen = !fullscreen
+        screen.removeFromSuperview()
+        if fullscreen {
+            // Raw fullscreen: video edge-to-edge, everything else hidden.
+            view.insertSubview(screen, belowSubview: exitFull)
+            screen.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                screen.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                screen.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                screen.topAnchor.constraint(equalTo: view.topAnchor),
+                screen.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            ])
+        } else {
+            stack.insertArrangedSubview(screen, at: 3)
+        }
+        stack.isHidden = fullscreen
+        exitFull.isHidden = !fullscreen
+        setNeedsStatusBarAppearanceUpdate()
+    }
+
+    @objc private func toggleAudio() {
+        desktop.session.audioEnabled = !desktop.session.audioEnabled
+        update(external: usingExternal)
+    }
+
+    @objc private func sendPaste() {
+        _ = desktop.session.sendClipboard()
+    }
+
+    @objc private func pickDisplay() {
+        let list = desktop.session.host?.displayList ?? []
+        guard !list.isEmpty else { return }
+        let sheet = UIAlertController(title: "Display", message: nil, preferredStyle: .actionSheet)
+        for display in list {
+            sheet.addAction(UIAlertAction(title: "\(display.name) (\(display.width)×\(display.height))",
+                                          style: .default) { [weak self] _ in
+                _ = self?.desktop.session.selectDisplay(display.id)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        sheet.popoverPresentationController?.sourceView = displays
+        present(sheet, animated: true)
     }
 
     private func sendPointer(_ point: CGPoint, action: String) {

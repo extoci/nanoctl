@@ -33,18 +33,44 @@ struct ViewerError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct DisplayInfo: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let width: Int
+    let height: Int
+    let scaleFactor: Double?
+    let primary: Bool?
+}
+
+struct AudioOutput: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let isDefault: Bool?
+}
+
 struct HostInfo: Decodable {
     struct Viewer: Decodable { let mayControl: Bool }
     struct Capabilities: Decodable {
         let protocolVersion: Int
         let gamepad: Bool?
+        let codecs: [String]?
+        let systemAudio: Bool?
+        let audioOutputs: [AudioOutput]?
+        let input: Bool?
+        let clipboard: Bool?
+        let displays: [DisplayInfo]?
     }
 
     let hostName: String
+    let platform: String?
+    let version: String?
+    let displays: [DisplayInfo]?
     let remoteInput: Bool
     let viewer: Viewer
     let capabilities: Capabilities
     var canControl: Bool { remoteInput && viewer.mayControl }
+    var displayList: [DisplayInfo] { displays ?? capabilities.displays ?? [] }
+    var audioAvailable: Bool { capabilities.systemAudio == true || capabilities.audioOutputs != nil }
 }
 
 struct SignalPayload: Codable {
@@ -80,6 +106,8 @@ struct ServerMessage: Decodable {
     let host: HostInfo?
     let envelope: SignalEnvelope?
     let reason: String?
+    let outputs: [AudioOutput]?
+    let selectedId: String?
 }
 
 struct ClientSignal: Encodable {

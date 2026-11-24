@@ -132,6 +132,7 @@ pub struct PipelineStats {
     pub encode_attempts: AtomicU64,
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
+    pub queue_ns: AtomicU64,
     #[cfg(target_os = "linux")]
     pub producer_tid: AtomicU32,
 }
@@ -161,6 +162,7 @@ impl PipelineStats {
             sample_writes = self.sample_writes.load(Ordering::Relaxed),
             fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
             pacer_skips = self.pacer_skips.load(Ordering::Relaxed),
+            queue_ns = self.queue_ns.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
     }
@@ -197,8 +199,25 @@ impl EncodeScale {
         self.0 != previous
     }
 
+    /// Update the divisor and report whether the clamped encode size
+    /// actually changed — a divisor flip that the floor absorbs needs
+    /// no keyframe and no encoder resize.
+    fn changed_limits(&mut self, kbps: u32, width: u32, height: u32) -> bool {
+        let before = self.limits(width, height);
+        self.update(kbps);
+        self.limits(width, height) != before
+    }
+
     fn limits(&self, width: u32, height: u32) -> (u32, u32) {
-        ((width / self.0).max(2), (height / self.0).max(2))
+        // Never encode below 1080p when the source has the pixels — viewers
+        // upscale the result to full screen anyway, and a quarter-res frame at
+        // high bitrate reads as soft rather than detailed.
+        let divisor = self
+            .0
+            .min(width / 1920.min(width).max(1))
+            .min(height / 1080.min(height).max(1))
+            .max(1);
+        ((width / divisor).max(2), (height / divisor).max(2))
     }
 }
 
@@ -540,89 +559,26 @@ impl I420Frame {
         }
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
-        let row_pairs = self.height / 2;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(4);
-        if threads <= 1 || row_pairs < 8 {
-            read_rgba_rows(rgba, self.width, 0..row_pairs, y, u, v);
-            return Ok(());
-        }
-        let per = row_pairs.div_ceil(threads) & !1;
-        let uv_width = self.width / 2;
-        std::thread::scope(|scope| {
-            let mut y_rest: &mut [u8] = y;
-            let mut u_rest: &mut [u8] = u;
-            let mut v_rest: &mut [u8] = v;
-            let mut start = 0usize;
-            while start < row_pairs {
-                let end = (start + per).min(row_pairs);
-                let take = (end - start) * uv_width;
-                let (y_part, y_tail) = y_rest.split_at_mut((end - start) * self.width * 2);
-                let (u_part, u_tail) = u_rest.split_at_mut(take);
-                let (v_part, v_tail) = v_rest.split_at_mut(take);
-                y_rest = y_tail;
-                u_rest = u_tail;
-                v_rest = v_tail;
-                let width = self.width;
-                let range = start..end;
-                scope.spawn(move || {
-                    read_rgba_rows(rgba, width, range, y_part, u_part, v_part);
-                });
-                start = end;
-            }
-        });
+        let mut planar = yuv::YuvPlanarImageMut {
+            y_plane: yuv::BufferStoreMut::Borrowed(y),
+            y_stride: self.width as u32,
+            u_plane: yuv::BufferStoreMut::Borrowed(u),
+            u_stride: (self.width / 2) as u32,
+            v_plane: yuv::BufferStoreMut::Borrowed(v),
+            v_stride: (self.width / 2) as u32,
+            width: self.width as u32,
+            height: self.height as u32,
+        };
+        yuv::rgba_to_yuv420(
+            &mut planar,
+            rgba,
+            (self.width * 4) as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )
+        .map_err(|error| anyhow!("RGBA to I420 conversion failed: {error}"))?;
         Ok(())
-    }
-}
-
-#[inline]
-fn rgba_to_y(pixel: &[u8]) -> u8 {
-    ((66 * u16::from(pixel[0]) + 129 * u16::from(pixel[1]) + 25 * u16::from(pixel[2]) + 4224) >> 8)
-        as u8
-}
-
-/// Convert a band of row-pairs (2 source rows each) of RGBA into I420 planes.
-fn read_rgba_rows(
-    rgba: &[u8],
-    width: usize,
-    row_pairs: std::ops::Range<usize>,
-    y: &mut [u8],
-    u: &mut [u8],
-    v: &mut [u8],
-) {
-    let pair_stride = width * 8;
-    let start = row_pairs.start * pair_stride;
-    let end = row_pairs.end * pair_stride;
-    for (((rows, y_rows), u), v) in rgba[start..end]
-        .chunks_exact(pair_stride)
-        .zip(y.chunks_exact_mut(width * 2))
-        .zip(u.chunks_exact_mut(width / 2))
-        .zip(v.chunks_exact_mut(width / 2))
-    {
-        for (pixel, y) in rows.chunks_exact(4).zip(y_rows.iter_mut()) {
-            *y = rgba_to_y(pixel);
-        }
-        let (top, bottom) = rows.split_at(width * 4);
-        for (((top, bottom), u), v) in top
-            .chunks_exact(8)
-            .zip(bottom.chunks_exact(8))
-            .zip(u)
-            .zip(v)
-        {
-            let average = |channel| {
-                (u16::from(top[channel])
-                    + u16::from(top[channel + 4])
-                    + u16::from(bottom[channel])
-                    + u16::from(bottom[channel + 4])
-                    + 2)
-                    >> 2
-            };
-            let (r, g, b) = (average(0), average(1), average(2));
-            *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
-            *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
-        }
     }
 }
 
@@ -879,6 +835,12 @@ impl CaptureEncoder {
         #[cfg(target_os = "linux")]
         let trace_started = trace::now();
         let preprocess_started = Instant::now();
+        self.latest_frame.stats.queue_ns.fetch_add(
+            preprocess_started
+                .saturating_duration_since(*captured_at)
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         let source = rgba_view(frame)?;
         let (source_width, source_height) = source.dimensions();
         let (target_width, target_height) =
@@ -955,6 +917,7 @@ impl CaptureEncoder {
             TimingSample {
                 capture_to_encode: encoded_at.saturating_duration_since(*captured_at),
                 encode: encoded_at.saturating_duration_since(encode_started),
+                queue: preprocess_started.saturating_duration_since(*captured_at),
             },
         ))
     }
@@ -1812,12 +1775,14 @@ impl ReferenceRecovery {
 struct TimingSample {
     capture_to_encode: Duration,
     encode: Duration,
+    queue: Duration,
 }
 
 #[derive(Default)]
 struct TimingSamples {
     capture_to_encode_micros: Vec<u64>,
     encode_micros: Vec<u64>,
+    queue_micros: Vec<u64>,
 }
 
 const MAX_TIMING_SAMPLES: usize = 524_288;
@@ -1836,11 +1801,16 @@ impl TimingSamples {
             self.encode_micros
                 .push(sample.encode.as_micros().min(u128::from(u64::MAX)) as u64);
         }
+        if fresh && self.queue_micros.len() < MAX_TIMING_SAMPLES {
+            self.queue_micros
+                .push(sample.queue.as_micros().min(u128::from(u64::MAX)) as u64);
+        }
     }
 
     fn percentiles(&mut self) -> TimingPercentiles {
         self.capture_to_encode_micros.sort_unstable();
         self.encode_micros.sort_unstable();
+        self.queue_micros.sort_unstable();
         TimingPercentiles {
             capture_to_encode_p50_milliseconds: percentile_milliseconds(
                 &self.capture_to_encode_micros,
@@ -1852,6 +1822,7 @@ impl TimingSamples {
             ),
             encode_p50_milliseconds: percentile_milliseconds(&self.encode_micros, 0.50),
             encode_p95_milliseconds: percentile_milliseconds(&self.encode_micros, 0.95),
+            queue_p50_milliseconds: percentile_milliseconds(&self.queue_micros, 0.50),
         }
     }
 }
@@ -1861,6 +1832,7 @@ struct TimingPercentiles {
     capture_to_encode_p95_milliseconds: f64,
     encode_p50_milliseconds: f64,
     encode_p95_milliseconds: f64,
+    queue_p50_milliseconds: f64,
 }
 
 fn percentile_f64(samples: &[f64], percentile: f64) -> f64 {
@@ -1905,6 +1877,7 @@ pub struct MediaSmokeReport {
     pub capture_to_encode_p95_milliseconds: f64,
     pub encode_p50_milliseconds: f64,
     pub encode_p95_milliseconds: f64,
+    pub queue_p50_milliseconds: f64,
     /// Y+U+V PSNR (dB) of each decoded access unit vs its I420 source; None when the
     /// probe was off. p05 is the worst tail — the number a marketing claim must survive.
     pub psnr_p50_db: Option<f64>,
@@ -2073,6 +2046,7 @@ pub fn run_smoke(
         capture_to_encode_p95_milliseconds: timing.capture_to_encode_p95_milliseconds,
         encode_p50_milliseconds: timing.encode_p50_milliseconds,
         encode_p95_milliseconds: timing.encode_p95_milliseconds,
+        queue_p50_milliseconds: timing.queue_p50_milliseconds,
         psnr_p50_db: psnr
             .as_ref()
             .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.50))),
@@ -2188,18 +2162,81 @@ pub(crate) async fn release_session_memory() {
     }
 }
 
-fn au_contains_idr(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 4 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            let nal_type = data[i + 3] & 0x1f;
-            if nal_type == 5 || nal_type == 7 {
-                return true;
-            }
-        }
-        i += 1;
+/// Captures a single frame and encodes it as an IDR into the replay window so
+/// a viewer's very first attach is served a stream tail immediately instead
+/// of waiting for the new pipeline's first keyframe (~100ms cold). Runs on a
+/// blocking thread; a no-op once any stream has warmed the window.
+#[cfg(feature = "media")]
+pub fn prime_replay(
+    max_bitrate_kbps: u32,
+    max_fps: u16,
+    max_width: u32,
+    max_height: u32,
+    latency_mode: LatencyMode,
+    encoder_preference: EncoderPreference,
+) -> Result<()> {
+    let replay = crate::rtc::video_replay();
+    if replay.lock().unwrap().snapshot().is_some() {
+        return Ok(());
     }
-    false
+    let monitor = Monitor::all()
+        .context("screen capture is unavailable")?
+        .into_iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .context("no display is available")?;
+    // A single-shot grab, not a recorder: a second capture session starves
+    // the real pipeline's recorder (its first-frame wait timed out at 5s).
+    let image = monitor.capture_image()?;
+    let (source_width, source_height) = image.dimensions();
+    let (target_width, target_height) =
+        fit_dimensions(source_width, source_height, max_width, max_height);
+    let image = if target_width == source_width && target_height == source_height {
+        image
+    } else {
+        xcap::image::imageops::resize(
+            &image,
+            target_width,
+            target_height,
+            xcap::image::imageops::FilterType::Triangle,
+        )
+    };
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        bail!("captured display dimensions must be non-zero and even");
+    }
+    // The data-channel path only carries H.264 (rtc.rs gates the channels on
+    // the negotiated codec), so the warm keyframe is always baseline H.264.
+    let mut backend = EncoderBackend::new_for_codec(
+        VideoCodec::H264,
+        false,
+        encoder_preference,
+        max_bitrate_kbps,
+        max_fps,
+        latency_mode,
+        (width, height),
+    )?;
+    let frame = backend.encode(&image)?;
+    const CHUNK: usize = 48 * 1024;
+    let parts = frame.bytes.len().div_ceil(CHUNK).max(1) as u16;
+    let sent_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let mut messages = Vec::with_capacity(parts as usize);
+    for part in 0..parts {
+        let start = part as usize * CHUNK;
+        let end = (start + CHUNK).min(frame.bytes.len());
+        let mut msg = Vec::with_capacity(end - start + 17);
+        msg.extend_from_slice(&0_u32.to_le_bytes());
+        msg.push(1_u8);
+        msg.extend_from_slice(&part.to_le_bytes());
+        msg.extend_from_slice(&parts.to_le_bytes());
+        msg.extend_from_slice(&sent_ms.to_le_bytes());
+        msg.extend_from_slice(&frame.bytes[start..end]);
+        messages.push(msg);
+    }
+    replay.lock().unwrap().seed(messages);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2325,7 +2362,11 @@ pub fn spawn_video(
                                 .apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                             fps = decision.fps;
                             pacer.set_fps(fps);
-                            forced_keyframe |= scale.update(decision.bitrate_kbps);
+                            forced_keyframe |= scale.changed_limits(
+                                decision.bitrate_kbps,
+                                quality.max_width,
+                                quality.max_height,
+                            );
                             producer_stats
                                 .target_kbps
                                 .store(decision.bitrate_kbps, Ordering::Relaxed);
@@ -2341,7 +2382,11 @@ pub fn spawn_video(
                         encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
-                        forced_keyframe |= scale.update(decision.bitrate_kbps);
+                        forced_keyframe |= scale.changed_limits(
+                            decision.bitrate_kbps,
+                            quality.max_width,
+                            quality.max_height,
+                        );
                         producer_stats
                             .target_kbps
                             .store(decision.bitrate_kbps, Ordering::Relaxed);
@@ -2422,9 +2467,12 @@ pub fn spawn_video(
                     if frame.bytes.is_empty() {
                         continue;
                     }
-                    let changed_output = last_encoded
-                        .as_ref()
-                        .is_none_or(|previous| captured.differs_from(previous));
+                    // `changed` already ran this exact comparison for fresh
+                    // frames; only re-compare for keepalive/pace re-encodes.
+                    let changed_output = changed
+                        || last_encoded
+                            .as_ref()
+                            .is_none_or(|previous| captured.differs_from(previous));
                     if changed_output {
                         #[cfg(target_os = "linux")]
                         if let Some(started) = producer_stats.damage_started.lock().unwrap().take()
@@ -2497,6 +2545,11 @@ pub fn spawn_video(
         let mut dc_backed_up = false;
         let mut dc_seq = 0_u32;
         let mut dc_kf_seen = 0_u64;
+        let mut dc_had_channel = false;
+        let mut dc_replay: Option<std::collections::VecDeque<Vec<u8>>> = None;
+        let mut dc_replay_served: Option<Instant> = None;
+        let mut replay_last_orig: Option<u32> = None;
+        let mut replay_last_new = 0_u32;
         let mut dc_was_live = false;
         let mut dc_skips = 0_u64;
         let mut reference_recovery = ReferenceRecovery {
@@ -2504,9 +2557,86 @@ pub fn spawn_video(
             ..ReferenceRecovery::default()
         };
         let mut write_result = Ok(());
+        let mut attach_poll = tokio::time::interval(Duration::from_millis(5));
+        attach_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = stats_tick.tick() => writer_stats.log(),
+                _ = attach_poll.tick() => {
+                    let video_channel = video_data_channel.channel.lock().unwrap().clone();
+                    let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
+                    let has_channel = video_channel.is_some() || idr_channel.is_some();
+                    if has_channel && !dc_had_channel {
+                        // A viewer just attached: replay the last keyframe and
+                        // the deltas that followed it so it sees a picture
+                        // immediately instead of waiting for a forced IDR.
+                        let replayed = video_data_channel
+                            .replay
+                            .lock()
+                            .unwrap()
+                            .snapshot()
+                            .map(|(idr, deltas)| {
+                                let mut queue = std::collections::VecDeque::new();
+                                queue.extend(idr);
+                                queue.extend(deltas);
+                                queue
+                            });
+                        if replayed.is_some() {
+                            tracing::info!("video data channel replaying stream to new viewer");
+                            dc_replay_served = Some(Instant::now());
+                        }
+                        dc_replay = replayed;
+                    }
+                    dc_had_channel = has_channel;
+                    if let Some(queue) = dc_replay.as_mut() {
+                        while let Some(mut msg) = queue.pop_front() {
+                            // Everything replays on the reliable channel: the
+                            // tail must arrive in order — an unordered delta
+                            // outrunning its keyframe makes the viewer drop
+                            // the keyframe as late and wait for the next one.
+                            let replay_channel =
+                                idr_channel.as_ref().or(video_channel.as_ref());
+                            let Some(channel) = replay_channel else {
+                                queue.clear();
+                                break;
+                            };
+                            for _ in 0..30 {
+                                if channel.buffered_amount().await <= 128 * 1024 {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            // Renumber into the live sequence and restamp the
+                            // send time so the replayed tail flows straight
+                            // into the frames that follow it. All parts of a
+                            // chunked access unit share one sequence number.
+                            let orig_seq = u32::from_le_bytes(msg[0..4].try_into().unwrap());
+                            let new_seq = if Some(orig_seq) == replay_last_orig {
+                                replay_last_new
+                            } else {
+                                let allocated = dc_seq;
+                                dc_seq = dc_seq.wrapping_add(1);
+                                replay_last_orig = Some(orig_seq);
+                                replay_last_new = allocated;
+                                allocated
+                            };
+                            msg[0..4].copy_from_slice(&new_seq.to_le_bytes());
+                            let replay_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or_default();
+                            msg[9..17].copy_from_slice(&replay_ms.to_le_bytes());
+                            if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                tracing::warn!(%error, "video data channel replay failed");
+                                queue.clear();
+                                break;
+                            }
+                        }
+                        if queue.is_empty() {
+                            dc_replay = None;
+                        }
+                    }
+                }
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
                         break;
@@ -2538,13 +2668,21 @@ pub fn spawn_video(
                     let dc_kf = video_data_channel.keyframe_requests.load(Ordering::Relaxed);
                     if dc_kf != dc_kf_seen {
                         dc_kf_seen = dc_kf;
-                        delivery_recovery.send_modify(|generation| {
-                            *generation = generation.wrapping_add(1);
-                        });
+                        // A freshly served replay already gave the viewer a
+                        // complete stream, so its attach-time KF request is
+                        // satisfied: forcing another IDR now only congests the
+                        // association right behind the replayed keyframe.
+                        let replay_recent = dc_replay_served
+                            .is_some_and(|served| served.elapsed() < Duration::from_secs(1));
+                        if !replay_recent {
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
                     }
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
-                    let is_idr = au_contains_idr(&sample.data);
+                    let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_live = video_channel.is_some();
                     if dc_live != dc_was_live {
                         dc_was_live = dc_live;
@@ -2558,94 +2696,95 @@ pub fn spawn_video(
                             });
                         }
                     }
-                    if dc_live || idr_channel.is_some() {
-                        // [u32 seq][u8 flags][annex-b au]; the viewer drops
-                        // post-gap deltas and asks for a keyframe on "KF".
-                        // Keyframes go over the reliable channel: they are
-                        // large and cannot survive partial reliability.
-                        // SCTP caps a message at ~64KiB, so large AUs are
-                        // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
-                        const CHUNK: usize = 48 * 1024;
-                        let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
-                        if is_idr {
-                            tracing::info!(
-                                dc_skips,
-                                "video data channel sending IDR seq={dc_seq} parts={parts}"
-                            );
-                        }
-                        let seq = dc_seq;
-                        dc_seq = dc_seq.wrapping_add(1);
-                        let sent_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or_default();
-                        let target = if is_idr {
-                            idr_channel.as_ref().or(video_channel.as_ref())
-                        } else {
-                            video_channel.as_ref()
-                        };
-                        if let Some(channel) = target {
-                            let au_len = sample.data.len();
-                            for part in 0..parts {
-                                let start = part as usize * CHUNK;
-                                let end = (start + CHUNK).min(sample.data.len());
-                                let mut msg = Vec::with_capacity(end - start + 17);
-                                msg.extend_from_slice(&seq.to_le_bytes());
-                                msg.push(u8::from(is_idr));
-                                msg.extend_from_slice(&part.to_le_bytes());
-                                msg.extend_from_slice(&parts.to_le_bytes());
-                                msg.extend_from_slice(&sent_ms.to_le_bytes());
-                                msg.extend_from_slice(&sample.data[start..end]);
-                                if is_idr {
-                                    // Pace IDR parts: bursting ~150KB into the
-                                    // association starves the congestion window
-                                    // and drops deltas on the sibling channel,
-                                    // which re-triggers keyframe requests.
-                                    for _ in 0..30 {
-                                        if channel.buffered_amount().await
-                                            <= 128 * 1024
-                                        {
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(1))
-                                            .await;
-                                    }
-                                    if let Err(error) =
-                                        channel.send(&Bytes::from(msg)).await
-                                    {
-                                        tracing::warn!(%error, "video data channel send failed");
-                                        dc_backed_up = true;
+                    // [u32 seq][u8 flags][annex-b au]; the viewer drops
+                    // post-gap deltas and asks for a keyframe on "KF".
+                    // Keyframes go over the reliable channel: they are
+                    // large and cannot survive partial reliability.
+                    // SCTP caps a message at ~64KiB, so large AUs are
+                    // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
+                    const CHUNK: usize = 48 * 1024;
+                    let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
+                    if is_idr {
+                        tracing::info!(
+                            dc_skips,
+                            "video data channel sending IDR seq={dc_seq} parts={parts}"
+                        );
+                    }
+                    let seq = dc_seq;
+                    dc_seq = dc_seq.wrapping_add(1);
+                    let sent_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default();
+                    // Messages are built even without an attached viewer so the
+                    // replay window stays warm for the next attach.
+                    let mut messages = Vec::with_capacity(parts as usize);
+                    for part in 0..parts {
+                        let start = part as usize * CHUNK;
+                        let end = (start + CHUNK).min(sample.data.len());
+                        let mut msg = Vec::with_capacity(end - start + 17);
+                        msg.extend_from_slice(&seq.to_le_bytes());
+                        msg.push(u8::from(is_idr));
+                        msg.extend_from_slice(&part.to_le_bytes());
+                        msg.extend_from_slice(&parts.to_le_bytes());
+                        msg.extend_from_slice(&sent_ms.to_le_bytes());
+                        msg.extend_from_slice(&sample.data[start..end]);
+                        video_data_channel
+                            .replay
+                            .lock()
+                            .unwrap()
+                            .push(is_idr, part, parts, &msg);
+                        messages.push(msg);
+                    }
+                    let target = if is_idr {
+                        idr_channel.as_ref().or(video_channel.as_ref())
+                    } else {
+                        video_channel.as_ref()
+                    };
+                    if let Some(channel) = target {
+                        let au_len = sample.data.len();
+                        for msg in messages {
+                            if is_idr {
+                                // Pace IDR parts: bursting ~150KB into the
+                                // association starves the congestion window
+                                // and drops deltas on the sibling channel,
+                                // which re-triggers keyframe requests.
+                                for _ in 0..30 {
+                                    if channel.buffered_amount().await <= 128 * 1024 {
                                         break;
                                     }
-                                    dc_backed_up = false;
-                                } else if channel.buffered_amount().await <= 64 * 1024
-                                {
-                                    if let Err(error) =
-                                        channel.send(&Bytes::from(msg)).await
-                                    {
-                                        tracing::warn!(%error, "video data channel send failed");
-                                        dc_backed_up = true;
-                                        break;
-                                    }
-                                    dc_backed_up = false;
-                                } else {
-                                    dc_skips += 1;
-                                    if !dc_backed_up {
-                                        dc_backed_up = true;
-                                        delivery_recovery.send_modify(|generation| {
-                                            *generation = generation.wrapping_add(1);
-                                        });
-                                    }
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                                if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                    tracing::warn!(%error, "video data channel send failed");
+                                    dc_backed_up = true;
                                     break;
                                 }
+                                dc_backed_up = false;
+                            } else if channel.buffered_amount().await <= 64 * 1024 {
+                                if let Err(error) = channel.send(&Bytes::from(msg)).await {
+                                    tracing::warn!(%error, "video data channel send failed");
+                                    dc_backed_up = true;
+                                    break;
+                                }
+                                dc_backed_up = false;
+                            } else {
+                                dc_skips += 1;
+                                if !dc_backed_up {
+                                    dc_backed_up = true;
+                                    delivery_recovery.send_modify(|generation| {
+                                        *generation = generation.wrapping_add(1);
+                                    });
+                                }
+                                break;
                             }
-                            if !dc_backed_up {
-                                // Count the data-channel egress too: the rate
-                                // controller measures real wire bytes, not
-                                // just the RTP share.
-                                writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
-                                writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
-                            }
+                        }
+                        if !dc_backed_up {
+                            // Count the data-channel egress too: the rate
+                            // controller measures real wire bytes, not
+                            // just the RTP share.
+                            writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
+                            writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
                         }
                     } else if dc_backed_up {
                         dc_backed_up = false;
@@ -2831,10 +2970,16 @@ mod tests {
         let mut scale = super::EncodeScale::new(2_000);
         assert_eq!(scale.limits(1920, 1080), (1920, 1080));
         assert!(scale.update(1_400));
-        assert_eq!(scale.limits(1920, 1080), (960, 540));
+        // The divisor still tracks the link, but limits() clamps it so a
+        // 1080p source never encodes below 1080p.
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
         assert!(!scale.update(1_700));
         assert!(scale.update(500));
-        assert_eq!(scale.limits(1920, 1080), (480, 270));
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
+        // A 4K source may halve to exactly 1080p but not quarter below it.
+        assert_eq!(scale.limits(3840, 2160), (1920, 1080));
+        // Sub-1080p sources keep their full resolution too.
+        assert_eq!(scale.limits(1280, 720), (1280, 720));
         assert!(!scale.update(700));
         assert!(scale.update(900));
         assert!(scale.update(1_900));
@@ -3164,7 +3309,15 @@ mod tests {
                 converted.read_rgba(&rgba).unwrap();
                 assert_eq!(converted.bytes.as_ptr(), allocation);
                 assert_eq!(converted.strides(), reference.strides());
-                assert_eq!(converted.bytes, expected.bytes);
+                // SIMD conversion may round within 1 LSB of the scalar kernel.
+                let max_delta = converted
+                    .bytes
+                    .iter()
+                    .zip(expected.bytes.iter())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                assert!(max_delta <= 1, "max channel delta {max_delta}");
             }
         }
     }
@@ -3411,6 +3564,7 @@ mod tests {
                 TimingSample {
                     capture_to_encode: age,
                     encode: Duration::from_millis(4),
+                    queue: Duration::ZERO,
                 },
                 fresh,
             );

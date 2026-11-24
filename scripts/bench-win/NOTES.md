@@ -135,6 +135,49 @@ is idle). Agent-side proactive IDR on channel open was tried and reverted:
 it raced the viewer's own KF and emitted a duplicate ~150KB IDR that
 congested SCTP (+30-50ms joinMs).
 
+**Stream replay (ships).** The writer keeps a process-global, ~4MB replay
+window of the last complete keyframe plus every delta after it. A 5ms
+attach poll snapshots it and replays the tail over the reliable channel —
+ordered delivery is required, an unordered delta outrunning the keyframe
+makes the viewer drop it as "late" — with seq renumbered into the live
+stream. The attach-time `KF` is swallowed for 1s after a served replay so
+no duplicate IDR follows.
+
+| variant                           | joinMs (n=3)    |
+| --------------------------------- | --------------- |
+| cold attach (empty replay window) | ~127            |
+| **reattach (replayed tail)**      | **10.5 / 16.4** |
+
+~8x faster rejoins. The first-ever attach still waits for a fresh IDR
+because nothing has been encoded yet.
+
+**Replay warmup (ships).** At agent start `prime_replay` does a single-shot
+`Monitor::capture_image` + one H.264 IDR encode and atomically `seed`s it
+into the replay window (seed refuses once any live keyframe exists, so it
+can never corrupt the delta chain). A session-connect retry covers agents
+whose boot capture failed. A second _recorder_ is not used: an early
+version spawned `CaptureEncoder::primary`, whose capture session starved
+the real pipeline's recorder and timed out its first-frame wait at 5s.
+
+| variant                             | joinMs (n=3)  |
+| ----------------------------------- | ------------- |
+| **first-ever attach (warm window)** | **4.5 / 6.5** |
+
+The warm frame can be seconds-to-minutes old on the very first attach; the
+pipeline's own startup IDR replaces it ~50ms later. Encoder smoke
+unchanged: 5.65ms p50, PSNR p05 45.85dB, ~108kbps static.
+
+**Attach→first decode** (`__dcv.firstDecodeMs`): **14–22ms** — join ~9ms plus
+~5–12ms software decode+present on this GPU-less VM.
+
+**srcObject race fix (ships).** `peer.ontrack` unconditionally overwrote
+`video.srcObject` with the RTP stream; if it fired after the DC path had
+claimed the element, the MediaStreamTrackGenerator went unconsumed,
+`writer.write()` pended, unclosed VideoFrames wedged Chrome's decoder and
+the viewer stayed on "waiting for video" forever. Now the RTP stream is
+only assigned when no DC path is attached (the RTP fallback is preserved —
+`restoreRemoteVideo` puts it back on teardown).
+
 ## Delivered fps under motion (`__dcv` counters, 30s windows)
 
 End-to-end decode delivery while the scrolling checkerboard covers the
@@ -192,3 +235,22 @@ hardware and the jitter-buffer bypass is worth ~20-35ms on its own.
 - Window occlusion breaks the marker scan (locate -> marker_y=-1): the
   viewer window must be visible and not maximized over the band. If it
   paints white after restore, `Page.reload` via CDP :9222.
+
+## Frame-slot queue (cycle 9)
+
+`capture_to_encode` decomposes: `queue` (capture → encode dispatch) +
+`encode`. media-smoke now reports `queue_p50_milliseconds`: 7.85ms in the
+harness (its 60Hz pull cadence parks ~30Hz frames half an interval), vs
+**0.91ms** queue_ns/frame in the live producer. Real production
+capture→encode ≈ 11.6ms = backend 7.5 + color 2.3 + compare 0.9 + queue 0.9.
+Also removed a redundant full-frame `differs_from` after every changed
+encode (~0.87ms × encoded frames ≈ 1.5% agent CPU under motion).
+
+## RGBA→I420 conversion (cycle 10)
+
+Replaced hand-rolled 4-thread scalar conversion with the `yuv` crate's
+runtime-dispatched SIMD (SSE→AVX2), same BT.601 limited matrix. 720p
+microbench: 1103µs → 189µs/frame (−83%). media-smoke encode p50
+5.43→4.07ms (−25%), capture_to_encode 13.1→11.79ms. Bit-exact test
+relaxed to ±1 LSB — SIMD rounds chroma slightly differently; PSNR
+unchanged (45.9dB).

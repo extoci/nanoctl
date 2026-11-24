@@ -172,6 +172,94 @@ pub(crate) struct DataChannelVideo {
     pub channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub idr_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub keyframe_requests: AtomicU64,
+    pub replay: Arc<std::sync::Mutex<VideoReplay>>,
+}
+
+/// The most recent complete keyframe plus every delta produced after it, kept
+/// so a freshly attached viewer can be caught up without waiting for the
+/// encoder to produce a new keyframe.
+#[cfg(feature = "media")]
+#[derive(Default)]
+pub(crate) struct VideoReplay {
+    idr: Vec<Vec<u8>>,
+    pending_idr: Vec<Vec<u8>>,
+    deltas: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+/// A copied replay window: the keyframe's wire messages and the deltas after it.
+#[cfg(feature = "media")]
+pub(crate) type VideoReplaySnapshot = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+#[cfg(feature = "media")]
+const VIDEO_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The replay window outlives a single peer connection: a freshly attached
+/// viewer replays the previous stream's tail and reaches live video without
+/// waiting for the new pipeline to produce its first keyframe.
+#[cfg(feature = "media")]
+static VIDEO_REPLAY: std::sync::OnceLock<Arc<std::sync::Mutex<VideoReplay>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "media")]
+pub(crate) fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
+    VIDEO_REPLAY
+        .get_or_init(|| Arc::new(std::sync::Mutex::new(VideoReplay::default())))
+        .clone()
+}
+
+#[cfg(feature = "media")]
+impl VideoReplay {
+    /// Records a wire-format video message. `is_idr`, `part` and `parts` come
+    /// from the message header the producer already computed.
+    pub fn push(&mut self, is_idr: bool, part: u16, parts: u16, message: &[u8]) {
+        if is_idr {
+            if part == 0 {
+                self.pending_idr.clear();
+            }
+            self.pending_idr.push(message.to_vec());
+            if part + 1 == parts {
+                self.idr = std::mem::take(&mut self.pending_idr);
+                self.deltas.clear();
+                self.bytes = self.idr.iter().map(Vec::len).sum();
+            }
+            return;
+        }
+        if self.idr.is_empty() {
+            // No complete keyframe base to anchor the delta to.
+            return;
+        }
+        if self.bytes + message.len() > VIDEO_REPLAY_MAX_BYTES {
+            self.idr.clear();
+            self.deltas.clear();
+            self.bytes = 0;
+            return;
+        }
+        self.bytes += message.len();
+        self.deltas.push(message.to_vec());
+    }
+
+    /// Installs a ready-made keyframe only while the window is still empty.
+    /// Checking and installing under one lock keeps a warm frame from ever
+    /// overwriting a live stream's keyframe, which would corrupt the deltas
+    /// anchored to it.
+    pub fn seed(&mut self, idr: Vec<Vec<u8>>) -> bool {
+        if !self.idr.is_empty() || !self.pending_idr.is_empty() {
+            return false;
+        }
+        self.bytes = idr.iter().map(Vec::len).sum();
+        self.idr = idr;
+        true
+    }
+
+    /// Clones the replay for a newly attached channel. The cache keeps
+    /// accumulating so later attaches get a fresh window too.
+    pub fn snapshot(&self) -> Option<VideoReplaySnapshot> {
+        if self.idr.is_empty() {
+            return None;
+        }
+        Some((self.idr.clone(), self.deltas.clone()))
+    }
 }
 
 #[derive(Clone)]
@@ -535,6 +623,7 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (viewer_limits, _) =
             tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
+        let (link_feedback, _) = tokio::sync::watch::channel(None);
         #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
             tokio::sync::watch::channel(String::new());
@@ -549,6 +638,7 @@ impl HostPeer {
             channel: std::sync::Mutex::new(None),
             idr_channel: std::sync::Mutex::new(None),
             keyframe_requests: AtomicU64::new(0),
+            replay: video_replay(),
         });
         #[cfg(feature = "media")]
         {
@@ -618,6 +708,15 @@ impl HostPeer {
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
+            // The data-channel video path decodes Annex-B access units: the
+            // browser viewer handles H.264 and the iOS app adds HEVC via
+            // VideoToolbox. A viewer in "auto" may open the channels before
+            // negotiation decides the codec, so they are honoured solely when
+            // an Annex-B codec won (anything else, e.g. AV1, keeps RTP only).
+            let video_dc_codec_ok = matches!(
+                negotiated.codec,
+                crate::codec::VideoCodec::H264 | crate::codec::VideoCodec::Hevc
+            );
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let viewer_limits = viewer_limits_for_channel.clone();
@@ -625,6 +724,13 @@ impl HostPeer {
                 if channel.label() == "nanoctl.video.v1"
                     || channel.label() == "nanoctl.video-idr.v1"
                 {
+                    if !video_dc_codec_ok {
+                        tracing::info!(
+                            codec = negotiated.codec.id(),
+                            "video data channel ignored: negotiated codec is not Annex-B"
+                        );
+                        return Box::pin(async {});
+                    }
                     let is_idr = channel.label() == "nanoctl.video-idr.v1";
                     tracing::info!(idr = is_idr, "video data channel opened");
                     let slot = video_dc_for_channel.clone();
@@ -680,7 +786,7 @@ impl HostPeer {
                 }
                 let reliable = channel.label() == "nanoctl.control.v1";
                 if input.is_none() {
-                    // View-only sessions still adjust stream quality.
+                    // View-only sessions still adjust stream quality and transport.
                     if reliable {
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
                             if message.is_string
@@ -834,7 +940,6 @@ impl HostPeer {
         let (keyframe_requests, _) = tokio::sync::watch::channel(0_u64);
         #[cfg(feature = "media")]
         let keyframe_feedback = keyframe_requests.clone();
-        let (link_feedback, _) = tokio::sync::watch::channel(None);
         let link_samples = link_feedback.clone();
         let video_ssrc = sender
             .get_parameters()

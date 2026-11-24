@@ -24,10 +24,16 @@ runs:
       shell: bash
       run: echo "ym=$(date -u +%Y-%m)" >>"$GITHUB_OUTPUT"
     - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      id: apt-cache
       with:
         path: ~/apt-archives
-        key: apt-media-${{ inputs.cache-suffix }}-${{ steps.month.outputs.ym }}
-        restore-keys: apt-media-${{ inputs.cache-suffix }}-
+        key: apt-${{ inputs.cache-suffix }}-${{ steps.month.outputs.ym }}
+        # Second entry lets a leg with extra packages fall back to a sibling
+        # package set's archives (e.g. x264 legs restore the plain media entry
+        # and download only libx264-dev) on a cold-month cache.
+        restore-keys: |
+          apt-${{ inputs.cache-suffix }}-
+          apt-
     - name: Install apt packages
       shell: bash
       run: |
@@ -40,8 +46,17 @@ runs:
           libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev \
           libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev \
           libxtst-dev cmake nasm pkg-config ${{ inputs.extra-packages }}
+      # The bind-mounted /var/cache/apt/archives holds root-owned files
+      # (apt's lock, partial/) that the runner cannot read; tar exits 2
+      # without this.
+    - name: Make archives readable for cache save
+      if: inputs.save-cache == 'true' && steps.apt-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: sudo chmod -R a+rX "$HOME/apt-archives"
+    # Skip on a hit: the entry already exists, so saving would only emit
+    # "Unable to reserve" warnings on every leg that races the same key.
     - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-      if: inputs.save-cache == 'true'
+      if: inputs.save-cache == 'true' && steps.apt-cache.outputs.cache-hit != 'true'
       with:
         path: ~/apt-archives
-        key: apt-media-${{ inputs.cache-suffix }}-${{ steps.month.outputs.ym }}
+        key: apt-${{ inputs.cache-suffix }}-${{ steps.month.outputs.ym }}

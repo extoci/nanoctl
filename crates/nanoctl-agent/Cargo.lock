@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctl-agent"
-version = "3.0.0-alpha.4"
+version = "3.0.0-alpha.5"
 dependencies = [
  "anstyle-query",
  "anyhow",
@@ -2772,6 +2772,7 @@ dependencies = [
  "xcap",
  "xcb",
  "xkeysym",
+ "yuv",
 ]
 
 [[package]]
@@ -6163,6 +6164,15 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "yuv"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2145858fb536669bf8eef4ddfdd3dee3504239af508c4468705c4dc4d518112"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
