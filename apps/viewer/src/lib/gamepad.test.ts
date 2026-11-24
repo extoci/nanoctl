@@ -82,11 +82,16 @@ test("bounds to four controllers, preserves slots, and retries a blocked release
     return true;
   });
   gamepad.sample([pad(2), pad(3), pad(4), pad(8), pad(9)], 0);
+  // Renumbered controllers keep their slots when the pad id is still present.
   gamepad.sample([pad(8), pad(3), pad(9)], 1);
   gamepad.sample([pad(8), pad(3), pad(9)], 2);
   blocked = true;
   gamepad.release();
   blocked = false;
   gamepad.release();
-  expect(slots).toEqual([[0, 1, 2, 3], [1, 3], [0, 1, 3], []]);
+  expect(slots).toEqual([
+    [0, 1, 2, 3],
+    [0, 1, 2],
+    [0, 1, 2],
+  ]);
 });

@@ -65,6 +65,10 @@ test("forwards gamepad reports only while enabled and detaches on disconnect", a
   });
   await expect.poll(async () => (await events()).match(/0 attached/g)?.length).toBe(2);
   await page.getByRole("button", { name: "Input on" }).click();
-  await expect.poll(async () => (await events()).match(/0 detached/g)?.length).toBe(2);
   await expect(gamepad).toBeDisabled();
+  // Suspending input idles the emulated pads instead of unplugging them.
+  await page.waitForTimeout(500);
+  const log = await events();
+  expect(log.match(/0 detached/g)?.length).toBe(1);
+  expect(log.match(/1 detached/g)?.length).toBe(1);
 });

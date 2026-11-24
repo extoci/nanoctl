@@ -5,6 +5,7 @@ const XINPUT_BUTTONS = [
   0x0002, 0x0004, 0x0008, 0x0400,
 ];
 const KEEPALIVE_MS = 500;
+const MAX_SLOTS = 4;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
 type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
 type DualShock4Pad = NonNullable<GamepadMessage["dualShock4"]>[number];
@@ -46,8 +47,23 @@ function report(pad: InputPad, slot: number): GamepadReport {
   ];
 }
 
+/**
+ * A slot is one virtual controller on the host, tracked by browser pad identity rather than by
+ * position: `navigator.getGamepads()` renumbers pads as devices come and go, so identity keeps a
+ * pad that re-enumerates on the same host controller instead of unplugging and replugging it.
+ */
+type TrackedPad = { index: number; id: string };
+
+/**
+ * Maps browser gamepads onto host-side virtual controller slots and publishes their state.
+ *
+ * Slots that go silent are released by omission: a report list without a slot detaches that slot's
+ * virtual controller on the host. `release` instead zeroes the occupied slots — the controllers
+ * stay plugged in and go idle — which is what a transient disconnect or window blur wants.
+ * `detach` is the opposite and is reserved for an explicit "gamepad off"/session end.
+ */
 export class GamepadForwarder {
-  private readonly slots: (number | undefined)[] = Array.from({ length: 4 });
+  private readonly slots: (TrackedPad | undefined)[] = Array.from({ length: MAX_SLOTS });
   private sentSlots = new Set<number>();
   private lastSent = JSON.stringify({ type: "gamepad", pads: [] });
   private sentAt = -Infinity;
@@ -62,25 +78,37 @@ export class GamepadForwarder {
       if (pad.mapping === "standard") available.set(pad.index, pad);
       else unsupported = true;
     }
+    const unclaimed = new Map(available);
     for (let slot = 0; slot < this.slots.length; slot++) {
-      const index = this.slots[slot];
-      if (index !== undefined && !available.has(index)) this.slots[slot] = undefined;
+      const tracked = this.slots[slot];
+      if (!tracked) continue;
+      const current = unclaimed.get(tracked.index);
+      if (current?.id === tracked.id) {
+        unclaimed.delete(tracked.index);
+        continue;
+      }
+      const moved = [...unclaimed.values()].find((pad) => pad.id === tracked.id);
+      if (moved) {
+        this.slots[slot] = { index: moved.index, id: moved.id };
+        unclaimed.delete(moved.index);
+      } else {
+        this.slots[slot] = undefined;
+      }
     }
-    for (const index of available.keys()) {
-      if (this.slots.includes(index)) continue;
+    for (const pad of unclaimed.values()) {
       const free = this.slots.findIndex(
-        (current, slot) => current === undefined && !this.sentSlots.has(slot),
+        (tracked, slot) => tracked === undefined && !this.sentSlots.has(slot),
       );
       if (free === -1) break;
-      this.slots[free] = index;
+      this.slots[free] = { index: pad.index, id: pad.id };
     }
     const reports: GamepadReport[] = [];
     const dualShock4: DualShock4Pad[] = [];
-    this.slots.forEach((index, slot) => {
-      const pad = index === undefined ? undefined : available.get(index);
-      if (!pad) return;
+    this.slots.forEach((tracked, slot) => {
+      const pad = tracked === undefined ? undefined : available.get(tracked.index);
+      if (!pad || !tracked) return;
       reports.push(report(pad, slot));
-      if (isPlayStation(pad.id)) {
+      if (isPlayStation(tracked.id)) {
         dualShock4.push({
           slot,
           leftTriggerPressed: pad.buttons[6]?.pressed ?? false,
@@ -93,8 +121,30 @@ export class GamepadForwarder {
     return available.size ? "connected" : unsupported ? "unsupported" : "waiting";
   }
 
+  /** Zero every occupied slot without detaching it: the host keeps an idle controller. */
   release(): void {
+    const pads: GamepadReport[] = [];
+    const dualShock4: DualShock4Pad[] = [];
+    this.slots.forEach((tracked, slot) => {
+      if (!tracked) return;
+      pads.push([slot, 0, 0, 0, 0, 0, 0, 0]);
+      if (isPlayStation(tracked.id)) {
+        dualShock4.push({
+          slot,
+          leftTriggerPressed: false,
+          rightTriggerPressed: false,
+          touchpadPressed: false,
+        });
+      }
+    });
+    this.flush({ type: "gamepad", pads, ...(dualShock4.length && { dualShock4 }) }, 0);
+  }
+
+  /** Tell the host to unplug every slot and forget the pad-to-slot mapping. */
+  detach(): void {
     this.flush({ type: "gamepad", pads: [] }, 0);
+    this.slots.fill(undefined);
+    this.sentSlots.clear();
   }
 
   private flush(message: GamepadMessage, now: number): void {

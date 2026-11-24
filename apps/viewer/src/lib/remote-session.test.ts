@@ -169,6 +169,61 @@ describe("remote session lifecycle", () => {
     }
   });
 
+  test("gamepad polling resumes by itself when the connection recovers", async () => {
+    installBrowserGlobals();
+    const pad = {
+      axes: [0, 0, 0, 0],
+      buttons: Array.from({ length: 17 }, () => ({ pressed: false, value: 0 })),
+      connected: true,
+      id: "Xbox Wireless Controller",
+      index: 0,
+      mapping: "standard",
+    };
+    defineGlobal("navigator", { getGamepads: () => [pad] });
+    const peer = new FakePeer();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: new FakeVideo() as unknown as HTMLVideoElement,
+      gamepadAvailable: true,
+      preferences: { inputEnabled: true },
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    peer.connectionState = "connected";
+    peer.onconnectionstatechange?.();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    controller.setGamepadEnabled(true);
+    expect(controller.snapshot.gamepadEnabled).toBe(true);
+    channel.sent = [];
+    flushAnimationFrame(1_000);
+    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+      type: "gamepad",
+      pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
+    });
+
+    peer.connectionState = "disconnected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(false);
+    expect(controller.snapshot.gamepadEnabled).toBe(false);
+
+    peer.connectionState = "connected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(true);
+    expect(controller.snapshot.gamepadEnabled).toBe(true);
+    channel.sent = [];
+    flushAnimationFrame(2_000);
+    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+      type: "gamepad",
+      pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
+    });
+    await controller.stop();
+  });
+
   test("requests zero receiver buffering only through supported browser APIs", async () => {
     installBrowserGlobals();
     for (const receiver of [
@@ -701,8 +756,19 @@ function pressKey(type: string, target: unknown, properties: object): void {
   for (const listener of windowListeners.get(type) ?? []) listener(event);
 }
 
+const animationFrames = new Map<number, FrameRequestCallback>();
+let animationFrameId = 0;
+
+/** Runs one round of queued rAF callbacks (they re-queue themselves). */
+function flushAnimationFrame(now: number): void {
+  const callbacks = [...animationFrames.values()];
+  animationFrames.clear();
+  for (const callback of callbacks) callback(now);
+}
+
 function installBrowserGlobals(setInterval?: (callback: () => void) => number): void {
   windowListeners.clear();
+  animationFrames.clear();
   const eventTarget = {
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -718,11 +784,19 @@ function installBrowserGlobals(setInterval?: (callback: () => void) => number): 
     clearInterval: globalThis.clearInterval.bind(globalThis),
     setTimeout: globalThis.setTimeout.bind(globalThis),
     clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    requestAnimationFrame: (callback: FrameRequestCallback) => {
+      animationFrames.set(++animationFrameId, callback);
+      return animationFrameId;
+    },
+    cancelAnimationFrame: (id: number) => {
+      animationFrames.delete(id);
+    },
   });
   defineGlobal("document", {
     ...eventTarget,
     visibilityState: "visible",
     fullscreenElement: null,
+    hasFocus: () => true,
   });
   defineGlobal("MediaStream", FakeMediaStream);
 }

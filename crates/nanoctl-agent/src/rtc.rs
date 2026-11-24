@@ -855,8 +855,10 @@ impl HostPeer {
                             && let Ok(mut input) = input.lock()
                         {
                             input.release_all();
+                            // A close can be transient (ICE restart): idle the
+                            // emulated pads but keep them plugged in.
                             if reliable {
-                                input.revoke_gamepads();
+                                input.neutralize_gamepads();
                             }
                         }
                     })

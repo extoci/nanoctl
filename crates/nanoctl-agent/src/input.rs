@@ -433,6 +433,13 @@ impl InputController {
         }
     }
 
+    /// Idle every emulated pad without unplugging it: the right response to a
+    /// transient control-channel loss, as opposed to `revoke_gamepads` which
+    /// detaches the virtual controllers for good.
+    pub fn neutralize_gamepads(&mut self) {
+        self.gamepads.neutralize();
+    }
+
     pub fn revoke_gamepads(&mut self) {
         self.gamepads_revoked = true;
         self.gamepads = Default::default();

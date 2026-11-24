@@ -148,22 +148,28 @@ impl Gamepads {
         error.map_or(Ok(()), Err)
     }
 
+    /// Zero every attached pad without unplugging it, so a transient channel
+    /// loss does not look like the controller was removed.
+    pub fn neutralize(&mut self) {
+        self.last_snapshot = None;
+        for current in &mut self.pads {
+            if let Some(pad) = current {
+                let neutral = PadReport::neutral(pad.kind);
+                match pad.target.update(neutral) {
+                    Ok(UpdateStatus::Applied) => pad.last = Some(neutral),
+                    Ok(UpdateStatus::Retry) => {}
+                    Err(_) => *current = None,
+                }
+            }
+        }
+    }
+
     pub fn neutralize_if_idle(&mut self, timeout: Duration) {
         if self
             .last_snapshot
             .is_some_and(|last| last.elapsed() >= timeout)
         {
-            self.last_snapshot = None;
-            for current in &mut self.pads {
-                if let Some(pad) = current {
-                    let neutral = PadReport::neutral(pad.kind);
-                    match pad.target.update(neutral) {
-                        Ok(UpdateStatus::Applied) => pad.last = Some(neutral),
-                        Ok(UpdateStatus::Retry) => {}
-                        Err(_) => *current = None,
-                    }
-                }
-            }
+            self.neutralize();
         }
     }
 }
@@ -568,6 +574,29 @@ mod tests {
             // Subsequent identical snapshot is deduplicated once applied.
             apply(&mut slot, 0, report).unwrap();
             assert_eq!(updates.lock().unwrap().as_slice(), &[report, report]);
+        }
+
+        #[test]
+        fn neutralize_idles_pads_but_keeps_them_attached() {
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let mut gamepads = Gamepads::default();
+            gamepads.pads[0] = Some(Pad {
+                kind: PadKind::DualShock4,
+                target: Box::new(ScriptedPad {
+                    outcomes: VecDeque::new(),
+                    updates: Arc::clone(&updates),
+                }),
+                last: None,
+            });
+            gamepads.last_snapshot = Some(Instant::now());
+
+            gamepads.neutralize();
+            assert!(gamepads.pads[0].is_some());
+            assert_eq!(gamepads.last_snapshot, None);
+            assert_eq!(
+                updates.lock().unwrap().as_slice(),
+                &[PadReport::neutral(PadKind::DualShock4)]
+            );
         }
 
         #[test]

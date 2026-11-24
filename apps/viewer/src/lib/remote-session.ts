@@ -92,7 +92,7 @@ export type RemoteSessionOptions = {
   gamepadAvailable?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
-  preferences?: { inputEnabled: boolean; displayId?: string };
+  preferences?: { inputEnabled: boolean; displayId?: string; gamepadEnabled?: boolean };
   /** Codecs the host can encode; the viewer orders its offer so the host picks the best one. */
   videoCodecs?: readonly VideoCodec[];
   codecChoice?: CodecChoice;
@@ -173,7 +173,11 @@ export class RemoteSessionController {
   private inputEnabled = false;
   private inputBlocked = 0;
   private readonly pressedKeys = new Set<string>();
-  private readonly preferences: { inputEnabled: boolean; displayId?: string };
+  private readonly preferences: {
+    inputEnabled: boolean;
+    displayId?: string;
+    gamepadEnabled?: boolean;
+  };
   private firstFrameReceived = false;
   private stopPromise: Promise<void> | null = null;
   private signalQueue: Promise<void> = Promise.resolve();
@@ -344,20 +348,27 @@ export class RemoteSessionController {
   }
 
   setGamepadEnabled(enabled: boolean): void {
+    this.preferences.gamepadEnabled = enabled;
     if (enabled) {
-      if (
-        this.gamepadFrame !== null ||
-        !this.options.gamepadAvailable ||
-        !this.inputEnabled ||
-        this.phase !== "connected" ||
-        typeof navigator.getGamepads !== "function"
-      )
-        return;
-      this.gamepadFrame = window.requestAnimationFrame(this.pollGamepads);
+      this.startGamepadPolling();
     } else {
       this.stopGamepads();
+      this.gamepad.detach();
     }
     this.publishSnapshot();
+  }
+
+  private startGamepadPolling(): void {
+    if (
+      this.gamepadFrame !== null ||
+      !this.preferences.gamepadEnabled ||
+      !this.options.gamepadAvailable ||
+      !this.inputEnabled ||
+      this.phase !== "connected" ||
+      typeof navigator.getGamepads !== "function"
+    )
+      return;
+    this.gamepadFrame = window.requestAnimationFrame(this.pollGamepads);
   }
 
   private readonly pollGamepads = (now: number): void => {
@@ -573,13 +584,7 @@ export class RemoteSessionController {
     };
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
-      this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
-      const displayId = this.preferences.displayId;
-      if (displayId && this.displays.some((display) => display.id === displayId))
-        this.sendControl({ type: "display", displayId });
-      if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
-        this.sendControl({ type: "quality", ...this.qualityLimits });
-      this.publishSnapshot();
+      this.onControlReady();
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
     this.videoTransceiver = peer.addTransceiver("video", {
@@ -686,8 +691,9 @@ export class RemoteSessionController {
           this.clearRecoveryTimer();
           this.clearNegotiationTimer();
           this.phase = "connected";
-          this.inputEnabled =
-            this.preferences.inputEnabled && this.remoteInputAllowed && this.isControlOpen();
+          // Data channels survive an ICE restart, so a recovered connection re-opens input
+          // and gamepad polling without waiting for another channel.onopen.
+          this.onControlReady();
           this.armFirstFrameTimer(lifecycle, peer);
           this.publishSnapshot();
           break;
@@ -1313,6 +1319,18 @@ export class RemoteSessionController {
 
   private isControlOpen(): boolean {
     return this.controlChannel?.readyState === "open";
+  }
+
+  private onControlReady(): void {
+    if (!this.isControlOpen()) return;
+    this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
+    const displayId = this.preferences.displayId;
+    if (displayId && this.displays.some((display) => display.id === displayId))
+      this.sendControl({ type: "display", displayId });
+    if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
+      this.sendControl({ type: "quality", ...this.qualityLimits });
+    this.startGamepadPolling();
+    this.publishSnapshot();
   }
 
   private isCurrent(lifecycle: number, peer: RTCPeerConnection): boolean {
