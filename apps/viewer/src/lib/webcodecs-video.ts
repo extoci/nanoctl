@@ -85,6 +85,7 @@ function createVideoSink(
   video: HTMLVideoElement,
   onTeardown?: () => void,
   joinAt?: number,
+  onDecoderBackup?: () => void,
 ): VideoSink {
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
@@ -262,6 +263,7 @@ function createVideoSink(
   // Chrome delivers H.264 in Annex-B. Keep an AVCC/packetized fallback just in
   // case the framing differs.
   let decoderConfigured = false;
+  let decoderBackedUp = false;
 
   const toAnnexB = (data: Uint8Array): Uint8Array => {
     if (
@@ -312,10 +314,31 @@ function createVideoSink(
       decoderConfigured = true;
     }
     if (!decoder) return;
+    const key = isKey || containsIdr(annexB);
+    // Once one delta is dropped, later deltas reference a frame the decoder
+    // never saw. Feeding them wastes decode work and can render corruption
+    // until the next keyframe, so suppress the broken tail and use the next
+    // IDR to reset the decoder immediately.
+    if (decoderBackedUp) {
+      if (!key) {
+        dropped += 1;
+        return;
+      }
+      decoderBackedUp = false;
+      try {
+        const codec = codecOf(annexB);
+        decoder.reset();
+        decoder.configure(decoderConfig(codec));
+        configuredCodec = codec;
+      } catch {
+        decoderConfigured = false;
+        return;
+      }
+    }
     // Adaptive encoders may switch H.264 profiles between IDRs (e.g. baseline
     // under stress, high when the content is easy). Annex-B carries the new
     // SPS in-band; re-configure the decoder so the codec string tracks it.
-    if (isKey || containsIdr(annexB)) {
+    if (key) {
       const codec = codecOf(annexB);
       if (codec !== configuredCodec) {
         try {
@@ -328,15 +351,17 @@ function createVideoSink(
         }
       }
     }
-    if (decoder.decodeQueueSize > 1 && !isKey) {
+    if (decoder.decodeQueueSize > 1 && !key) {
       dropped += 1;
+      decoderBackedUp = true;
+      onDecoderBackup?.();
       return;
     }
     try {
       decodeSubmit.set(timestampUs, performance.now());
       decoder.decode(
         new EncodedVideoChunk({
-          type: isKey ? "key" : "delta",
+          type: key ? "key" : "delta",
           timestamp: timestampUs,
           data: annexB,
         }),
@@ -409,17 +434,26 @@ export function attachDataChannelVideo(
 ): WebCodecsVideoHandle {
   // Join latency: attach -> first keyframe fed to the decoder.
   const joinAt = performance.now();
-  const sink = createVideoSink(video, onTeardown, joinAt);
+  const dbg = ((
+    window as unknown as { __dcv?: Record<string, number | boolean | string> }
+  ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
+  let kfRequestedAt = 0;
+  const requestKeyframe = (force = false) => {
+    const now = Date.now();
+    if (!force && now - kfRequestedAt <= 250) return;
+    kfRequestedAt = now;
+    dbg.kf = (dbg.kf as number) + 1;
+    try {
+      channel.send("KF");
+    } catch {}
+  };
+  const sink = createVideoSink(video, onTeardown, joinAt, () => requestKeyframe(true));
   // Wire format: [u32 seq][u8 flags][annex-b au]. Deltas ride the unordered,
   // unreliable channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
   // chain — drop deltas until the next keyframe and ask the host for one.
   let expectedSeq: number | null = null;
   let waitingForKey = true;
-  let kfRequestedAt = 0;
-  const dbg = ((
-    window as unknown as { __dcv?: Record<string, number | boolean | string> }
-  ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
   dbg.waitingForKey = true;
   dbg.joinAt = joinAt;
   delete dbg.joinMs;
@@ -428,9 +462,7 @@ export function attachDataChannelVideo(
   // Ask for a keyframe immediately: without it the request only goes out
   // after the first delta arrives, and an idle producer can delay that.
   if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {
-    try {
-      channel.send("KF");
-    } catch {}
+    requestKeyframe();
   }
   const pending = new Map<
     number,
@@ -518,13 +550,7 @@ export function attachDataChannelVideo(
       const deliver = (s: number, a: Uint8Array, k: boolean) => {
         expectedSeq = (s + 1) >>> 0;
         if (waitingForKey) {
-          if (Date.now() - kfRequestedAt > 250) {
-            kfRequestedAt = Date.now();
-            dbg.kf = (dbg.kf as number) + 1;
-            try {
-              channel.send("KF");
-            } catch {}
-          }
+          requestKeyframe();
           if (!k) return;
           waitingForKey = false;
           dbg.waitingForKey = false;
