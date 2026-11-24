@@ -666,10 +666,10 @@ no hidden overhead in the live path.
 
 Measured on this VM (8 logical CPUs):
 
-| Condition | nanoctl agent | Sunshine |
-|---|---|---|
-| Idle, no viewer | 0.0% CPU, pipeline fully stopped | 0.0% CPU, ~31MB RSS |
-| Streaming static desktop | ~8.6% CPU, ~115MB RSS | ~21% CPU, ~112MB RSS (earlier) |
+| Condition                | nanoctl agent                    | Sunshine                       |
+| ------------------------ | -------------------------------- | ------------------------------ |
+| Idle, no viewer          | 0.0% CPU, pipeline fully stopped | 0.0% CPU, ~31MB RSS            |
+| Streaming static desktop | ~8.6% CPU, ~115MB RSS            | ~21% CPU, ~112MB RSS (earlier) |
 
 The streaming-static cost is xcap's Windows pull model (continuous frame
 readback at capture cadence; no dirty-rect events — Linux gets XDamage, macOS
