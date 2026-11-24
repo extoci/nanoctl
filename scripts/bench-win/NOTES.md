@@ -440,3 +440,13 @@ Default stays hex; umh available via env when encode headroom exists.
 loopback, but this headless box has no audio endpoint and the Windows
 Audio service cannot start (no render device). Audio latency/bitrate
 numbers need a box with a sound device (or a virtual audio driver).
+
+## Attach churn bench (cycle 20)
+
+`churn-bench.ts <page-id> [N]` reloads the viewer page N times via CDP
+and reports joinMs/firstDecodeMs/live/decoded/kf/gaps per attach - a
+regression probe for the replay-window + decoder-attach path.
+
+8/8 attaches clean under motion scene: joinMs 4.6-10.9 (mean ~8),
+firstDecodeMs 8.3-16.5, exactly 1 kf each, 0 gaps, all live+decoding.
+No wedge/leak across repeated attach/detach churn.
