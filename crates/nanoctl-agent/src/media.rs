@@ -2219,6 +2219,83 @@ fn au_contains_idr(data: &[u8]) -> bool {
     false
 }
 
+/// Captures a single frame and encodes it as an IDR into the replay window so
+/// a viewer's very first attach is served a stream tail immediately instead
+/// of waiting for the new pipeline's first keyframe (~100ms cold). Runs on a
+/// blocking thread; a no-op once any stream has warmed the window.
+#[cfg(feature = "media")]
+pub fn prime_replay(
+    max_bitrate_kbps: u32,
+    max_fps: u16,
+    max_width: u32,
+    max_height: u32,
+    latency_mode: LatencyMode,
+    encoder_preference: EncoderPreference,
+) -> Result<()> {
+    let replay = crate::rtc::video_replay();
+    if replay.lock().unwrap().snapshot().is_some() {
+        return Ok(());
+    }
+    let monitor = Monitor::all()
+        .context("screen capture is unavailable")?
+        .into_iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .context("no display is available")?;
+    // A single-shot grab, not a recorder: a second capture session starves
+    // the real pipeline's recorder (its first-frame wait timed out at 5s).
+    let image = monitor.capture_image()?;
+    let (source_width, source_height) = image.dimensions();
+    let (target_width, target_height) =
+        fit_dimensions(source_width, source_height, max_width, max_height);
+    let image = if target_width == source_width && target_height == source_height {
+        image
+    } else {
+        xcap::image::imageops::resize(
+            &image,
+            target_width,
+            target_height,
+            xcap::image::imageops::FilterType::Triangle,
+        )
+    };
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        bail!("captured display dimensions must be non-zero and even");
+    }
+    // The data-channel path only carries H.264 (rtc.rs gates the channels on
+    // the negotiated codec), so the warm keyframe is always baseline H.264.
+    let mut backend = EncoderBackend::new_for_codec(
+        VideoCodec::H264,
+        false,
+        encoder_preference,
+        max_bitrate_kbps,
+        max_fps,
+        latency_mode,
+        (width, height),
+    )?;
+    let frame = backend.encode(&image)?;
+    const CHUNK: usize = 48 * 1024;
+    let parts = frame.bytes.len().div_ceil(CHUNK).max(1) as u16;
+    let sent_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let mut messages = Vec::with_capacity(parts as usize);
+    for part in 0..parts {
+        let start = part as usize * CHUNK;
+        let end = (start + CHUNK).min(frame.bytes.len());
+        let mut msg = Vec::with_capacity(end - start + 17);
+        msg.extend_from_slice(&0_u32.to_le_bytes());
+        msg.push(1_u8);
+        msg.extend_from_slice(&part.to_le_bytes());
+        msg.extend_from_slice(&parts.to_le_bytes());
+        msg.extend_from_slice(&sent_ms.to_le_bytes());
+        msg.extend_from_slice(&frame.bytes[start..end]);
+        messages.push(msg);
+    }
+    replay.lock().unwrap().seed(messages);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,

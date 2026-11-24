@@ -202,7 +202,7 @@ static VIDEO_REPLAY: std::sync::OnceLock<Arc<std::sync::Mutex<VideoReplay>>> =
     std::sync::OnceLock::new();
 
 #[cfg(feature = "media")]
-fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
+pub(crate) fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
     VIDEO_REPLAY
         .get_or_init(|| Arc::new(std::sync::Mutex::new(VideoReplay::default())))
         .clone()
@@ -237,6 +237,19 @@ impl VideoReplay {
         }
         self.bytes += message.len();
         self.deltas.push(message.to_vec());
+    }
+
+    /// Installs a ready-made keyframe only while the window is still empty.
+    /// Checking and installing under one lock keeps a warm frame from ever
+    /// overwriting a live stream's keyframe, which would corrupt the deltas
+    /// anchored to it.
+    pub fn seed(&mut self, idr: Vec<Vec<u8>>) -> bool {
+        if !self.idr.is_empty() || !self.pending_idr.is_empty() {
+            return false;
+        }
+        self.bytes = idr.iter().map(Vec::len).sum();
+        self.idr = idr;
+        true
     }
 
     /// Clones the replay for a newly attached channel. The cache keeps

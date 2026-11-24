@@ -50,6 +50,26 @@ async fn run_until(
         crate::server::ServerState::new(config.clone(), crate::tailnet::real(&config.tailnet));
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let server = tokio::spawn(crate::server::serve(state.clone(), receiver));
+    #[cfg(feature = "media")]
+    {
+        // Warm the stream replay window at boot so even a first-ever attach
+        // replays a tail instead of waiting for a pipeline cold start.
+        let (bitrate, fps, width, height, mode, encoder) = (
+            config.quality.max_bitrate_kbps,
+            crate::media::effective_max_fps(config.quality.max_fps),
+            config.quality.max_width,
+            config.quality.max_height,
+            config.quality.latency_mode,
+            config.quality.encoder,
+        );
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) =
+                crate::media::prime_replay(bitrate, fps, width, height, mode, encoder)
+            {
+                tracing::debug!(%error, "video replay warmup failed");
+            }
+        });
+    }
     let _ready = ready_file
         .map(|path| ReadyFile::create(path, ready_token.as_deref()))
         .transpose()?;

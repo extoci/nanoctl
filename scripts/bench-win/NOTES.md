@@ -151,6 +151,22 @@ no duplicate IDR follows.
 ~8x faster rejoins. The first-ever attach still waits for a fresh IDR
 because nothing has been encoded yet.
 
+**Replay warmup (ships).** At agent start `prime_replay` does a single-shot
+`Monitor::capture_image` + one H.264 IDR encode and atomically `seed`s it
+into the replay window (seed refuses once any live keyframe exists, so it
+can never corrupt the delta chain). A session-connect retry covers agents
+whose boot capture failed. A second *recorder* is not used: an early
+version spawned `CaptureEncoder::primary`, whose capture session starved
+the real pipeline's recorder and timed out its first-frame wait at 5s.
+
+| variant                             | joinMs (n=3)  |
+| ----------------------------------- | ------------- |
+| **first-ever attach (warm window)** | **4.5 / 6.5** |
+
+The warm frame can be seconds-to-minutes old on the very first attach; the
+pipeline's own startup IDR replaces it ~50ms later. Encoder smoke
+unchanged: 5.65ms p50, PSNR p05 45.85dB, ~108kbps static.
+
 ## Delivered fps under motion (`__dcv` counters, 30s windows)
 
 End-to-end decode delivery while the scrolling checkerboard covers the

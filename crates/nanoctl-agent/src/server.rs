@@ -458,6 +458,26 @@ async fn session(
         return;
     }
     tracing::info!(target: "nanoctl::status", "Viewer connected");
+    #[cfg(feature = "media")]
+    {
+        // Seed the replay window while signaling runs: when it wins the race
+        // to the channel attach the very first join is as fast as a rejoin.
+        let (bitrate, fps, width, height, mode, encoder) = (
+            state.config.quality.max_bitrate_kbps,
+            crate::media::effective_max_fps(state.config.quality.max_fps),
+            state.config.quality.max_width,
+            state.config.quality.max_height,
+            state.config.quality.latency_mode,
+            state.config.quality.encoder,
+        );
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) =
+                crate::media::prime_replay(bitrate, fps, width, height, mode, encoder)
+            {
+                tracing::debug!(%error, "video replay warmup failed");
+            }
+        });
+    }
     let (outgoing, mut messages) = tokio::sync::mpsc::channel::<Value>(64);
     #[cfg(feature = "rtc")]
     let (audio_output, _) = watch::channel(None);
