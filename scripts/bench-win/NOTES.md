@@ -594,3 +594,14 @@ tier 3, then hard-dropped 3->0 inside the first noise second; the
 transition second dipped to 50fps (vs 54-56 steady) during the
 re-open, then matched pure-noise metrics exactly. Worst-case safety
 holds end-to-end, not just in the unit test.
+
+## Faster promotion ramp (cycle 29)
+
+Per-step ease windows `[60, 90, 150]` frames (was a flat 150): tier 1
+(CABAC, cheap) engages ~1s in, tier 3 stays careful at ~2.5s of ease.
+Motion reaches tier 3 at ~5s vs ~8s (-38% time-to-optimal); steady
+state unchanged ~135kbps / 56.6dB / 57.9fps; noise tier 0, 0 switches.
+
+Also swept under noise and rejected: threads=4 (+6% fps, +80% bits,
++0.8dB), AQ modes 1/2/3 (flat - noise is CRF-bound at ~11Mbps against
+the 24Mbps VBV cap, not VBV-bound).

@@ -163,8 +163,10 @@ struct AdaptPolicy {
 
 impl AdaptPolicy {
     const MAX_TIER: u8 = 3;
-    /// Frames of sustained ease before a promotion (~2.5s at 60fps).
-    const EASE_FRAMES: u32 = 150;
+    /// Frames of sustained ease before each promotion step — cheap tier 1
+    /// (CABAC/8x8) engages fast, the slower-preset tier 3 stays careful.
+    /// ~1s/1.5s/2.5s at 60fps.
+    const EASE_FRAMES: [u32; 3] = [60, 90, 150];
     /// Consecutive stressed frames before a demotion (~0.33s at 60fps).
     const STRESS_FRAMES: u32 = 20;
     /// Minimum frames between any two tier switches.
@@ -205,7 +207,7 @@ impl AdaptPolicy {
         self.stress_frames = 0;
         self.ease_frames = self.ease_frames.saturating_add(1);
         if self.tier < Self::MAX_TIER
-            && self.ease_frames >= Self::EASE_FRAMES
+            && self.ease_frames >= Self::EASE_FRAMES[self.tier as usize]
             && self.cooldown >= Self::SWITCH_COOLDOWN
             && self.encode_ewma_ns < 0.30 * budget_ns
             && self.bytes_ewma < 0.50 * cap_bytes
@@ -648,12 +650,12 @@ mod tests {
         let budget = 1_000_000_000.0 / 60.0;
         let cap = 4_000.0 * 125.0 / 60.0;
         // Easy frames: promotion only after the sustained window.
-        for _ in 0..AdaptPolicy::EASE_FRAMES - 1 {
+        for _ in 0..AdaptPolicy::EASE_FRAMES[0] - 1 {
             assert_eq!(policy.observe(1_000_000, 500, budget, cap), None);
         }
         assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(1));
         policy.committed(1);
-        for _ in 0..AdaptPolicy::EASE_FRAMES + AdaptPolicy::SWITCH_COOLDOWN {
+        for _ in 0..AdaptPolicy::EASE_FRAMES[1] + AdaptPolicy::SWITCH_COOLDOWN {
             policy.observe(1_000_000, 500, budget, cap);
         }
         assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(2));
