@@ -368,3 +368,19 @@ content), backend toggled via `NANOCTL_SOFTWARE_ENCODER=openh264`:
 | bitrate                | 20.6Mbps | 11.2Mbps | -46%  |
 
 (Bitrate/fps vary run to run on the noise scene - direction is stable.)
+
+## x264 preset re-sweep: superfast -> veryfast (cycle 16)
+
+Motion-scene preset sweep at CRF18 (media-smoke, 12s):
+
+| preset    | kbps       | encode p50 | PSNR p50 |
+| --------- | ---------- | ---------- | -------- |
+| superfast | 355        | 3.7ms      | 56.8dB   |
+| veryfast  | 235 (-34%) | 4.8ms      | 57.4dB   |
+| faster    | 324        | 6.1ms      | 57.8dB   |
+
+Default moved superfast -> veryfast: -34% bitstream on realistic
+content, slightly better PSNR, +1.1ms encode. Noise worst-case stays
+green: 54.8fps, encode 10.4ms, 10.8Mbps, 24.3dB (passes; fps dips vs
+58 under superfast - the honest trade). `NANOCTL_X264_PRESET` still
+overrides.

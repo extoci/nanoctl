@@ -89,7 +89,7 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     RESOLVE(picture_init, "x264_picture_init");
     x264_param_t p;
     const char *preset = getenv("NANOCTL_X264_PRESET");
-    if (!preset || !preset[0]) preset = "superfast";
+    if (!preset || !preset[0]) preset = "veryfast";
     const char *tune = getenv("NANOCTL_X264_TUNE");
     if (!tune || !tune[0]) tune = "zerolatency";
     if (context->param_default_preset(&p, preset, tune) < 0) goto fail;
