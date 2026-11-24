@@ -353,3 +353,18 @@ the lag is WGC/compositor pacing, not consumer queue buildup).
 Present wait is likewise vsync/composite-bound. Both are floor effects
 of this GPU-less VM; on a real display at 144Hz both shrink with the
 composite period.
+
+## Agent CPU + RSS: OpenH264 vs x264 (cycle 15)
+
+Same media-smoke run on the same VM under `band --noise` (worst-case
+content), backend toggled via `NANOCTL_SOFTWARE_ENCODER=openh264`:
+
+| metric                 | OpenH264 | x264     | delta |
+| ---------------------- | -------- | -------- | ----- |
+| agent CPU (of 8 cores) | 19.6%    | 13.0%    | -34%  |
+| peak RSS               | 243MB    | 113MB    | -53%  |
+| delivered fps          | 51.9     | 58.4     | +12%  |
+| encode p50             | 16.8ms   | 7.0ms    | -58%  |
+| bitrate                | 20.6Mbps | 11.2Mbps | -46%  |
+
+(Bitrate/fps vary run to run on the noise scene - direction is stable.)
