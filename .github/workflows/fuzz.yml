@@ -30,11 +30,16 @@ jobs:
           workspaces: crates/nanoctl-agent/fuzz
           save-if: ${{ github.event_name != 'pull_request' }}
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: cargo-fuzz
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
       - name: Install pinned cargo-fuzz
-        run: cargo install --locked --force cargo-fuzz --version 0.13.2
+        # `cargo install` exits 101 when the binary already exists, so it
+        # must be skipped on a cache hit. (`--force` would be idempotent
+        # too but recompiles the tool on every run.)
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-fuzz --version 0.13.2
       - name: Fuzz signed update envelope parser
         working-directory: crates/nanoctl-agent
         env:

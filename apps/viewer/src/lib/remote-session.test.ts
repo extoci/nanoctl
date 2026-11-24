@@ -832,7 +832,7 @@ class FakePeer {
 }
 
 describe("webcodecs video gating and teardown", () => {
-  test("only creates WebCodecs encoded streams when H.264 is explicitly chosen", async () => {
+  test("creates WebCodecs encoded streams whenever the choice allows H.264", async () => {
     installBrowserGlobals(() => 0);
     defineGlobal("VideoDecoder", class FakeVideoDecoder {});
     for (const codecChoice of ["auto", "av1", "hevc", "h264"] as const) {
@@ -865,7 +865,9 @@ describe("webcodecs video gating and teardown", () => {
         onSnapshot: () => {},
       });
       await controller.start();
-      expect(createEncodedStreamsCalls).toBe(codecChoice === "h264" ? 1 : 0);
+      expect(createEncodedStreamsCalls).toBe(
+        codecChoice === "av1" || codecChoice === "hevc" ? 0 : 1,
+      );
       await controller.stop("done", false);
     }
   });
