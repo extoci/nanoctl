@@ -535,3 +535,26 @@ Measured (15s smokes; per-second tier in JSON makes it observable):
 Observability: `x264_tier` per-second field + `x264_adapt_tier` /
 `x264_adapt_switches` top-level in smoke JSON; `tracing::info!` on
 every switch.
+
+## NR / scenecut / fast-path sweep on noise (cycle 26)
+
+New env knobs `NANOCTL_X264_NR` (x264 `analyse.i_noise_reduction`) and
+`NANOCTL_X264_SCENECUT` (`i_scenecut_threshold`, default stays 0).
+Worst-case noise, 15s smokes (baseline: 53.8fps, 10.6Mbps, encode
+10.6ms, PSNR p05 24.07dB, tier 0 / 0 switches):
+
+| env             | fps  | Mbps  | enc ms | p05 dB |
+| --------------- | ---- | ----- | ------ | ------ |
+| baseline        | 53.8 | 10.62 | 10.57  | 24.07  |
+| NR=150          | 53.6 | 10.60 | 10.56  | 24.08  |
+| NR=300          | 54.3 | 10.73 | 10.38  | 24.07  |
+| NR=600          | 52.9 | 10.42 | 10.50  | 24.08  |
+| NR=1000         | 53.0 | 10.44 | 10.69  | 24.08  |
+| ME=dia          | 55.9 | 11.03 | 9.90   | 24.08  |
+| TUNE=fastdecode | 56.9 | 11.11 | 10.20  | 24.02  |
+
+Rejected — all flat or +4%-bits-for-+4%-fps trades: under noise the
+encoder is VBV-capped (CRF unreachable), so denoising has no bits to
+recover and cheaper analysis only buys fps at the cap's bitrate.
+Flash scene sanity: 57fps / 292kbps / 57.5dB, adapt promotes
+correctly to tier 1 between flashes.

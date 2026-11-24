@@ -94,7 +94,10 @@ static int fill_params(NanoX264 *context, x264_param_t *p) {
     p->b_vfr_input = 0;
     p->i_bframe = 0;
     p->i_keyint_max = X264_KEYINT_MAX_INFINITE;
-    p->i_scenecut_threshold = 0;
+    const char *scenecut = getenv("NANOCTL_X264_SCENECUT");
+    p->i_scenecut_threshold = scenecut && scenecut[0] ? atoi(scenecut) : 0;
+    const char *nr = getenv("NANOCTL_X264_NR");
+    if (nr && nr[0]) p->analyse.i_noise_reduction = atoi(nr);
     int me = env_me();
     p->analyse.i_me_method = me >= 0 ? me : context->want_me;
     const char *subme = getenv("NANOCTL_X264_SUBME");
