@@ -245,3 +245,12 @@ harness (its 60Hz pull cadence parks ~30Hz frames half an interval), vs
 capture→encode ≈ 11.6ms = backend 7.5 + color 2.3 + compare 0.9 + queue 0.9.
 Also removed a redundant full-frame `differs_from` after every changed
 encode (~0.87ms × encoded frames ≈ 1.5% agent CPU under motion).
+
+## RGBA→I420 conversion (cycle 10)
+
+Replaced hand-rolled 4-thread scalar conversion with the `yuv` crate's
+runtime-dispatched SIMD (SSE→AVX2), same BT.601 limited matrix. 720p
+microbench: 1103µs → 189µs/frame (−83%). media-smoke encode p50
+5.43→4.07ms (−25%), capture_to_encode 13.1→11.79ms. Bit-exact test
+relaxed to ±1 LSB — SIMD rounds chroma slightly differently; PSNR
+unchanged (45.9dB).

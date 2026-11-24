@@ -39,6 +39,7 @@ media = [
   "dep:x11rb",
   "dep:xkeysym",
   "rtc",
+  "dep:yuv",
 ]
 rtc = ["dep:interceptor", "dep:webrtc", "dep:bytes"]
 x264 = ["media", "dep:pkg-config"]
@@ -93,6 +94,7 @@ opus = { version = "0.4", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
+yuv = { version = "0.8.21", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xcb = { version = "1.7", features = ["damage", "randr"], optional = true }

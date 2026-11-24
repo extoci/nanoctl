@@ -559,91 +559,29 @@ impl I420Frame {
         }
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
-        let row_pairs = self.height / 2;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(4);
-        if threads <= 1 || row_pairs < 8 {
-            read_rgba_rows(rgba, self.width, 0..row_pairs, y, u, v);
-            return Ok(());
-        }
-        let per = row_pairs.div_ceil(threads) & !1;
-        let uv_width = self.width / 2;
-        std::thread::scope(|scope| {
-            let mut y_rest: &mut [u8] = y;
-            let mut u_rest: &mut [u8] = u;
-            let mut v_rest: &mut [u8] = v;
-            let mut start = 0usize;
-            while start < row_pairs {
-                let end = (start + per).min(row_pairs);
-                let take = (end - start) * uv_width;
-                let (y_part, y_tail) = y_rest.split_at_mut((end - start) * self.width * 2);
-                let (u_part, u_tail) = u_rest.split_at_mut(take);
-                let (v_part, v_tail) = v_rest.split_at_mut(take);
-                y_rest = y_tail;
-                u_rest = u_tail;
-                v_rest = v_tail;
-                let width = self.width;
-                let range = start..end;
-                scope.spawn(move || {
-                    read_rgba_rows(rgba, width, range, y_part, u_part, v_part);
-                });
-                start = end;
-            }
-        });
+        let mut planar = yuv::YuvPlanarImageMut {
+            y_plane: yuv::BufferStoreMut::Borrowed(y),
+            y_stride: self.width as u32,
+            u_plane: yuv::BufferStoreMut::Borrowed(u),
+            u_stride: (self.width / 2) as u32,
+            v_plane: yuv::BufferStoreMut::Borrowed(v),
+            v_stride: (self.width / 2) as u32,
+            width: self.width as u32,
+            height: self.height as u32,
+        };
+        yuv::rgba_to_yuv420(
+            &mut planar,
+            rgba,
+            (self.width * 4) as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )
+        .map_err(|error| anyhow!("RGBA to I420 conversion failed: {error}"))?;
         Ok(())
     }
 }
 
-#[inline]
-fn rgba_to_y(pixel: &[u8]) -> u8 {
-    ((66 * u16::from(pixel[0]) + 129 * u16::from(pixel[1]) + 25 * u16::from(pixel[2]) + 4224) >> 8)
-        as u8
-}
-
-/// Convert a band of row-pairs (2 source rows each) of RGBA into I420 planes.
-fn read_rgba_rows(
-    rgba: &[u8],
-    width: usize,
-    row_pairs: std::ops::Range<usize>,
-    y: &mut [u8],
-    u: &mut [u8],
-    v: &mut [u8],
-) {
-    let pair_stride = width * 8;
-    let start = row_pairs.start * pair_stride;
-    let end = row_pairs.end * pair_stride;
-    for (((rows, y_rows), u), v) in rgba[start..end]
-        .chunks_exact(pair_stride)
-        .zip(y.chunks_exact_mut(width * 2))
-        .zip(u.chunks_exact_mut(width / 2))
-        .zip(v.chunks_exact_mut(width / 2))
-    {
-        for (pixel, y) in rows.chunks_exact(4).zip(y_rows.iter_mut()) {
-            *y = rgba_to_y(pixel);
-        }
-        let (top, bottom) = rows.split_at(width * 4);
-        for (((top, bottom), u), v) in top
-            .chunks_exact(8)
-            .zip(bottom.chunks_exact(8))
-            .zip(u)
-            .zip(v)
-        {
-            let average = |channel| {
-                (u16::from(top[channel])
-                    + u16::from(top[channel + 4])
-                    + u16::from(bottom[channel])
-                    + u16::from(bottom[channel + 4])
-                    + 2)
-                    >> 2
-            };
-            let (r, g, b) = (average(0), average(1), average(2));
-            *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
-            *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
-        }
-    }
-}
 
 impl YUVSource for I420Frame {
     fn dimensions(&self) -> (usize, usize) {
@@ -3386,7 +3324,15 @@ mod tests {
                 converted.read_rgba(&rgba).unwrap();
                 assert_eq!(converted.bytes.as_ptr(), allocation);
                 assert_eq!(converted.strides(), reference.strides());
-                assert_eq!(converted.bytes, expected.bytes);
+                // SIMD conversion may round within 1 LSB of the scalar kernel.
+                let max_delta = converted
+                    .bytes
+                    .iter()
+                    .zip(expected.bytes.iter())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                assert!(max_delta <= 1, "max channel delta {max_delta}");
             }
         }
     }
