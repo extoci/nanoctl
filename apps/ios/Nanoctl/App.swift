@@ -200,9 +200,12 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
             exitFull.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
         ])
 
-        let controls = UIStackView(arrangedSubviews: [codec, audio, displays, paste, fullBtn])
+        let buttons = UIStackView(arrangedSubviews: [audio, displays, paste, fullBtn])
+        buttons.spacing = 8
+        buttons.distribution = .fillEqually
+        let controls = UIStackView(arrangedSubviews: [codec, buttons])
+        controls.axis = .vertical
         controls.spacing = 8
-        controls.distribution = .fill
 
         let row = UIStackView(arrangedSubviews: [address, toggle])
         row.spacing = 8
