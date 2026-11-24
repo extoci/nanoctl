@@ -5,6 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
+#[cfg(any(feature = "media", test))]
+use bytes::Bytes;
 use interceptor::registry::Registry;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
@@ -233,20 +235,22 @@ pub(crate) struct DataChannelVideo {
 /// The most recent complete keyframe plus every delta produced after it, kept
 /// so a freshly attached viewer can be caught up without waiting for the
 /// encoder to produce a new keyframe.
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 #[derive(Default)]
 pub(crate) struct VideoReplay {
-    idr: Vec<Vec<u8>>,
-    pending_idr: Vec<Vec<u8>>,
-    deltas: Vec<Vec<u8>>,
+    idr: Vec<Bytes>,
+    pending_idr: Vec<Bytes>,
+    deltas: Vec<Bytes>,
     bytes: usize,
 }
 
-/// A copied replay window: the keyframe's wire messages and the deltas after it.
-#[cfg(feature = "media")]
-pub(crate) type VideoReplaySnapshot = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+/// A reference-counted replay window: the keyframe's wire messages and the
+/// deltas after it. Cloning the snapshot is cheap; messages themselves are
+/// shared with the live send path instead of copied a second time.
+#[cfg(any(feature = "media", test))]
+pub(crate) type VideoReplaySnapshot = (Vec<Bytes>, Vec<Bytes>);
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 const VIDEO_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// The replay window outlives a single peer connection: a freshly attached
@@ -263,20 +267,20 @@ pub(crate) fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
         .clone()
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 impl VideoReplay {
     /// Records a wire-format video message. `is_idr`, `part` and `parts` come
     /// from the message header the producer already computed.
-    pub fn push(&mut self, is_idr: bool, part: u16, parts: u16, message: &[u8]) {
+    pub fn push(&mut self, is_idr: bool, part: u16, parts: u16, message: Bytes) {
         if is_idr {
             if part == 0 {
                 self.pending_idr.clear();
             }
-            self.pending_idr.push(message.to_vec());
+            self.pending_idr.push(message);
             if part + 1 == parts {
                 self.idr = std::mem::take(&mut self.pending_idr);
                 self.deltas.clear();
-                self.bytes = self.idr.iter().map(Vec::len).sum();
+                self.bytes = self.idr.iter().map(Bytes::len).sum();
             }
             return;
         }
@@ -291,18 +295,18 @@ impl VideoReplay {
             return;
         }
         self.bytes += message.len();
-        self.deltas.push(message.to_vec());
+        self.deltas.push(message);
     }
 
     /// Installs a ready-made keyframe only while the window is still empty.
     /// Checking and installing under one lock keeps a warm frame from ever
     /// overwriting a live stream's keyframe, which would corrupt the deltas
     /// anchored to it.
-    pub fn seed(&mut self, idr: Vec<Vec<u8>>) -> bool {
+    pub fn seed(&mut self, idr: Vec<Bytes>) -> bool {
         if !self.idr.is_empty() || !self.pending_idr.is_empty() {
             return false;
         }
-        self.bytes = idr.iter().map(Vec::len).sum();
+        self.bytes = idr.iter().map(Bytes::len).sum();
         self.idr = idr;
         true
     }
@@ -1816,6 +1820,42 @@ mod tests {
     use tokio::time::{Duration, Instant, timeout};
     use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+    #[test]
+    fn video_replay_snapshot_shares_message_allocations() {
+        let mut replay = VideoReplay::default();
+        let idr = Bytes::from(vec![1, 2, 3, 4]);
+        let delta = Bytes::from(vec![5, 6, 7]);
+        replay.push(true, 0, 1, idr.clone());
+        replay.push(false, 0, 1, delta.clone());
+
+        let (idr_replay, deltas) = replay.snapshot().expect("complete replay window");
+        assert_eq!(idr_replay.len(), 1);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(idr_replay[0].as_ptr(), idr.as_ptr());
+        assert_eq!(deltas[0].as_ptr(), delta.as_ptr());
+        assert_eq!(idr_replay[0].len(), idr.len());
+        assert_eq!(deltas[0].len(), delta.len());
+    }
+
+    #[test]
+    fn video_replay_requires_complete_keyframe_and_resets_at_next_idr() {
+        let mut replay = VideoReplay::default();
+        assert!(replay.seed(vec![Bytes::from_static(b"seed-idr")]));
+        assert!(!replay.seed(vec![Bytes::from_static(b"replacement")]));
+        assert_eq!(replay.snapshot().unwrap().0.len(), 1);
+
+        let mut replay = VideoReplay::default();
+        replay.push(true, 0, 2, Bytes::from_static(b"first-half"));
+        assert!(replay.snapshot().is_none());
+        replay.push(true, 1, 2, Bytes::from_static(b"second-half"));
+        assert_eq!(replay.snapshot().unwrap().0.len(), 2);
+        replay.push(false, 0, 1, Bytes::from_static(b"delta"));
+        assert_eq!(replay.snapshot().unwrap().1.len(), 1);
+        replay.push(true, 0, 1, Bytes::from_static(b"new-idr"));
+        let (_, deltas) = replay.snapshot().unwrap();
+        assert!(deltas.is_empty());
+    }
 
     #[test]
     fn receiver_report_sample_converts_loss_rtt_and_remb() {
