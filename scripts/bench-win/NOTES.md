@@ -281,3 +281,31 @@ probes used to prove capture sees what the screen shows.
 Viewer: `__dcv` now exposes decode (submit->output) and present
 (output->composited rVFC) sums/max via `decodeSum/N/Max` and
 `presentSum/N/Max`.
+
+## x264 backend on Windows (cycle 12)
+
+The in-tree `x264` feature now builds on Windows: `build.rs` accepts
+`NANOCTL_X264_INCLUDE=<dir with x264.h>` when pkg-config is absent, and
+the shim dlopens `libx264-165.dll` (MSYS2 `mingw-w64-x86_64-libx264`
+package) placed beside nanoctl.exe. Shim gains env knobs:
+`NANOCTL_X264_PRESET` (default `superfast`), `NANOCTL_X264_TUNE`
+(default `zerolatency`), `NANOCTL_X264_THREADS` (default 2, sliced).
+
+Same media-smoke protocol, OpenH264 -> x264(superfast):
+
+| scene | fps | encode p50 | bitrate | PSNR p50 | verdict |
+|---|---|---|---|---|---|
+| noise (worst case) | 39.6 -> 58.0 (+46%) | 16.9 -> 7.5ms (-56%) | 15.5 -> 11.2Mbps (-28%) | 25.3 -> 24.2dB | fail -> pass |
+| motion | 58 -> 58.2 | ~7 -> 3.8ms | 462kbps (vs 618 ultrafast) | 60.8dB | pass |
+| flash | - | 4.2ms | 633kbps | 63.2dB | pass |
+| static | 58 | 3.3ms | 666kbps (CRF12 encodes every frame; OpenH264 emitted ~61B P-skip AUs) | 68dB | pass |
+
+Preset sweep (noise): ultrafast 6.2ms/11.3Mbps/24.5dB, superfast
+7.5ms/11.2/24.2, veryfast 11.5ms/10.1/24.2 (fps drops to 52). On motion
+superfast saves 25% bits vs ultrafast (618->463kbps, 61dB still
+transparent) -> shipped as default. Threads=4 under noise: enc -19% but
+bitrate +75% (slice boundaries kill compression) -> stays 2.
+
+Caveats: noise PSNR is CRF-quality-bound (~24dB either encoder; content
+is uncompressible, quality trade is the honest one). Shipping
+libx264.dll is GPL — packaging decision deferred.

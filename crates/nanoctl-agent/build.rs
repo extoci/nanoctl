@@ -57,14 +57,26 @@ fn main() {
 
 #[cfg(feature = "x264")]
 fn build_x264() {
-    let library = pkg_config::Config::new()
-        .cargo_metadata(false)
-        .statik(false)
-        .probe("x264")
-        .expect("feature x264 requires system libx264 headers and pkg-config (libx264-dev)");
+    // libx264 is only dlopen'ed at runtime, so the build needs its headers alone. pkg-config
+    // supplies them where it exists; NANOCTL_X264_INCLUDE covers platforms like Windows where
+    // a vendored/libx264-dev tree is the only source of x264.h.
+    let include_paths: Vec<PathBuf> = match env::var_os("NANOCTL_X264_INCLUDE") {
+        Some(dir) if !dir.is_empty() => vec![PathBuf::from(dir)],
+        _ => {
+            pkg_config::Config::new()
+                .cargo_metadata(false)
+                .statik(false)
+                .probe("x264")
+                .expect(
+                    "feature x264 requires system libx264 headers (libx264-dev) or \
+                 NANOCTL_X264_INCLUDE=<dir containing x264.h>",
+                )
+                .include_paths
+        }
+    };
     let mut build = cc::Build::new();
     build.file("src/x264_shim.c");
-    for include in library.include_paths {
+    for include in include_paths {
         build.include(include);
     }
     build.compile("nanoctl_x264_shim");
