@@ -138,7 +138,7 @@ for (let i = 0; i < clicks; i++) {
   const s = await ev("JSON.stringify(window.__inp.samples.slice(-3))");
   const samples = JSON.parse(s || "[]");
   if (samples.length) {
-    const [t, clk] = samples[samples.length - 1];
+    const [, clk] = samples[samples.length - 1];
     G2G.push(((Date.now() % 60000) - clk + 60000) % 60000);
   }
   await sleep(400);
