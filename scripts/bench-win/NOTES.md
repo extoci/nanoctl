@@ -605,3 +605,22 @@ state unchanged ~135kbps / 56.6dB / 57.9fps; noise tier 0, 0 switches.
 Also swept under noise and rejected: threads=4 (+6% fps, +80% bits,
 +0.8dB), AQ modes 1/2/3 (flat - noise is CRF-bound at ~11Mbps against
 the 24Mbps VBV cap, not VBV-bound).
+
+## Trellis sweep + latency-mode comparison (cycle 30)
+
+`NANOCTL_X264_TRELLIS` env knob → `analyse.i_trellis` (default 0).
+Rejected hard: trellis=1/2 under noise → encode 10.4→30ms, fps
+55→25-26 (pipe becomes encode-bound); motion flat (218 vs 216kbps).
+
+Latency-mode A-B (VBV window: Resp=1f, Balanced=2f, Quality=4f):
+
+| mode           | noise kbps | noise fps | noise dB | queue p50 ms | motion kbps | motion dB |
+| -------------- | ---------- | --------- | -------- | ------------ | ----------- | --------- |
+| responsiveness | 10,620     | 55.2      | 23.9     | ~0.9         | 203         | 56.7      |
+| balanced       | 15,113     | 50.3      | 24.7     | 8.5          | 256         | 55.1      |
+| quality        | 19,889     | 50.6      | 25.2     | 8.6          | 253         | 55.3      |
+
+Balanced/Quality add ~8.5ms of encode queueing AND 42-88% more bits
+for +0.8-1.3dB under noise, and _lower_ motion PSNR. Responsiveness is
+the best mode on every axis with the adaptive encoder — the larger VBV
+windows just let rate control spend more under CRF-bound content.
