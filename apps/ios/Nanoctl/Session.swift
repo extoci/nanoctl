@@ -368,7 +368,8 @@ final class Session {
         let session = RTCAudioSession.sharedInstance()
         session.lockForConfiguration()
         do {
-            try session.setCategory(.playback, with: [.allowBluetoothHFP])
+            // .allowBluetoothHFP needs the iOS 26 SDK; .allowBluetooth is still valid (and not yet deprecated) on the iOS 18 SDK CI builds with.
+            try session.setCategory(.playback, with: [.allowBluetooth])
             try session.setMode(.default)
             try session.setActive(true)
         } catch {}
