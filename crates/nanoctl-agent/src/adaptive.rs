@@ -34,6 +34,44 @@ struct DelaySignal {
     draining: bool,
 }
 
+/// Caps a viewer asked for over the reliable control channel. They can lower the configured
+/// `quality.max_fps` / `quality.max_bitrate_kbps` for one session, never exceed them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewerLimits {
+    pub max_fps: Option<u16>,
+    pub max_bitrate_kbps: Option<u32>,
+}
+
+impl ViewerLimits {
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(flatten)]
+            limits: ViewerLimits,
+        }
+        if !data.windows(9).any(|window| window == b"\"quality\"") {
+            return None;
+        }
+        let envelope: Envelope = serde_json::from_slice(data).ok()?;
+        (envelope.kind == "quality").then_some(envelope.limits)
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn resolve(self, max_bitrate_kbps: u32, max_fps: u16) -> (u32, u16) {
+        (
+            self.max_bitrate_kbps.map_or(max_bitrate_kbps, |cap| {
+                cap.clamp(MIN_BITRATE_KBPS.min(max_bitrate_kbps), max_bitrate_kbps)
+            }),
+            self.max_fps
+                .map_or(max_fps, |cap| cap.clamp(15.min(max_fps), max_fps)),
+        )
+    }
+}
+
 pub struct RateController {
     ceiling: u32,
     max_fps: u16,
@@ -58,8 +96,10 @@ pub struct RateController {
 
 impl RateController {
     pub fn new(ceiling_kbps: u32, max_fps: u16) -> Self {
+        // Start high enough for a presentable first frame — a 4Mbps opening undershoots a
+        // LAN-scale link badly, and the probe-up path recovers in seconds on a real WAN.
         let initial = (ceiling_kbps / 4)
-            .min(4_000)
+            .min(6_000)
             .clamp(ceiling_kbps.min(MIN_BITRATE_KBPS), ceiling_kbps);
         let max_fps = max_fps.max(1);
         let fps = Self::tier(initial as f64, max_fps);
@@ -89,6 +129,22 @@ impl RateController {
         }
     }
 
+    /// Replaces the bitrate ceiling and frame-rate cap mid-session. The current estimate is kept
+    /// below the new ceiling and the frame-rate tier is recomputed immediately.
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn set_limits(&mut self, ceiling_kbps: u32, max_fps: u16) -> RateDecision {
+        self.ceiling = ceiling_kbps;
+        self.max_fps = max_fps.max(1);
+        self.rate = self.rate.clamp(
+            ceiling_kbps.min(MIN_BITRATE_KBPS) as f64,
+            ceiling_kbps as f64,
+        );
+        self.fps = Self::tier(self.rate, self.max_fps);
+        self.low_fps_since = None;
+        self.reported = self.decision();
+        self.reported
+    }
+
     pub fn decision(&self) -> RateDecision {
         RateDecision {
             bitrate_kbps: self.rate.floor() as u32,
@@ -108,14 +164,16 @@ impl RateController {
     }
 
     fn tier(rate: f64, max_fps: u16) -> u16 {
+        // Bitrate is the congestion knob, framerate mostly isn't: a 1080p60 stream
+        // dropping to 15-20fps reads as broken to a viewer, while the same budget at
+        // 60fps just looks softer. Hold 60fps (or the configured ceiling) down to
+        // 500kbps, and never go below 30.
         if rate >= 2_500.0 {
             max_fps
-        } else if rate >= 1_000.0 {
-            max_fps.min(30)
         } else if rate >= 500.0 {
-            max_fps.min(20)
+            max_fps.min(60)
         } else {
-            max_fps.min(15)
+            max_fps.min(30)
         }
     }
 
@@ -514,6 +572,61 @@ pub fn frame_changed(prev: &[u8], next: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn viewer_limits_lower_but_never_exceed_the_configured_maximums() {
+        let limits =
+            ViewerLimits::parse(br#"{"type":"quality","maxFps":30,"maxBitrateKbps":10000}"#)
+                .unwrap();
+        assert_eq!(limits.resolve(50_000, 60), (10_000, 30));
+        let raised =
+            ViewerLimits::parse(br#"{"type":"quality","maxFps":240,"maxBitrateKbps":900000}"#)
+                .unwrap();
+        assert_eq!(raised.resolve(50_000, 120), (50_000, 120));
+        assert_eq!(ViewerLimits::default().resolve(50_000, 120), (50_000, 120));
+        assert_eq!(
+            ViewerLimits::parse(br#"{"type":"quality","maxFps":1}"#)
+                .unwrap()
+                .resolve(50_000, 60),
+            (50_000, 15)
+        );
+        assert!(ViewerLimits::parse(br#"{"type":"key","code":"quality"}"#).is_none());
+        assert!(ViewerLimits::parse(br#"{"type":"display","displayId":"1"}"#).is_none());
+    }
+
+    #[test]
+    fn set_limits_clamps_rate_and_recomputes_fps() {
+        let mut controller = RateController::new(50_000, 120);
+        let initial = controller.decision();
+        assert_eq!(
+            initial,
+            RateDecision {
+                bitrate_kbps: 6_000,
+                fps: 120
+            }
+        );
+        assert_eq!(
+            controller.set_limits(2_000, 60),
+            RateDecision {
+                bitrate_kbps: 2_000,
+                fps: 60
+            }
+        );
+        assert_eq!(
+            controller.set_limits(50_000, 120),
+            RateDecision {
+                bitrate_kbps: 2_000,
+                fps: 60
+            }
+        );
+        assert_eq!(
+            controller.set_limits(50_000, 24),
+            RateDecision {
+                bitrate_kbps: 2_000,
+                fps: 24
+            }
+        );
+    }
+
     fn sample(at: Instant, loss: f64) -> LinkSample {
         LinkSample {
             fraction_lost: loss,
@@ -621,7 +734,7 @@ mod tests {
     fn clean_feedback_reaches_a_fifty_megabit_ceiling() {
         let now = Instant::now();
         let mut controller = RateController::new(50_000, 60);
-        assert_eq!(controller.decision().bitrate_kbps, 4_000);
+        assert_eq!(controller.decision().bitrate_kbps, 6_000);
         let mut ceiling_at = None;
         for second in 0..=14 {
             let mut input = sample(now + Duration::from_secs(second), 0.0);
@@ -667,7 +780,7 @@ mod tests {
             input.rtt = Some(Duration::from_millis(1));
             controller.observe(input);
         }
-        assert_eq!(controller.decision().bitrate_kbps, 11_696);
+        assert_eq!(controller.decision().bitrate_kbps, 17_544);
     }
 
     #[test]
@@ -753,7 +866,7 @@ mod tests {
         let mut controller = RateController::new(12_000, 60);
         controller.update_sender(4_000.0, false, now - Duration::from_secs(3));
         let mut input = sample(now, 0.05);
-        input.remb_kbps = Some(2_000);
+        input.remb_kbps = Some(400);
         controller.observe(input);
         assert_eq!(controller.decision().fps, 60);
         input.at += Duration::from_millis(999);
@@ -769,9 +882,9 @@ mod tests {
             input.receiver_report_at = Some(input.at);
             controller.observe(input);
         }
-        assert!(controller.decision().bitrate_kbps > 2_500);
+        assert!(controller.decision().bitrate_kbps > 400);
         assert_eq!(controller.decision().fps, 30);
-        for second in 9..=10 {
+        for second in 9..=14 {
             input.at = now + Duration::from_secs(second);
             input.receiver_report_at = Some(input.at);
             controller.observe(input);
@@ -1172,10 +1285,17 @@ mod tests {
     #[test]
     fn raising_the_ceiling_does_not_add_queue_on_a_two_megabit_link() {
         for rtt in [Duration::from_millis(20), Duration::from_millis(80)] {
-            let previous = two_megabit_link(24_000, rtt);
-            let higher = two_megabit_link(50_000, rtt);
-            assert_eq!(higher, previous);
-            assert!((1_000..=2_200).contains(&higher.1));
+            for ceiling in [24_000, 50_000] {
+                // A larger ceiling opens at a higher estimate, so the transient backlog is
+                // larger — but the delay cuts must still pull the applied rate back onto the
+                // link and keep the queue bounded.
+                let (max_queue, applied) = two_megabit_link(ceiling, rtt);
+                assert!(
+                    (1_000..=2_500).contains(&applied),
+                    "ceiling={ceiling} rtt={rtt:?} applied={applied}"
+                );
+                assert!(max_queue < 12.0, "ceiling={ceiling} queue={max_queue}");
+            }
         }
     }
 

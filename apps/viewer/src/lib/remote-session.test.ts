@@ -1,17 +1,25 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { RemoteSessionController, type HostSignalRow } from "./remote-session";
+import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
+import { attachWebCodecsVideo } from "./webcodecs-video";
 
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
 const originalMediaStream = globalThis.MediaStream;
 const originalNavigator = globalThis.navigator;
+const originalVideoDecoder = (globalThis as { VideoDecoder?: unknown }).VideoDecoder;
+const originalEncodedVideoChunk = (globalThis as { EncodedVideoChunk?: unknown }).EncodedVideoChunk;
+const originalMediaStreamTrackGenerator = (globalThis as { MediaStreamTrackGenerator?: unknown })
+  .MediaStreamTrackGenerator;
 
 afterEach(() => {
   defineGlobal("window", originalWindow);
   defineGlobal("document", originalDocument);
   defineGlobal("MediaStream", originalMediaStream);
   defineGlobal("navigator", originalNavigator);
+  defineGlobal("VideoDecoder", originalVideoDecoder);
+  defineGlobal("EncodedVideoChunk", originalEncodedVideoChunk);
+  defineGlobal("MediaStreamTrackGenerator", originalMediaStreamTrackGenerator);
 });
 
 describe("remote session lifecycle", () => {
@@ -149,9 +157,7 @@ describe("remote session lifecycle", () => {
       await controller.start();
       expect(peer.channels.has("nanoctl.clipboard.v1")).toBe(!!mayControl && !!remoteInput);
       if (mayControl && remoteInput) {
-        video.dispatchEvent(
-          Object.assign(new Event("keydown"), { code: "KeyV", key: "v", ctrlKey: true }),
-        );
+        pressKey("keydown", video, { code: "KeyV", key: "v", ctrlKey: true });
         await flushSignals();
         expect(peer.sent.map(([label]) => label)).toEqual([
           "nanoctl.clipboard.v1",
@@ -210,9 +216,7 @@ describe("remote session lifecycle", () => {
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
     expect(video.focused).toBe(true);
     expect(channel.sent).toEqual([]);
-    video.dispatchEvent(
-      Object.assign(new Event("keydown"), { code: "Space", key: " ", repeat: false }),
-    );
+    pressKey("keydown", video, { code: "Space", key: " ", repeat: false });
     expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
       type: "key",
       action: "down",
@@ -230,13 +234,74 @@ describe("remote session lifecycle", () => {
     controller.setInputEnabled(false);
     channel.sent = [];
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
-    video.dispatchEvent(Object.assign(new Event("keydown"), { code: "Space", key: " " }));
+    pressKey("keydown", video, { code: "Space", key: " " });
     expect(channel.sent).toEqual([]);
     channel.readyState = "closed";
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 1 }));
     expect(channel.sent).toEqual([]);
     await controller.stop();
   });
+  test("keys reach the host from the video or page but not from panel controls", async () => {
+    installBrowserGlobals();
+    const body = {};
+    Object.assign(globalThis.document, { body });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    channel.sent = [];
+    pressKey("keydown", { tagName: "BUTTON" }, { code: "Space", key: " " });
+    pressKey("keydown", body, { code: "Tab", key: "Tab" });
+    expect(channel.sent).toEqual([]);
+    for (const [target, code] of [
+      [video, "KeyA"],
+      [body, "KeyB"],
+    ] as const) {
+      pressKey("keydown", target, { code, key: code.at(-1)!.toLowerCase() });
+      expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({ type: "key", code });
+    }
+    channel.sent = [];
+    pressKey("keyup", { tagName: "BUTTON" }, { code: "KeyC", key: "c" });
+    expect(channel.sent).toEqual([]);
+    pressKey("keydown", body, { code: "ShiftLeft", key: "Shift", shiftKey: true });
+    pressKey("keyup", { tagName: "BUTTON" }, { code: "ShiftLeft", key: "Shift" });
+    expect(channel.sent.map((data) => JSON.parse(data).action)).toEqual(["down", "up"]);
+    await controller.stop();
+  });
+
+  test("counts host input-blocked notices on the control channel", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const snapshots: number[] = [];
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: new FakeVideo() as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: (snapshot) => snapshots.push(snapshot.inputBlocked),
+    });
+    await controller.start();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    for (const data of ["not json", '{"type":"other"}', '{"type":"inputBlocked"}'])
+      channel.onmessage?.({ data } as MessageEvent);
+    expect(controller.snapshot.inputBlocked).toBe(1);
+    expect(snapshots.at(-1)).toBe(1);
+    await controller.stop();
+  });
+
   test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
     installBrowserGlobals();
     const preferences = { inputEnabled: true, displayId: "secondary" };
@@ -508,6 +573,96 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.phase).toBe("ended");
     expect(restored).toBe(true);
   });
+
+  test("restores input after a transient ICE disconnected-to-connected flap", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+
+    await controller.start();
+    expect(controller.snapshot.inputEnabled).toBe(true);
+
+    peer.connectionState = "disconnected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(false);
+
+    peer.connectionState = "connected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(true);
+
+    // Respect explicit user preference when input was intentionally turned off.
+    controller.setInputEnabled(false);
+    peer.connectionState = "disconnected";
+    peer.onconnectionstatechange?.();
+    peer.connectionState = "connected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(false);
+
+    await controller.stop();
+  });
+
+  test("a hanging clipboard read on Ctrl+V does not stall subsequent keyboard input", async () => {
+    installBrowserGlobals();
+    defineGlobal("navigator", {
+      clipboard: {
+        readText: () => new Promise<string>(() => {}),
+        writeText: async () => {},
+      },
+    });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      clipboardEnabled: true,
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+
+    await controller.start();
+    pressKey("keydown", video, {
+      code: "KeyV",
+      key: "v",
+      ctrlKey: true,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      repeat: false,
+    });
+    pressKey("keydown", video, {
+      code: "KeyA",
+      key: "a",
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      repeat: false,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    const keys = peer.sent
+      .filter(([label]) => label === "nanoctl.control.v1")
+      .map(([, message]) => JSON.parse(message) as { type?: string; code?: string })
+      .filter((message) => message.type === "key")
+      .map((message) => message.code);
+    expect(keys).toEqual(["KeyV", "KeyA"]);
+
+    await controller.stop();
+  });
 });
 
 function hostSignal(
@@ -537,13 +692,28 @@ async function flushSignals(): Promise<void> {
   await Promise.resolve();
 }
 
+const windowListeners = new Map<string, Set<(event: Event) => void>>();
+
+/** Delivers a key event to window listeners as if it bubbled up from `target`. */
+function pressKey(type: string, target: unknown, properties: object): void {
+  const event = Object.assign(new Event(type, { cancelable: true }), properties);
+  Object.defineProperty(event, "target", { value: target });
+  for (const listener of windowListeners.get(type) ?? []) listener(event);
+}
+
 function installBrowserGlobals(setInterval?: (callback: () => void) => number): void {
+  windowListeners.clear();
   const eventTarget = {
     addEventListener: () => {},
     removeEventListener: () => {},
   };
   defineGlobal("window", {
-    ...eventTarget,
+    addEventListener: (type: string, listener: (event: Event) => void) => {
+      if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+      windowListeners.get(type)!.add(listener);
+    },
+    removeEventListener: (type: string, listener: (event: Event) => void) =>
+      windowListeners.get(type)?.delete(listener),
     setInterval: setInterval ?? globalThis.setInterval.bind(globalThis),
     clearInterval: globalThis.clearInterval.bind(globalThis),
     setTimeout: globalThis.setTimeout.bind(globalThis),
@@ -595,6 +765,7 @@ class FakeDataChannel {
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
+  onmessage: ((event: MessageEvent) => void) | null = null;
 
   send(message: string): void {
     this.sent.push(message);
@@ -659,3 +830,114 @@ class FakePeer {
     this.signalingState = "closed";
   }
 }
+
+describe("webcodecs video gating and teardown", () => {
+  test("only creates WebCodecs encoded streams when H.264 is explicitly chosen", async () => {
+    installBrowserGlobals(() => 0);
+    defineGlobal("VideoDecoder", class FakeVideoDecoder {});
+    for (const codecChoice of ["auto", "av1", "hevc", "h264"] as const) {
+      let createEncodedStreamsCalls = 0;
+      const peer = new FakePeer();
+      peer.addTransceiver = (kind: string, init: RTCRtpTransceiverInit) => {
+        peer.transceivers.push([kind, init.direction]);
+        return {
+          receiver: {
+            createEncodedStreams: () => {
+              createEncodedStreamsCalls += 1;
+              return {
+                readable: new ReadableStream(),
+                writable: new WritableStream(),
+              };
+            },
+          },
+        } as unknown as RTCRtpTransceiver;
+      };
+      const video = new FakeVideo();
+      const controller = new RemoteSessionController({
+        sessionId: `session-${codecChoice}`,
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        codecChoice,
+        video: video as unknown as HTMLVideoElement,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      expect(createEncodedStreamsCalls).toBe(codecChoice === "h264" ? 1 : 0);
+      await controller.stop("done", false);
+    }
+  });
+
+  test("webcodecs teardown does not clear an unowned video srcObject", async () => {
+    installBrowserGlobals(() => 0);
+    let decoderError: ((error: Error) => void) | null = null;
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      constructor(init: { error: (error: Error) => void }) {
+        decoderError = init.error;
+      }
+      configure() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    let readableController: ReadableStreamDefaultController<unknown> | null = null;
+    const readable = new ReadableStream({
+      start(controller) {
+        readableController = controller;
+      },
+    });
+    const writable = new WritableStream();
+    let teardownNotified = 0;
+    const handle = attachWebCodecsVideo(
+      { readable, writable } as unknown as Parameters<typeof attachWebCodecsVideo>[0],
+      video as unknown as HTMLVideoElement,
+      () => {
+        teardownNotified += 1;
+      },
+    );
+
+    const liveStream = new FakeMediaStream();
+    video.srcObject = liveStream;
+    readableController!.enqueue({
+      type: "key",
+      timestamp: 0,
+      data: new Uint8Array([0, 0, 0, 1, 0x65, 0x01]).buffer,
+      getMetadata: () => ({ rtpTimestamp: 0 }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(decoderError).not.toBeNull();
+    decoderError!(new Error("Decoding error"));
+
+    expect(video.srcObject).toBe(liveStream);
+    expect(teardownNotified).toBe(1);
+    handle.drop();
+  });
+});
+
+describe("wheel normalization", () => {
+  test("keeps fine-grained trackpad deltas and normalizes delta modes", () => {
+    expect(wheelPixels(1, 0)).toBe(1);
+    expect(wheelPixels(0.5, 0)).toBe(0.5);
+    expect(wheelPixels(100, 0)).toBe(100);
+    expect(wheelPixels(3, 1)).toBeCloseTo(100, 5);
+    expect(wheelPixels(0.5, 2)).toBe(400);
+    expect(wheelPixels(10_000, 0)).toBe(4_000);
+    expect(wheelPixels(Number.NaN, 0)).toBe(0);
+  });
+});

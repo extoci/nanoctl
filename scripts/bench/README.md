@@ -234,13 +234,13 @@ still limit the strength of any conclusion from only five trials.
 
 ### Optional nanoctl stage attribution
 
-Restart the Linux agent with `NANOCTL_BENCH_TRACE=1` and redirect its output to
-a fresh persistent log. Then run the browser benchmark with
+Restart the Linux agent with `NANOCTL_BENCH_TRACE=1` and `run --verbose`, and
+redirect its output to a fresh persistent log. Then run the browser benchmark with
 `BENCH_ATTRIBUTION=1`. For example, using the displays/config above:
 
 ```sh
 DISPLAY=:97 NANOCTL_DEV_LOOPBACK_USER=dev@example.com NANOCTL_BENCH_TRACE=1 \
-  crates/nanoctl-agent/target/release/nanoctl --config "$HOME/nanoctl-bench.toml" run \
+  crates/nanoctl-agent/target/release/nanoctl --config "$HOME/nanoctl-bench.toml" run --verbose \
   > "$HOME/bench-results/trace.agent.log" 2>&1 &
 HOST_PID=$!
 BENCH_ATTRIBUTION=1 VIEWER_URL=http://127.0.0.1:7338 \
@@ -306,8 +306,8 @@ the browser's `getContextAttributes()` response. This is a browser hint, not a
 portable guarantee of a particular presentation latency; recalibrate source
 presentation when changing browsers, displays or platforms.
 
-For per-frame attribution, start nanoctl with `NANOCTL_BENCH_TRACE=1` and run the
-benchmark with `BENCH_ATTRIBUTION=1`. Agent logs correlate marker IDs with
+For per-frame attribution, start nanoctl with `NANOCTL_BENCH_TRACE=1` and
+`run --verbose`, and run the benchmark with `BENCH_ATTRIBUTION=1`. Agent logs correlate marker IDs with
 monotonic damage-dequeue, capture start/end, encode start/end and RTP-write
 start/end timestamps. Browser attribution correlates the same IDs with
 `requestVideoFrameCallback` receive/presentation/expected-display timestamps and

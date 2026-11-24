@@ -282,7 +282,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
         "bench-host".into(),
         false,
         false,
-        false,
+        None,
     )
     .await?;
     timeout(Duration::from_secs(20), async {
@@ -342,8 +342,10 @@ pub async fn run(seconds: u64) -> Result<Value> {
     }
     let pipeline = crate::media::spawn_video(
         host.video_track(),
+        host.video_data_channel(),
         host.keyframe_requests(),
         host.link_feedback(),
+        host.viewer_limits(),
         host.display_selection(),
         host.display_selection_feedback_sender(),
         VideoQuality {
@@ -353,6 +355,8 @@ pub async fn run(seconds: u64) -> Result<Value> {
             max_height: 1080,
             latency_mode: LatencyMode::Balanced,
             encoder_preference: EncoderPreference::Software,
+            codec: crate::codec::VideoCodec::H264,
+            h264_high: false,
         },
     );
     tokio::time::sleep(Duration::from_secs(5)).await;

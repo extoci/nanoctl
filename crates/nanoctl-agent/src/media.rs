@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use openh264::OpenH264API;
+use openh264::decoder::Decoder;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, MatrixCoefficients,
     QpRange, RateControlMode, UsageType, VuiConfig,
@@ -17,6 +18,7 @@ use openh264_sys2::{
 };
 use xcap::Monitor;
 
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{
@@ -45,6 +47,7 @@ pub(crate) mod trace;
 mod macos_capture;
 
 use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
+use crate::codec::{VideoCodec, is_keyframe};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
 
@@ -365,6 +368,8 @@ pub struct CaptureEncoder {
     latest_frame: Arc<LatestFrame>,
     display_id: String,
     encoder: EncoderBackend,
+    /// In-process decode-and-compare probe used by `media-smoke` to report PSNR.
+    psnr: Option<PsnrProbe>,
     #[cfg(target_os = "windows")]
     resizer: resize::RgbaResizer,
 }
@@ -403,6 +408,8 @@ pub(crate) trait FrameEncoder {
 
 #[derive(Clone, Copy)]
 struct EncoderSettings {
+    codec: VideoCodec,
+    h264_high: bool,
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
@@ -413,14 +420,33 @@ type OpenEncoder = fn(EncoderSettings, (u32, u32)) -> Result<Box<dyn FrameEncode
 struct HardwareBackend {
     id: &'static str,
     name: &'static str,
+    codecs: &'static [VideoCodec],
     open: OpenEncoder,
 }
 
 macro_rules! hardware_backend {
+    ($id:literal, $name:literal, $encoder:path, codecs: [$($codec:ident),+]) => {
+        HardwareBackend {
+            id: $id,
+            name: $name,
+            codecs: &[$(VideoCodec::$codec),+],
+            open: |settings, dimensions| {
+                Ok(Box::new(<$encoder>::with_codec(
+                    settings.codec,
+                    settings.h264_high,
+                    settings.bitrate_kbps,
+                    settings.max_fps,
+                    settings.latency_mode,
+                    dimensions,
+                )?))
+            },
+        }
+    };
     ($id:literal, $name:literal, $encoder:path) => {
         HardwareBackend {
             id: $id,
             name: $name,
+            codecs: &[VideoCodec::H264],
             open: |settings, dimensions| {
                 Ok(Box::new(<$encoder>::new(
                     settings.bitrate_kbps,
@@ -437,18 +463,25 @@ const HARDWARE_BACKENDS: &[HardwareBackend] = &[
     #[cfg(target_os = "linux")]
     hardware_backend!("vaapi", "VA-API", crate::linux_encoder::LinuxEncoder),
     #[cfg(target_os = "linux")]
-    hardware_backend!("nvenc", "NVENC", crate::nvenc_encoder::NvencEncoder),
+    hardware_backend!(
+        "nvenc",
+        "NVENC",
+        crate::nvenc_encoder::NvencEncoder,
+        codecs: [H264, Hevc, Av1]
+    ),
     #[cfg(target_os = "macos")]
     hardware_backend!(
         "videotoolbox",
         "VideoToolbox",
-        crate::macos_encoder::MacOsEncoder
+        crate::macos_encoder::MacOsEncoder,
+        codecs: [H264]
     ),
     #[cfg(target_os = "windows")]
     hardware_backend!(
         "media-foundation",
         "Media Foundation hardware MFT",
-        crate::windows_encoder::WindowsEncoder
+        crate::windows_encoder::WindowsEncoder,
+        codecs: [H264, Hevc, Av1]
     ),
 ];
 
@@ -507,39 +540,89 @@ impl I420Frame {
         }
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
-        for (pixel, y) in rgba.chunks_exact(4).zip(y) {
-            *y = ((66 * u16::from(pixel[0])
-                + 129 * u16::from(pixel[1])
-                + 25 * u16::from(pixel[2])
-                + 4224)
-                >> 8) as u8;
+        let row_pairs = self.height / 2;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4);
+        if threads <= 1 || row_pairs < 8 {
+            read_rgba_rows(rgba, self.width, 0..row_pairs, y, u, v);
+            return Ok(());
         }
-        for ((rows, u), v) in rgba
-            .chunks_exact(self.width * 8)
-            .zip(u.chunks_exact_mut(self.width / 2))
-            .zip(v.chunks_exact_mut(self.width / 2))
-        {
-            let (top, bottom) = rows.split_at(self.width * 4);
-            for (((top, bottom), u), v) in top
-                .chunks_exact(8)
-                .zip(bottom.chunks_exact(8))
-                .zip(u)
-                .zip(v)
-            {
-                let average = |channel| {
-                    (u16::from(top[channel])
-                        + u16::from(top[channel + 4])
-                        + u16::from(bottom[channel])
-                        + u16::from(bottom[channel + 4])
-                        + 2)
-                        >> 2
-                };
-                let (r, g, b) = (average(0), average(1), average(2));
-                *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
-                *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
+        let per = row_pairs.div_ceil(threads) & !1;
+        let uv_width = self.width / 2;
+        std::thread::scope(|scope| {
+            let mut y_rest: &mut [u8] = y;
+            let mut u_rest: &mut [u8] = u;
+            let mut v_rest: &mut [u8] = v;
+            let mut start = 0usize;
+            while start < row_pairs {
+                let end = (start + per).min(row_pairs);
+                let take = (end - start) * uv_width;
+                let (y_part, y_tail) = y_rest.split_at_mut((end - start) * self.width * 2);
+                let (u_part, u_tail) = u_rest.split_at_mut(take);
+                let (v_part, v_tail) = v_rest.split_at_mut(take);
+                y_rest = y_tail;
+                u_rest = u_tail;
+                v_rest = v_tail;
+                let width = self.width;
+                let range = start..end;
+                scope.spawn(move || {
+                    read_rgba_rows(rgba, width, range, y_part, u_part, v_part);
+                });
+                start = end;
             }
-        }
+        });
         Ok(())
+    }
+}
+
+#[inline]
+fn rgba_to_y(pixel: &[u8]) -> u8 {
+    ((66 * u16::from(pixel[0]) + 129 * u16::from(pixel[1]) + 25 * u16::from(pixel[2]) + 4224) >> 8)
+        as u8
+}
+
+/// Convert a band of row-pairs (2 source rows each) of RGBA into I420 planes.
+fn read_rgba_rows(
+    rgba: &[u8],
+    width: usize,
+    row_pairs: std::ops::Range<usize>,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+) {
+    let pair_stride = width * 8;
+    let start = row_pairs.start * pair_stride;
+    let end = row_pairs.end * pair_stride;
+    for (((rows, y_rows), u), v) in rgba[start..end]
+        .chunks_exact(pair_stride)
+        .zip(y.chunks_exact_mut(width * 2))
+        .zip(u.chunks_exact_mut(width / 2))
+        .zip(v.chunks_exact_mut(width / 2))
+    {
+        for (pixel, y) in rows.chunks_exact(4).zip(y_rows.iter_mut()) {
+            *y = rgba_to_y(pixel);
+        }
+        let (top, bottom) = rows.split_at(width * 4);
+        for (((top, bottom), u), v) in top
+            .chunks_exact(8)
+            .zip(bottom.chunks_exact(8))
+            .zip(u)
+            .zip(v)
+        {
+            let average = |channel| {
+                (u16::from(top[channel])
+                    + u16::from(top[channel + 4])
+                    + u16::from(bottom[channel])
+                    + u16::from(bottom[channel + 4])
+                    + 2)
+                    >> 2
+            };
+            let (r, g, b) = (average(0), average(1), average(2));
+            *u = ((112 * b + 32896 - 38 * r - 74 * g) >> 8) as u8;
+            *v = ((112 * r + 32896 - 18 * b - 94 * g) >> 8) as u8;
+        }
     }
 }
 
@@ -561,7 +644,114 @@ impl YUVSource for I420Frame {
     }
 }
 
+/// Decode-and-compare probe for `media-smoke`: each encoded access unit goes back through
+/// OpenH264's decoder and the result is compared (Y+U+V PSNR, dB) against the exact I420
+/// the encoder consumed. Opt-in so production sessions pay nothing.
+struct PsnrProbe {
+    decoder: Decoder,
+    scratch: Option<I420Frame>,
+    pub decoded: u64,
+    pub samples: Vec<f64>,
+}
+
+impl PsnrProbe {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            decoder: Decoder::new().context("H.264 decoder is unavailable")?,
+            scratch: None,
+            decoded: 0,
+            samples: Vec::new(),
+        })
+    }
+
+    fn observe(&mut self, image: &RgbaFrame<'_>, access_unit: &[u8]) {
+        if let Err(error) = self.observe_inner(image, access_unit) {
+            tracing::debug!(%error, "psnr probe skipped a frame");
+        }
+    }
+
+    fn observe_inner(&mut self, image: &RgbaFrame<'_>, access_unit: &[u8]) -> Result<()> {
+        let dimensions = (image.width() as usize, image.height() as usize);
+        if self
+            .scratch
+            .as_ref()
+            .is_none_or(|frame| (frame.width, frame.height) != dimensions)
+        {
+            self.scratch = Some(I420Frame::new(dimensions.0, dimensions.1)?);
+        }
+        let source = self
+            .scratch
+            .as_mut()
+            .context("I420 buffer is unavailable")?;
+        source.read_rgba(image.as_raw())?;
+        let Some(decoded) = self
+            .decoder
+            .decode(access_unit)
+            .context("H.264 decode failed")?
+        else {
+            return Ok(());
+        };
+        if decoded.dimensions() != dimensions {
+            return Ok(());
+        }
+        self.decoded += 1;
+        self.samples.push(i420_psnr(source, &decoded));
+        Ok(())
+    }
+}
+
+fn plane_mse(
+    source: &[u8],
+    source_stride: usize,
+    decoded: &[u8],
+    decoded_stride: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    let mut sum = 0f64;
+    for row in 0..height {
+        let source_row = &source[row * source_stride..row * source_stride + width];
+        let decoded_row = &decoded[row * decoded_stride..row * decoded_stride + width];
+        for (&a, &b) in source_row.iter().zip(decoded_row.iter()) {
+            let d = f64::from(a) - f64::from(b);
+            sum += d * d;
+        }
+    }
+    sum
+}
+
+/// PSNR (dB) over all three I420 planes; identical frames report the 99dB cap.
+fn i420_psnr(source: &I420Frame, decoded: &impl YUVSource) -> f64 {
+    let (width, height) = source.dimensions();
+    let (sy, su, sv) = decoded.strides();
+    let pixels = (width * height) as f64;
+    let mse_sum = plane_mse(source.y(), width, decoded.y(), sy, width, height)
+        + plane_mse(
+            source.u(),
+            width / 2,
+            decoded.u(),
+            su,
+            width / 2,
+            height / 2,
+        )
+        + plane_mse(
+            source.v(),
+            width / 2,
+            decoded.v(),
+            sv,
+            width / 2,
+            height / 2,
+        );
+    let mse = mse_sum / (pixels * 1.5);
+    if mse <= 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    }
+}
+
 impl CaptureEncoder {
+    #[allow(clippy::too_many_arguments)]
     pub fn primary(
         max_bitrate_kbps: u32,
         max_fps: u16,
@@ -569,6 +759,8 @@ impl CaptureEncoder {
         max_height: u32,
         latency_mode: LatencyMode,
         encoder_preference: EncoderPreference,
+        codec: VideoCodec,
+        h264_high: bool,
         stats: Arc<PipelineStats>,
     ) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
@@ -588,7 +780,9 @@ impl CaptureEncoder {
             max_width,
             max_height,
         );
-        let encoder = EncoderBackend::new(
+        let encoder = EncoderBackend::new_for_codec(
+            codec,
+            h264_high,
             encoder_preference,
             max_bitrate_kbps,
             max_fps,
@@ -606,6 +800,7 @@ impl CaptureEncoder {
             latest_frame,
             display_id,
             encoder,
+            psnr: None,
             #[cfg(target_os = "windows")]
             resizer: resize::RgbaResizer::default(),
         })
@@ -642,6 +837,17 @@ impl CaptureEncoder {
 
     fn current_display_id(&self) -> &str {
         &self.display_id
+    }
+
+    pub fn enable_psnr_probe(&mut self) -> Result<()> {
+        self.psnr = Some(PsnrProbe::new()?);
+        Ok(())
+    }
+
+    pub fn psnr_report(&self) -> Option<(u64, &[f64])> {
+        self.psnr
+            .as_ref()
+            .map(|probe| (probe.decoded, probe.samples.as_slice()))
     }
 
     pub fn apply_bitrate_estimate(
@@ -725,6 +931,9 @@ impl CaptureEncoder {
         let color_before = self.encoder.color_convert_ns();
         let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
+        if let Some(probe) = self.psnr.as_mut() {
+            probe.observe(&image, &encoded.bytes);
+        }
         #[cfg(target_os = "linux")]
         trace::encoded(frame, &encoded.bytes, trace_started, trace::now());
         self.latest_frame.stats.backend_ns.fetch_add(
@@ -765,9 +974,31 @@ impl EncoderBackend {
         latency_mode: LatencyMode,
         probe_dimensions: (u32, u32),
     ) -> Result<Self> {
+        Self::new_for_codec(
+            VideoCodec::H264,
+            false,
+            preference,
+            bitrate_kbps,
+            max_fps,
+            latency_mode,
+            probe_dimensions,
+        )
+    }
+
+    fn new_for_codec(
+        codec: VideoCodec,
+        h264_high: bool,
+        preference: EncoderPreference,
+        bitrate_kbps: u32,
+        max_fps: u16,
+        latency_mode: LatencyMode,
+        probe_dimensions: (u32, u32),
+    ) -> Result<Self> {
         Self::with_hardware(
             preference,
             EncoderSettings {
+                codec,
+                h264_high,
                 bitrate_kbps,
                 max_fps,
                 latency_mode,
@@ -785,7 +1016,9 @@ impl EncoderBackend {
     ) -> Result<Self> {
         let mut backend = Self {
             active: None,
-            remaining_hardware: if matches!(preference, EncoderPreference::Software) {
+            remaining_hardware: if matches!(preference, EncoderPreference::Software)
+                && settings.codec == VideoCodec::H264
+            {
                 &[]
             } else {
                 hardware
@@ -803,6 +1036,9 @@ impl EncoderBackend {
         self.active.take();
         while let Some((hardware, remaining)) = self.remaining_hardware.split_first() {
             self.remaining_hardware = remaining;
+            if !hardware.codecs.contains(&self.settings.codec) {
+                continue;
+            }
             match (hardware.open)(self.settings, self.dimensions) {
                 Ok(encoder) => {
                     self.active = Some(ActiveEncoder {
@@ -817,6 +1053,18 @@ impl EncoderBackend {
                     last_error = Some(error.context(hardware.name));
                 }
             }
+        }
+        let codec = self.settings.codec;
+        if codec != VideoCodec::H264 {
+            // Only native encoders produce HEVC and AV1. Withdraw the codec so the next
+            // negotiation falls back to H.264 instead of repeating this failure.
+            crate::codec::withdraw_host_codec(codec);
+            return Err(last_error
+                .unwrap_or_else(|| anyhow!("no native {} encoder was compiled", codec.label())))
+            .context(format!(
+                "{} requires a hardware encoder but no usable backend remains",
+                codec.label()
+            ));
         }
         if matches!(self.preference, EncoderPreference::Hardware) {
             return Err(
@@ -884,6 +1132,8 @@ impl EncoderBackend {
         dimensions: (u32, u32),
     ) -> Result<Self> {
         let settings = EncoderSettings {
+            codec: VideoCodec::H264,
+            h264_high: false,
             bitrate_kbps,
             max_fps,
             latency_mode,
@@ -910,13 +1160,13 @@ impl EncoderBackend {
         ) else {
             return Ok(false);
         };
-        let active = self.active.as_mut().context("no active H.264 encoder")?;
+        let active = self.active.as_mut().context("no active video encoder")?;
         self.settings.bitrate_kbps = target_kbps;
         if let Err(error) = active.encoder.set_bitrate(target_kbps) {
             let Some(hardware) = active.hardware else {
                 return Err(error);
             };
-            tracing::warn!(backend = hardware.name, %error, "hardware bitrate change failed; switching H.264 backend");
+            tracing::warn!(backend = hardware.name, %error, "hardware bitrate change failed; switching encoder backend");
             self.activate_next(Some(error.context(hardware.name)))?;
         }
         Ok(true)
@@ -943,13 +1193,10 @@ impl EncoderBackend {
         }
         self.dimensions = image.dimensions();
         loop {
-            let active = self.active.as_mut().context("no active H.264 encoder")?;
+            let active = self.active.as_mut().context("no active video encoder")?;
             let encoded = active.encoder.encode(image).and_then(|frame| {
                 if active.needs_initial_idr {
-                    let types = annex_b_nal_types(&frame.bytes)?;
-                    if ![5, 7, 8].iter().all(|nal| types.contains(nal)) {
-                        bail!("first H.264 access unit did not contain IDR, SPS and PPS");
-                    }
+                    crate::codec::validate_initial_access_unit(self.settings.codec, &frame.bytes)?;
                     active.needs_initial_idr = false;
                 }
                 Ok(frame)
@@ -960,7 +1207,7 @@ impl EncoderBackend {
                     let Some(hardware) = active.hardware else {
                         return Err(error);
                     };
-                    tracing::warn!(backend = hardware.name, %error, "hardware encode failed; switching H.264 backend");
+                    tracing::warn!(backend = hardware.name, %error, "hardware encode failed; switching encoder backend");
                     self.activate_next(Some(error.context(hardware.name)))?;
                 }
             }
@@ -1260,16 +1507,29 @@ fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<Started
     ))
 }
 
+// Slice-parallel OpenH264: encode latency dominates the software path, and
+// frame latency matters more than the last few percent of compression here.
+fn encode_threads() -> u16 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4) as u16)
+        .unwrap_or(2)
+}
+
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
-    let (complexity, skip_frames) = match latency_mode {
-        LatencyMode::Responsiveness => (Complexity::Low, true),
-        LatencyMode::Balanced => (Complexity::Medium, true),
-        LatencyMode::Quality => (Complexity::High, false),
+    let (complexity, skip_frames, qp_min) = match latency_mode {
+        // Responsiveness caps QP at 26: below ~47dB PSNR the bits are invisible on easy
+        // scenes anyway, and the floor only binds there — a ~40% bitstream cut on
+        // low-motion desktops at no perceptible quality cost (measured in NOTES.md).
+        LatencyMode::Responsiveness => (Complexity::Low, true, 26),
+        LatencyMode::Balanced => (Complexity::Medium, true, 14),
+        LatencyMode::Quality => (Complexity::High, false, 14),
     };
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
-        .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 2))
+        // A 30s GOP, not 2s: unrepairable IDRs already force a keyframe
+        // through the RTCP loss path, so periodic IDRs are pure overhead.
+        .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 30))
         .usage_type(UsageType::CameraVideoRealTime)
         .vui(
             VuiConfig::srgb()
@@ -1278,9 +1538,15 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         )
         .rate_control_mode(RateControlMode::Bitrate)
         // A zero minimum is OpenH264's sentinel for its lossy 26–35 screen default.
-        .qp(QpRange::new(14, 51))
+        .qp(QpRange::new(qp_min, 51))
         .complexity(complexity)
-        .skip_frames(skip_frames);
+        .skip_frames(skip_frames)
+        .scene_change_detect(false)
+        // Slice-parallel encode: OpenH264 only uses encoder threads when the
+        // frame is cut into slices. A ~1.5KB cap splits even small deltas
+        // (~6-9KB) across the encode threads; tiny frames stay single-slice.
+        .max_slice_len(1_500)
+        .num_threads(encode_threads());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
 }
@@ -1288,6 +1554,48 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
 pub fn probe_encoder(preference: EncoderPreference) -> Result<(&'static str, &'static str)> {
     let encoder = EncoderBackend::new(preference, 1_000, 30, LatencyMode::Balanced, (1_280, 720))?;
     Ok((encoder.id(), encoder.name()))
+}
+
+/// Probes advanced codecs once per process; later calls reuse the recorded host codec set.
+pub fn ensure_codecs_probed(preference: EncoderPreference) {
+    static PROBED: std::sync::Once = std::sync::Once::new();
+    PROBED.call_once(|| {
+        probe_codecs(preference);
+    });
+}
+
+/// Opens a short-lived native encoder for each advanced codec and records which ones this
+/// host can produce. H.264 is always included because a software fallback backs it.
+pub fn probe_codecs(preference: EncoderPreference) -> Vec<VideoCodec> {
+    let mut codecs = Vec::new();
+    if !matches!(preference, EncoderPreference::Software) {
+        for codec in [VideoCodec::Av1, VideoCodec::Hevc] {
+            match EncoderBackend::new_for_codec(
+                codec,
+                false,
+                EncoderPreference::Hardware,
+                1_000,
+                30,
+                LatencyMode::Balanced,
+                (1_280, 720),
+            ) {
+                Ok(encoder) => {
+                    tracing::info!(
+                        codec = codec.id(),
+                        backend = encoder.id(),
+                        "hardware encoder available"
+                    );
+                    codecs.push(codec);
+                }
+                Err(error) => {
+                    tracing::debug!(codec = codec.id(), %error, "hardware encoder unavailable")
+                }
+            }
+        }
+    }
+    codecs.push(VideoCodec::H264);
+    crate::codec::set_host_codecs(&codecs);
+    codecs
 }
 
 pub(crate) fn bitrate_target(current: u32, estimate: u32, floor: u32, ceiling: u32) -> Option<u32> {
@@ -1373,6 +1681,7 @@ pub struct EncodedFrame {
 /// shape for remote desktop video: keeping an obsolete frame adds latency and can discard the
 /// IDR requested for recovery.
 struct EncodedFrameSlot {
+    codec: VideoCodec,
     frame: Mutex<Option<EncodedFrame>>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
@@ -1380,8 +1689,14 @@ struct EncodedFrameSlot {
 }
 
 impl EncodedFrameSlot {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_codec(VideoCodec::H264)
+    }
+
+    fn with_codec(codec: VideoCodec) -> Self {
         Self {
+            codec,
             frame: Mutex::new(None),
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
@@ -1402,10 +1717,10 @@ impl EncodedFrameSlot {
         // Never overwrite a recovery keyframe with a delta frame. The consumer may be briefly
         // backpressured while Chromium requests an IDR; dropping that IDR would leave the peer
         // waiting for the next periodic keyframe and turn a transient loss into visible outage.
-        let incoming_is_keyframe = is_idr(&frame.bytes);
+        let incoming_is_keyframe = is_keyframe(self.codec, &frame.bytes);
         if slot
             .as_ref()
-            .is_some_and(|current| is_idr(&current.bytes) && !incoming_is_keyframe)
+            .is_some_and(|current| is_keyframe(self.codec, &current.bytes) && !incoming_is_keyframe)
         {
             self.record_drop();
             return true;
@@ -1464,31 +1779,9 @@ impl Drop for EncodedFrameProducer {
     }
 }
 
-fn is_idr(bytes: &[u8]) -> bool {
-    let mut offset = 0_usize;
-    while offset + 3 < bytes.len() {
-        let start_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            offset += 1;
-            continue;
-        };
-        let Some(&header) = bytes.get(offset + start_length) else {
-            return false;
-        };
-        match header & 0x1f {
-            5 => return true,
-            1..=4 => return false,
-            _ => offset += start_length + 1,
-        }
-    }
-    false
-}
-
 #[derive(Default)]
 struct ReferenceRecovery {
+    codec: VideoCodec,
     pending: bool,
 }
 
@@ -1507,7 +1800,7 @@ impl ReferenceRecovery {
         if !self.pending {
             return true;
         }
-        if !is_idr(bytes) {
+        if !is_keyframe(self.codec, bytes) {
             return false;
         }
         // A drop beside an already queued IDR can affect frames encoded after that IDR.
@@ -1570,6 +1863,16 @@ struct TimingPercentiles {
     encode_p95_milliseconds: f64,
 }
 
+fn percentile_f64(samples: &[f64], percentile: f64) -> f64 {
+    let Some(last) = samples.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((last as f64) * percentile).round() as usize;
+    sorted[index.min(last)]
+}
+
 fn percentile_milliseconds(samples: &[u64], percentile: f64) -> f64 {
     let Some(last) = samples.len().checked_sub(1) else {
         return 0.0;
@@ -1602,6 +1905,11 @@ pub struct MediaSmokeReport {
     pub capture_to_encode_p95_milliseconds: f64,
     pub encode_p50_milliseconds: f64,
     pub encode_p95_milliseconds: f64,
+    /// Y+U+V PSNR (dB) of each decoded access unit vs its I420 source; None when the
+    /// probe was off. p05 is the worst tail — the number a marketing claim must survive.
+    pub psnr_p50_db: Option<f64>,
+    pub psnr_p05_db: Option<f64>,
+    pub psnr_decoded_frames: u64,
     pub width: u32,
     pub height: u32,
     pub idr_frames: u64,
@@ -1630,10 +1938,47 @@ impl MediaSmokeReport {
             self.sps_units,
             self.pps_units
         );
+        if let (Some(p50), Some(p05)) = (self.psnr_p50_db, self.psnr_p05_db) {
+            println!(
+                "media-smoke psnr_p50_db={:.2} psnr_p05_db={:.2} psnr_frames={}",
+                p50, p05, self.psnr_decoded_frames
+            );
+        }
     }
 }
 
-pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeReport> {
+/// `quality.max_fps = 0` follows the primary display's refresh rate, so 120, 144 and 240 Hz
+/// monitors stream at their native rate; 60 when the platform does not report one.
+pub fn effective_max_fps(configured: u16) -> u16 {
+    if configured != 0 {
+        return configured;
+    }
+    Monitor::all()
+        .ok()
+        .and_then(|monitors| {
+            let monitor = monitors
+                .iter()
+                .find(|monitor| monitor.is_primary().unwrap_or(false))
+                .or_else(|| monitors.first())?;
+            monitor.frequency().ok()
+        })
+        .and_then(refresh_to_fps)
+        .unwrap_or(60)
+}
+
+fn refresh_to_fps(hz: f32) -> Option<u16> {
+    (hz.is_finite() && hz >= 23.5).then(|| (hz.round() as u16).clamp(24, 240))
+}
+
+pub fn run_smoke(
+    quality: &QualityConfig,
+    seconds: u64,
+    measure_psnr: bool,
+) -> Result<MediaSmokeReport> {
+    let quality = &QualityConfig {
+        max_fps: effective_max_fps(quality.max_fps),
+        ..quality.clone()
+    };
     if !(1..=3_600).contains(&seconds) {
         bail!("media smoke duration must be between 1 and 3600 seconds");
     }
@@ -1644,8 +1989,13 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         quality.max_height,
         quality.latency_mode,
         quality.encoder,
+        VideoCodec::H264,
+        false,
         Arc::default(),
     )?;
+    if measure_psnr {
+        encoder.enable_psnr_probe()?;
+    }
     let started_unix_seconds = crate::update::unix_time_now()?;
     let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
@@ -1697,6 +2047,9 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
     // Auto mode may switch from a native encoder to OpenH264 after the first real frame. Report
     // the backend that completed the smoke test, not merely the one that initialized.
     let backend = encoder.encoder.name();
+    let psnr = encoder
+        .psnr_report()
+        .map(|(decoded, samples)| (decoded, samples.to_vec()));
     let timing = timing_samples.percentiles();
     Ok(MediaSmokeReport {
         schema_version: 1,
@@ -1720,6 +2073,13 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
         capture_to_encode_p95_milliseconds: timing.capture_to_encode_p95_milliseconds,
         encode_p50_milliseconds: timing.encode_p50_milliseconds,
         encode_p95_milliseconds: timing.encode_p95_milliseconds,
+        psnr_p50_db: psnr
+            .as_ref()
+            .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.50))),
+        psnr_p05_db: psnr
+            .as_ref()
+            .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.05))),
+        psnr_decoded_frames: psnr.map_or(0, |(d, _)| d),
         width: dimensions.0,
         height: dimensions.1,
         idr_frames,
@@ -1729,31 +2089,10 @@ pub fn run_smoke(quality: &QualityConfig, seconds: u64) -> Result<MediaSmokeRepo
 }
 
 pub(crate) fn annex_b_nal_types(bytes: &[u8]) -> Result<Vec<u8>> {
-    if bytes.len() > 32 * 1024 * 1024 {
-        bail!("H.264 access unit exceeds the size limit");
-    }
-    let mut types = Vec::new();
-    let mut offset = 0_usize;
-    while offset + 3 < bytes.len() {
-        let start_length = if bytes[offset..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if bytes[offset..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            offset += 1;
-            continue;
-        };
-        let header = offset + start_length;
-        let byte = *bytes
-            .get(header)
-            .context("H.264 access unit ends after a start code")?;
-        types.push(byte & 0x1f);
-        offset = header + 1;
-    }
-    if types.is_empty() {
-        bail!("H.264 access unit contains no Annex-B NAL units");
-    }
-    Ok(types)
+    Ok(crate::codec::annex_b_nal_headers(bytes)?
+        .into_iter()
+        .map(|header| header & 0x1f)
+        .collect())
 }
 
 #[derive(Clone, Copy)]
@@ -1764,6 +2103,8 @@ pub struct VideoQuality {
     pub max_height: u32,
     pub latency_mode: LatencyMode,
     pub encoder_preference: EncoderPreference,
+    pub codec: VideoCodec,
+    pub h264_high: bool,
 }
 
 /// Owns both halves of the capture pipeline so shutdown can wait for the blocking worker to
@@ -1847,10 +2188,27 @@ pub(crate) async fn release_session_memory() {
     }
 }
 
+fn au_contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let nal_type = data[i + 3] & 0x1f;
+            if nal_type == 5 || nal_type == 7 {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_video(
     track: Arc<TrackLocalStaticSample>,
+    video_data_channel: Arc<crate::rtc::DataChannelVideo>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
@@ -1867,12 +2225,13 @@ pub fn spawn_video(
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker_stopped = stopped.clone();
     let task = tokio::spawn(async move {
-        let encoded_slot = Arc::new(EncodedFrameSlot::new());
+        let encoded_slot = Arc::new(EncodedFrameSlot::with_codec(quality.codec));
         let (delivery_recovery, mut delivery_recovery_requests) =
             tokio::sync::watch::channel(0_u64);
         let producer_slot = EncodedFrameProducer(encoded_slot.clone());
         let producer_stopped = worker_stopped.clone();
         let producer_stats = writer_stats.clone();
+        let producer_video_channel = video_data_channel.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
             let producer_slot = producer_slot;
             #[cfg(target_os = "linux")]
@@ -1891,10 +2250,14 @@ pub fn spawn_video(
                     quality.max_height,
                     quality.latency_mode,
                     quality.encoder_preference,
+                    quality.codec,
+                    quality.h264_high,
                     producer_stats.clone(),
                 )?;
                 let mut keyframe_requests = keyframe_requests;
                 let mut link_feedback = link_feedback;
+                let mut viewer_limits = viewer_limits;
+                let mut bitrate_ceiling = quality.max_bitrate_kbps;
                 let mut display_selection = display_selection;
                 let display_selection_feedback = display_selection_feedback;
                 let mut controller = controller;
@@ -1948,13 +2311,34 @@ pub fn spawn_video(
                         .store(send_kbps as u32, Ordering::Relaxed);
                     controller.update_sender(send_kbps, pacer.idle(), now);
                     if link_feedback.has_changed().unwrap_or(false)
-                        && let Some(sample) = *link_feedback.borrow_and_update()
-                        && let Some(decision) = controller.observe(sample)
+                        && let Some(mut sample) = *link_feedback.borrow_and_update()
                     {
-                        encoder.apply_bitrate_estimate(
-                            decision.bitrate_kbps,
-                            quality.max_bitrate_kbps,
-                        )?;
+                        // While the data channel carries video, RTP only
+                        // sends sparse IDRs — the browser's REMB describes
+                        // that thin stream, not real egress, so it must not
+                        // bind the encoder rate.
+                        if producer_video_channel.channel.lock().unwrap().is_some() {
+                            sample.remb_kbps = None;
+                        }
+                        if let Some(decision) = controller.observe(sample) {
+                            encoder
+                                .apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
+                            fps = decision.fps;
+                            pacer.set_fps(fps);
+                            forced_keyframe |= scale.update(decision.bitrate_kbps);
+                            producer_stats
+                                .target_kbps
+                                .store(decision.bitrate_kbps, Ordering::Relaxed);
+                            producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                        }
+                    }
+                    if viewer_limits.has_changed().unwrap_or(false) {
+                        let (ceiling, max_fps) = viewer_limits
+                            .borrow_and_update()
+                            .resolve(quality.max_bitrate_kbps, quality.max_fps);
+                        let decision = controller.set_limits(ceiling, max_fps);
+                        bitrate_ceiling = ceiling;
+                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
                         forced_keyframe |= scale.update(decision.bitrate_kbps);
@@ -2110,7 +2494,15 @@ pub fn spawn_video(
         let mut delivery_interrupted_since: Option<Instant> = None;
         let mut delivery_error_count = 0_u64;
         let mut recovery_keyframe_requested = false;
-        let mut reference_recovery = ReferenceRecovery::default();
+        let mut dc_backed_up = false;
+        let mut dc_seq = 0_u32;
+        let mut dc_kf_seen = 0_u64;
+        let mut dc_was_live = false;
+        let mut dc_skips = 0_u64;
+        let mut reference_recovery = ReferenceRecovery {
+            codec: quality.codec,
+            ..ReferenceRecovery::default()
+        };
         let mut write_result = Ok(());
         loop {
             tokio::select! {
@@ -2138,26 +2530,153 @@ pub fn spawn_video(
                     // A broken transport must not hold capture/encoder teardown hostage forever.
                     // Cancelling the packetizer future is safe; the next successful delivery is
                     // followed by a forced recovery keyframe.
-                    let result = await_video_delivery(
-                        async {
-                            track
-                                .write_sample_with_extensions(&sample, &extensions)
-                                .await
-                                .map_err(anyhow::Error::from)
-                        },
-                        VIDEO_SAMPLE_WRITE_TIMEOUT,
-                    )
-                    .await;
-                    writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
-                    if result.is_ok() {
-                        #[cfg(target_os = "linux")]
-                        trace::sent(&sample.data, trace_started, trace::now());
-                        previous_written = Some(written_at);
-                        writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
-                        writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
+                    // Low-latency path: also ship the same Annex-B access unit
+                    // over the viewer's unreliable data channel when present,
+                    // skipping it while its SCTP buffer backs up. Skipped
+                    // deltas would wedge the decoder, so a stall requests a
+                    // fresh keyframe once throughput recovers.
+                    let dc_kf = video_data_channel.keyframe_requests.load(Ordering::Relaxed);
+                    if dc_kf != dc_kf_seen {
+                        dc_kf_seen = dc_kf;
+                        delivery_recovery.send_modify(|generation| {
+                            *generation = generation.wrapping_add(1);
+                        });
                     }
-                    match result {
+                    let video_channel = video_data_channel.channel.lock().unwrap().clone();
+                    let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
+                    let is_idr = au_contains_idr(&sample.data);
+                    let dc_live = video_channel.is_some();
+                    if dc_live != dc_was_live {
+                        dc_was_live = dc_live;
+                        if !dc_live {
+                            // The unreliable video channel just went away and
+                            // RTP is the primary path again — the decoder's
+                            // reference chain is stale, so force a keyframe
+                            // for the resumed track.
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
+                    }
+                    if dc_live || idr_channel.is_some() {
+                        // [u32 seq][u8 flags][annex-b au]; the viewer drops
+                        // post-gap deltas and asks for a keyframe on "KF".
+                        // Keyframes go over the reliable channel: they are
+                        // large and cannot survive partial reliability.
+                        // SCTP caps a message at ~64KiB, so large AUs are
+                        // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
+                        const CHUNK: usize = 48 * 1024;
+                        let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
+                        if is_idr {
+                            tracing::info!(
+                                dc_skips,
+                                "video data channel sending IDR seq={dc_seq} parts={parts}"
+                            );
+                        }
+                        let seq = dc_seq;
+                        dc_seq = dc_seq.wrapping_add(1);
+                        let sent_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or_default();
+                        let target = if is_idr {
+                            idr_channel.as_ref().or(video_channel.as_ref())
+                        } else {
+                            video_channel.as_ref()
+                        };
+                        if let Some(channel) = target {
+                            let au_len = sample.data.len();
+                            for part in 0..parts {
+                                let start = part as usize * CHUNK;
+                                let end = (start + CHUNK).min(sample.data.len());
+                                let mut msg = Vec::with_capacity(end - start + 17);
+                                msg.extend_from_slice(&seq.to_le_bytes());
+                                msg.push(u8::from(is_idr));
+                                msg.extend_from_slice(&part.to_le_bytes());
+                                msg.extend_from_slice(&parts.to_le_bytes());
+                                msg.extend_from_slice(&sent_ms.to_le_bytes());
+                                msg.extend_from_slice(&sample.data[start..end]);
+                                if is_idr {
+                                    // Pace IDR parts: bursting ~150KB into the
+                                    // association starves the congestion window
+                                    // and drops deltas on the sibling channel,
+                                    // which re-triggers keyframe requests.
+                                    for _ in 0..30 {
+                                        if channel.buffered_amount().await
+                                            <= 128 * 1024
+                                        {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(1))
+                                            .await;
+                                    }
+                                    if let Err(error) =
+                                        channel.send(&Bytes::from(msg)).await
+                                    {
+                                        tracing::warn!(%error, "video data channel send failed");
+                                        dc_backed_up = true;
+                                        break;
+                                    }
+                                    dc_backed_up = false;
+                                } else if channel.buffered_amount().await <= 64 * 1024
+                                {
+                                    if let Err(error) =
+                                        channel.send(&Bytes::from(msg)).await
+                                    {
+                                        tracing::warn!(%error, "video data channel send failed");
+                                        dc_backed_up = true;
+                                        break;
+                                    }
+                                    dc_backed_up = false;
+                                } else {
+                                    dc_skips += 1;
+                                    if !dc_backed_up {
+                                        dc_backed_up = true;
+                                        delivery_recovery.send_modify(|generation| {
+                                            *generation = generation.wrapping_add(1);
+                                        });
+                                    }
+                                    break;
+                                }
+                            }
+                            if !dc_backed_up {
+                                // Count the data-channel egress too: the rate
+                                // controller measures real wire bytes, not
+                                // just the RTP share.
+                                writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
+                                writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
+                            }
+                        }
+                    } else if dc_backed_up {
+                        dc_backed_up = false;
+                    }
+                    // While the data-channel path is live it carries every AU
+                    // and the viewer drops the RTP copy, so delta frames over
+                    // RTP are pure duplicate bandwidth. IDRs still go to RTP:
+                    // they keep RTCP RTT/loss reports meaningful and let a
+                    // data-channel teardown resume the media track without
+                    // waiting for the next GOP boundary.
+                    if !dc_live || is_idr {
+                        let result = await_video_delivery(
+                            async {
+                                track
+                                    .write_sample_with_extensions(&sample, &extensions)
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            },
+                            VIDEO_SAMPLE_WRITE_TIMEOUT,
+                        )
+                        .await;
+                        writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
+                        if result.is_ok() {
+                            #[cfg(target_os = "linux")]
+                            trace::sent(&sample.data, trace_started, trace::now());
+                            previous_written = Some(written_at);
+                            writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
+                            writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
+                        }
+                        match result {
                         Ok(()) if delivery_interrupted_since.is_some() => {
                             let outage = delivery_interrupted_since
                                 .map_or(Duration::ZERO, |started| started.elapsed());
@@ -2204,6 +2723,7 @@ pub fn spawn_video(
                                 write_result = Err(anyhow!(VideoDeliveryUnavailable));
                                 break;
                             }
+                        }
                         }
                     }
                 }
@@ -2476,7 +2996,11 @@ mod tests {
             assert_eq!(bitrate.iBitrate, target as i32 * 1_000);
             let next = encoder.encode(&image).unwrap();
             let types = annex_b_nal_types(&next.bytes).unwrap();
-            assert!(types.contains(&1));
+            assert!(
+                types.contains(&1),
+                "types={types:?} bytes={}",
+                next.bytes.len()
+            );
             assert!(!types.contains(&5));
         }
     }
@@ -2677,6 +3201,7 @@ mod tests {
                 (64, 64),
             )
             .unwrap(),
+            psnr: None,
             #[cfg(target_os = "windows")]
             resizer: super::resize::RgbaResizer::default(),
         };
@@ -2904,7 +3429,19 @@ mod tests {
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
     }
 
+    #[test]
+    fn display_refresh_rates_map_to_frame_rate_caps() {
+        assert_eq!(super::refresh_to_fps(59.94), Some(60));
+        assert_eq!(super::refresh_to_fps(143.9), Some(144));
+        assert_eq!(super::refresh_to_fps(360.0), Some(240));
+        assert_eq!(super::refresh_to_fps(0.0), None);
+        assert_eq!(super::refresh_to_fps(f32::NAN), None);
+        assert_eq!(super::effective_max_fps(90), 90);
+    }
+
     const TEST_SETTINGS: EncoderSettings = EncoderSettings {
+        codec: crate::codec::VideoCodec::H264,
+        h264_high: false,
         bitrate_kbps: 4_000,
         max_fps: 30,
         latency_mode: LatencyMode::Balanced,
@@ -2990,6 +3527,7 @@ mod tests {
     const FAILING_HARDWARE: HardwareBackend = HardwareBackend {
         id: "first",
         name: "First native backend",
+        codecs: &[crate::codec::VideoCodec::H264],
         open: |_, _| {
             Ok(Box::new(FakeHardware {
                 frames_left: 1,
@@ -3000,6 +3538,7 @@ mod tests {
     const ALTERNATE: HardwareBackend = HardwareBackend {
         id: "second",
         name: "Second native backend",
+        codecs: &[crate::codec::VideoCodec::H264],
         open: |_, _| {
             Ok(Box::new(FakeHardware {
                 frames_left: 1,
@@ -3025,6 +3564,7 @@ mod tests {
         const MISSING: &[HardwareBackend] = &[HardwareBackend {
             id: "missing",
             name: "Unavailable native backend",
+            codecs: &[crate::codec::VideoCodec::H264],
             open: |_, _| anyhow::bail!("simulated missing driver"),
         }];
         let open = |preference| {
@@ -3038,6 +3578,7 @@ mod tests {
         const NEVER_OPEN: &[HardwareBackend] = &[HardwareBackend {
             id: "never",
             name: "Forbidden native backend",
+            codecs: &[crate::codec::VideoCodec::H264],
             open: |_, _| panic!("software mode probed a hardware driver"),
         }];
         let software = EncoderBackend::with_hardware(
@@ -3089,6 +3630,7 @@ mod tests {
         const NO_HEADERS: &[HardwareBackend] = &[HardwareBackend {
             id: "no-headers",
             name: "Native backend without headers",
+            codecs: &[crate::codec::VideoCodec::H264],
             open: |_, _| {
                 Ok(Box::new(FakeHardware {
                     frames_left: 1,
@@ -3248,7 +3790,13 @@ mod tests {
                 )
             };
             assert_eq!(result, 0);
-            assert_eq!((params.iMinQp, params.iMaxQp), (14, 51));
+            // Responsiveness floors QP at 26 to stop paying for invisible quality on
+            // easy scenes; the fidelity modes keep the full range.
+            let expected_min_qp = match mode {
+                LatencyMode::Responsiveness => 26,
+                _ => 14,
+            };
+            assert_eq!((params.iMinQp, params.iMaxQp), (expected_min_qp, 51));
             assert_eq!(params.iRCMode, openh264_sys2::RC_BITRATE_MODE);
             assert_eq!(params.iUsageType, openh264_sys2::CAMERA_VIDEO_REAL_TIME);
             let layer = &params.sSpatialLayers[0];

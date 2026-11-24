@@ -60,16 +60,56 @@ void nanoctl_nvenc_close(NanoNvenc *h) {
 }
 
 static void rate_control(NV_ENC_RC_PARAMS *rc, uint32_t bitrate, uint32_t fps) {
-    rc->rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    /* VBR lets easy frames undershoot the target instead of padding to it;
+     * maxBitRate still caps the peak at the negotiated bitrate. */
+    rc->rateControlMode = NV_ENC_PARAMS_RC_VBR;
     rc->averageBitRate = bitrate;
     rc->maxBitRate = bitrate;
     rc->vbvBufferSize = bitrate / fps + (bitrate % fps != 0);
     rc->vbvInitialDelay = rc->vbvBufferSize;
 }
 
-static int initialize_session(NanoNvenc *h, uint32_t width, uint32_t height,
+enum { NANO_CODEC_H264 = 0, NANO_CODEC_HEVC = 1, NANO_CODEC_AV1 = 2 };
+
+static int codec_guid(uint32_t codec, GUID *guid) {
+    switch (codec) {
+    case NANO_CODEC_H264:
+        *guid = NV_ENC_CODEC_H264_GUID;
+        return 0;
+    case NANO_CODEC_HEVC:
+        *guid = NV_ENC_CODEC_HEVC_GUID;
+        return 0;
+#if NVENCAPI_MAJOR_VERSION >= 12
+    case NANO_CODEC_AV1:
+        *guid = NV_ENC_CODEC_AV1_GUID;
+        return 0;
+#endif
+    default:
+        return -1;
+    }
+}
+
+static int supports_codec(NanoNvenc *h, GUID guid) {
+    uint32_t count = 0;
+    if (h->api.nvEncGetEncodeGUIDCount(h->session, &count) != NV_ENC_SUCCESS || count == 0 ||
+        count > 64)
+        return 0;
+    GUID guids[64];
+    uint32_t returned = 0;
+    if (h->api.nvEncGetEncodeGUIDs(h->session, guids, count, &returned) != NV_ENC_SUCCESS)
+        return 0;
+    for (uint32_t i = 0; i < returned; i++)
+        if (memcmp(&guids[i], &guid, sizeof(guid)) == 0)
+            return 1;
+    return 0;
+}
+
+static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, uint32_t width, uint32_t height,
                               uint32_t bitrate, uint32_t fps, uint32_t quality,
                               char *error, size_t len) {
+    GUID codec_id;
+    if (codec_guid(codec, &codec_id) != 0)
+        return fail(error, len, "this build's NVENC SDK headers do not support the codec", 0);
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS open = {0};
     open.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     open.apiVersion = NVENCAPI_VERSION;
@@ -78,6 +118,8 @@ static int initialize_session(NanoNvenc *h, uint32_t width, uint32_t height,
     NVENCSTATUS status = h->api.nvEncOpenEncodeSessionEx(&open, &h->session);
     if (status != NV_ENC_SUCCESS)
         return fail(error, len, "opening NVENC CUDA session failed", status);
+    if (!supports_codec(h, codec_id))
+        return fail(error, len, "this NVIDIA GPU cannot encode the requested codec", 0);
 
     GUID preset = quality == 0 ? NV_ENC_PRESET_P1_GUID :
                   quality == 2 ? NV_ENC_PRESET_P4_GUID : NV_ENC_PRESET_P3_GUID;
@@ -85,30 +127,59 @@ static int initialize_session(NanoNvenc *h, uint32_t width, uint32_t height,
     defaults.version = NV_ENC_PRESET_CONFIG_VER;
     defaults.presetCfg.version = NV_ENC_CONFIG_VER;
     status = h->api.nvEncGetEncodePresetConfigEx(
-        h->session, NV_ENC_CODEC_H264_GUID, preset,
+        h->session, codec_id, preset,
         NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &defaults);
     if (status != NV_ENC_SUCCESS)
-        return fail(error, len, "querying low-latency NVENC H.264 preset failed", status);
+        return fail(error, len, "querying low-latency NVENC preset failed", status);
 
     h->config = defaults.presetCfg;
-    h->config.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
-    h->config.gopLength = fps * 2;
+    /* A 30s GOP, not 2s: unrepairable IDRs already force a keyframe through
+     * the RTCP loss path, so periodic IDRs are pure overhead. */
+    h->config.gopLength = fps * 30;
     h->config.frameIntervalP = 1;
     h->config.rcParams.enableLookahead = 0;
     h->config.rcParams.enableTemporalAQ = 0;
     h->config.rcParams.zeroReorderDelay = 1;
-    h->config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+    /* Quarter-resolution first pass (Sunshine's default): better rate allocation within the
+     * one-frame VBV at a negligible latency cost. Falls back to single pass if unsupported. */
+    h->config.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
     rate_control(&h->config.rcParams, bitrate, fps);
-    NV_ENC_CONFIG_H264 *h264 = &h->config.encodeCodecConfig.h264Config;
-    h264->idrPeriod = h->config.gopLength;
-    h264->chromaFormatIDC = 1;
-    h264->repeatSPSPPS = 1;
-    h264->disableSPSPPS = 0;
-    h264->entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+    if (codec == NANO_CODEC_H264) {
+        /* High with frameIntervalP = 1 is Constrained High: CABAC and 8x8 transforms, no
+         * B-frames. Baseline/CAVLC only when the browser did not offer High. */
+        h->config.profileGUID =
+            h264_high ? NV_ENC_H264_PROFILE_HIGH_GUID : NV_ENC_H264_PROFILE_BASELINE_GUID;
+        NV_ENC_CONFIG_H264 *h264 = &h->config.encodeCodecConfig.h264Config;
+        h264->idrPeriod = h->config.gopLength;
+        h264->chromaFormatIDC = 1;
+        h264->repeatSPSPPS = 1;
+        h264->disableSPSPPS = 0;
+        h264->entropyCodingMode = h264_high ? NV_ENC_H264_ENTROPY_CODING_MODE_CABAC
+                                            : NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+    } else if (codec == NANO_CODEC_HEVC) {
+        h->config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+        NV_ENC_CONFIG_HEVC *hevc = &h->config.encodeCodecConfig.hevcConfig;
+        hevc->idrPeriod = h->config.gopLength;
+        hevc->chromaFormatIDC = 1;
+        hevc->repeatSPSPPS = 1;
+        hevc->disableSPSPPS = 0;
+    }
+#if NVENCAPI_MAJOR_VERSION >= 12
+    else if (codec == NANO_CODEC_AV1) {
+        h->config.profileGUID = NV_ENC_AV1_PROFILE_MAIN_GUID;
+        NV_ENC_CONFIG_AV1 *av1 = &h->config.encodeCodecConfig.av1Config;
+        av1->idrPeriod = h->config.gopLength;
+        av1->chromaFormatIDC = 1;
+        av1->repeatSeqHdr = 1;
+        av1->disableSeqHdr = 0;
+        // WebRTC carries low-overhead OBUs (RFC AV1 RTP payload), not Annex-B temporal units.
+        av1->outputAnnexBFormat = 0;
+    }
+#endif
 
     h->params = (NV_ENC_INITIALIZE_PARAMS){0};
     h->params.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    h->params.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    h->params.encodeGUID = codec_id;
     h->params.presetGUID = preset;
     h->params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     h->params.encodeWidth = h->params.darWidth = width;
@@ -118,8 +189,12 @@ static int initialize_session(NanoNvenc *h, uint32_t width, uint32_t height,
     h->params.enablePTD = 1;
     h->params.encodeConfig = &h->config;
     status = h->api.nvEncInitializeEncoder(h->session, &h->params);
+    if (status != NV_ENC_SUCCESS) {
+        h->config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+        status = h->api.nvEncInitializeEncoder(h->session, &h->params);
+    }
     if (status != NV_ENC_SUCCESS)
-        return fail(error, len, "initializing NVENC H.264 failed", status);
+        return fail(error, len, "initializing NVENC encoder failed", status);
 
     NV_ENC_CREATE_INPUT_BUFFER input = {0};
     input.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
@@ -141,7 +216,7 @@ static int initialize_session(NanoNvenc *h, uint32_t width, uint32_t height,
     return 0;
 }
 
-NanoNvenc *nanoctl_nvenc_open(uint32_t width, uint32_t height, uint32_t bitrate,
+NanoNvenc *nanoctl_nvenc_open(uint32_t codec, uint32_t h264_high, uint32_t width, uint32_t height, uint32_t bitrate,
                              uint32_t fps, uint32_t quality, char *error, size_t len) {
     NanoNvenc *h = calloc(1, sizeof(*h));
     if (!h) {
@@ -204,7 +279,7 @@ NanoNvenc *nanoctl_nvenc_open(uint32_t width, uint32_t height, uint32_t bitrate,
             continue;
         }
         h->context = context;
-        int initialized = initialize_session(h, width, height, bitrate, fps, quality, error, len);
+        int initialized = initialize_session(h, codec, h264_high, width, height, bitrate, fps, quality, error, len);
         if (initialized != 0)
             destroy_session(h);
         CUcontext popped;

@@ -55,7 +55,7 @@ async fn run_until(
         .transpose()?;
     let result = shutdown_requested.await;
     if let Ok(reason) = &result {
-        tracing::info!(reason, "agent shutdown requested");
+        tracing::info!(target: "nanoctl::status", reason, "Agent shutting down");
     }
     shutdown.send_replace(true);
     state.stop().await;
@@ -107,17 +107,21 @@ pub(crate) fn spawn_media(
 ) -> crate::media::VideoPipeline {
     crate::media::spawn_video(
         peer.video_track(),
+        peer.video_data_channel(),
         peer.keyframe_requests(),
         peer.link_feedback(),
+        peer.viewer_limits(),
         peer.display_selection(),
         peer.display_selection_feedback_sender(),
         crate::media::VideoQuality {
             max_bitrate_kbps: config.quality.max_bitrate_kbps,
-            max_fps: config.quality.max_fps,
+            max_fps: crate::media::effective_max_fps(config.quality.max_fps),
             max_width: config.quality.max_width,
             max_height: config.quality.max_height,
             latency_mode: config.quality.latency_mode,
             encoder_preference: config.quality.encoder,
+            codec: peer.video_codec(),
+            h264_high: peer.h264_high(),
         },
     )
 }

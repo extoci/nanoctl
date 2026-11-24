@@ -4,7 +4,10 @@ mod adaptive;
 mod audio;
 #[cfg(feature = "media")]
 mod clipboard;
+#[cfg(feature = "rtc")]
+mod codec;
 mod config;
+mod diagnostics;
 #[cfg(feature = "media")]
 mod gamepad;
 #[cfg(feature = "media")]
@@ -17,6 +20,8 @@ mod macos_encoder;
 mod media;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod media_bench;
+#[cfg(any(all(feature = "media", target_os = "windows"), test))]
+mod nv12;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod nvenc_encoder;
 mod platform;
@@ -41,7 +46,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{ColorChoice, Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::config::AgentConfig;
 
@@ -88,7 +98,11 @@ enum Command {
         json: bool,
     },
     /// Start the agent in this terminal, or show the viewer URL if it is already running.
-    Run,
+    Run {
+        /// Show detailed diagnostics instead of the short run status.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Stop the running agent gracefully.
     Stop,
     /// Check configuration, Tailscale, capture, and input readiness.
@@ -105,9 +119,23 @@ enum Command {
         /// Fail instead of falling back to the software encoder.
         #[arg(long)]
         require_hardware: bool,
+        /// Also decode each access unit in-process and report Y+U+V PSNR vs the source.
+        /// Adds a few ms of work per frame; leave off when measuring throughput/latency.
+        #[arg(long)]
+        psnr: bool,
         /// Print the acceptance record as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Print a paste-ready debug report: build, OS, doctor checks, encoders, displays,
+    /// redacted configuration and recent agent logs.
+    Debug {
+        /// Recent agent log lines to include.
+        #[arg(long, default_value_t = diagnostics::REPORT_LOG_LINES)]
+        lines: usize,
+        /// Also write the report to this file.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Print the effective redacted configuration.
     Config,
@@ -149,34 +177,77 @@ enum Command {
     CommitUpdate,
 }
 
-fn init_logging(log_file: Option<&Path>, diagnostics_to_stderr: bool) -> Result<()> {
-    let filter =
-        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("nanoctl=info"));
+#[cfg(test)]
+fn quiet_console<W>(writer: W) -> impl tracing::Subscriber
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::registry().with(quiet_layer(writer))
+}
+
+fn quiet_layer<S, W>(writer: W) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .without_time()
+        .with_level(false)
+        .with_target(false)
+        .compact()
+        .with_filter(
+            Targets::new()
+                .with_target("nanoctl", LevelFilter::ERROR)
+                .with_target("nanoctl::status", LevelFilter::INFO),
+        )
+}
+
+fn init_logging(log_file: Option<&Path>, command: &Command) -> Result<()> {
+    let diagnostics = matches!(command, Command::Run { .. })
+        .then(diagnostics::layer)
+        .flatten();
+    let registry = tracing_subscriber::registry().with(diagnostics);
+    let env_filter = EnvFilter::try_from_default_env().ok();
+    if log_file.is_none()
+        && env_filter.is_none()
+        && matches!(command, Command::Run { verbose: false })
+    {
+        registry.with(quiet_layer(std::io::stdout)).init();
+        return Ok(());
+    }
+    let filter = env_filter.unwrap_or_else(|| EnvFilter::new("nanoctl=info"));
     if let Some(path) = log_file {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create log directory {}", parent.display()))?;
         }
+        rotate_log_file(path);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .with_context(|| format!("cannot open log file {}", path.display()))?;
-        tracing_subscriber::fmt()
-            .with_env_filter(filter())
-            .with_ansi(false)
-            .with_writer(file)
-            .compact()
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file)
+                    .compact()
+                    .with_filter(filter),
+            )
             .init();
     } else {
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter())
+        let layer = tracing_subscriber::fmt::layer()
             .with_ansi(terminal::supports_styling())
             .compact();
-        if diagnostics_to_stderr {
-            subscriber.with_writer(std::io::stderr).init();
+        if matches!(command, Command::Url { .. }) {
+            registry
+                .with(layer.with_writer(std::io::stderr).with_filter(filter))
+                .init();
         } else {
-            subscriber.init();
+            registry.with(layer.with_filter(filter)).init();
         }
     }
     Ok(())
@@ -229,7 +300,7 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = cli.config.unwrap_or(AgentConfig::default_path()?);
 
     match cli.command {
-        Command::Run => {
+        Command::Run { .. } => {
             let config = AgentConfig::load_or_default(&config_path)?;
             config.validate()?;
             #[cfg(windows)]
@@ -238,6 +309,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             match service_control::ServiceControl::acquire()? {
                 service_control::StartOutcome::Acquired(control) => {
+                    tracing::info!(target: "nanoctl::status", "nanoctl {} starting", env!("CARGO_PKG_VERSION"));
                     #[cfg(windows)]
                     if cli.ready_file.is_none() && cli.ready_token.is_none() {
                         return supervisor::run(control).await;
@@ -282,6 +354,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::MediaSmoke {
             seconds,
             require_hardware,
+            psnr,
             json,
         } => {
             let mut config = AgentConfig::load_or_default(&config_path)?;
@@ -289,7 +362,7 @@ async fn run(cli: Cli) -> Result<()> {
             if require_hardware {
                 config.quality.encoder = crate::config::EncoderPreference::Hardware;
             }
-            let report = crate::media::run_smoke(&config.quality, seconds)?;
+            let report = crate::media::run_smoke(&config.quality, seconds, psnr)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -306,6 +379,16 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{report}");
+            }
+        }
+        Command::Debug { lines, output } => {
+            let config = AgentConfig::load_or_default(&config_path)?;
+            let report = diagnostics::report(&config, Some(&config_path), lines).await;
+            print!("{report}");
+            if let Some(path) = output {
+                std::fs::write(&path, &report)
+                    .with_context(|| format!("cannot write {}", path.display()))?;
+                eprintln!("Debug report written to {}", path.display());
             }
         }
         Command::Config => {
@@ -402,6 +485,18 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// `--log-file` (the Windows service's agent.log) is appended across restarts; start a new
+/// file once it passes this size, keeping one previous `.1` copy.
+const LOG_FILE_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn rotate_log_file(path: &Path) {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_FILE_ROTATE_BYTES) {
+        let mut previous = path.as_os_str().to_owned();
+        previous.push(".1");
+        let _ = std::fs::rename(path, previous);
+    }
+}
+
 fn append_diagnostic(log_file: Option<&Path>, message: std::fmt::Arguments<'_>) {
     if let Some(path) = log_file
         && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
@@ -421,10 +516,12 @@ async fn main() -> Result<()> {
             previous_hook(panic);
         }));
     }
-    if let Err(error) = init_logging(
-        log_file.as_deref(),
-        matches!(cli.command, Command::Url { .. }),
-    ) {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        diagnostics::append(format_args!("nanoctl: {panic}"));
+        previous_hook(panic);
+    }));
+    if let Err(error) = init_logging(log_file.as_deref(), &cli.command) {
         append_diagnostic(
             log_file.as_deref(),
             format_args!("nanoctl command failed: {error:#}"),
@@ -433,10 +530,77 @@ async fn main() -> Result<()> {
     }
     let result = run(cli).await;
     if let Err(error) = &result {
+        diagnostics::append(format_args!("nanoctl: command failed: {error:#}"));
         append_diagnostic(
             log_file.as_deref(),
             format_args!("nanoctl command failed: {error:#}"),
         );
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_file_rotates_only_past_the_limit() {
+        let dir = std::env::temp_dir().join(format!("nanoctl-logfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.log");
+        std::fs::write(&path, b"small").unwrap();
+        rotate_log_file(&path);
+        assert!(path.exists());
+        std::fs::write(&path, vec![b'x'; LOG_FILE_ROTATE_BYTES as usize + 1]).unwrap();
+        rotate_log_file(&path);
+        assert!(!path.exists());
+        assert!(dir.join("agent.log.1").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn run_diagnostics_are_opt_in() {
+        for (args, verbose) in [
+            (vec!["nanoctl", "run"], false),
+            (vec!["nanoctl", "run", "-v"], true),
+            (vec!["nanoctl", "run", "--verbose"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Command::Run { verbose: value } if value == verbose));
+        }
+    }
+
+    #[test]
+    fn quiet_console_prints_only_plain_status_and_agent_errors() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = quiet_console({
+            let output = Arc::clone(&output);
+            move || SharedOutput(Arc::clone(&output))
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "nanoctl::rtc", "video REMB");
+            tracing::warn!(target: "nanoctl::media", "frame discarded");
+            tracing::debug!(target: "nanoctl::status", "debug details");
+            tracing::info!(target: "nanoctl::status", "Viewer connected");
+            tracing::warn!(target: "nanoctl::status", "Waiting for Tailscale");
+            tracing::error!(target: "nanoctl::service", "Agent failed");
+        });
+        assert_eq!(
+            *output.lock().unwrap(),
+            b"Viewer connected\nWaiting for Tailscale\nAgent failed\n"
+        );
+    }
+
+    struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 }

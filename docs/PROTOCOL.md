@@ -14,7 +14,7 @@ Types and validators live in `packages/protocol`.
   {
     "hostName": "desktop",
     "platform": "linux",
-    "version": "3.0.0-alpha.1",
+    "version": "3.0.0-alpha.4",
     "displays": [
       {
         "id": "59",
@@ -30,7 +30,7 @@ Types and validators live in `packages/protocol`.
       "protocolVersion": 2,
       "platform": "linux",
       "architecture": "x64",
-      "codecs": ["h264"],
+      "codecs": ["av1", "hevc", "h264"],
       "encoderBackends": ["software-openh264"],
       "ready": true,
       "readiness": "ready",
@@ -90,7 +90,8 @@ A newer authorized socket replaces the active session. Socket closure ends the s
 
 ## Media and input
 
-WebRTC uses empty ICE servers, tailnet host candidates, H.264 RTP, DTLS-SRTP video and
+WebRTC uses empty ICE servers, tailnet host candidates, AV1, HEVC or H.264 RTP (the
+host answers with the first offered codec in `capabilities.codecs`), DTLS-SRTP video and
 SCTP data channels. No application-level TURN/STUN is used; Tailscale may relay its
 underlying encrypted transport through DERP. Reliable control carries discrete commands;
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
@@ -104,7 +105,9 @@ transceiver. The agent sends a separate Opus RTP track: 48 kHz stereo, 20 ms fra
 RTCP is drained independently, and bounded audio queues drop stale work rather than
 blocking video. Capture starts after the peer connects and stops with the session.
 
-`features.system_audio` defaults to true. Linux requires `parec` and a reachable
+`features.system_audio` defaults to true. Configuration files saved by control-plane releases
+(they contain `control_plane_url`) pinned it to false; that saved value is treated as unset.
+Linux requires `parec` and a reachable
 PulseAudio/PipeWire-pulse server; capture reads `@DEFAULT_MONITOR@`, not the microphone.
 Windows uses WASAPI output-device loopback. macOS system audio is unsupported and
 advertised false. Opus is bundled statically, so no runtime libopus installation is needed.

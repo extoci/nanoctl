@@ -3,16 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
 use interceptor::registry::Registry;
-#[cfg(feature = "media")]
-use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
-#[cfg(feature = "media")]
-use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 #[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
@@ -25,6 +22,8 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtcp::reception_report::ReceptionReport;
@@ -68,7 +67,6 @@ const MAX_ICE_GENERATION: u64 = 1_000_000;
 // Level 5.2 is the highest H.264 level supported by the configured 4K60 release envelope. The
 // WebRTC matcher treats the level byte asymmetrically, so this remains compatible with Chromium's
 // lower-level offer while no longer advertising a 720p30 ceiling for a 4K-capable sender.
-const H264_PROFILE_LEVEL_ID: &str = "42e034";
 #[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 #[cfg(any(feature = "media", test))]
@@ -147,11 +145,33 @@ pub struct HostPeer {
     #[cfg(feature = "media")]
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
+    viewer_limits: tokio::sync::watch::Sender<crate::adaptive::ViewerLimits>,
+    #[cfg(feature = "media")]
     input_shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")]
     input_revoked: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
+    /// Optional viewer-created unreliable channel carrying H.264 access
+    /// units straight to WebCodecs, bypassing the track's jitter buffer.
+    #[cfg(feature = "media")]
+    video_data_channel: Arc<DataChannelVideo>,
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    video_codec: VideoCodec,
+    #[cfg(feature = "media")]
+    h264_high: bool,
+}
+
+/// Viewer-created unreliable data channel carrying raw Annex-B access units
+/// straight to WebCodecs. The viewer can request a keyframe by sending `KF`
+/// when it detects a sequence gap. `idr_channel` is the reliable channel
+/// (`nanoctl.video-idr.v1`) used to deliver keyframes, which are too large
+/// to survive partial reliability.
+#[cfg(feature = "media")]
+pub(crate) struct DataChannelVideo {
+    pub channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
+    pub idr_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
+    pub keyframe_requests: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -433,7 +453,7 @@ impl HostPeer {
         host_epoch: String,
         allow_remote_input: bool,
         allow_clipboard: bool,
-        allow_audio: bool,
+        audio_output: Option<tokio::sync::watch::Receiver<Option<String>>>,
     ) -> Result<Self> {
         Self::answer_with_publisher(
             SignalPublisher::websocket(sender),
@@ -444,7 +464,7 @@ impl HostPeer {
             host_epoch,
             allow_remote_input,
             allow_clipboard,
-            allow_audio,
+            audio_output,
         )
         .await
     }
@@ -459,7 +479,7 @@ impl HostPeer {
         host_epoch: String,
         allow_remote_input: bool,
         allow_clipboard: bool,
-        allow_audio: bool,
+        audio_output: Option<tokio::sync::watch::Receiver<Option<String>>>,
     ) -> Result<Self> {
         let (offer, initial_generation, controller_epoch) =
             parse_offer(serialized_offer, &session_id)?;
@@ -470,6 +490,12 @@ impl HostPeer {
         {
             anyhow::bail!("peer epoch is invalid");
         }
+        let negotiated = crate::codec::negotiate(
+            &offer,
+            &crate::codec::host_codecs(),
+            crate::codec::host_preference(),
+        );
+        tracing::info!(codec = negotiated.codec.id(), "negotiated video codec");
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         media_engine.register_header_extension(
@@ -495,7 +521,7 @@ impl HostPeer {
             .with_interceptor_registry(registry)
             .build();
         #[cfg(not(feature = "media"))]
-        let _ = (allow_remote_input, allow_clipboard, allow_audio);
+        let _ = (allow_remote_input, allow_clipboard, audio_output);
         let peer = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
@@ -507,6 +533,9 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
+        let (viewer_limits, _) =
+            tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
+        #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
             tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
@@ -515,6 +544,12 @@ impl HostPeer {
         let input_revoked = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "media")]
         let mut input_tasks = Vec::new();
+        #[cfg(feature = "media")]
+        let video_data_channel = Arc::new(DataChannelVideo {
+            channel: std::sync::Mutex::new(None),
+            idr_channel: std::sync::Mutex::new(None),
+            keyframe_requests: AtomicU64::new(0),
+        });
         #[cfg(feature = "media")]
         {
             let input = if allow_remote_input {
@@ -551,6 +586,7 @@ impl HostPeer {
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
             let (pointer_sender, pointer_receiver) = tokio::sync::watch::channel(None);
+            let blocked_notices = InputBlockedNotices::default();
             if let Some(input) = &input {
                 input_tasks.push(spawn_input_worker(
                     InputReceiver::Reliable(control_receiver),
@@ -560,6 +596,7 @@ impl HostPeer {
                     Some(display_selection_feedback_receiver),
                     input_shutdown_receiver.clone(),
                     input_revoked.clone(),
+                    blocked_notices.clone(),
                 ));
                 input_tasks.push(spawn_input_worker(
                     InputReceiver::Motion(pointer_receiver),
@@ -569,6 +606,7 @@ impl HostPeer {
                     None,
                     input_shutdown_receiver,
                     input_revoked.clone(),
+                    blocked_notices.clone(),
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
@@ -578,9 +616,41 @@ impl HostPeer {
                 None
             };
             let clipboard_shutdown = input_shutdown.subscribe();
+            let video_dc_for_channel = video_data_channel.clone();
+            let viewer_limits_for_channel = viewer_limits.clone();
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
+                let viewer_limits = viewer_limits_for_channel.clone();
                 let input_revoked = input_revoked_for_channel.clone();
+                if channel.label() == "nanoctl.video.v1"
+                    || channel.label() == "nanoctl.video-idr.v1"
+                {
+                    let is_idr = channel.label() == "nanoctl.video-idr.v1";
+                    tracing::info!(idr = is_idr, "video data channel opened");
+                    let slot = video_dc_for_channel.clone();
+                    if is_idr {
+                        *slot.idr_channel.lock().unwrap() = Some(channel.clone());
+                    } else {
+                        *slot.channel.lock().unwrap() = Some(channel.clone());
+                    }
+                    let kf = video_dc_for_channel.clone();
+                    channel.on_message(Box::new(move |message| {
+                        if message.data.as_ref() == b"KF" {
+                            tracing::info!("video data channel keyframe request received");
+                            kf.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Box::pin(async {})
+                    }));
+                    channel.on_close(Box::new(move || {
+                        if is_idr {
+                            *slot.idr_channel.lock().unwrap() = None;
+                        } else {
+                            *slot.channel.lock().unwrap() = None;
+                        }
+                        Box::pin(async {})
+                    }));
+                    return Box::pin(async {});
+                }
                 if channel.label() == "nanoctl.clipboard.v1" {
                     if let Some(backend) = clipboard.clone() {
                         let initial_backend = backend.clone();
@@ -608,10 +678,25 @@ impl HostPeer {
                     }
                     return Box::pin(async {});
                 }
+                let reliable = channel.label() == "nanoctl.control.v1";
                 if input.is_none() {
+                    // View-only sessions still adjust stream quality.
+                    if reliable {
+                        channel.on_message(Box::new(move |message: DataChannelMessage| {
+                            if message.is_string
+                                && let Some(limits) =
+                                    crate::adaptive::ViewerLimits::parse(&message.data)
+                            {
+                                viewer_limits.send_replace(limits);
+                            }
+                            Box::pin(async {})
+                        }));
+                    }
                     return Box::pin(async {});
                 }
-                let reliable = channel.label() == "nanoctl.control.v1";
+                if reliable {
+                    blocked_notices.attach(&channel);
+                }
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
                     "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
@@ -620,6 +705,13 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
+                    if reliable
+                        && message.is_string
+                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
+                    {
+                        viewer_limits.send_replace(limits);
+                        return Box::pin(async {});
+                    }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
                     let sender = sender.clone();
@@ -667,7 +759,9 @@ impl HostPeer {
             }));
         }
         #[cfg(feature = "media")]
-        if allow_audio && crate::audio::available() {
+        if let Some(output) = audio_output
+            && offer.lines().any(|line| line.starts_with("m=audio "))
+        {
             let audio = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability {
                     mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
@@ -684,6 +778,7 @@ impl HostPeer {
                 audio,
                 peer.clone(),
                 input_shutdown.subscribe(),
+                output,
             )));
             let mut shutdown = input_shutdown.subscribe();
             input_tasks.push(tokio::spawn(async move {
@@ -697,12 +792,21 @@ impl HostPeer {
         }
         let video = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
+                mime_type: match negotiated.codec {
+                    VideoCodec::H264 => MIME_TYPE_H264,
+                    VideoCodec::Hevc => MIME_TYPE_HEVC,
+                    VideoCodec::Av1 => MIME_TYPE_AV1,
+                }
+                .to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
-                sdp_fmtp_line: format!(
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_PROFILE_LEVEL_ID}"
-                ),
+                sdp_fmtp_line: match negotiated.codec {
+                    VideoCodec::H264 => format!(
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
+                        negotiated.h264_profile_level_id()
+                    ),
+                    VideoCodec::Hevc | VideoCodec::Av1 => negotiated.offered_fmtp.clone(),
+                },
                 rtcp_feedback: vec![
                     RTCPFeedback {
                         typ: "nack".to_owned(),
@@ -741,9 +845,16 @@ impl HostPeer {
             .ssrc;
         let rtcp_task = tokio::spawn(async move {
             let mut remb_kbps = None;
+            let mut feedback = FeedbackSummary::default();
             let mut latest_sample: Option<LinkSample> = None;
             while let Ok((packets, _attributes)) = sender.read_rtcp().await {
-                let at = Instant::now();
+                let at = std::time::Instant::now();
+                if packets.iter().any(|packet| {
+                    packet.as_any().is::<PictureLossIndication>()
+                        || packet.as_any().is::<FullIntraRequest>()
+                }) {
+                    feedback.keyframe_requests += 1;
+                }
                 let compact_ntp = (unix2ntp(SystemTime::now()) >> 16) as u32;
                 #[cfg(feature = "media")]
                 {
@@ -759,12 +870,14 @@ impl HostPeer {
                 let previous_remb = remb_kbps;
                 for packet in &packets {
                     if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
-                        tracing::info!(
+                        tracing::debug!(
                             video_ssrc,
                             media_ssrc = nack.media_ssrc,
                             nack_pairs = nack.nacks.len(),
                             "video NACK"
                         );
+                        feedback.nacks += 1;
+                        feedback.nack_pairs += nack.nacks.len() as u64;
                     }
                     if let Some(estimate) = packet
                         .as_any()
@@ -773,8 +886,9 @@ impl HostPeer {
                         && estimate.bitrate > 0.0
                     {
                         let kbps = (estimate.bitrate / 1_000.0).min(u32::MAX as f32) as u32;
-                        tracing::info!(video_ssrc, remb_kbps = kbps, "video REMB");
+                        tracing::debug!(video_ssrc, remb_kbps = kbps, "video REMB");
                         remb_kbps = Some(kbps.max(1));
+                        feedback.record_remb(kbps);
                     }
                 }
                 let mut reported = false;
@@ -800,6 +914,18 @@ impl HostPeer {
                         link_samples.send_replace(Some(sample));
                         reported = true;
                     }
+                }
+                if let Some(summary) = feedback.take_due(at) {
+                    tracing::info!(
+                        video_ssrc,
+                        nacks = summary.nacks,
+                        nack_pairs = summary.nack_pairs,
+                        keyframe_requests = summary.keyframe_requests,
+                        remb_min_kbps = summary.remb_min_kbps,
+                        remb_last_kbps = summary.remb_last_kbps,
+                        "video feedback (last {}s)",
+                        FEEDBACK_SUMMARY_INTERVAL.as_secs()
+                    );
                 }
                 if !reported && remb_kbps != previous_remb {
                     let mut sample = latest_sample.unwrap_or(LinkSample {
@@ -941,10 +1067,17 @@ impl HostPeer {
             #[cfg(feature = "media")]
             display_selection_feedback,
             #[cfg(feature = "media")]
+            viewer_limits,
+            #[cfg(feature = "media")]
             input_shutdown,
             #[cfg(feature = "media")]
             input_revoked,
             video,
+            #[cfg(feature = "media")]
+            video_data_channel,
+            video_codec: negotiated.codec,
+            #[cfg(feature = "media")]
+            h264_high: negotiated.h264_high,
         })
     }
 
@@ -1145,8 +1278,23 @@ impl HostPeer {
     }
 
     #[cfg(feature = "media")]
+    pub fn h264_high(&self) -> bool {
+        self.h264_high
+    }
+
+    #[cfg(feature = "media")]
+    pub fn video_codec(&self) -> VideoCodec {
+        self.video_codec
+    }
+
+    #[cfg(feature = "media")]
     pub fn video_track(&self) -> Arc<TrackLocalStaticSample> {
         self.video.clone()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn video_data_channel(&self) -> Arc<DataChannelVideo> {
+        self.video_data_channel.clone()
     }
 
     #[cfg(feature = "media")]
@@ -1157,6 +1305,11 @@ impl HostPeer {
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub fn link_feedback(&self) -> tokio::sync::watch::Receiver<Option<LinkSample>> {
         self.link_feedback.subscribe()
+    }
+
+    #[cfg(feature = "media")]
+    pub fn viewer_limits(&self) -> tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits> {
+        self.viewer_limits.subscribe()
     }
 
     #[cfg(feature = "media")]
@@ -1171,6 +1324,53 @@ impl HostPeer {
 }
 
 #[cfg(feature = "media")]
+const INPUT_BLOCKED_NOTICE: &str = r#"{"type":"inputBlocked"}"#;
+#[cfg(feature = "media")]
+const INPUT_BLOCKED_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "media")]
+/// Tells the viewer when the host OS refuses injected input (for example Windows UIPI while an
+/// elevated window, UAC prompt or the lock screen is in front), at most once per interval.
+#[derive(Clone, Default)]
+struct InputBlockedNotices(Arc<std::sync::Mutex<InputBlockedState>>);
+
+#[cfg(feature = "media")]
+#[derive(Default)]
+struct InputBlockedState {
+    channel: Option<std::sync::Weak<RTCDataChannel>>,
+    last_sent: Option<Instant>,
+}
+
+#[cfg(feature = "media")]
+impl InputBlockedNotices {
+    fn attach(&self, channel: &Arc<RTCDataChannel>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.channel = Some(Arc::downgrade(channel));
+        }
+    }
+
+    fn notify(&self) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if state
+            .last_sent
+            .is_some_and(|sent| sent.elapsed() < INPUT_BLOCKED_NOTICE_INTERVAL)
+        {
+            return;
+        }
+        let Some(channel) = state.channel.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        state.last_sent = Some(Instant::now());
+        tokio::spawn(async move {
+            let _ = channel.send_text(INPUT_BLOCKED_NOTICE.to_owned()).await;
+        });
+    }
+}
+
+#[cfg(feature = "media")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_input_worker(
     mut receiver: InputReceiver,
     input: Arc<std::sync::Mutex<crate::input::InputController>>,
@@ -1179,6 +1379,7 @@ fn spawn_input_worker(
     mut display_selection_feedback: Option<tokio::sync::watch::Receiver<String>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     input_revoked: Arc<AtomicBool>,
+    blocked_notices: InputBlockedNotices,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1259,7 +1460,12 @@ fn spawn_input_worker(
                             }
                         }
                         Ok(Ok(None)) => {}
-                        Ok(Err(error)) => tracing::warn!(error = %error, "control message rejected"),
+                        Ok(Err(error)) => {
+                            tracing::warn!(error = %error, "control message rejected");
+                            if error.downcast_ref::<enigo::InputError>().is_some() {
+                                blocked_notices.notify();
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(error = %error, "input worker stopped unexpectedly");
                             break;
@@ -1379,8 +1585,69 @@ fn supported_version(version: u8) -> bool {
     (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
 }
 
+const FEEDBACK_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Viewer RTCP feedback folded into one info line per interval: per-packet NACK and REMB
+/// lines would otherwise crowd everything else out of the diagnostics log tail.
+#[derive(Debug, Default, PartialEq)]
+struct FeedbackSummary {
+    nacks: u64,
+    nack_pairs: u64,
+    keyframe_requests: u64,
+    remb_min_kbps: Option<u32>,
+    remb_last_kbps: Option<u32>,
+    since: Option<Instant>,
+}
+
+impl FeedbackSummary {
+    fn record_remb(&mut self, kbps: u32) {
+        self.remb_min_kbps = Some(self.remb_min_kbps.map_or(kbps, |min| min.min(kbps)));
+        self.remb_last_kbps = Some(kbps);
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<Self> {
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since) < FEEDBACK_SUMMARY_INTERVAL {
+            return None;
+        }
+        let summary = std::mem::take(self);
+        self.since = Some(now);
+        (summary.nacks > 0 || summary.keyframe_requests > 0 || summary.remb_last_kbps.is_some())
+            .then_some(summary)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn feedback_summary_reports_once_per_interval() {
+        let start = std::time::Instant::now();
+        let mut feedback = FeedbackSummary::default();
+        assert_eq!(feedback.take_due(start), None);
+        feedback.nacks = 3;
+        feedback.nack_pairs = 5;
+        feedback.record_remb(9_000);
+        feedback.record_remb(7_000);
+        feedback.record_remb(8_000);
+        assert_eq!(feedback.take_due(start + Duration::from_secs(5)), None);
+        let summary = feedback
+            .take_due(start + FEEDBACK_SUMMARY_INTERVAL)
+            .expect("due");
+        assert_eq!(
+            (
+                summary.nacks,
+                summary.nack_pairs,
+                summary.remb_min_kbps,
+                summary.remb_last_kbps
+            ),
+            (3, 5, Some(7_000), Some(8_000))
+        );
+        assert_eq!(
+            feedback.take_due(start + FEEDBACK_SUMMARY_INTERVAL * 2),
+            None
+        );
+    }
+
     use super::*;
     use proptest::prelude::*;
     use serde_json::Value;
@@ -1718,7 +1985,7 @@ mod tests {
             "host-test".to_owned(),
             false,
             false,
-            false,
+            None,
         )
         .await;
 
@@ -1786,7 +2053,7 @@ mod tests {
             "host-test".to_owned(),
             false,
             false,
-            false,
+            None,
         )
         .await
         .unwrap();

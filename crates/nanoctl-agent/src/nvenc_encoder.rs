@@ -4,11 +4,14 @@ use std::slice;
 
 use anyhow::{Result, anyhow, ensure};
 
+use crate::codec::VideoCodec;
 use crate::config::LatencyMode;
 use crate::media::{EncodedFrame, FrameEncoder};
 
 unsafe extern "C" {
     fn nanoctl_nvenc_open(
+        codec: u32,
+        h264_high: u32,
         width: u32,
         height: u32,
         bitrate: u32,
@@ -61,6 +64,8 @@ unsafe extern "C" fn copy_bitstream(destination: *mut c_void, data: *const u8, l
 }
 
 pub struct NvencEncoder {
+    codec: VideoCodec,
+    h264_high: bool,
     session: Option<Session>,
     dimensions: (u32, u32),
     bitrate_kbps: u32,
@@ -71,13 +76,17 @@ pub struct NvencEncoder {
 }
 
 impl NvencEncoder {
-    pub fn new(
+    pub fn with_codec(
+        codec: VideoCodec,
+        h264_high: bool,
         bitrate_kbps: u32,
         max_fps: u16,
         latency_mode: LatencyMode,
         dimensions: (u32, u32),
     ) -> Result<Self> {
         let mut encoder = Self {
+            codec,
+            h264_high,
             session: None,
             dimensions,
             bitrate_kbps,
@@ -106,6 +115,12 @@ impl NvencEncoder {
         // SAFETY: the shim borrows the writable error buffer for the duration of the call.
         let handle = unsafe {
             nanoctl_nvenc_open(
+                match self.codec {
+                    VideoCodec::H264 => 0,
+                    VideoCodec::Hevc => 1,
+                    VideoCodec::Av1 => 2,
+                },
+                u32::from(self.h264_high),
                 width,
                 height,
                 self.bitrate_kbps.saturating_mul(1_000),

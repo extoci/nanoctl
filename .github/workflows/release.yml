@@ -39,7 +39,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-24.04
     permissions:
-      actions: read
+      actions: write # re-runs a cancelled CI run instead of failing the tag
       contents: read
     outputs:
       run_id: ${{ steps.locate.outputs.run_id }}
@@ -52,8 +52,9 @@ jobs:
         run: |
           set -euo pipefail
           endpoint="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=20"
+          rerun_requested=""
 
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 240); do
             if ! run_id="$(gh api "$endpoint" --jq \
                 '[.workflow_runs[] | select(.head_branch == "master" and .status == "completed" and .conclusion == "success")] | sort_by(.created_at) | reverse | .[0].id // empty')"; then
               echo "GitHub could not be queried for the CI run for $GITHUB_SHA." >&2
@@ -72,13 +73,34 @@ jobs:
             fi
             if [ -n "$latest" ]; then
               IFS=$'\t' read -r latest_id latest_status latest_conclusion latest_url <<<"$latest"
-              if [ "$latest_status" = "completed" ] && [ "$latest_conclusion" != "success" ]; then
-                echo "The CI run for this commit failed: $latest_url" >&2
-                exit 1
+              if [ "$latest_status" = "completed" ]; then
+                case "$latest_conclusion" in
+                  cancelled)
+                    # A cancelled run (superseded concurrency group, runner capacity,
+                    # manual cancel) produced no artifacts and says nothing about the
+                    # code. Re-run it once instead of failing the release, then keep
+                    # waiting on the re-run.
+                    if [ "$rerun_requested" = "$latest_id" ]; then
+                      echo "CI run $latest_id was cancelled again after a requested re-run: $latest_url" >&2
+                      exit 1
+                    fi
+                    echo "CI run $latest_id was cancelled; requesting a re-run (attempt $attempt/240)."
+                    if ! gh run rerun -R "$GITHUB_REPOSITORY" "$latest_id"; then
+                      echo "Could not re-run cancelled CI run $latest_id: $latest_url" >&2
+                      exit 1
+                    fi
+                    rerun_requested="$latest_id"
+                    ;;
+                  *)
+                    echo "The CI run for this commit ended with conclusion '$latest_conclusion': $latest_url" >&2
+                    exit 1
+                    ;;
+                esac
+              else
+                echo "CI run $latest_id is $latest_status${latest_conclusion:+ ($latest_conclusion)}; waiting (attempt $attempt/240)."
               fi
-              echo "CI run $latest_id is $latest_status${latest_conclusion:+ ($latest_conclusion)}; waiting (attempt $attempt/120)."
             else
-              echo "No CI run is visible for $GITHUB_SHA yet; waiting (attempt $attempt/120)."
+              echo "No CI run is visible for $GITHUB_SHA yet; waiting (attempt $attempt/240)."
             fi
             sleep 15
           done

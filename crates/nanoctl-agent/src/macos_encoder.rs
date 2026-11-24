@@ -1,12 +1,13 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use apple_cf::cf::CFNumber;
 use apple_cf::iosurface::IOSurface;
 use videotoolbox::compression::{CompressionSession, ProfileLevel};
 use videotoolbox::session::Codec;
 
+use crate::codec::VideoCodec;
 use crate::config::LatencyMode;
 use crate::media::{EncodedFrame, FrameEncoder, avcc_to_annex_b};
 
@@ -29,6 +30,7 @@ pub struct MacOsEncoder {
     session: Option<CompressionSession>,
     surface: Option<IOSurface>,
     dimensions: (u32, u32),
+    h264_high: bool,
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
@@ -37,16 +39,23 @@ pub struct MacOsEncoder {
 }
 
 impl MacOsEncoder {
-    pub fn new(
+    pub fn with_codec(
+        codec: VideoCodec,
+        h264_high: bool,
         bitrate_kbps: u32,
         max_fps: u16,
         latency_mode: LatencyMode,
         dimensions: (u32, u32),
     ) -> Result<Self> {
+        ensure!(
+            codec == VideoCodec::H264,
+            "VideoToolbox backend only encodes H.264"
+        );
         let mut encoder = Self {
             session: None,
             surface: None,
             dimensions: (0, 0),
+            h264_high,
             bitrate_kbps,
             max_fps,
             latency_mode,
@@ -63,6 +72,7 @@ impl MacOsEncoder {
         self.session = Some(create_session(
             width,
             height,
+            self.h264_high,
             self.bitrate_kbps,
             self.max_fps,
             self.latency_mode,
@@ -149,6 +159,7 @@ impl FrameEncoder for MacOsEncoder {
 fn create_session(
     width: u32,
     height: u32,
+    h264_high: bool,
     bitrate_kbps: u32,
     max_fps: u16,
     latency_mode: LatencyMode,
@@ -168,9 +179,15 @@ fn create_session(
                 .context("VideoToolbox bitrate exceeds i32")?,
         )
         .with_expected_frame_rate(f64::from(max_fps))
-        .with_max_keyframe_interval(i32::from(max_fps) * 2)
+        // A 30s GOP, not 2s: unrepairable IDRs already force a keyframe
+        // through the RTCP loss path, so periodic IDRs are pure overhead.
+        .with_max_keyframe_interval(i32::from(max_fps) * 30)
         .with_quality(quality)
-        .with_profile_level(ProfileLevel::H264ConstrainedBaselineAutoLevel)
+        .with_profile_level(if h264_high {
+            ProfileLevel::H264ConstrainedHighAutoLevel
+        } else {
+            ProfileLevel::H264ConstrainedBaselineAutoLevel
+        })
         .build()
         .context("cannot create real-time VideoToolbox H.264 session")?;
     // SAFETY: the key is a process-lifetime CoreFoundation constant documented for compression

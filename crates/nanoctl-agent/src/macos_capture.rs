@@ -193,7 +193,9 @@ impl ScreenRecorder {
                 config.setWidth(width);
                 config.setHeight(height);
                 config.setPixelFormat(kCVPixelFormatType_32BGRA);
-                config.setMinimumFrameInterval(CMTime::new(1, 60));
+                // Deliver at the display's refresh rate (ProMotion and high-refresh external
+                // displays); the encode pacer applies quality.max_fps.
+                config.setMinimumFrameInterval(CMTime::new(1, 240));
                 config.setQueueDepth(3);
                 config.setShowsCursor(true);
                 config.setShowMouseClicks(true);

@@ -7,11 +7,21 @@ import {
   type DisplayInfo,
   type NormalizedSignal,
   type SignalPayload,
+  type VideoCodec,
 } from "@nanoctl/protocol";
+import { recordDebugEvent } from "./debug-report";
+import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
+import {
+  attachDataChannelVideo,
+  attachWebCodecsVideo,
+  createVideoEncodedStreams,
+  supportsWebCodecsVideo,
+  type WebCodecsVideoHandle,
+} from "./webcodecs-video";
 import { normalizedPosition, videoGeometry } from "./touch-input";
 
 export type RemoteSessionPhase =
@@ -29,7 +39,13 @@ export type RemoteSessionMetrics = {
   rttMs: number | null;
   packetsLost: number;
   framesDropped: number;
+  /** Share of packets lost since the previous stats sample. */
+  lossPercent: number | null;
+  jitterMs: number | null;
   route: "direct" | "relay" | "unknown";
+  codec: string | null;
+  decoder: string | null;
+  decodeMs: number | null;
 };
 
 export type RemoteSessionSnapshot = {
@@ -42,6 +58,8 @@ export type RemoteSessionSnapshot = {
   gamepadStatus: GamepadStatus;
   firstFrameReceived: boolean;
   metrics: RemoteSessionMetrics | null;
+  /** Increments each time the host reports that its OS refused injected input. */
+  inputBlocked: number;
 };
 
 export type RemoteSessionOperations = {
@@ -58,6 +76,8 @@ export type HostSignalRow = {
   envelope: string;
 };
 
+export type QualityLimits = { maxFps?: number; maxBitrateKbps?: number };
+
 export type RemoteSessionOptions = {
   sessionId: string;
   controllerEpoch: string;
@@ -73,6 +93,10 @@ export type RemoteSessionOptions = {
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
   preferences?: { inputEnabled: boolean; displayId?: string };
+  /** Codecs the host can encode; the viewer orders its offer so the host picks the best one. */
+  videoCodecs?: readonly VideoCodec[];
+  codecChoice?: CodecChoice;
+  qualityLimits?: QualityLimits;
   operations: RemoteSessionOperations;
   getIceServers?: () => Promise<readonly RTCIceServer[]>;
   revalidateController?: () => Promise<{
@@ -112,6 +136,12 @@ export class RemoteSessionController {
   private readonly pendingEndOfCandidates = new Map<number, string>();
 
   private peer: RTCPeerConnection | null = null;
+  private webCodecsVideo: WebCodecsVideoHandle | null = null;
+  private remoteVideoStream: MediaStream | null = null;
+  private pendingEncodedStreams: {
+    readable: ReadableStream;
+    writable: WritableStream;
+  } | null = null;
   private pointerChannel: RTCDataChannel | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private clipboardChannel: RTCDataChannel | null = null;
@@ -141,6 +171,8 @@ export class RemoteSessionController {
   private pendingHostRestartGeneration: number | null = null;
   private lifecycleGeneration = 0;
   private inputEnabled = false;
+  private inputBlocked = 0;
+  private readonly pressedKeys = new Set<string>();
   private readonly preferences: { inputEnabled: boolean; displayId?: string };
   private firstFrameReceived = false;
   private stopPromise: Promise<void> | null = null;
@@ -162,6 +194,11 @@ export class RemoteSessionController {
   private readonly offerPublicationGates = new Map<number, Promise<boolean>>();
   private readonly offerCompletionWaiters = new Map<number, () => void>();
   private metrics: RemoteSessionMetrics | null = null;
+  private videoTransceiver: RTCRtpTransceiver | null = null;
+  private qualityLimits: QualityLimits = {};
+  private codecPreferencesApplied = false;
+  private previousDecode: { id: string; time: number; frames: number } | null = null;
+  private previousLoss: { id: string; lost: number; received: number } | null = null;
 
   private readonly onWindowBlur = () => {
     this.gamepad.release();
@@ -216,6 +253,7 @@ export class RemoteSessionController {
   };
 
   constructor(options: RemoteSessionOptions) {
+    this.qualityLimits = { ...options.qualityLimits };
     this.options = options;
     this.preferences = options.preferences ?? { inputEnabled: true };
     this.controllerEpoch = options.controllerEpoch;
@@ -239,6 +277,7 @@ export class RemoteSessionController {
       gamepadStatus: this.gamepadStatus,
       firstFrameReceived: this.firstFrameReceived,
       metrics: this.metrics,
+      inputBlocked: this.inputBlocked,
     };
   }
 
@@ -351,6 +390,12 @@ export class RemoteSessionController {
     this.gamepad.release();
   }
 
+  /** Applies live without renegotiation; the host clamps to its configured maximums. */
+  setQualityLimits(limits: QualityLimits): boolean {
+    this.qualityLimits = { ...limits };
+    return this.sendControl({ type: "quality", ...this.qualityLimits });
+  }
+
   selectDisplay(displayId: string): boolean {
     if (!this.inputEnabled || !this.isControlOpen()) return false;
     if (!this.displays.some((display) => display.id === displayId)) return false;
@@ -454,6 +499,10 @@ export class RemoteSessionController {
         peer.close();
       }
       this.peer = null;
+      this.webCodecsVideo?.drop();
+      this.webCodecsVideo = null;
+      this.remoteVideoStream = null;
+      this.pendingEncodedStreams = null;
       const stream = this.options.video.srcObject;
       if (stream instanceof MediaStream) {
         for (const track of stream.getTracks()) track.stop();
@@ -480,7 +529,9 @@ export class RemoteSessionController {
 
   private attachPeer(peer: RTCPeerConnection, lifecycle: number): void {
     if (this.options.clipboardEnabled && this.remoteInputAllowed) {
-      const channel = peer.createDataChannel("nanoctl.clipboard.v1", { ordered: true });
+      const channel = peer.createDataChannel("nanoctl.clipboard.v1", {
+        ordered: true,
+      });
       this.clipboardChannel = channel;
       this.clipboard = new ClipboardSync({
         focused: () => this.clipboardChannel === channel && document.hasFocus(),
@@ -510,16 +561,71 @@ export class RemoteSessionController {
       this.preferences.inputEnabled &&
       this.remoteInputAllowed &&
       this.controlChannel.readyState === "open";
+    this.controlChannel.onmessage = (event) => {
+      if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
+      try {
+        if ((JSON.parse(event.data) as { type?: unknown }).type !== "inputBlocked") return;
+      } catch {
+        return;
+      }
+      this.inputBlocked += 1;
+      this.publishSnapshot();
+    };
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
       this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
       const displayId = this.preferences.displayId;
       if (displayId && this.displays.some((display) => display.id === displayId))
         this.sendControl({ type: "display", displayId });
+      if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
+        this.sendControl({ type: "quality", ...this.qualityLimits });
       this.publishSnapshot();
     };
     this.options.video.addEventListener("loadeddata", this.onVideoLoadedData);
-    peer.addTransceiver("video", { direction: "recvonly" });
+    this.videoTransceiver = peer.addTransceiver("video", {
+      direction: "recvonly",
+    });
+    this.codecPreferencesApplied = false;
+    // Chrome only allows encoded streams before any RTP arrives, so the
+    // transform must be created here — before negotiation — not in ontrack.
+    // The WebCodecs decode paths only handle Annex-B H.264; "auto" prefers
+    // AV1/HEVC, so gate both paths on an explicit H.264 codec choice.
+    const receiver = this.videoTransceiver?.receiver as RTCRtpReceiver | undefined;
+    this.pendingEncodedStreams =
+      this.options.codecChoice === "h264" && receiver && supportsWebCodecsVideo(receiver)
+        ? (createVideoEncodedStreams(receiver) as {
+            readable: ReadableStream;
+            writable: WritableStream;
+          } | null)
+        : null;
+    const restoreRemoteVideo = () => {
+      if (!this.isCurrent(lifecycle, peer) || !this.remoteVideoStream) return;
+      if (this.options.video.srcObject !== this.remoteVideoStream) {
+        this.options.video.srcObject = this.remoteVideoStream;
+        void this.options.video.play().catch(() => {});
+      }
+    };
+    // True low-latency path: raw AUs over an unreliable data channel feed
+    // WebCodecs directly — no jitter buffer anywhere.
+    if (typeof VideoDecoder === "function" && this.options.codecChoice === "h264") {
+      const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
+        ordered: false,
+        maxRetransmits: 0,
+      });
+      const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
+      videoChannel.onopen = () => {
+        if (this.isCurrent(lifecycle, peer)) {
+          // The data-channel path beats the jitter-buffered transform tap.
+          this.webCodecsVideo?.drop();
+          this.webCodecsVideo = attachDataChannelVideo(
+            videoChannel,
+            idrChannel,
+            this.options.video,
+            restoreRemoteVideo,
+          );
+        }
+      };
+    }
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
       if (!this.isCurrent(lifecycle, peer)) return;
@@ -540,17 +646,30 @@ export class RemoteSessionController {
         return;
       }
       const stream = streams[0] ?? new MediaStream([track]);
+      this.remoteVideoStream = stream;
+      // The transform tap sits behind Chrome's jitter buffer anyway, so
+      // only use it when the data-channel path did not attach.
+      if (this.pendingEncodedStreams && !this.webCodecsVideo) {
+        const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
+        this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video, restoreRemoteVideo);
+      }
       this.options.video.srcObject = stream;
       void this.options.video.play().catch(() => {});
     };
     peer.onconnectionstatechange = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
+      recordDebugEvent(
+        `peer ${peer.connectionState}`,
+        `ice ${peer.iceConnectionState}; generation ${this.iceGeneration}`,
+      );
       switch (peer.connectionState) {
         case "connected":
           this.reconnectAttempt = 0;
           this.clearRecoveryTimer();
           this.clearNegotiationTimer();
           this.phase = "connected";
+          this.inputEnabled =
+            this.preferences.inputEnabled && this.remoteInputAllowed && this.isControlOpen();
           this.armFirstFrameTimer(lifecycle, peer);
           this.publishSnapshot();
           break;
@@ -619,8 +738,8 @@ export class RemoteSessionController {
     video.addEventListener("lostpointercapture", this.onLostPointerCapture);
     video.addEventListener("wheel", this.onWheel, { passive: false });
     video.addEventListener("contextmenu", this.onContextMenu);
-    video.addEventListener("keydown", this.onKey);
-    video.addEventListener("keyup", this.onKey);
+    window.addEventListener("keydown", this.onKey);
+    window.addEventListener("keyup", this.onKey);
     window.addEventListener("keydown", this.onEmergencyShortcut, true);
     window.addEventListener("blur", this.onWindowBlur);
     window.addEventListener("focus", this.onClipboardFocus);
@@ -639,8 +758,8 @@ export class RemoteSessionController {
     video.removeEventListener("lostpointercapture", this.onLostPointerCapture);
     video.removeEventListener("wheel", this.onWheel);
     video.removeEventListener("contextmenu", this.onContextMenu);
-    video.removeEventListener("keydown", this.onKey);
-    video.removeEventListener("keyup", this.onKey);
+    window.removeEventListener("keydown", this.onKey);
+    window.removeEventListener("keyup", this.onKey);
     window.removeEventListener("keydown", this.onEmergencyShortcut, true);
     window.removeEventListener("blur", this.onWindowBlur);
     window.removeEventListener("focus", this.onClipboardFocus);
@@ -658,7 +777,11 @@ export class RemoteSessionController {
     if (event.type === "pointerdown") {
       event.preventDefault();
       this.options.video.focus();
-      this.options.video.setPointerCapture(event.pointerId);
+      try {
+        this.options.video.setPointerCapture(event.pointerId);
+      } catch {
+        // Synthetic or already-ended pointers can reject capture; still deliver the click.
+      }
     }
     this.sendControl({
       type: "pointer",
@@ -685,8 +808,8 @@ export class RemoteSessionController {
       type: "pointer",
       action: "wheel",
       ...position,
-      deltaX: clampWheel(event.deltaX),
-      deltaY: clampWheel(event.deltaY),
+      deltaX: wheelPixels(event.deltaX, event.deltaMode),
+      deltaY: wheelPixels(event.deltaY, event.deltaMode),
     });
   };
 
@@ -696,6 +819,18 @@ export class RemoteSessionController {
 
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
+    // Keys go to the host while the video or nothing in particular has focus; panel controls keep
+    // theirs, and Tab from the page still moves browser focus so the controls stay reachable.
+    // A key the host saw pressed is always released there, wherever focus has moved since.
+    const target = event.target;
+    const releasing = event.type === "keyup" && this.pressedKeys.delete(event.code);
+    if (
+      !releasing &&
+      target !== this.options.video &&
+      (event.code === "Tab" || (target !== document.body && target !== document.documentElement))
+    )
+      return;
+    if (event.type === "keydown") this.pressedKeys.add(event.code);
     event.preventDefault();
     const message: ControlMessage = {
       type: "key",
@@ -713,11 +848,17 @@ export class RemoteSessionController {
       this.sendControl(message);
       return;
     }
-    this.keyQueue = this.keyQueue.then(async () => {
-      if (event.type === "keydown" && event.code === "KeyV" && (event.ctrlKey || event.metaKey))
-        await this.clipboard?.focus();
-      if (this.inputEnabled) this.sendControl(message);
-    });
+    this.keyQueue = this.keyQueue
+      .then(async () => {
+        if (event.type === "keydown" && event.code === "KeyV" && (event.ctrlKey || event.metaKey)) {
+          await Promise.race([
+            this.clipboard?.focus(),
+            new Promise<void>((resolve) => window.setTimeout(resolve, 250)),
+          ]);
+        }
+        if (this.inputEnabled) this.sendControl(message);
+      })
+      .catch(() => {});
   };
 
   private normalizedPosition(event: MouseEvent): { x: number; y: number } | null {
@@ -918,6 +1059,7 @@ export class RemoteSessionController {
       });
       this.offerPublicationGates.set(generation, offerPublication);
       try {
+        await this.applyCodecPreferences();
         const offer = await peer.createOffer({ iceRestart });
         if (!this.isCurrent(lifecycle, peer)) {
           if (this.outstandingOfferGeneration === generation) {
@@ -1086,6 +1228,10 @@ export class RemoteSessionController {
     }
     if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
       this.requestRecovery(lifecycle, peer);
+    } else if (peer.connectionState === "connected") {
+      this.inputEnabled =
+        this.preferences.inputEnabled && this.remoteInputAllowed && this.isControlOpen();
+      this.publishSnapshot();
     }
   }
 
@@ -1134,6 +1280,7 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
+    this.pressedKeys.clear();
     if (!this.inputEnabled) this.stopGamepads();
     const channel = this.controlChannel;
     if (channel?.readyState === "open") {
@@ -1195,6 +1342,25 @@ export class RemoteSessionController {
   private clearFirstFrameTimer(): void {
     if (this.firstFrameTimer !== null) window.clearTimeout(this.firstFrameTimer);
     this.firstFrameTimer = null;
+  }
+
+  private async applyCodecPreferences(): Promise<void> {
+    const transceiver = this.videoTransceiver;
+    if (this.codecPreferencesApplied || !transceiver) return;
+    this.codecPreferencesApplied = true;
+    if (typeof transceiver.setCodecPreferences !== "function") return;
+    const receive = RTCRtpReceiver.getCapabilities?.("video")?.codecs;
+    if (!receive || !this.options.videoCodecs) return;
+    try {
+      const order = await orderVideoCodecs(
+        this.options.codecChoice ?? "auto",
+        this.options.videoCodecs,
+        receive,
+      );
+      if (order) transceiver.setCodecPreferences(order);
+    } catch {
+      // Codec ordering is an optimization; the browser's default order still negotiates H.264.
+    }
   }
 
   private async collectStats(lifecycle: number): Promise<void> {
@@ -1261,6 +1427,37 @@ export class RemoteSessionController {
             ? "direct"
             : "unknown";
       const rtt = statNumber(candidatePair, "currentRoundTripTime");
+      const codecId = statString(inbound, "codecId");
+      const decodeTime = statNumber(inbound, "totalDecodeTime");
+      const decodedFrames = statNumber(inbound, "framesDecoded");
+      const previousDecode = this.previousDecode;
+      const decodeMs =
+        decodeTime !== undefined &&
+        decodedFrames !== undefined &&
+        previousDecode?.id === inbound.id &&
+        decodedFrames > previousDecode.frames
+          ? ((decodeTime - previousDecode.time) * 1_000) / (decodedFrames - previousDecode.frames)
+          : null;
+      this.previousDecode =
+        decodeTime !== undefined && decodedFrames !== undefined
+          ? { id: inbound.id, time: decodeTime, frames: decodedFrames }
+          : null;
+      const lost = statNumber(inbound, "packetsLost");
+      const received = statNumber(inbound, "packetsReceived");
+      const previousLoss = this.previousLoss;
+      const lostDelta =
+        lost !== undefined && previousLoss?.id === inbound.id ? lost - previousLoss.lost : 0;
+      const receivedDelta =
+        received !== undefined && previousLoss?.id === inbound.id
+          ? received - previousLoss.received
+          : 0;
+      const lossPercent =
+        receivedDelta + lostDelta > 0
+          ? Math.round((Math.max(0, lostDelta) / (receivedDelta + lostDelta)) * 1_000) / 10
+          : null;
+      this.previousLoss =
+        lost !== undefined && received !== undefined ? { id: inbound.id, lost, received } : null;
+      const jitter = statNumber(inbound, "jitter");
       this.metrics = {
         resolution:
           (statNumber(inbound, "frameWidth") ?? 0) > 0 &&
@@ -1271,7 +1468,12 @@ export class RemoteSessionController {
         rttMs: rtt !== undefined && rtt > 0 ? Math.round(rtt * 1_000) : null,
         packetsLost: Math.max(0, Math.round(statNumber(inbound, "packetsLost") ?? 0)),
         framesDropped: Math.max(0, Math.round(statNumber(inbound, "framesDropped") ?? 0)),
+        lossPercent,
+        jitterMs: jitter !== undefined && jitter >= 0 ? Math.round(jitter * 10_000) / 10 : null,
         route,
+        codec: codecLabel(statString(codecId ? report.get(codecId) : undefined, "mimeType")),
+        decoder: statString(inbound, "decoderImplementation") ?? null,
+        decodeMs: decodeMs !== null && decodeMs >= 0 ? Math.round(decodeMs * 10) / 10 : null,
       };
       this.publishSnapshot();
     } catch {
@@ -1301,9 +1503,15 @@ export class RemoteSessionController {
   }
 }
 
-function clampWheel(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(-20, Math.min(20, value));
+/**
+ * Normalizes a wheel delta to CSS pixels. Trackpads emit fine-grained
+ * deltas that must not be rounded away, and line/page delta modes need
+ * conversion before the host can map pixels to wheel units.
+ */
+export function wheelPixels(delta: number, deltaMode: number): number {
+  if (!Number.isFinite(delta)) return 0;
+  const pixels = deltaMode === 1 ? (delta * 100) / 3 : deltaMode === 2 ? delta * 800 : delta;
+  return Math.max(-4_000, Math.min(4_000, pixels));
 }
 
 function safeSequenceSeed(): number {

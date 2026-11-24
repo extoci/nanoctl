@@ -50,9 +50,16 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(config: AgentConfig, tailnet: Arc<dyn Tailnet>) -> Arc<Self> {
         if dev_user().is_some() {
-            tracing::warn!(
+            tracing::warn!(target: "nanoctl::status",
                 "DANGER: NANOCTL_DEV_LOOPBACK_USER enabled: loopback authentication and loopback ICE are trusted. DEVELOPMENT ONLY."
             );
+        }
+        #[cfg(feature = "rtc")]
+        crate::codec::set_host_preference(config.quality.codec);
+        #[cfg(all(feature = "media", not(test)))]
+        {
+            let preference = config.quality.encoder;
+            std::thread::spawn(move || crate::media::ensure_codecs_probed(preference));
         }
         Arc::new(Self {
             hosts: Mutex::new(None),
@@ -201,6 +208,7 @@ pub fn valid_origin(headers: &HeaderMap, tls: bool, serve: bool) -> bool {
 pub fn router(state: Arc<ServerState>, tls: bool) -> Router {
     Router::new()
         .route("/v1/info", get(info))
+        .route("/v1/debug", get(debug_report))
         .route("/v1/hosts", get(hosts))
         .route("/v1/connect", get(connect))
         .fallback(get(asset))
@@ -331,6 +339,28 @@ async fn info(
     }
 }
 
+/// The host half of the viewer's "Copy debug info", limited to viewers that may control.
+async fn debug_report(
+    State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(tls): Extension<bool>,
+    headers: HeaderMap,
+) -> Response {
+    match state.authenticate(peer, &headers, false, tls).await {
+        Ok((_, true)) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            crate::diagnostics::report(&state.config, None, crate::diagnostics::REPORT_LOG_LINES)
+                .await,
+        )
+            .into_response(),
+        Ok((identity, false)) => forbidden(anyhow::anyhow!(
+            "identity={}: the debug report requires control permission",
+            identity.login
+        )),
+        Err(error) => forbidden(error),
+    }
+}
+
 async fn asset(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -427,7 +457,20 @@ async fn session(
     {
         return;
     }
+    tracing::info!(target: "nanoctl::status", "Viewer connected");
     let (outgoing, mut messages) = tokio::sync::mpsc::channel::<Value>(64);
+    #[cfg(feature = "rtc")]
+    let (audio_output, _) = watch::channel(None);
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let mut audio_selection = state
+        .config
+        .features
+        .system_audio
+        .then(crate::audio::OutputSelection::default);
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let mut last_audio_message = None;
+    #[cfg(all(feature = "media", target_os = "windows"))]
+    let mut reports_audio_outputs = false;
     #[cfg(feature = "rtc")]
     let mut peer: Option<crate::rtc::HostPeer> = None;
     #[cfg(feature = "media")]
@@ -446,6 +489,15 @@ async fn session(
                 if let Some(message) = message && send(&mut socket, message).await.is_err() { break "disconnected".into(); }
             }
             _ = tick.tick() => {
+                #[cfg(all(feature = "media", target_os = "windows"))]
+                if let Some(selection) = &mut audio_selection {
+                    selection.refresh(crate::audio::outputs());
+                    let message = audio_output_state(selection, &audio_output);
+                    if reports_audio_outputs && last_audio_message.as_ref() != Some(&message) {
+                        if send(&mut socket, message.clone()).await.is_err() { break "disconnected".into(); }
+                        last_audio_message = Some(message);
+                    }
+                }
                 #[cfg(feature = "media")]
                 if media.as_ref().is_some_and(|media| media.is_finished()) {
                     if let Some(finished) = media.take() && let Err(error) = finished.finish().await {
@@ -471,6 +523,23 @@ async fn session(
                 };
                 let message: Value = match serde_json::from_str(&text) { Ok(value) => value, Err(_) => break "invalid-message".into() };
                 if message["type"] == "end" { break "viewer-ended".into(); }
+                #[cfg(all(feature = "media", target_os = "windows"))]
+                if message["type"] == "select-audio-output" {
+                    if let Some(selection) = &mut audio_selection {
+                        let requested = match message.get("outputId") {
+                            Some(Value::Null) => None,
+                            Some(Value::String(id)) => Some(id.as_str()),
+                            _ => break "invalid-message".into(),
+                        };
+                        selection.refresh(crate::audio::outputs());
+                        selection.select(requested);
+                        reports_audio_outputs = true;
+                        let message = audio_output_state(selection, &audio_output);
+                        if send(&mut socket, message.clone()).await.is_err() { break "disconnected".into(); }
+                        last_audio_message = Some(message);
+                    }
+                    continue;
+                }
                 if message["type"] != "signal" || !message["envelope"].is_object() { break "invalid-message".into(); }
                 #[cfg(not(feature = "rtc"))]
                 { let _ = &outgoing; break "rtc-unavailable".into(); }
@@ -488,7 +557,7 @@ async fn session(
                             webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
                             crate::rtc::host_epoch_seed(), state.config.features.remote_input && control,
                             state.config.features.clipboard && state.config.features.remote_input && control,
-                            state.config.features.system_audio).await {
+                            state.config.features.system_audio.then(|| audio_output.subscribe())).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
                                 { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }
@@ -527,6 +596,23 @@ async fn session(
     }
     let _ = send(&mut socket, json!({"type":"end","reason":reason})).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
+    tracing::info!(target: "nanoctl::status", %reason, "Viewer disconnected");
+}
+
+#[cfg(all(feature = "media", target_os = "windows"))]
+fn audio_output_state(
+    selection: &crate::audio::OutputSelection,
+    output: &watch::Sender<Option<String>>,
+) -> Value {
+    let effective = selection.effective();
+    output.send_if_modified(|current| {
+        if *current == effective {
+            return false;
+        }
+        *current = effective;
+        true
+    });
+    json!({"type":"audio-outputs","outputs":selection.outputs,"selectedId":selection.selected})
 }
 
 async fn bind_listener(
@@ -564,6 +650,8 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
     let mut cert_node = String::new();
     let mut cert_checked = None::<tokio::time::Instant>;
     let mut announced_url = None;
+    let mut waiting_for_tailscale = false;
+    let mut waiting_for_listener = false;
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     loop {
         tokio::select! {
@@ -573,6 +661,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
         let mut wanted = HashSet::new();
         match state.tailnet.status().await {
             Ok(node) => {
+                waiting_for_tailscale = false;
                 wanted.extend(node.ips.iter().copied());
                 if cert_node != node.dns_name
                     || cert_checked.is_none_or(|checked| {
@@ -586,7 +675,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
                     if result.config.is_none()
                         && state.config.tailnet.tls != crate::config::TlsMode::Off
                     {
-                        tracing::warn!("{}", result.detail);
+                        tracing::warn!(target: "nanoctl::status", "{}", result.detail);
                     }
                     match (&tls_config, result.config) {
                         (Some(current), Some(config)) => current.reload_from_config(config),
@@ -608,7 +697,12 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
                 *state.node.write().await = node;
             }
             Err(error) => {
-                tracing::warn!(%error, "waiting for Tailscale");
+                if waiting_for_tailscale {
+                    tracing::warn!(%error, "Waiting for Tailscale");
+                } else {
+                    tracing::warn!(target: "nanoctl::status", %error, "Waiting for Tailscale");
+                    waiting_for_tailscale = true;
+                }
                 *state.node.write().await = Node::default();
             }
         }
@@ -630,6 +724,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
         unavailable_ipv6.retain(|ip| wanted.contains(ip));
         let mut wanted = wanted.into_iter().collect::<Vec<_>>();
         wanted.sort_unstable_by_key(IpAddr::is_ipv6);
+        let needs_listener = !wanted.is_empty();
         for ip in wanted {
             if listeners.contains_key(&ip) {
                 continue;
@@ -681,6 +776,11 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
             });
             listeners.insert(ip, (stop, task));
         }
+        let retrying_bind = needs_listener && listeners.is_empty();
+        if retrying_bind && !waiting_for_listener {
+            tracing::warn!(target: "nanoctl::status", port = state.config.tailnet.port, "Could not open a viewer listener; retrying");
+        }
+        waiting_for_listener = retrying_bind;
         let node = state.node.read().await;
         let url = node
             .ips
@@ -690,7 +790,7 @@ pub async fn serve(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>)
             .flatten();
         if url != announced_url {
             if let Some(url) = &url {
-                tracing::info!("Open on a device connected to Tailscale: {url}");
+                tracing::info!(target: "nanoctl::status", "Open on a device connected to Tailscale: {url}");
             }
             announced_url = url;
         }

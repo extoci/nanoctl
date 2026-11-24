@@ -27,7 +27,7 @@ WireGuard transport, NAT traversal and, when needed, DERP relay.
 - `rtc.rs` retains v2 epochs, ICE generations, input lanes and bounded recovery.
   ICE has no servers and only gathers tailnet host candidates.
 - The media pipeline captures the interactive desktop, bounds its newest-frame queue,
-  encodes H.264 and sends RTP. Input requires config, platform capability and viewer permission.
+  encodes the negotiated codec (AV1, HEVC or H.264) and sends RTP. Input requires config, platform capability and viewer permission.
 
 ## Viewer
 
