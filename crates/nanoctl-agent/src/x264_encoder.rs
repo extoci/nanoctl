@@ -212,6 +212,11 @@ impl AdaptPolicy {
             && self.encode_ewma_ns < 0.30 * budget_ns
             && self.bytes_ewma < 0.50 * cap_bytes
         {
+            // Trivially easy content skips intermediate tiers entirely —
+            // one re-open/IDR instead of one per rung.
+            if self.encode_ewma_ns < 0.12 * budget_ns && self.bytes_ewma < 0.20 * cap_bytes {
+                return Some((self.tier + 2).min(Self::MAX_TIER));
+            }
             return Some(self.tier + 1);
         }
         None
@@ -649,17 +654,18 @@ mod tests {
         };
         let budget = 1_000_000_000.0 / 60.0;
         let cap = 4_000.0 * 125.0 / 60.0;
-        // Easy frames: promotion only after the sustained window.
+        // Moderately easy frames climb one rung at a time.
         for _ in 0..AdaptPolicy::EASE_FRAMES[0] - 1 {
-            assert_eq!(policy.observe(1_000_000, 500, budget, cap), None);
+            assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), None);
         }
-        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(1));
+        assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), Some(1));
         policy.committed(1);
+        // Trivially easy frames skip intermediate tiers (one re-open).
         for _ in 0..AdaptPolicy::EASE_FRAMES[1] + AdaptPolicy::SWITCH_COOLDOWN {
             policy.observe(1_000_000, 500, budget, cap);
         }
-        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(2));
-        policy.committed(2);
+        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(3));
+        policy.committed(3);
         // Hard overload drops straight to tier 0.
         for _ in 0..40 {
             policy.observe(15_000_000, 500, budget, cap);

@@ -634,3 +634,20 @@ same run's clock-marker G2G read p50 61ms — the input lane (reliable DC
 
 - coalesced motion watch-channel) adds ≈0-5ms over the video path;
   input→photon is entirely pipeline-bound, nothing to shave.
+
+## fps decimation disproven + trivial-content tier skip (cycle 32)
+
+`max_fps=30` under noise: 11.57Mbps vs 10.62 at 60fps, PSNR 25.0 vs
+23.9 — halving the frame rate does NOT halve bits; x264 refills the
+per-frame VBV budget and returns quality instead (+1.1dB). The
+fps-degrade lever is dead: it costs fps for ~0 bit savings.
+
+input→photon under noise: p50 49ms / mean 59 (n=8) — same as clean
+pipeline; the input lane survives worst-case unchanged.
+
+`AdaptPolicy` promotion can now jump `tier+2` when content is
+trivially easy (encode EWMA <12% budget AND bytes <20% cap) — saves
+one re-open/IDR burst on attaches to near-idle desktops. Verified as
+a no-op on this VM: even a static desktop encodes ~5.5ms/frame
+(>12%), so all scenes still promote 0→1→2→3 stepwise; worst case
+unchanged (noise tier 0, 0 switches).
