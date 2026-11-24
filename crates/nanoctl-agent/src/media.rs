@@ -878,12 +878,12 @@ impl CaptureEncoder {
                     )
                 }
             };
-            xcap::image::ImageBuffer::from_raw(
-                target_width,
-                target_height,
-                resized.as_raw().as_slice(),
-            )
-            .context("resized capture returned an invalid RGBA frame")?
+            #[cfg(target_os = "windows")]
+            let resized_pixels = resized;
+            #[cfg(not(target_os = "windows"))]
+            let resized_pixels = resized.as_raw().as_slice();
+            xcap::image::ImageBuffer::from_raw(target_width, target_height, resized_pixels)
+                .context("resized capture returned an invalid RGBA frame")?
         };
         let (width, height) = image.dimensions();
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
