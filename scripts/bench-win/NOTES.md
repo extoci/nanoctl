@@ -235,3 +235,13 @@ hardware and the jitter-buffer bypass is worth ~20-35ms on its own.
 - Window occlusion breaks the marker scan (locate -> marker_y=-1): the
   viewer window must be visible and not maximized over the band. If it
   paints white after restore, `Page.reload` via CDP :9222.
+
+## Frame-slot queue (cycle 9)
+
+`capture_to_encode` decomposes: `queue` (capture → encode dispatch) +
+`encode`. media-smoke now reports `queue_p50_milliseconds`: 7.85ms in the
+harness (its 60Hz pull cadence parks ~30Hz frames half an interval), vs
+**0.91ms** queue_ns/frame in the live producer. Real production
+capture→encode ≈ 11.6ms = backend 7.5 + color 2.3 + compare 0.9 + queue 0.9.
+Also removed a redundant full-frame `differs_from` after every changed
+encode (~0.87ms × encoded frames ≈ 1.5% agent CPU under motion).

@@ -132,6 +132,7 @@ pub struct PipelineStats {
     pub encode_attempts: AtomicU64,
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
+    pub queue_ns: AtomicU64,
     #[cfg(target_os = "linux")]
     pub producer_tid: AtomicU32,
 }
@@ -161,6 +162,7 @@ impl PipelineStats {
             sample_writes = self.sample_writes.load(Ordering::Relaxed),
             fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
             pacer_skips = self.pacer_skips.load(Ordering::Relaxed),
+            queue_ns = self.queue_ns.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
     }
@@ -896,6 +898,12 @@ impl CaptureEncoder {
         #[cfg(target_os = "linux")]
         let trace_started = trace::now();
         let preprocess_started = Instant::now();
+        self.latest_frame.stats.queue_ns.fetch_add(
+            preprocess_started
+                .saturating_duration_since(*captured_at)
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         let source = rgba_view(frame)?;
         let (source_width, source_height) = source.dimensions();
         let (target_width, target_height) =
@@ -972,6 +980,7 @@ impl CaptureEncoder {
             TimingSample {
                 capture_to_encode: encoded_at.saturating_duration_since(*captured_at),
                 encode: encoded_at.saturating_duration_since(encode_started),
+                queue: preprocess_started.saturating_duration_since(*captured_at),
             },
         ))
     }
@@ -1829,12 +1838,14 @@ impl ReferenceRecovery {
 struct TimingSample {
     capture_to_encode: Duration,
     encode: Duration,
+    queue: Duration,
 }
 
 #[derive(Default)]
 struct TimingSamples {
     capture_to_encode_micros: Vec<u64>,
     encode_micros: Vec<u64>,
+    queue_micros: Vec<u64>,
 }
 
 const MAX_TIMING_SAMPLES: usize = 524_288;
@@ -1853,11 +1864,16 @@ impl TimingSamples {
             self.encode_micros
                 .push(sample.encode.as_micros().min(u128::from(u64::MAX)) as u64);
         }
+        if fresh && self.queue_micros.len() < MAX_TIMING_SAMPLES {
+            self.queue_micros
+                .push(sample.queue.as_micros().min(u128::from(u64::MAX)) as u64);
+        }
     }
 
     fn percentiles(&mut self) -> TimingPercentiles {
         self.capture_to_encode_micros.sort_unstable();
         self.encode_micros.sort_unstable();
+        self.queue_micros.sort_unstable();
         TimingPercentiles {
             capture_to_encode_p50_milliseconds: percentile_milliseconds(
                 &self.capture_to_encode_micros,
@@ -1869,6 +1885,7 @@ impl TimingSamples {
             ),
             encode_p50_milliseconds: percentile_milliseconds(&self.encode_micros, 0.50),
             encode_p95_milliseconds: percentile_milliseconds(&self.encode_micros, 0.95),
+            queue_p50_milliseconds: percentile_milliseconds(&self.queue_micros, 0.50),
         }
     }
 }
@@ -1878,6 +1895,7 @@ struct TimingPercentiles {
     capture_to_encode_p95_milliseconds: f64,
     encode_p50_milliseconds: f64,
     encode_p95_milliseconds: f64,
+    queue_p50_milliseconds: f64,
 }
 
 fn percentile_f64(samples: &[f64], percentile: f64) -> f64 {
@@ -1922,6 +1940,7 @@ pub struct MediaSmokeReport {
     pub capture_to_encode_p95_milliseconds: f64,
     pub encode_p50_milliseconds: f64,
     pub encode_p95_milliseconds: f64,
+    pub queue_p50_milliseconds: f64,
     /// Y+U+V PSNR (dB) of each decoded access unit vs its I420 source; None when the
     /// probe was off. p05 is the worst tail — the number a marketing claim must survive.
     pub psnr_p50_db: Option<f64>,
@@ -2090,6 +2109,7 @@ pub fn run_smoke(
         capture_to_encode_p95_milliseconds: timing.capture_to_encode_p95_milliseconds,
         encode_p50_milliseconds: timing.encode_p50_milliseconds,
         encode_p95_milliseconds: timing.encode_p95_milliseconds,
+        queue_p50_milliseconds: timing.queue_p50_milliseconds,
         psnr_p50_db: psnr
             .as_ref()
             .and_then(|(d, s)| (*d > 0).then(|| percentile_f64(s, 0.50))),
@@ -2524,9 +2544,12 @@ pub fn spawn_video(
                     if frame.bytes.is_empty() {
                         continue;
                     }
-                    let changed_output = last_encoded
-                        .as_ref()
-                        .is_none_or(|previous| captured.differs_from(previous));
+                    // `changed` already ran this exact comparison for fresh
+                    // frames; only re-compare for keepalive/pace re-encodes.
+                    let changed_output = changed
+                        || last_encoded
+                            .as_ref()
+                            .is_none_or(|previous| captured.differs_from(previous));
                     if changed_output {
                         #[cfg(target_os = "linux")]
                         if let Some(started) = producer_stats.damage_started.lock().unwrap().take()
@@ -3610,6 +3633,7 @@ mod tests {
                 TimingSample {
                     capture_to_encode: age,
                     encode: Duration::from_millis(4),
+                    queue: Duration::ZERO,
                 },
                 fresh,
             );
