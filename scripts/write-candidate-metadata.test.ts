@@ -52,8 +52,11 @@ describe("release candidate identity", () => {
       unsigned: boolean;
       signingRequirements: string[];
     };
+    const { version } = (await Bun.file(join(repository, "package.json")).json()) as {
+      version: string;
+    };
     expect(metadata).toMatchObject({
-      version: "3.0.0-alpha.5",
+      version,
       commit,
       target: { platform: "linux", architecture: "x64" },
       binary: { size: 17 },
