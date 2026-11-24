@@ -51,11 +51,19 @@ export function createVideoEncodedStreams(receiver: RTCRtpReceiver): EncodedStre
   }
 }
 
-function containsIdr(annexB: Uint8Array): boolean {
+/**
+ * True when an Annex-B access unit starts an IDR (SPS or IDR slice). Every
+ * slice of a picture shares its IDR-ness and parameter sets precede the
+ * first slice, so the scan stops at the first VCL NAL instead of walking
+ * the whole (often tens of KB) slice payload of every delta frame.
+ */
+export function containsIdr(annexB: Uint8Array): boolean {
   for (let i = 0; i + 4 < annexB.length; i++) {
     if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) {
       const type = annexB[i + 3]! & 0x1f;
       if (type === 5 || type === 7) return true;
+      if (type >= 1 && type <= 4) return false;
+      i += 3;
     }
   }
   return false;
