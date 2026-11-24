@@ -164,14 +164,16 @@ impl RateController {
     }
 
     fn tier(rate: f64, max_fps: u16) -> u16 {
+        // Bitrate is the congestion knob, framerate mostly isn't: a 1080p60 stream
+        // dropping to 15-20fps reads as broken to a viewer, while the same budget at
+        // 60fps just looks softer. Hold 60fps (or the configured ceiling) down to
+        // 500kbps, and never go below 30.
         if rate >= 2_500.0 {
             max_fps
-        } else if rate >= 1_000.0 {
-            max_fps.min(30)
         } else if rate >= 500.0 {
-            max_fps.min(20)
+            max_fps.min(60)
         } else {
-            max_fps.min(15)
+            max_fps.min(30)
         }
     }
 
@@ -606,14 +608,14 @@ mod tests {
             controller.set_limits(2_000, 60),
             RateDecision {
                 bitrate_kbps: 2_000,
-                fps: 30
+                fps: 60
             }
         );
         assert_eq!(
             controller.set_limits(50_000, 120),
             RateDecision {
                 bitrate_kbps: 2_000,
-                fps: 30
+                fps: 60
             }
         );
         assert_eq!(
@@ -864,7 +866,7 @@ mod tests {
         let mut controller = RateController::new(12_000, 60);
         controller.update_sender(4_000.0, false, now - Duration::from_secs(3));
         let mut input = sample(now, 0.05);
-        input.remb_kbps = Some(2_000);
+        input.remb_kbps = Some(400);
         controller.observe(input);
         assert_eq!(controller.decision().fps, 60);
         input.at += Duration::from_millis(999);
@@ -880,9 +882,9 @@ mod tests {
             input.receiver_report_at = Some(input.at);
             controller.observe(input);
         }
-        assert!(controller.decision().bitrate_kbps > 2_500);
+        assert!(controller.decision().bitrate_kbps > 400);
         assert_eq!(controller.decision().fps, 30);
-        for second in 9..=10 {
+        for second in 9..=14 {
             input.at = now + Duration::from_secs(second);
             input.receiver_report_at = Some(input.at);
             controller.observe(input);
