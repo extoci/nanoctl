@@ -44,7 +44,29 @@ jobs:
       - run: bun run test:browser
       - run: bun run audit
 
+  # Every Rust leg embeds apps/viewer/dist via build.rs include_bytes!. Build it
+  # once here and hand each leg the artifact instead of ~10 redundant
+  # bun install + build:viewer runs.
+  viewer-dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run build:viewer
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   agent:
+    needs: viewer-dist
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -53,9 +75,6 @@ jobs:
         os: [ubuntu-latest, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -73,11 +92,14 @@ jobs:
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - run: cargo test --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-check:
+    needs: viewer-dist
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -86,9 +108,6 @@ jobs:
         os: [ubuntu-latest, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -107,8 +126,10 @@ jobs:
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - run: cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
@@ -140,14 +161,12 @@ jobs:
           }
 
   agent-media-linux:
+    needs: viewer-dist
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # Match Linux release builds; cros-libva 0.0.12 does not compile with libva 2.23+.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -156,8 +175,10 @@ jobs:
           key: media-linux
           workspaces: crates/nanoctl-agent
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: ./.github/actions/linux-media-deps
         with:
           cache-suffix: media
@@ -166,13 +187,11 @@ jobs:
 
   agent-x264-linux:
     # GPL opt-in only; default/release jobs deliberately do not enable this feature.
+    needs: viewer-dist
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -181,8 +200,10 @@ jobs:
           key: x264
           workspaces: crates/nanoctl-agent
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: ./.github/actions/linux-media-deps
         with:
           cache-suffix: media-x264
@@ -191,13 +212,11 @@ jobs:
       - run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-x264-check:
+    needs: viewer-dist
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -207,8 +226,10 @@ jobs:
           key: x264-check
           workspaces: crates/nanoctl-agent
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: ./.github/actions/linux-media-deps
         with:
           cache-suffix: media-x264
@@ -217,6 +238,7 @@ jobs:
       - run: cargo clippy --all-targets --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
 
   agent-x264-package:
+    needs: viewer-dist
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -224,9 +246,6 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -235,8 +254,10 @@ jobs:
           key: x264-package
           workspaces: crates/nanoctl-agent
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: ./.github/actions/linux-media-deps
         with:
           cache-suffix: media-x264
@@ -245,6 +266,7 @@ jobs:
       - run: cargo build --release --locked --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-native:
+    needs: viewer-dist
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -253,9 +275,6 @@ jobs:
         os: [macos-15, windows-2025]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -273,11 +292,14 @@ jobs:
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
 
   agent-media-check:
+    needs: viewer-dist
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -286,9 +308,6 @@ jobs:
         os: [ubuntu-24.04, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -307,8 +326,10 @@ jobs:
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: ./.github/actions/linux-media-deps
         if: matrix.os == 'ubuntu-24.04'
         with:
@@ -317,6 +338,7 @@ jobs:
       - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
 
   agent-media-package:
+    needs: viewer-dist
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Master release candidates own the only exact-profile release build. This job keeps
@@ -332,9 +354,6 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.14
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
@@ -352,8 +371,10 @@ jobs:
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: ./.github/actions/linux-media-deps
         if: matrix.os == 'ubuntu-24.04'
         with:
@@ -365,6 +386,7 @@ jobs:
   release-candidate:
     # This is the single artifact-producing build for a master commit. The tag workflow promotes
     # these immutable artifacts instead of compiling the same commit on a second set of runners.
+    needs: viewer-dist
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     strategy:
       fail-fast: false
@@ -398,11 +420,10 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          bun-version: 1.3.14
-      - run: bun install --frozen-lockfile
-      - run: bun run build:viewer
+          name: viewer-dist
+          path: apps/viewer/dist
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
