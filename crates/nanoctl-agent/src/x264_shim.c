@@ -37,9 +37,12 @@ typedef struct {
     void (*picture_init)(x264_picture_t *);
     /* Retained open arguments so adapt can rebuild params on a re-open. */
     int width, height, kbps, fps, frames;
-    /* Effective adaptive knobs: profile tier, motion-estimation, subpel refine. */
+    /* Effective adaptive knobs: preset, profile tier, motion-estimation,
+       subpel refine. */
+    const char *want_preset;
     int want_high, want_me, want_subme;
-    /* bit0 profile, bit1 me, bit2 subme: env-pinned knobs adapt may not touch. */
+    /* bit0 profile, bit1 me, bit2 subme, bit3 preset: env-pinned knobs adapt
+       may not touch. */
     int pins;
 } NanoX264;
 
@@ -76,7 +79,7 @@ static int env_me(void) {
    adaptive wants; env-set knobs always win over the adaptive ones. */
 static int fill_params(NanoX264 *context, x264_param_t *p) {
     const char *preset = getenv("NANOCTL_X264_PRESET");
-    if (!preset || !preset[0]) preset = "veryfast";
+    if (!preset || !preset[0]) preset = context->want_preset;
     const char *tune = getenv("NANOCTL_X264_TUNE");
     if (!tune || !tune[0]) tune = "zerolatency";
     if (context->param_default_preset(p, preset, tune) < 0) return -1;
@@ -156,6 +159,7 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     context->kbps = kbps;
     context->fps = fps;
     context->frames = frames;
+    context->want_preset = "veryfast";
     context->want_me = X264_ME_HEX;
     context->want_subme = 2;
     const char *profile_env = getenv("NANOCTL_X264_PROFILE");
@@ -163,6 +167,8 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     if (env_me() >= 0) context->pins |= 2;
     const char *subme_env = getenv("NANOCTL_X264_SUBME");
     if (subme_env && subme_env[0]) context->pins |= 4;
+    const char *preset_env = getenv("NANOCTL_X264_PRESET");
+    if (preset_env && preset_env[0]) context->pins |= 8;
     if (library) {
         context->library = load(library);
     } else {
@@ -197,31 +203,39 @@ fail:
 }
 
 /* Adaptive parameter tiers: 0 = baseline/hex/subme2 (worst-case safe),
-   1 = +CABAC/8x8 (high profile), 2 = +UMH. Env-pinned knobs are left alone.
-   Returns 0 on a re-open, 1 when the masked target already matches,
-   -2 when adapt is disabled, -1 on failure (previous params restored). */
+   1 = +CABAC/8x8 (high profile), 2 = +UMH, 3 = preset fast/subme6
+   (only reachable after a long easy window). Env-pinned knobs are left
+   alone. Returns 0 on a re-open, 1 when the masked target already
+   matches, -2 when adapt is disabled, -1 on failure (previous params
+   restored). */
 int nano_x264_adapt(NanoX264 *context, int tier) {
     const char *off = getenv("NANOCTL_X264_ADAPT");
     if (off && (!strcmp(off, "0") || !strcmp(off, "false"))) return -2;
+    const char *preset;
     int high, me, subme;
     switch (tier) {
-    case 0: high = 0; me = X264_ME_HEX; subme = 2; break;
-    case 1: high = 1; me = X264_ME_HEX; subme = 2; break;
-    case 2: high = 1; me = X264_ME_UMH; subme = 2; break;
+    case 0: preset = "veryfast"; high = 0; me = X264_ME_HEX; subme = 2; break;
+    case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; break;
+    case 2: preset = "veryfast"; high = 1; me = X264_ME_UMH; subme = 2; break;
+    case 3: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; break;
     default: return -1;
     }
     if (context->pins & 1) high = context->want_high;
     if (context->pins & 2) me = context->want_me;
     if (context->pins & 4) subme = context->want_subme;
+    if (context->pins & 8) preset = context->want_preset;
     if (high == context->want_high && me == context->want_me &&
-        subme == context->want_subme)
+        subme == context->want_subme && !strcmp(preset, context->want_preset))
         return 1;
+    const char *prev_preset = context->want_preset;
     int prev_high = context->want_high, prev_me = context->want_me,
         prev_subme = context->want_subme;
+    context->want_preset = preset;
     context->want_high = high;
     context->want_me = me;
     context->want_subme = subme;
     if (reopen(context) == 0) return 0;
+    context->want_preset = prev_preset;
     context->want_high = prev_high;
     context->want_me = prev_me;
     context->want_subme = prev_subme;

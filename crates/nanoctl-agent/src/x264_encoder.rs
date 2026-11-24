@@ -147,10 +147,10 @@ impl Drop for Active {
 }
 
 /// Content-driven encoder parameter negotiation. Tier 0 (baseline/hex/subme2)
-/// is the measured worst-case-safe configuration; tiers 1 and 2 spend encode
-/// headroom on CABAC/8x8 and UMH for fewer bits. The policy only promotes
-/// after a sustained easy window and demotes fast under stress — defaults must
-/// never regress the hard scene.
+/// is the measured worst-case-safe configuration; tiers 1-3 spend encode
+/// headroom on CABAC/8x8, UMH, and finally a slower preset for fewer bits.
+/// The policy only promotes after a sustained easy window and demotes fast
+/// under stress — defaults must never regress the hard scene.
 struct AdaptPolicy {
     tier: u8,
     encode_ewma_ns: f64,
@@ -162,7 +162,7 @@ struct AdaptPolicy {
 }
 
 impl AdaptPolicy {
-    const MAX_TIER: u8 = 2;
+    const MAX_TIER: u8 = 3;
     /// Frames of sustained ease before a promotion (~2.5s at 60fps).
     const EASE_FRAMES: u32 = 150;
     /// Consecutive stressed frames before a demotion (~0.33s at 60fps).
@@ -620,6 +620,9 @@ mod tests {
         assert_eq!(encoder.active.adapt(1), 1);
         assert_eq!(encoder.active.adapt(2), 0);
         assert_eq!(encoder.active.parameters().me, ME_UMH);
+        assert_eq!(encoder.active.adapt(3), 0);
+        let p = encoder.active.parameters();
+        assert_eq!((p.cabac, p.me, p.subme), (1, ME_UMH, 6));
         assert_eq!(encoder.active.adapt(0), 0);
         let p = encoder.active.parameters();
         assert_eq!((p.cabac, p.transform8x8, p.me), (0, 0, ME_HEX));
