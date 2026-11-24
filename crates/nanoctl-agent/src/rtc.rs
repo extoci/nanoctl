@@ -146,10 +146,6 @@ pub struct HostPeer {
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
     viewer_limits: tokio::sync::watch::Sender<crate::adaptive::ViewerLimits>,
-    /// Viewer-preferred video transport: `data-channel` suppresses the RTP sample write
-    /// once the video data channels are open.
-    #[cfg(feature = "media")]
-    video_transport: tokio::sync::watch::Sender<crate::adaptive::VideoTransport>,
     #[cfg(feature = "media")]
     input_shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")]
@@ -627,9 +623,6 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (viewer_limits, _) =
             tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
-        #[cfg(feature = "media")]
-        let (video_transport, _) =
-            tokio::sync::watch::channel(crate::adaptive::VideoTransport::default());
         let (link_feedback, _) = tokio::sync::watch::channel(None);
         #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
@@ -796,22 +789,11 @@ impl HostPeer {
                     // View-only sessions still adjust stream quality and transport.
                     if reliable {
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
-                            if message.is_string {
-                                if let Some(limits) =
+                            if message.is_string
+                                && let Some(limits) =
                                     crate::adaptive::ViewerLimits::parse(&message.data)
-                                {
-                                    viewer_limits.send_replace(limits);
-                                }
-                                if let Some(transport) =
-                                    crate::adaptive::VideoTransport::parse(&message.data)
-                                {
-                                    video_transport.send_replace(transport);
-                                }
-                                if let Some(stats) =
-                                    crate::adaptive::LinkStats::parse(&message.data)
-                                {
-                                    link_feedback.send_replace(Some(stats.sample()));
-                                }
+                            {
+                                viewer_limits.send_replace(limits);
                             }
                             Box::pin(async {})
                         }));
@@ -829,21 +811,12 @@ impl HostPeer {
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    if reliable && message.is_string {
-                        if let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data) {
-                            viewer_limits.send_replace(limits);
-                            return Box::pin(async {});
-                        }
-                        if let Some(transport) =
-                            crate::adaptive::VideoTransport::parse(&message.data)
-                        {
-                            video_transport.send_replace(transport);
-                            return Box::pin(async {});
-                        }
-                        if let Some(stats) = crate::adaptive::LinkStats::parse(&message.data) {
-                            link_feedback.send_replace(Some(stats.sample()));
-                            return Box::pin(async {});
-                        }
+                    if reliable
+                        && message.is_string
+                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
+                    {
+                        viewer_limits.send_replace(limits);
+                        return Box::pin(async {});
                     }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
@@ -1201,8 +1174,6 @@ impl HostPeer {
             #[cfg(feature = "media")]
             viewer_limits,
             #[cfg(feature = "media")]
-            video_transport,
-            #[cfg(feature = "media")]
             input_shutdown,
             #[cfg(feature = "media")]
             input_revoked,
@@ -1444,11 +1415,6 @@ impl HostPeer {
     #[cfg(feature = "media")]
     pub fn viewer_limits(&self) -> tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits> {
         self.viewer_limits.subscribe()
-    }
-
-    #[cfg(feature = "media")]
-    pub fn video_transport(&self) -> tokio::sync::watch::Receiver<crate::adaptive::VideoTransport> {
-        self.video_transport.subscribe()
     }
 
     #[cfg(feature = "media")]

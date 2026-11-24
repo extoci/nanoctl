@@ -7,7 +7,7 @@ import Foundation
 /// injected at the front of the video m-section. The host answers with the
 /// first offered codec it can encode, so first position means "preferred".
 /// libwebrtc ignores the unknown payload type in the answer — the RTP stream it
-/// describes is suppressed by `video-transport: data-channel` anyway.
+/// describes is suppressed automatically once the data channels are open anyway.
 enum SDP {
     /// Payload type claimed for the injected H265 codec. PTs 35 and 36 are
     /// unassigned in RTP/AVP and unused by libwebrtc's offer.

@@ -2246,7 +2246,6 @@ pub fn spawn_video(
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
     viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
-    video_transport: tokio::sync::watch::Receiver<crate::adaptive::VideoTransport>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,

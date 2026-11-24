@@ -168,21 +168,7 @@ export type ControlMessage =
   | { readonly type: "release" }
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }
-  | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number }
-  | {
-      /** Viewer opt-in to data-channel-only video; the host stops writing the RTP
-       * track once nanoctl.video.v1 / nanoctl.video-idr.v1 are open. */
-      readonly type: "video-transport";
-      readonly prefer: "all" | "data-channel";
-    }
-  | {
-      /** Viewer-measured link report used for adaptive bitrate when RTP feedback
-       * is absent (video-transport: data-channel). */
-      readonly type: "link-stats";
-      readonly fractionLost: number;
-      readonly rttMs?: number;
-      readonly rembKbps?: number;
-    };
+  | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number };
 
 export type DeviceCapabilities = {
   readonly protocolVersion: SupportedProtocolVersion;

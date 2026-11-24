@@ -276,7 +276,7 @@ final class Session {
     }
 
     /// Control-channel send that does not require input admission (used for
-    /// video-transport / link-stats, which are view-only safe).
+    /// ping, which is view-only safe).
     private func sendControlFree(_ value: [String: Any]) -> Bool {
         guard let data = try? JSONSerialization.data(withJSONObject: value),
               let channel = connection?.control, channel.readyState == .open else { return false }
@@ -554,9 +554,8 @@ final class Session {
         }
         current.dcVideo = receiver
         transport = .dataChannel
-        // Once both channels are open the host accepts the RTP opt-out; this
-        // halves payload bandwidth. link-stats then replaces RTCP feedback.
-        _ = sendControlFree(["type": "video-transport", "prefer": "data-channel"])
+        // The agent suppresses delta-frame RTP writes automatically while the
+        // video channel is open; IDRs still flow so RTCP feedback survives.
         onControlOpen(current)
         onChange?()
     }
@@ -571,9 +570,6 @@ final class Session {
 
     private func onControlOpen(_ current: Connection) {
         guard current.control?.readyState == .open else { return }
-        if transport == .dataChannel {
-            _ = sendControlFree(["type": "video-transport", "prefer": "data-channel"])
-        }
         guard statsTask == nil else { return }
         statsTask = nil
         statsTask = Task { [weak self, weak current] in
@@ -592,19 +588,15 @@ final class Session {
         }
     }
 
-    /// Reports link stats to the host while RTP is suppressed (replacing RTCP
-    /// feedback), refreshes the status line, and watches for a decoder path
-    /// that never produces frames so it can fall back to RTP.
+    /// Refreshes the status line and watches for a decoder path that never
+    /// produces frames so it can fall back to RTP.
     private func collectStats(_ current: Connection) async {
         guard let receiver = current.dcVideo else {
             statsLine = codec.map { "RTP · \($0)" } ?? ""
             onChange?()
             return
         }
-        let (fractionLost, transit) = receiver.takeLinkStats()
-        var message: [String: Any] = ["type": "link-stats", "fractionLost": fractionLost]
-        if let rtt = await peerRTT(current) { message["rttMs"] = rtt * 1000 }
-        _ = sendControlFree(message)
+        let (_, transit) = receiver.takeLinkStats()
         let s = receiver.stats
         statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(s.fed) fps-ish · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount)"
         onChange?()
@@ -615,18 +607,6 @@ final class Session {
             current.video?.close()
             current.videoIdr?.close()
             deactivateDataChannelVideo(current)
-            _ = sendControlFree(["type": "video-transport", "prefer": "all"])
-        }
-    }
-
-    private func peerRTT(_ current: Connection) async -> Double? {
-        guard let peer = current.peer else { return nil }
-        return await withCheckedContinuation { reply in
-            peer.statistics { report in
-                let rtt = report.statistics.values.first { $0.type == "candidate-pair" }
-                    .flatMap { ($0.values["currentRoundTripTime"] as? NSNumber)?.doubleValue }
-                reply.resume(returning: rtt)
-            }
         }
     }
 

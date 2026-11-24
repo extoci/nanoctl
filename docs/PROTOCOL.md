@@ -106,13 +106,12 @@ bypassing the RTP jitter buffer. Each message is
 with all integers little-endian; `parts` splits large access units into ~48 KiB chunks.
 Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks
 the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
-video channel until a keyframe arrives. The video track keeps sending regardless, so the
-data channels add bandwidth on top of RTP unless the viewer sends
-`{"type":"video-transport","prefer":"data-channel"}` on the control channel — honored
-only while the video data channels are open. With RTP suppressed there is no RTCP
-feedback, so the viewer should report `{"type":"link-stats","fractionLost":0.02,
-"rttMs":14.5,"rembKbps":3200}` on the control channel to keep adaptive bitrate working.
-`"prefer":"all"` restores RTP delivery.
+video channel until a keyframe arrives. While `nanoctl.video.v1` is open the agent
+suppresses delta-frame writes on the RTP track automatically — a viewer decoding the
+data channel drops the RTP copy, so those samples are duplicate bandwidth. Keyframes
+still go to RTP, which keeps RTCP round-trip and loss reports meaningful for adaptive
+bitrate. When the video channel closes, the agent resumes full RTP delivery and forces
+a keyframe so the resumed track's reference chain is fresh.
 
 ### System audio
 
