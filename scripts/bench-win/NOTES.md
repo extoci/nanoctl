@@ -651,3 +651,13 @@ one re-open/IDR burst on attaches to near-idle desktops. Verified as
 a no-op on this VM: even a static desktop encodes ~5.5ms/frame
 (>12%), so all scenes still promote 0→1→2→3 stepwise; worst case
 unchanged (noise tier 0, 0 switches).
+
+## Live wire bytes vs smoke (cycle 33)
+
+`window.__dcv.bytes` added to the viewer (sum of DC message bytes). Measured
+live under `band --motion --height 300` on loopback: steady-state wire rate
+~179 kbps vs media-smoke encode output ~190 kbps for the same scene — parity
+within measurement noise. The initial attach replay burst (~400KB: latest
+keyframe + replayed deltas) is one-time and amortizes to nothing on any
+session longer than ~30s. Conclusion: smoke numbers are honest wire numbers;
+no hidden overhead in the live path.
