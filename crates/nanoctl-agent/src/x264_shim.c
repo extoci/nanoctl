@@ -119,6 +119,13 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     }
     const char *subme = getenv("NANOCTL_X264_SUBME");
     if (subme && subme[0]) p.analyse.i_subpel_refine = atoi(subme);
+    const char *aq = getenv("NANOCTL_X264_AQ");
+    if (aq && aq[0]) {
+        const char *colon = strchr(aq, ':');
+        p.rc.i_aq_mode = atoi(aq);
+        if (colon && atof(colon + 1) > 0.0f)
+            p.rc.f_aq_strength = (float)atof(colon + 1);
+    }
     p.i_sync_lookahead = 0;
     p.rc.i_lookahead = 0;
     p.rc.i_rc_method = X264_RC_CRF;

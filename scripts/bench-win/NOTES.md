@@ -473,3 +473,34 @@ media-smoke, per-pixel noise scene, 60s continuous: 3,498 frames @
 58.3fps, 11.5Mbps, encode p50 10.6ms / p95 12.9ms, passed.
 Encoder process RSS flat at ~91-96MB across the whole run - no growth
 or degradation under a full minute of worst-case load.
+
+## x264 adaptive-quantizer sweep (cycle 23)
+
+`NANOCTL_X264_AQ` env knob added (`mode[:strength]` on
+`p.rc.i_aq_mode`/`f_aq_strength`; default = veryfast's aq_mode 1 @
+1.0). Motion scene: AQ is doing massive bit shaping - the defaults are
+already at the pareto point.
+
+| aq                | kbps        | PSNR p05 | encode p50 |
+| ----------------- | ----------- | -------- | ---------- |
+| off (0)           | 789 (+231%) | 62.8dB   | 4.5ms      |
+| 1 @ 1.0 (default) | 238         | 56.8dB   | 4.4ms      |
+| 1 @ 1.5           | 280 (+18%)  | 53.8dB   | 4.5ms      |
+
+## Plan: adaptive encoder negotiation (user directive, cycle 24+)
+
+"Best possible defaults ever, no compromises" = per-content params at
+runtime, not one static tuple. The sweeps define the policy table:
+
+- normal content (bits << VBV cap, encode fits budget): PROMOTE -
+  high profile (CABAC, -28%) + umh (-17%) costs ~+1ms encode there.
+- stress content (bits near cap OR encode_p50 > ~14ms): DEMOTE -
+  baseline/hex/subme2 (worst-case-safe: 54-58fps noise).
+- Mechanism: x264_encoder_reconfig for CRF/AQ/VBV; profile/ME changes
+  need encoder re-open + forced IDR (SPS switch in-band, decoder-safe
+  since deltas can't cross a re-open anyway).
+- Classifier inputs already on the loop: bits/AU window, encode_ns,
+  qp trend, frame-changed fraction. No extra capture pass needed.
+- Debugging needed first: per-second time-series (fps/kbps/encode_ms)
+  in media-smoke JSON + effective-param echo, so adaptation is
+  observable and re-sweeps stay honest.
