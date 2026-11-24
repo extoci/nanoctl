@@ -624,3 +624,13 @@ Balanced/Quality add ~8.5ms of encode queueing AND 42-88% more bits
 for +0.8-1.3dB under noise, and _lower_ motion PSNR. Responsiveness is
 the best mode on every axis with the adaptive encoder — the larger VBV
 windows just let rate control spend more under CRF-bound content.
+
+## Input→photon decomposition (cycle 31)
+
+`input-photon.ts`: CDP `Input.dispatchMouseEvent` into the viewer page
+→ remote DC → SendInput → band `INPUT_COUNT` bump decoded from the
+stream. 10 clicks, loopback: **p50 48ms / min 43 / mean 55** while the
+same run's clock-marker G2G read p50 61ms — the input lane (reliable DC
+
+- coalesced motion watch-channel) adds ≈0-5ms over the video path;
+  input→photon is entirely pipeline-bound, nothing to shave.
