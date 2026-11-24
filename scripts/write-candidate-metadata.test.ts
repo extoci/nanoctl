@@ -43,7 +43,11 @@ describe("release candidate identity", () => {
   test("records exact version, commit, target, digest, and unsigned state", async () => {
     const stage = await fixture();
     const child = generate(stage, {});
-    expect(await child.exited).toBe(0);
+    const exitCode = await child.exited;
+    if (exitCode !== 0) {
+      console.log("write-candidate-metadata stderr:", await new Response(child.stderr).text());
+    }
+    expect(exitCode).toBe(0);
     const metadata = (await Bun.file(join(stage, "CANDIDATE.json")).json()) as {
       version: string;
       commit: string;
