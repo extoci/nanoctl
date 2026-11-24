@@ -589,6 +589,66 @@ async fn forward_clipboard(
     }
 }
 
+fn shared_video_track(negotiated: &crate::codec::NegotiatedCodec) -> Arc<TrackLocalStaticSample> {
+    static TRACKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, std::sync::Weak<TrackLocalStaticSample>>>,
+    > = std::sync::OnceLock::new();
+    let key = match negotiated.codec {
+        VideoCodec::H264 => format!("h264:{}", negotiated.h264_profile_level_id()),
+        VideoCodec::Hevc | VideoCodec::Av1 => {
+            format!("{}:{}", negotiated.codec.id(), negotiated.offered_fmtp)
+        }
+    };
+    let mut tracks = TRACKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(track) = tracks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return track;
+    }
+    let track = Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: match negotiated.codec {
+                VideoCodec::H264 => MIME_TYPE_H264,
+                VideoCodec::Hevc => MIME_TYPE_HEVC,
+                VideoCodec::Av1 => MIME_TYPE_AV1,
+            }
+            .to_owned(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line: match negotiated.codec {
+                VideoCodec::H264 => format!(
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
+                    negotiated.h264_profile_level_id()
+                ),
+                VideoCodec::Hevc | VideoCodec::Av1 => negotiated.offered_fmtp.clone(),
+            },
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "nack".to_owned(),
+                    parameter: "".to_owned(),
+                },
+                RTCPFeedback {
+                    typ: "nack".to_owned(),
+                    parameter: "pli".to_owned(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".to_owned(),
+                    parameter: "fir".to_owned(),
+                },
+                RTCPFeedback {
+                    typ: "goog-remb".to_owned(),
+                    parameter: "".to_owned(),
+                },
+            ],
+        },
+        "desktop".to_owned(),
+        "nanoctl".to_owned(),
+    ));
+    tracks.insert(key, Arc::downgrade(&track));
+    track
+}
+
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
@@ -957,45 +1017,7 @@ impl HostPeer {
                 }
             }));
         }
-        let video = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: match negotiated.codec {
-                    VideoCodec::H264 => MIME_TYPE_H264,
-                    VideoCodec::Hevc => MIME_TYPE_HEVC,
-                    VideoCodec::Av1 => MIME_TYPE_AV1,
-                }
-                .to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line: match negotiated.codec {
-                    VideoCodec::H264 => format!(
-                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={}",
-                        negotiated.h264_profile_level_id()
-                    ),
-                    VideoCodec::Hevc | VideoCodec::Av1 => negotiated.offered_fmtp.clone(),
-                },
-                rtcp_feedback: vec![
-                    RTCPFeedback {
-                        typ: "nack".to_owned(),
-                        parameter: "".to_owned(),
-                    },
-                    RTCPFeedback {
-                        typ: "nack".to_owned(),
-                        parameter: "pli".to_owned(),
-                    },
-                    RTCPFeedback {
-                        typ: "ccm".to_owned(),
-                        parameter: "fir".to_owned(),
-                    },
-                    RTCPFeedback {
-                        typ: "goog-remb".to_owned(),
-                        parameter: "".to_owned(),
-                    },
-                ],
-            },
-            "desktop".to_owned(),
-            "nanoctl".to_owned(),
-        ));
+        let video = shared_video_track(&negotiated);
         let sender = peer.add_track(video.clone()).await?;
         #[cfg(feature = "media")]
         let (keyframe_requests, _) = tokio::sync::watch::channel(0_u64);

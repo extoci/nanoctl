@@ -83,6 +83,8 @@ pub struct ServerState {
     node: RwLock<Node>,
     sessions: Mutex<HashMap<SessionKey, ActiveSession>>,
     presence: broadcast::Sender<Value>,
+    #[cfg(feature = "media")]
+    pub media_hub: crate::media::VideoHub,
     stopping: std::sync::atomic::AtomicBool,
 }
 
@@ -108,6 +110,8 @@ impl ServerState {
             node: RwLock::new(Node::default()),
             sessions: Mutex::new(HashMap::new()),
             presence,
+            #[cfg(feature = "media")]
+            media_hub: crate::media::VideoHub::default(),
             stopping: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -640,7 +644,7 @@ async fn session(
                         tracing::warn!(%error, "media pipeline failed");
                     }
                     if media_restarts >= 2 { break "media-failed".into(); }
-                    if let Some(peer) = &peer { media = Some(crate::service::spawn_media(peer, &state.config)); }
+                    if let Some(peer) = &peer { media = Some(crate::service::spawn_media(&state.media_hub, peer, &state.config)); }
                     media_restarts += 1;
                 }
                 #[cfg(feature = "rtc")]
@@ -695,7 +699,7 @@ async fn session(
                             state.config.features.system_audio.then(|| audio_output.subscribe())).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
-                                { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }
+                                { media = Some(crate::service::spawn_media(&state.media_hub, &new_peer, &state.config)); }
                                 peer = Some(new_peer);
                                 Ok(true)
                             }
