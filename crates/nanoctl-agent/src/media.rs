@@ -884,13 +884,13 @@ impl CaptureEncoder {
         #[cfg(target_os = "windows")]
         {
             static DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            if let Ok(path) = std::env::var("NANOCTL_DUMP_FRAME") {
-                if !path.is_empty() {
-                    let n = DUMPED.fetch_add(1, Ordering::Relaxed);
-                    if n < 3 {
-                        let p = path.replace(".png", &format!("{n}.png"));
-                        let _ = image.save(&p);
-                    }
+            if let Ok(path) = std::env::var("NANOCTL_DUMP_FRAME")
+                && !path.is_empty()
+            {
+                let n = DUMPED.fetch_add(1, Ordering::Relaxed);
+                if n < 3 {
+                    let p = path.replace(".png", &format!("{n}.png"));
+                    let _ = image.save(&p);
                 }
             }
         }
