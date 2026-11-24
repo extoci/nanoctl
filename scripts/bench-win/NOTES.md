@@ -579,10 +579,10 @@ Measured (20s motion smoke): 0->1 @ ~2s, ->2 @ ~5s, ->3 @ ~8s, holds
 ffplay fullscreen on screen during media-smoke (real video instead of
 synthetic scenes):
 
-| content                        | tier | fps  | avg kbps | p05 dB |
-| ------------------------------ | ---- | ---- | -------- | ------ |
-| Big Buck Bunny 720p (cartoon)  | 3    | 58.4 | 292      | 56.1   |
-| testsrc2 lavfi (dense charts)  | 0    | 51.8 | 10258    | 24.05  |
+| content                       | tier | fps  | avg kbps | p05 dB |
+| ----------------------------- | ---- | ---- | -------- | ------ |
+| Big Buck Bunny 720p (cartoon) | 3    | 58.4 | 292      | 56.1   |
+| testsrc2 lavfi (dense charts) | 0    | 51.8 | 10258    | 24.05  |
 
 testsrc2 is effectively worst-case: dense per-frame-changing detail
 lands within ~4% of the per-pixel-noise numbers, so synthetic noise is
