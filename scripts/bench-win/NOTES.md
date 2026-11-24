@@ -704,3 +704,23 @@ is largest exactly where adaptivity pays (static/motion desktop). Under
 worst-case noise nanoctl still sends ~11.2Mbps < 15Mbps. Client-side the
 browser viewer costs 1/14th the CPU of Moonlight's software-decode path but
 ~3.5x the RSS.
+||||||| parent of a5aff93 (viewer: open the signaling socket alongside /v1/info)
+
+## Session startup round trips (cycle 36)
+
+`connect-bench.ts <base-url> [N]` (Playwright Chromium, fresh page per run)
+timestamps navigation → signaling `WebSocket` created → server hello →
+`RTCPeerConnection` connected. RTT modeled with `tc qdisc add dev lo root
+netem delay 20ms` (40ms RTT) against a Linux loopback agent, n=15 medians:
+
+| variant                          | ws    | hello | connected |
+| -------------------------------- | ----- | ----- | --------- |
+| 0ms: `/v1/info` gates the socket | 73.8  | 75.6  | 166.1     |
+| 0ms: `/v1/info` alongside socket | 62.1  | 67.5  | 149.2     |
+| 40ms RTT: gated                  | 186.1 | 307.8 | 588.9     |
+| **40ms RTT: alongside**          | 144.2 | 266.3 | **548.5** |
+
+The hello already carries the host info, so the serialized `/v1/info` fetch
+cost exactly one RTT on every connect and reconnect. It still runs (its 403
+body is the only verbatim refusal explanation): a socket that fails before
+hello waits for its outcome before retrying.
