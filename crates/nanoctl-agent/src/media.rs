@@ -198,7 +198,15 @@ impl EncodeScale {
     }
 
     fn limits(&self, width: u32, height: u32) -> (u32, u32) {
-        ((width / self.0).max(2), (height / self.0).max(2))
+        // Never encode below 1080p when the source has the pixels — viewers
+        // upscale the result to full screen anyway, and a quarter-res frame at
+        // high bitrate reads as soft rather than detailed.
+        let divisor = self
+            .0
+            .min(width / 1920.min(width).max(1))
+            .min(height / 1080.min(height).max(1))
+            .max(1);
+        ((width / divisor).max(2), (height / divisor).max(2))
     }
 }
 
@@ -2831,10 +2839,16 @@ mod tests {
         let mut scale = super::EncodeScale::new(2_000);
         assert_eq!(scale.limits(1920, 1080), (1920, 1080));
         assert!(scale.update(1_400));
-        assert_eq!(scale.limits(1920, 1080), (960, 540));
+        // The divisor still tracks the link, but limits() clamps it so a
+        // 1080p source never encodes below 1080p.
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
         assert!(!scale.update(1_700));
         assert!(scale.update(500));
-        assert_eq!(scale.limits(1920, 1080), (480, 270));
+        assert_eq!(scale.limits(1920, 1080), (1920, 1080));
+        // A 4K source may halve to exactly 1080p but not quarter below it.
+        assert_eq!(scale.limits(3840, 2160), (1920, 1080));
+        // Sub-1080p sources keep their full resolution too.
+        assert_eq!(scale.limits(1280, 720), (1280, 720));
         assert!(!scale.update(700));
         assert!(scale.update(900));
         assert!(scale.update(1_900));
