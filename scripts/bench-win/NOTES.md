@@ -558,3 +558,18 @@ encoder is VBV-capped (CRF unreachable), so denoising has no bits to
 recover and cheaper analysis only buys fps at the cap's bitrate.
 Flash scene sanity: 57fps / 292kbps / 57.5dB, adapt promotes
 correctly to tier 1 between flashes.
+
+## Adaptive tier 3: slower preset on easy content (cycle 27)
+
+Tier ladder extended: 0 baseline/hex/subme2, 1 +high, 2 +umh, 3 =
+preset `fast` + subme 6 (preset env-pinned via `NANOCTL_X264_PRESET`
+masks it like the other knobs). Policy `MAX_TIER` 2->3; promotion
+still requires <30% encode budget and <50% VBV for ~150 frames, so
+tier 3 only engages on easy content and demotes on any stress.
+
+Measured (20s motion smoke): 0->1 @ ~2s, ->2 @ ~5s, ->3 @ ~8s, holds
+
+- steady tier-3 ~128-133kbps vs ~135 tier-2 (-4%), PSNR p05 56.5dB,
+  fps 57.5. Encode p50 5.78ms overall (fits under the 55% stress
+  threshold; anything slower than `fast` would not). Noise: tier 0,
+  0 switches, metrics identical - no regression by construction.
