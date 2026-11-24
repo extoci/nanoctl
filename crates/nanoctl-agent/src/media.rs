@@ -582,7 +582,6 @@ impl I420Frame {
     }
 }
 
-
 impl YUVSource for I420Frame {
     fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
