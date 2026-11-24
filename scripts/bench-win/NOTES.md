@@ -293,12 +293,12 @@ package) placed beside nanoctl.exe. Shim gains env knobs:
 
 Same media-smoke protocol, OpenH264 -> x264(superfast):
 
-| scene | fps | encode p50 | bitrate | PSNR p50 | verdict |
-|---|---|---|---|---|---|
-| noise (worst case) | 39.6 -> 58.0 (+46%) | 16.9 -> 7.5ms (-56%) | 15.5 -> 11.2Mbps (-28%) | 25.3 -> 24.2dB | fail -> pass |
-| motion | 58 -> 58.2 | ~7 -> 3.8ms | 462kbps (vs 618 ultrafast) | 60.8dB | pass |
-| flash | - | 4.2ms | 633kbps | 63.2dB | pass |
-| static | 58 | 3.3ms | 666kbps (CRF12 encodes every frame; OpenH264 emitted ~61B P-skip AUs) | 68dB | pass |
+| scene              | fps                 | encode p50           | bitrate                                                               | PSNR p50       | verdict      |
+| ------------------ | ------------------- | -------------------- | --------------------------------------------------------------------- | -------------- | ------------ |
+| noise (worst case) | 39.6 -> 58.0 (+46%) | 16.9 -> 7.5ms (-56%) | 15.5 -> 11.2Mbps (-28%)                                               | 25.3 -> 24.2dB | fail -> pass |
+| motion             | 58 -> 58.2          | ~7 -> 3.8ms          | 462kbps (vs 618 ultrafast)                                            | 60.8dB         | pass         |
+| flash              | -                   | 4.2ms                | 633kbps                                                               | 63.2dB         | pass         |
+| static             | 58                  | 3.3ms                | 666kbps (CRF12 encodes every frame; OpenH264 emitted ~61B P-skip AUs) | 68dB           | pass         |
 
 Preset sweep (noise): ultrafast 6.2ms/11.3Mbps/24.5dB, superfast
 7.5ms/11.2/24.2, veryfast 11.5ms/10.1/24.2 (fps drops to 52). On motion
