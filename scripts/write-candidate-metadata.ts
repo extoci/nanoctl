@@ -39,8 +39,11 @@ const [rootPackage, agentManifest] = await Promise.all([
   Bun.file(join(repository, "crates/nanoctl-agent/Cargo.toml")).text(),
 ]);
 const version = packageVersion(rootPackage);
-if (cargoVersion(agentManifest) !== version) {
-  throw new Error("repository and agent versions do not match");
+const agentVersion = cargoVersion(agentManifest);
+if (agentVersion !== version) {
+  throw new Error(
+    `repository and agent versions do not match: package.json=${version} agent=${agentVersion}`,
+  );
 }
 if (process.env.GITHUB_REF_TYPE === "tag" && process.env.GITHUB_REF_NAME !== `v${version}`) {
   throw new Error(`release tag must be v${version}`);
