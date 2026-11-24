@@ -155,7 +155,7 @@ because nothing has been encoded yet.
 `Monitor::capture_image` + one H.264 IDR encode and atomically `seed`s it
 into the replay window (seed refuses once any live keyframe exists, so it
 can never corrupt the delta chain). A session-connect retry covers agents
-whose boot capture failed. A second *recorder* is not used: an early
+whose boot capture failed. A second _recorder_ is not used: an early
 version spawned `CaptureEncoder::primary`, whose capture session starved
 the real pipeline's recorder and timed out its first-frame wait at 5s.
 
