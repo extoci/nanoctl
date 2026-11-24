@@ -384,3 +384,17 @@ content, slightly better PSNR, +1.1ms encode. Noise worst-case stays
 green: 54.8fps, encode 10.4ms, 10.8Mbps, 24.3dB (passes; fps dips vs
 58 under superfast - the honest trade). `NANOCTL_X264_PRESET` still
 overrides.
+
+## Viewer client resources: Chrome viewer vs Moonlight client (cycle 17)
+
+Live motion stream (~32fps delivered, 1600x1200), whole-process sums:
+
+| client                                | CPU (8-core %) | RSS    |
+| ------------------------------------- | -------------- | ------ |
+| nanoctl Chrome viewer (bench profile) | 4.0            | 466MB  |
+| Moonlight client (earlier measure)    | ~43            | ~147MB |
+
+~10x lower client CPU than Moonlight (WebCodecs decode +
+MediaStreamTrackGenerator compositing is nearly free); 3x RSS — the
+browser tax a native client would erase. In-stream path under motion:
+transit 1.5ms, decode 1.16ms, present 12.4ms, 0 gaps/drops.
