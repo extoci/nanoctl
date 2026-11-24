@@ -221,6 +221,17 @@ describe("remote session lifecycle", () => {
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+
+    controller.setInputEnabled(false);
+    expect(controller.snapshot.gamepadEnabled).toBe(false);
+    controller.setInputEnabled(true);
+    expect(controller.snapshot.gamepadEnabled).toBe(true);
+    channel.sent = [];
+    flushAnimationFrame(3_000);
+    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+      type: "gamepad",
+      pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
+    });
     await controller.stop();
   });
 

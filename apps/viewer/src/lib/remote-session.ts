@@ -343,7 +343,10 @@ export class RemoteSessionController {
     this.preferences.inputEnabled = enabled;
     this.inputEnabled = enabled && this.remoteInputAllowed && this.isControlOpen();
     if (!enabled) this.releaseInput();
-    else this.options.video.focus();
+    else {
+      this.options.video.focus();
+      this.startGamepadPolling();
+    }
     this.publishSnapshot();
   }
 
