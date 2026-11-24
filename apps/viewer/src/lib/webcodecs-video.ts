@@ -128,13 +128,14 @@ function createVideoSink(
   const decodeOutput = new Map<number, number>();
   let firstOutTs: number | undefined;
   const armPresentProbe = () => {
-    if (typeof (video as { requestVideoFrameCallback?: unknown })
-        .requestVideoFrameCallback !== "function") {
+    if (
+      typeof (video as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback !==
+      "function"
+    ) {
       return;
     }
     const onFrame = (now: number, meta: { mediaTime?: number }) => {
-      const dbg = ((window as unknown as { __dcv?: Record<string, unknown> })
-        .__dcv ??= {});
+      const dbg = ((window as unknown as { __dcv?: Record<string, unknown> }).__dcv ??= {});
       if (firstOutTs !== undefined && meta.mediaTime !== undefined) {
         const stamp = firstOutTs + Math.round(meta.mediaTime * 1e6);
         const out = decodeOutput.get(stamp);
@@ -147,14 +148,18 @@ function createVideoSink(
         }
       }
       if (!closed) {
-        (video as HTMLVideoElement & {
-          requestVideoFrameCallback: (cb: typeof onFrame) => void;
-        }).requestVideoFrameCallback(onFrame);
+        (
+          video as HTMLVideoElement & {
+            requestVideoFrameCallback: (cb: typeof onFrame) => void;
+          }
+        ).requestVideoFrameCallback(onFrame);
       }
     };
-    (video as HTMLVideoElement & {
-      requestVideoFrameCallback: (cb: typeof onFrame) => void;
-    }).requestVideoFrameCallback(onFrame);
+    (
+      video as HTMLVideoElement & {
+        requestVideoFrameCallback: (cb: typeof onFrame) => void;
+      }
+    ).requestVideoFrameCallback(onFrame);
   };
   armPresentProbe();
 
