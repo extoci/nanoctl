@@ -73,7 +73,11 @@ interface VideoTrackGeneratorLike {
   writable: WritableStream<VideoFrame>;
 }
 
-function createVideoSink(video: HTMLVideoElement, onTeardown?: () => void): VideoSink {
+function createVideoSink(
+  video: HTMLVideoElement,
+  onTeardown?: () => void,
+  joinAt?: number,
+): VideoSink {
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
   // buffer and the costly software canvas composite. Fall back to a 2D canvas
@@ -133,6 +137,10 @@ function createVideoSink(video: HTMLVideoElement, onTeardown?: () => void): Vide
     }
     const next = new VideoDecoder({
       output: (frame) => {
+        const dbg = (window as unknown as { __dcv?: Record<string, unknown> }).__dcv;
+        if (dbg && joinAt !== undefined && dbg.firstDecodeMs === undefined) {
+          dbg.firstDecodeMs = performance.now() - joinAt;
+        }
         if (writer) {
           decoded += 1;
           // Close once the generator has consumed the frame.
@@ -274,7 +282,7 @@ export function attachWebCodecsVideo(
   video: HTMLVideoElement,
   onTeardown?: () => void,
 ): WebCodecsVideoHandle {
-  const sink = createVideoSink(video, onTeardown);
+  const sink = createVideoSink(video, onTeardown, performance.now());
   const wrappedTransform = new TransformStream<EncodedVideoFrameLike, EncodedVideoFrameLike>({
     transform: (frame, controller) => {
       try {
@@ -305,7 +313,9 @@ export function attachDataChannelVideo(
   video: HTMLVideoElement,
   onTeardown?: () => void,
 ): WebCodecsVideoHandle {
-  const sink = createVideoSink(video, onTeardown);
+  // Join latency: attach -> first keyframe fed to the decoder.
+  const joinAt = performance.now();
+  const sink = createVideoSink(video, onTeardown, joinAt);
   // Wire format: [u32 seq][u8 flags][annex-b au]. Deltas ride the unordered,
   // unreliable channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
@@ -317,11 +327,10 @@ export function attachDataChannelVideo(
     window as unknown as { __dcv?: Record<string, number | boolean | string> }
   ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
   dbg.waitingForKey = true;
-  // Join latency: attach -> first keyframe fed to the decoder.
-  const joinAt = performance.now();
   dbg.joinAt = joinAt;
   delete dbg.joinMs;
   delete dbg.firstMsgMs;
+  delete dbg.firstDecodeMs;
   // Ask for a keyframe immediately: without it the request only goes out
   // after the first delta arrives, and an idle producer can delay that.
   if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {

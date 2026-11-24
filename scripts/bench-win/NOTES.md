@@ -167,6 +167,17 @@ The warm frame can be seconds-to-minutes old on the very first attach; the
 pipeline's own startup IDR replaces it ~50ms later. Encoder smoke
 unchanged: 5.65ms p50, PSNR p05 45.85dB, ~108kbps static.
 
+**Attach→first decode** (`__dcv.firstDecodeMs`): **14–22ms** — join ~9ms plus
+~5–12ms software decode+present on this GPU-less VM.
+
+**srcObject race fix (ships).** `peer.ontrack` unconditionally overwrote
+`video.srcObject` with the RTP stream; if it fired after the DC path had
+claimed the element, the MediaStreamTrackGenerator went unconsumed,
+`writer.write()` pended, unclosed VideoFrames wedged Chrome's decoder and
+the viewer stayed on "waiting for video" forever. Now the RTP stream is
+only assigned when no DC path is attached (the RTP fallback is preserved —
+`restoreRemoteVideo` puts it back on teardown).
+
 ## Delivered fps under motion (`__dcv` counters, 30s windows)
 
 End-to-end decode delivery while the scrolling checkerboard covers the

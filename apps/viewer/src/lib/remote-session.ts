@@ -666,8 +666,13 @@ export class RemoteSessionController {
         const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
         this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video, restoreRemoteVideo);
       }
-      this.options.video.srcObject = stream;
-      void this.options.video.play().catch(() => {});
+      // The data-channel path owns the element through its track generator:
+      // writing the RTP stream over srcObject starves the generator, so the
+      // decoder's output frames stay unclosed and the decoder wedges.
+      if (!this.webCodecsVideo) {
+        this.options.video.srcObject = stream;
+        void this.options.video.play().catch(() => {});
+      }
     };
     peer.onconnectionstatechange = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
