@@ -573,3 +573,24 @@ Measured (20s motion smoke): 0->1 @ ~2s, ->2 @ ~5s, ->3 @ ~8s, holds
   fps 57.5. Encode p50 5.78ms overall (fits under the 55% stress
   threshold; anything slower than `fast` would not). Noise: tier 0,
   0 switches, metrics identical - no regression by construction.
+
+## Real-content + live demotion (cycle 28)
+
+ffplay fullscreen on screen during media-smoke (real video instead of
+synthetic scenes):
+
+| content                       | tier | fps  | avg kbps | p05 dB |
+| ----------------------------- | ---- | ---- | -------- | ------ |
+| Big Buck Bunny 720p (cartoon) | 3    | 58.4 | 292      | 56.1   |
+| testsrc2 lavfi (dense charts) | 0    | 51.8 | 10258    | 24.05  |
+
+testsrc2 is effectively worst-case: dense per-frame-changing detail
+lands within ~4% of the per-pixel-noise numbers, so synthetic noise is
+a representative hard bound. BBB promotes to tier 3 and sits at
+~240-290kbps steady - real video between the two synthetic extremes.
+
+Mid-stream hard transition (motion 9s -> noise): adapt climbed to
+tier 3, then hard-dropped 3->0 inside the first noise second; the
+transition second dipped to 50fps (vs 54-56 steady) during the
+re-open, then matched pure-noise metrics exactly. Worst-case safety
+holds end-to-end, not just in the unit test.
