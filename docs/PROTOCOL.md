@@ -14,7 +14,7 @@ Types and validators live in `packages/protocol`.
   {
     "hostName": "desktop",
     "platform": "linux",
-    "version": "3.0.0-alpha.4",
+    "version": "3.0.0-alpha.5",
     "displays": [
       {
         "id": "59",
