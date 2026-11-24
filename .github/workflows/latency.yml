@@ -50,15 +50,12 @@ jobs:
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
       - run: bun install --frozen-lockfile
-      - name: Refresh apt index
+      - uses: ./.github/actions/linux-media-deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update -o Acquire::Retries=10
-      - name: Install native Linux capture and desktop dependencies
-        if: runner.os == 'Linux'
-        shell: bash
-        run: >
-          sudo apt-get install -y -o Acquire::Retries=10
-          clang libdbus-1-dev libegl1-mesa-dev libgbm-dev libpipewire-0.3-dev libwayland-dev libx11-dev libxcb1-dev libxext-dev libxfixes-dev libffmpeg-nvenc-dev libva-dev libxinerama-dev libxrandr-dev libxtst-dev nasm pkg-config xauth xvfb
+        with:
+          cache-suffix: latency
+          extra-packages: xauth xvfb
+          save-cache: ${{ github.event_name != 'pull_request' }}
       - name: Install Chromium on Linux
         if: runner.os == 'Linux'
         run: bunx playwright install --with-deps chromium
