@@ -2847,13 +2847,7 @@ pub fn spawn_video(
                         msg.extend_from_slice(&parts.to_le_bytes());
                         msg.extend_from_slice(&sent_ms.to_le_bytes());
                         msg.extend_from_slice(&sample.data[start..end]);
-                        let msg = Bytes::from(msg);
-                        video_data_channel
-                            .replay
-                            .lock()
-                            .unwrap()
-                            .push(is_idr, part, parts, msg.clone());
-                        messages.push(msg);
+                        messages.push(Bytes::from(msg));
                     }
                     let target = if is_idr {
                         idr_channel.as_ref().or(video_channel.as_ref())
@@ -2862,7 +2856,7 @@ pub fn spawn_video(
                     };
                     if let Some(channel) = target {
                         let au_len = sample.data.len();
-                        for msg in messages {
+                        for msg in &messages {
                             if is_idr {
                                 // Pace IDR parts: bursting ~150KB into the
                                 // association starves the congestion window
@@ -2874,14 +2868,14 @@ pub fn spawn_video(
                                     }
                                     tokio::time::sleep(Duration::from_millis(1)).await;
                                 }
-                                if let Err(error) = channel.send(&msg).await {
+                                if let Err(error) = channel.send(msg).await {
                                     tracing::warn!(%error, "video data channel send failed");
                                     dc_backed_up = true;
                                     break;
                                 }
                                 dc_backed_up = false;
                             } else if channel.buffered_amount().await <= 64 * 1024 {
-                                if let Err(error) = channel.send(&msg).await {
+                                if let Err(error) = channel.send(msg).await {
                                     tracing::warn!(%error, "video data channel send failed");
                                     dc_backed_up = true;
                                     break;
@@ -2907,6 +2901,16 @@ pub fn spawn_video(
                         }
                     } else if dc_backed_up {
                         dc_backed_up = false;
+                    }
+                    // Move the exact wire messages into the replay window after
+                    // sending. The transport borrows them while sending, so the
+                    // cache no longer clones/copies every access-unit part just
+                    // to keep reattach warmup data.
+                    {
+                        let mut replay = video_data_channel.replay.lock().unwrap();
+                        for (part, msg) in messages.into_iter().enumerate() {
+                            replay.push(is_idr, part as u16, parts, msg);
+                        }
                     }
                     // While the data-channel path is live it carries every AU
                     // and the viewer drops the RTP copy, so delta frames over
