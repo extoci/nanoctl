@@ -573,6 +573,96 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.phase).toBe("ended");
     expect(restored).toBe(true);
   });
+
+  test("restores input after a transient ICE disconnected-to-connected flap", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+
+    await controller.start();
+    expect(controller.snapshot.inputEnabled).toBe(true);
+
+    peer.connectionState = "disconnected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(false);
+
+    peer.connectionState = "connected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(true);
+
+    // Respect explicit user preference when input was intentionally turned off.
+    controller.setInputEnabled(false);
+    peer.connectionState = "disconnected";
+    peer.onconnectionstatechange?.();
+    peer.connectionState = "connected";
+    peer.onconnectionstatechange?.();
+    expect(controller.snapshot.inputEnabled).toBe(false);
+
+    await controller.stop();
+  });
+
+  test("a hanging clipboard read on Ctrl+V does not stall subsequent keyboard input", async () => {
+    installBrowserGlobals();
+    defineGlobal("navigator", {
+      clipboard: {
+        readText: () => new Promise<string>(() => {}),
+        writeText: async () => {},
+      },
+    });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      clipboardEnabled: true,
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+
+    await controller.start();
+    pressKey("keydown", video, {
+      code: "KeyV",
+      key: "v",
+      ctrlKey: true,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      repeat: false,
+    });
+    pressKey("keydown", video, {
+      code: "KeyA",
+      key: "a",
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      repeat: false,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    const keys = peer.sent
+      .filter(([label]) => label === "nanoctl.control.v1")
+      .map(([, message]) => JSON.parse(message) as { type?: string; code?: string })
+      .filter((message) => message.type === "key")
+      .map((message) => message.code);
+    expect(keys).toEqual(["KeyV", "KeyA"]);
+
+    await controller.stop();
+  });
 });
 
 function hostSignal(

@@ -60,7 +60,9 @@ mod win_send {
 
     fn send(input: Input) -> Result<()> {
         let sent = unsafe { SendInput(1, &input, std::mem::size_of::<Input>() as i32) };
-        anyhow::ensure!(sent == 1, "SendInput rejected the mouse event");
+        if sent != 1 {
+            return Err(enigo::InputError::Simulate("SendInput rejected the mouse event").into());
+        }
         Ok(())
     }
 
@@ -340,8 +342,8 @@ impl InputController {
             PointerAction::Up => {
                 self.move_to(x, y)?;
                 let button = map_button(button)?;
-                self.enigo.button(button, Direction::Release)?;
                 self.held_buttons.remove(&button);
+                self.enigo.button(button, Direction::Release)?;
             }
             PointerAction::Wheel => {
                 // Wheel input reaches the window under the physical cursor,
@@ -399,12 +401,13 @@ impl InputController {
             return Ok(());
         };
         match action {
-            KeyAction::Down if repeat || self.held_keys.insert(key) => {
+            KeyAction::Down if repeat || !self.held_keys.contains(&key) => {
                 self.enigo.key(key, Direction::Press)?;
+                self.held_keys.insert(key);
             }
             KeyAction::Up => {
-                self.enigo.key(key, Direction::Release)?;
                 self.held_keys.remove(&key);
+                self.enigo.key(key, Direction::Release)?;
             }
             KeyAction::Down => {}
         }

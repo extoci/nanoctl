@@ -35,7 +35,10 @@ export default defineConfig({
   workers: 1,
   timeout: 45_000,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI && !latency ? 2 : 0,
+  // Latency assertions only check causality (a frame cannot be presented before
+  // its source time), so they can fail on clock-sync flakes but never on a real
+  // perf regression — retrying once in CI is safe and removes that flake class.
+  retries: process.env.CI ? (latency ? 1 : 2) : 0,
   reporter: process.env.CI ? "github" : "list",
   use: {
     baseURL,

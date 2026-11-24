@@ -175,6 +175,7 @@ pub struct WindowsEncoder {
     active: Option<ActiveEncoder>,
     bitrate_kbps: u32,
     max_fps: u16,
+    latency_mode: LatencyMode,
     reconfigure: bool,
     force_keyframe: bool,
     timestamp: i64,
@@ -198,7 +199,7 @@ impl WindowsEncoder {
         h264_high: bool,
         bitrate_kbps: u32,
         max_fps: u16,
-        _latency_mode: LatencyMode,
+        latency_mode: LatencyMode,
         (probe_width, probe_height): (u32, u32),
     ) -> Result<Self> {
         let runtime = MediaFoundationRuntime::start()?;
@@ -209,6 +210,7 @@ impl WindowsEncoder {
             active: None,
             bitrate_kbps,
             max_fps,
+            latency_mode,
             reconfigure: false,
             force_keyframe: false,
             timestamp: 0,
@@ -235,9 +237,20 @@ impl FrameEncoder for WindowsEncoder {
             let Ok(codec) = active.transform.cast::<ICodecAPI>() else {
                 return false;
             };
-            let value = ui4_variant(target_kbps.saturating_mul(1_000));
-            // SAFETY: the live encoder and scalar VARIANT are valid for this call.
-            unsafe { codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value) }.is_ok()
+            let mean = ui4_variant(target_kbps.saturating_mul(1_000));
+            let peak = ui4_variant(target_kbps.saturating_mul(2_000));
+            // SAFETY: the live encoder and scalar VARIANTs are valid for these calls.
+            // MaxBitRate is optional on vendor MFTs: only MeanBitRate decides
+            // whether the change applied in place.
+            unsafe {
+                let applied = codec
+                    .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &mean)
+                    .is_ok();
+                if applied {
+                    let _ = codec.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &peak);
+                }
+                applied
+            }
         });
         Ok(())
     }
@@ -396,10 +409,29 @@ impl WindowsEncoder {
                 );
                 // Peak-constrained VBR lets easy frames undershoot the
                 // target instead of padding to it; MeanBitRate stays the
-                // cap. Vendor MFTs without the property keep CBR.
+                // average cap. Vendor MFTs without the property keep CBR.
                 let _ = codec.SetValue(
                     &CODECAPI_AVEncCommonRateControlMode,
                     &ui4_variant(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+                );
+                // With no explicit peak, vendor MFTs typically clamp bursts
+                // near the mean, which starves hard frames (motion, scene
+                // cuts) and reads as blocking. 2x the mean lets VBR absorb
+                // them while the controller still owns the average.
+                let _ = codec.SetValue(
+                    &CODECAPI_AVEncCommonMaxBitRate,
+                    &ui4_variant(self.bitrate_kbps.saturating_mul(2_000)),
+                );
+                // Quality-vs-speed bias (0 = best quality, 100 = fastest).
+                // The latency mode was plumbed in but never applied.
+                let quality_speed: u32 = match self.latency_mode {
+                    LatencyMode::Responsiveness => 70,
+                    LatencyMode::Balanced => 40,
+                    LatencyMode::Quality => 20,
+                };
+                let _ = codec.SetValue(
+                    &CODECAPI_AVEncCommonQualityVsSpeed,
+                    &ui4_variant(quality_speed),
                 );
                 if self.codec == VideoCodec::H264 && self.h264_high {
                     let _ = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &low_latency);

@@ -2231,6 +2231,7 @@ pub fn spawn_video(
         let producer_slot = EncodedFrameProducer(encoded_slot.clone());
         let producer_stopped = worker_stopped.clone();
         let producer_stats = writer_stats.clone();
+        let producer_video_channel = video_data_channel.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
             let producer_slot = producer_slot;
             #[cfg(target_os = "linux")]
@@ -2310,17 +2311,26 @@ pub fn spawn_video(
                         .store(send_kbps as u32, Ordering::Relaxed);
                     controller.update_sender(send_kbps, pacer.idle(), now);
                     if link_feedback.has_changed().unwrap_or(false)
-                        && let Some(sample) = *link_feedback.borrow_and_update()
-                        && let Some(decision) = controller.observe(sample)
+                        && let Some(mut sample) = *link_feedback.borrow_and_update()
                     {
-                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
-                        fps = decision.fps;
-                        pacer.set_fps(fps);
-                        forced_keyframe |= scale.update(decision.bitrate_kbps);
-                        producer_stats
-                            .target_kbps
-                            .store(decision.bitrate_kbps, Ordering::Relaxed);
-                        producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                        // While the data channel carries video, RTP only
+                        // sends sparse IDRs — the browser's REMB describes
+                        // that thin stream, not real egress, so it must not
+                        // bind the encoder rate.
+                        if producer_video_channel.channel.lock().unwrap().is_some() {
+                            sample.remb_kbps = None;
+                        }
+                        if let Some(decision) = controller.observe(sample) {
+                            encoder
+                                .apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
+                            fps = decision.fps;
+                            pacer.set_fps(fps);
+                            forced_keyframe |= scale.update(decision.bitrate_kbps);
+                            producer_stats
+                                .target_kbps
+                                .store(decision.bitrate_kbps, Ordering::Relaxed);
+                            producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                        }
                     }
                     if viewer_limits.has_changed().unwrap_or(false) {
                         let (ceiling, max_fps) = viewer_limits
@@ -2492,6 +2502,7 @@ pub fn spawn_video(
         let mut dc_replay_served: Option<Instant> = None;
         let mut replay_last_orig: Option<u32> = None;
         let mut replay_last_new = 0_u32;
+        let mut dc_was_live = false;
         let mut dc_skips = 0_u64;
         let mut reference_recovery = ReferenceRecovery {
             codec: quality.codec,
@@ -2623,11 +2634,24 @@ pub fn spawn_video(
                     }
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
+                    let is_idr = au_contains_idr(&sample.data);
+                    let dc_live = video_channel.is_some();
+                    if dc_live != dc_was_live {
+                        dc_was_live = dc_live;
+                        if !dc_live {
+                            // The unreliable video channel just went away and
+                            // RTP is the primary path again — the decoder's
+                            // reference chain is stale, so force a keyframe
+                            // for the resumed track.
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
+                    }
                     // [u32 seq][u8 flags][annex-b au]; the viewer drops
                     // post-gap deltas and asks for a keyframe on "KF".
                     // Keyframes go over the reliable channel: they are
                     // large and cannot survive partial reliability.
-                    let is_idr = au_contains_idr(&sample.data);
                     // SCTP caps a message at ~64KiB, so large AUs are
                     // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
                     const CHUNK: usize = 48 * 1024;
@@ -2670,6 +2694,7 @@ pub fn spawn_video(
                         video_channel.as_ref()
                     };
                     if let Some(channel) = target {
+                        let au_len = sample.data.len();
                         for msg in messages {
                             if is_idr {
                                 // Pace IDR parts: bursting ~150KB into the
@@ -2706,29 +2731,43 @@ pub fn spawn_video(
                                 break;
                             }
                         }
+                        if !dc_backed_up {
+                            // Count the data-channel egress too: the rate
+                            // controller measures real wire bytes, not
+                            // just the RTP share.
+                            writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
+                            writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
+                        }
                     } else if dc_backed_up {
                         dc_backed_up = false;
                     }
-                    let result = await_video_delivery(
-                        async {
-                            track
-                                .write_sample_with_extensions(&sample, &extensions)
-                                .await
-                                .map_err(anyhow::Error::from)
-                        },
-                        VIDEO_SAMPLE_WRITE_TIMEOUT,
-                    )
-                    .await;
-                    writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
-                    if result.is_ok() {
-                        #[cfg(target_os = "linux")]
-                        trace::sent(&sample.data, trace_started, trace::now());
-                        previous_written = Some(written_at);
-                        writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
-                        writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
-                    }
-                    match result {
+                    // While the data-channel path is live it carries every AU
+                    // and the viewer drops the RTP copy, so delta frames over
+                    // RTP are pure duplicate bandwidth. IDRs still go to RTP:
+                    // they keep RTCP RTT/loss reports meaningful and let a
+                    // data-channel teardown resume the media track without
+                    // waiting for the next GOP boundary.
+                    if !dc_live || is_idr {
+                        let result = await_video_delivery(
+                            async {
+                                track
+                                    .write_sample_with_extensions(&sample, &extensions)
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            },
+                            VIDEO_SAMPLE_WRITE_TIMEOUT,
+                        )
+                        .await;
+                        writer_stats.send_ns.fetch_add(written_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        writer_stats.sample_writes.fetch_add(1, Ordering::Relaxed);
+                        if result.is_ok() {
+                            #[cfg(target_os = "linux")]
+                            trace::sent(&sample.data, trace_started, trace::now());
+                            previous_written = Some(written_at);
+                            writer_stats.bytes_sent.fetch_add(sample.data.len() as u64, Ordering::Relaxed);
+                            writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sample.data.len()));
+                        }
+                        match result {
                         Ok(()) if delivery_interrupted_since.is_some() => {
                             let outage = delivery_interrupted_since
                                 .map_or(Duration::ZERO, |started| started.elapsed());
@@ -2775,6 +2814,7 @@ pub fn spawn_video(
                                 write_result = Err(anyhow!(VideoDeliveryUnavailable));
                                 break;
                             }
+                        }
                         }
                     }
                 }
