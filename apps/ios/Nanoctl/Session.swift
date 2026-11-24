@@ -191,8 +191,11 @@ final class Session {
 
     @discardableResult
     func sendGamepad(_ report: GamepadMessage) -> Bool {
+        // Gamepad reports are full-state snapshots: ride the unordered
+        // zero-retransmit pointer channel so a lost report never delays the
+        // next one. The agent accepts gamepad on this lane.
         guard gamepadAllowed, let data = try? JSONEncoder().encode(report) else { return false }
-        return send(data, limitBacklog: true)
+        return send(data, pointer: true, limitBacklog: true)
     }
 
     @discardableResult

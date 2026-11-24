@@ -80,6 +80,8 @@ final class ExternalScene: UIResponder, UIWindowSceneDelegate {
         let video = VideoView()
         controller.view = video
         let window = UIWindow(windowScene: scene)
+        // TVs overscan (crop the edges); scaling keeps the full frame visible.
+        window.screen.overscanCompensation = .scale
         window.rootViewController = controller
         window.isHidden = false
         self.window = window
@@ -113,7 +115,14 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
     private let displays = UIButton(type: .system)
     private let paste = UIButton(type: .system)
     private let surface = TouchSurface()
+    private let screen = UIView()
+    private let fullBtn = UIButton(type: .system)
+    private let exitFull = UIButton(type: .system)
+    private var stack: UIStackView!
     private var usingExternal = false
+    private var fullscreen = false
+
+    override var prefersStatusBarHidden: Bool { fullscreen }
 
     init(desktop: Desktop) {
         self.desktop = desktop
@@ -177,16 +186,29 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         paste.setTitle("Paste→host", for: .normal)
         paste.addTarget(self, action: #selector(sendPaste), for: .touchUpInside)
 
-        let controls = UIStackView(arrangedSubviews: [codec, audio, displays, paste])
+        fullBtn.configuration = .tinted()
+        fullBtn.setTitle("Full", for: .normal)
+        fullBtn.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
+        exitFull.configuration = .tinted()
+        exitFull.setTitle("\u{2715}", for: .normal)
+        exitFull.isHidden = true
+        exitFull.addTarget(self, action: #selector(toggleFullscreen), for: .touchUpInside)
+        view.addSubview(exitFull)
+        exitFull.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            exitFull.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            exitFull.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
+        ])
+
+        let controls = UIStackView(arrangedSubviews: [codec, audio, displays, paste, fullBtn])
         controls.spacing = 8
-        controls.distribution = .fillEqually
+        controls.distribution = .fill
 
         let row = UIStackView(arrangedSubviews: [address, toggle])
         row.spacing = 8
         toggle.setContentHuggingPriority(.required, for: .horizontal)
         toggle.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let screen = UIView()
         screen.backgroundColor = .secondarySystemBackground
         screen.clipsToBounds = true
         screen.layer.cornerRadius = 12
@@ -212,7 +234,7 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
             stats.topAnchor.constraint(equalTo: screen.topAnchor, constant: 8),
         ])
 
-        let stack = UIStackView(arrangedSubviews: [title, row, state, screen, controls, gamepad, space])
+        stack = UIStackView(arrangedSubviews: [title, row, state, screen, controls, gamepad, space])
         stack.axis = .vertical
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -247,6 +269,7 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         space.isEnabled = session.inputReady
         surface.isUserInteractionEnabled = session.inputReady
         video.isHidden = external || !hasVideo
+        UIApplication.shared.isIdleTimerDisabled = hasVideo
         video.show(hasVideo && !external && session.transport == .rtp ? desktop.mailbox : nil)
         video.show(pixels: hasVideo && !external && session.transport == .dataChannel ? session.pixelMailbox : nil)
         output.isHidden = hasVideo && !external
@@ -292,6 +315,27 @@ final class PhoneViewController: UIViewController, UITextFieldDelegate {
         let index = codec.selectedSegmentIndex
         guard index >= 0 else { return }
         desktop.session.codecPreference = CodecPreference.allCases[index]
+    }
+
+    @objc private func toggleFullscreen() {
+        fullscreen = !fullscreen
+        screen.removeFromSuperview()
+        if fullscreen {
+            // Raw fullscreen: video edge-to-edge, everything else hidden.
+            view.insertSubview(screen, belowSubview: exitFull)
+            screen.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                screen.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                screen.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                screen.topAnchor.constraint(equalTo: view.topAnchor),
+                screen.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            ])
+        } else {
+            stack.insertArrangedSubview(screen, at: 3)
+        }
+        stack.isHidden = fullscreen
+        exitFull.isHidden = !fullscreen
+        setNeedsStatusBarAppearanceUpdate()
     }
 
     @objc private func toggleAudio() {
