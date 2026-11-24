@@ -420,7 +420,7 @@ export class RemoteSessionController {
 
   sendControl(payload: ControlMessage): boolean {
     const channel =
-      payload.type === "pointer" && payload.action === "move"
+      payload.type === "gamepad" || (payload.type === "pointer" && payload.action === "move")
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
