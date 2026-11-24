@@ -668,6 +668,8 @@ export class RemoteSessionController {
           this.clearRecoveryTimer();
           this.clearNegotiationTimer();
           this.phase = "connected";
+          this.inputEnabled =
+            this.preferences.inputEnabled && this.remoteInputAllowed && this.isControlOpen();
           this.armFirstFrameTimer(lifecycle, peer);
           this.publishSnapshot();
           break;
@@ -775,7 +777,11 @@ export class RemoteSessionController {
     if (event.type === "pointerdown") {
       event.preventDefault();
       this.options.video.focus();
-      this.options.video.setPointerCapture(event.pointerId);
+      try {
+        this.options.video.setPointerCapture(event.pointerId);
+      } catch {
+        // Synthetic or already-ended pointers can reject capture; still deliver the click.
+      }
     }
     this.sendControl({
       type: "pointer",
@@ -842,11 +848,17 @@ export class RemoteSessionController {
       this.sendControl(message);
       return;
     }
-    this.keyQueue = this.keyQueue.then(async () => {
-      if (event.type === "keydown" && event.code === "KeyV" && (event.ctrlKey || event.metaKey))
-        await this.clipboard?.focus();
-      if (this.inputEnabled) this.sendControl(message);
-    });
+    this.keyQueue = this.keyQueue
+      .then(async () => {
+        if (event.type === "keydown" && event.code === "KeyV" && (event.ctrlKey || event.metaKey)) {
+          await Promise.race([
+            this.clipboard?.focus(),
+            new Promise<void>((resolve) => window.setTimeout(resolve, 250)),
+          ]);
+        }
+        if (this.inputEnabled) this.sendControl(message);
+      })
+      .catch(() => {});
   };
 
   private normalizedPosition(event: MouseEvent): { x: number; y: number } | null {
@@ -1216,6 +1228,10 @@ export class RemoteSessionController {
     }
     if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
       this.requestRecovery(lifecycle, peer);
+    } else if (peer.connectionState === "connected") {
+      this.inputEnabled =
+        this.preferences.inputEnabled && this.remoteInputAllowed && this.isControlOpen();
+      this.publishSnapshot();
     }
   }
 
