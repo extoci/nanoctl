@@ -33,7 +33,7 @@ jobs:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
       - name: Install pinned cargo-fuzz
-        run: cargo install --locked cargo-fuzz --version 0.13.2
+        run: cargo install --locked cargo-fuzz --version 0.13.2 --force
       - name: Fuzz signed update envelope parser
         working-directory: crates/nanoctl-agent
         env:
