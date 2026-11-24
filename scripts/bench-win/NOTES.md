@@ -631,5 +631,6 @@ windows just let rate control spend more under CRF-bound content.
 → remote DC → SendInput → band `INPUT_COUNT` bump decoded from the
 stream. 10 clicks, loopback: **p50 48ms / min 43 / mean 55** while the
 same run's clock-marker G2G read p50 61ms — the input lane (reliable DC
-+ coalesced motion watch-channel) adds ≈0-5ms over the video path;
-input→photon is entirely pipeline-bound, nothing to shave.
+
+- coalesced motion watch-channel) adds ≈0-5ms over the video path;
+  input→photon is entirely pipeline-bound, nothing to shave.
