@@ -197,6 +197,15 @@ impl EncodeScale {
         self.0 != previous
     }
 
+    /// Update the divisor and report whether the clamped encode size
+    /// actually changed — a divisor flip that the floor absorbs needs
+    /// no keyframe and no encoder resize.
+    fn changed_limits(&mut self, kbps: u32, width: u32, height: u32) -> bool {
+        let before = self.limits(width, height);
+        self.update(kbps);
+        self.limits(width, height) != before
+    }
+
     fn limits(&self, width: u32, height: u32) -> (u32, u32) {
         // Never encode below 1080p when the source has the pixels — viewers
         // upscale the result to full screen anyway, and a quarter-res frame at
@@ -2333,7 +2342,11 @@ pub fn spawn_video(
                                 .apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                             fps = decision.fps;
                             pacer.set_fps(fps);
-                            forced_keyframe |= scale.update(decision.bitrate_kbps);
+                            forced_keyframe |= scale.changed_limits(
+                                decision.bitrate_kbps,
+                                quality.max_width,
+                                quality.max_height,
+                            );
                             producer_stats
                                 .target_kbps
                                 .store(decision.bitrate_kbps, Ordering::Relaxed);
@@ -2349,7 +2362,11 @@ pub fn spawn_video(
                         encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
-                        forced_keyframe |= scale.update(decision.bitrate_kbps);
+                        forced_keyframe |= scale.changed_limits(
+                            decision.bitrate_kbps,
+                            quality.max_width,
+                            quality.max_height,
+                        );
                         producer_stats
                             .target_kbps
                             .store(decision.bitrate_kbps, Ordering::Relaxed);
