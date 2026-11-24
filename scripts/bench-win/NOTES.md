@@ -450,3 +450,19 @@ regression probe for the replay-window + decoder-attach path.
 8/8 attaches clean under motion scene: joinMs 4.6-10.9 (mean ~8),
 firstDecodeMs 8.3-16.5, exactly 1 kf each, 0 gaps, all live+decoding.
 No wedge/leak across repeated attach/detach churn.
+
+## x264 subpel-refine sweep (cycle 21)
+
+`NANOCTL_X264_SUBME` env knob added (`p.analyse.i_subpel_refine`,
+default 2 = veryfast). Worst-case fps vs bitrate trade:
+
+| scene  | subme       | kbps           | fps        | encode p50   | PSNR p05 |
+| ------ | ----------- | -------------- | ---------- | ------------ | -------- |
+| noise  | 1           | 11,190 (+3.7%) | 58.3 (+6%) | 7.7ms (-25%) | 24.0dB   |
+| noise  | 2 (default) | 11,121         | 56.2       | 10.2ms       | 24.1dB   |
+| noise  | 3           | 10,601         | 53.9       | 11.5ms       | 24.1dB   |
+| motion | 1           | 319 (+34%)     | 58.2       | 3.6ms        | 56.4dB   |
+| motion | 2 (default) | 238            | 58.3       | 4.4ms        | 56.8dB   |
+
+subme=1 wins +6% worst-case fps but pays +34% bits on realistic
+motion - keeps the cheap-MV cost where it hurts most. Default 2.

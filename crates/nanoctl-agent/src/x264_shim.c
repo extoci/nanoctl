@@ -117,6 +117,8 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
                               : !strcmp(me, "tesa")  ? X264_ME_TESA
                                                    : p.analyse.i_me_method;
     }
+    const char *subme = getenv("NANOCTL_X264_SUBME");
+    if (subme && subme[0]) p.analyse.i_subpel_refine = atoi(subme);
     p.i_sync_lookahead = 0;
     p.rc.i_lookahead = 0;
     p.rc.i_rc_method = X264_RC_CRF;
