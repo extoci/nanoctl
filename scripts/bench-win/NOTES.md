@@ -328,3 +328,28 @@ pure noise is VBV-bound, not CRF-bound), flash 58.1fps/562kbps/58.3dB,
 static **666->70kbps (-90%)** at 55.9dB. All p05 >= 55.9dB except noise
 (content-bound, identical at every CRF). 18 chosen over 21: nearly all
 the savings, +3dB margin.
+
+## Viewer client-path breakdown + motion G2G (cycle 14)
+
+CDP probes (now in this directory): `g2g-probe.ts` (in-page clock-marker
+G2G), `dcv-snap.ts` (`window.__dcv` decode/present/transit counters),
+`join-bench.ts` (joinMs/firstDecodeMs). Chrome runs with
+`--remote-debugging-port=9222`; page ids from `localhost:9222/json/list`.
+
+Measured under `benchwin band --motion` (1600x1200, 58.6fps delivered,
+0 gaps, 0 decodeDropped, 15s window):
+
+- decode submit->output: **1.34ms avg**
+- decode output -> composited rVFC present: **11.15ms avg**
+- wire transit (send->recv): **~2.0ms avg**
+
+In-page G2G under `--clock --motion` (25s, n=395): **mean 56.9, p50 57,
+p90 72, p99 80** vs ~34ms semi-static. Pipeline stages account for
+~26ms; the ~31ms remainder is capture-side staleness — under continuous
+repaint the WGC-delivered frame is roughly one ~30Hz composite period
+old before encode starts (xcap WGC uses a rendezvous channel with a
+2-buffer free-threaded pool; FrameArrived delivers the newest frame, so
+the lag is WGC/compositor pacing, not consumer queue buildup).
+Present wait is likewise vsync/composite-bound. Both are floor effects
+of this GPU-less VM; on a real display at 144Hz both shrink with the
+composite period.
