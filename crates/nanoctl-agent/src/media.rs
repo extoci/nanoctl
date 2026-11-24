@@ -420,6 +420,10 @@ pub(crate) trait FrameEncoder {
         0
     }
     fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame>;
+    /// (tier, switches) for encoders with content-driven parameter negotiation.
+    fn adapt_state(&self) -> Option<(u8, u32)> {
+        None
+    }
     fn software_backend(&self) -> (&'static str, &'static str) {
         ("OpenH264", "software-openh264")
     }
@@ -795,6 +799,10 @@ impl CaptureEncoder {
         &self.display_id
     }
 
+    fn adapt_state(&self) -> Option<(u8, u32)> {
+        self.encoder.adapt_state()
+    }
+
     pub fn enable_psnr_probe(&mut self) -> Result<()> {
         self.psnr = Some(PsnrProbe::new()?);
         Ok(())
@@ -937,6 +945,12 @@ impl CaptureEncoder {
 }
 
 impl EncoderBackend {
+    fn adapt_state(&self) -> Option<(u8, u32)> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.encoder.adapt_state())
+    }
+
     fn color_convert_ns(&self) -> u64 {
         self.active
             .as_ref()
@@ -1881,6 +1895,8 @@ pub struct SmokeSecond {
     pub bytes: u64,
     pub encode_sum_milliseconds: f64,
     pub encode_max_milliseconds: f64,
+    /// Adaptive x264 tier at the end of this second (None for other backends).
+    pub x264_tier: Option<u8>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1928,6 +1944,9 @@ pub struct MediaSmokeReport {
     /// Per-second buckets: frames, bytes, and encode mean/max for that second.
     /// Ordered by `second`; trailing partial second included.
     pub per_second: Vec<SmokeSecond>,
+    /// Final adaptive-negotiation tier and cumulative tier switches (x264 only).
+    pub x264_adapt_tier: Option<u8>,
+    pub x264_adapt_switches: u32,
 }
 
 impl MediaSmokeReport {
@@ -2051,6 +2070,7 @@ pub fn run_smoke(
                 bytes: sec_bytes,
                 encode_sum_milliseconds: sec_encode_micros as f64 / 1_000.0,
                 encode_max_milliseconds: sec_encode_max_micros as f64 / 1_000.0,
+                x264_tier: encoder.adapt_state().map(|(tier, _)| tier),
             });
             sec_index = second;
             sec_frames = 0;
@@ -2087,6 +2107,7 @@ pub fn run_smoke(
             bytes: sec_bytes,
             encode_sum_milliseconds: sec_encode_micros as f64 / 1_000.0,
             encode_max_milliseconds: sec_encode_max_micros as f64 / 1_000.0,
+            x264_tier: encoder.adapt_state().map(|(tier, _)| tier),
         });
     }
     let elapsed = started.elapsed();
@@ -2102,6 +2123,7 @@ pub fn run_smoke(
     // Auto mode may switch from a native encoder to OpenH264 after the first real frame. Report
     // the backend that completed the smoke test, not merely the one that initialized.
     let backend = encoder.encoder.name();
+    let adapt_state = encoder.adapt_state();
     let psnr = encoder
         .psnr_report()
         .map(|(decoded, samples)| (decoded, samples.to_vec()));
@@ -2148,6 +2170,8 @@ pub fn run_smoke(
         sps_units,
         pps_units,
         per_second,
+        x264_adapt_tier: adapt_state.map(|(tier, _)| tier),
+        x264_adapt_switches: adapt_state.map_or(0, |(_, switches)| switches),
     })
 }
 

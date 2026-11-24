@@ -35,6 +35,12 @@ typedef struct {
     int (*encoder_reconfig)(x264_t *, x264_param_t *);
     int (*encoder_encode)(x264_t *, x264_nal_t **, int *, x264_picture_t *, x264_picture_t *);
     void (*picture_init)(x264_picture_t *);
+    /* Retained open arguments so adapt can rebuild params on a re-open. */
+    int width, height, kbps, fps, frames;
+    /* Effective adaptive knobs: profile tier, motion-estimation, subpel refine. */
+    int want_high, want_me, want_subme;
+    /* bit0 profile, bit1 me, bit2 subme: env-pinned knobs adapt may not touch. */
+    int pins;
 } NanoX264;
 
 void nano_x264_close(NanoX264 *context) {
@@ -55,12 +61,105 @@ static int buffer_size(int kbps, int fps, int frames) {
     return (int)(((int64_t)kbps * frames + fps - 1) / fps);
 }
 
+static int env_me(void) {
+    const char *me = getenv("NANOCTL_X264_ME");
+    if (!me || !me[0]) return -1;
+    return !strcmp(me, "dia")   ? X264_ME_DIA
+         : !strcmp(me, "hex")   ? X264_ME_HEX
+         : !strcmp(me, "umh")   ? X264_ME_UMH
+         : !strcmp(me, "esa")   ? X264_ME_ESA
+         : !strcmp(me, "tesa")  ? X264_ME_TESA
+                                : -1;
+}
+
+/* Builds the full param block from the retained open config plus the current
+   adaptive wants; env-set knobs always win over the adaptive ones. */
+static int fill_params(NanoX264 *context, x264_param_t *p) {
+    const char *preset = getenv("NANOCTL_X264_PRESET");
+    if (!preset || !preset[0]) preset = "veryfast";
+    const char *tune = getenv("NANOCTL_X264_TUNE");
+    if (!tune || !tune[0]) tune = "zerolatency";
+    if (context->param_default_preset(p, preset, tune) < 0) return -1;
+    p->i_width = context->width;
+    p->i_height = context->height;
+    p->i_csp = X264_CSP_I420;
+    p->i_bitdepth = 8;
+    const char *threads = getenv("NANOCTL_X264_THREADS");
+    p->i_threads = threads && threads[0] ? atoi(threads) : 2;
+    p->b_sliced_threads = 1;
+    p->i_fps_num = context->fps;
+    p->i_fps_den = 1;
+    p->i_timebase_num = 1;
+    p->i_timebase_den = 1000000;
+    p->b_vfr_input = 0;
+    p->i_bframe = 0;
+    p->i_keyint_max = X264_KEYINT_MAX_INFINITE;
+    p->i_scenecut_threshold = 0;
+    int me = env_me();
+    p->analyse.i_me_method = me >= 0 ? me : context->want_me;
+    const char *subme = getenv("NANOCTL_X264_SUBME");
+    if (subme && subme[0]) p->analyse.i_subpel_refine = atoi(subme);
+    else p->analyse.i_subpel_refine = context->want_subme;
+    const char *aq = getenv("NANOCTL_X264_AQ");
+    if (aq && aq[0]) {
+        const char *colon = strchr(aq, ':');
+        p->rc.i_aq_mode = atoi(aq);
+        if (colon && atof(colon + 1) > 0.0f)
+            p->rc.f_aq_strength = (float)atof(colon + 1);
+    }
+    p->i_sync_lookahead = 0;
+    p->rc.i_lookahead = 0;
+    p->rc.i_rc_method = X264_RC_CRF;
+    const char *crf = getenv("NANOCTL_X264_CRF");
+    p->rc.f_rf_constant = crf && crf[0] ? (float)atof(crf) : 18.0f;
+    p->rc.i_qp_min = 0;
+    p->rc.i_qp_max = 51;
+    p->rc.i_bitrate = context->kbps;
+    p->rc.i_vbv_max_bitrate = context->kbps;
+    p->rc.i_vbv_buffer_size =
+        buffer_size(context->kbps, context->fps, context->frames);
+    p->b_annexb = 1;
+    p->b_repeat_headers = 1;
+    p->vui.b_fullrange = 0;
+    p->vui.i_colorprim = 1;
+    p->vui.i_transfer = 13;
+    p->vui.i_colmatrix = 6;
+    p->vui.i_chroma_loc = 1;
+    p->i_log_level = X264_LOG_WARNING;
+    const char *profile = getenv("NANOCTL_X264_PROFILE");
+    if (!profile || !profile[0])
+        profile = context->want_high ? "high" : "baseline";
+    return context->param_apply_profile(p, profile);
+}
+
+static int reopen(NanoX264 *context) {
+    x264_param_t p;
+    if (fill_params(context, &p) < 0) return -1;
+    x264_t *encoder = context->encoder_open(&p);
+    if (!encoder) return -1;
+    if (context->encoder) context->encoder_close(context->encoder);
+    context->encoder = encoder;
+    return 0;
+}
+
 NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
                        const char *library) {
     if (width < 2 || height < 2 || width % 2 || height % 2 ||
         kbps <= 0 || fps <= 0 || frames <= 0) return NULL;
     NanoX264 *context = calloc(1, sizeof(*context));
     if (!context) return NULL;
+    context->width = width;
+    context->height = height;
+    context->kbps = kbps;
+    context->fps = fps;
+    context->frames = frames;
+    context->want_me = X264_ME_HEX;
+    context->want_subme = 2;
+    const char *profile_env = getenv("NANOCTL_X264_PROFILE");
+    if (profile_env && profile_env[0]) context->pins |= 1;
+    if (env_me() >= 0) context->pins |= 2;
+    const char *subme_env = getenv("NANOCTL_X264_SUBME");
+    if (subme_env && subme_env[0]) context->pins |= 4;
     if (library) {
         context->library = load(library);
     } else {
@@ -87,72 +186,44 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     RESOLVE(encoder_reconfig, "x264_encoder_reconfig");
     RESOLVE(encoder_encode, "x264_encoder_encode");
     RESOLVE(picture_init, "x264_picture_init");
-    x264_param_t p;
-    const char *preset = getenv("NANOCTL_X264_PRESET");
-    if (!preset || !preset[0]) preset = "veryfast";
-    const char *tune = getenv("NANOCTL_X264_TUNE");
-    if (!tune || !tune[0]) tune = "zerolatency";
-    if (context->param_default_preset(&p, preset, tune) < 0) goto fail;
-    p.i_width = width;
-    p.i_height = height;
-    p.i_csp = X264_CSP_I420;
-    p.i_bitdepth = 8;
-    const char *threads = getenv("NANOCTL_X264_THREADS");
-    p.i_threads = threads && threads[0] ? atoi(threads) : 2;
-    p.b_sliced_threads = 1;
-    p.i_fps_num = fps;
-    p.i_fps_den = 1;
-    p.i_timebase_num = 1;
-    p.i_timebase_den = 1000000;
-    p.b_vfr_input = 0;
-    p.i_bframe = 0;
-    p.i_keyint_max = X264_KEYINT_MAX_INFINITE;
-    p.i_scenecut_threshold = 0;
-    const char *me = getenv("NANOCTL_X264_ME");
-    if (me && me[0]) {
-        p.analyse.i_me_method = !strcmp(me, "dia")   ? X264_ME_DIA
-                              : !strcmp(me, "hex")   ? X264_ME_HEX
-                              : !strcmp(me, "umh")   ? X264_ME_UMH
-                              : !strcmp(me, "esa")   ? X264_ME_ESA
-                              : !strcmp(me, "tesa")  ? X264_ME_TESA
-                                                   : p.analyse.i_me_method;
-    }
-    const char *subme = getenv("NANOCTL_X264_SUBME");
-    if (subme && subme[0]) p.analyse.i_subpel_refine = atoi(subme);
-    const char *aq = getenv("NANOCTL_X264_AQ");
-    if (aq && aq[0]) {
-        const char *colon = strchr(aq, ':');
-        p.rc.i_aq_mode = atoi(aq);
-        if (colon && atof(colon + 1) > 0.0f)
-            p.rc.f_aq_strength = (float)atof(colon + 1);
-    }
-    p.i_sync_lookahead = 0;
-    p.rc.i_lookahead = 0;
-    p.rc.i_rc_method = X264_RC_CRF;
-    const char *crf = getenv("NANOCTL_X264_CRF");
-    p.rc.f_rf_constant = crf && crf[0] ? (float)atof(crf) : 18.0f;
-    p.rc.i_qp_min = 0;
-    p.rc.i_qp_max = 51;
-    p.rc.i_bitrate = kbps;
-    p.rc.i_vbv_max_bitrate = kbps;
-    p.rc.i_vbv_buffer_size = buffer_size(kbps, fps, frames);
-    p.b_annexb = 1;
-    p.b_repeat_headers = 1;
-    p.vui.b_fullrange = 0;
-    p.vui.i_colorprim = 1;
-    p.vui.i_transfer = 13;
-    p.vui.i_colmatrix = 6;
-    p.vui.i_chroma_loc = 1;
-    p.i_log_level = X264_LOG_WARNING;
-    const char *profile = getenv("NANOCTL_X264_PROFILE");
-    if (!profile || !profile[0]) profile = "baseline";
-    if (context->param_apply_profile(&p, profile) < 0) goto fail;
-    context->encoder = context->encoder_open(&p);
-    if (!context->encoder) goto fail;
+    if (reopen(context) < 0) goto fail;
     return context;
 fail:
     nano_x264_close(context);
     return NULL;
+}
+
+/* Adaptive parameter tiers: 0 = baseline/hex/subme2 (worst-case safe),
+   1 = +CABAC/8x8 (high profile), 2 = +UMH. Env-pinned knobs are left alone.
+   Returns 0 on a re-open, 1 when the masked target already matches,
+   -2 when adapt is disabled, -1 on failure (previous params restored). */
+int nano_x264_adapt(NanoX264 *context, int tier) {
+    const char *off = getenv("NANOCTL_X264_ADAPT");
+    if (off && (!strcmp(off, "0") || !strcmp(off, "false"))) return -2;
+    int high, me, subme;
+    switch (tier) {
+    case 0: high = 0; me = X264_ME_HEX; subme = 2; break;
+    case 1: high = 1; me = X264_ME_HEX; subme = 2; break;
+    case 2: high = 1; me = X264_ME_UMH; subme = 2; break;
+    default: return -1;
+    }
+    if (context->pins & 1) high = context->want_high;
+    if (context->pins & 2) me = context->want_me;
+    if (context->pins & 4) subme = context->want_subme;
+    if (high == context->want_high && me == context->want_me &&
+        subme == context->want_subme)
+        return 1;
+    int prev_high = context->want_high, prev_me = context->want_me,
+        prev_subme = context->want_subme;
+    context->want_high = high;
+    context->want_me = me;
+    context->want_subme = subme;
+    if (reopen(context) == 0) return 0;
+    context->want_high = prev_high;
+    context->want_me = prev_me;
+    context->want_subme = prev_subme;
+    reopen(context);
+    return -1;
 }
 
 int nano_x264_bitrate(NanoX264 *context, int kbps, int fps, int frames) {
@@ -162,7 +233,13 @@ int nano_x264_bitrate(NanoX264 *context, int kbps, int fps, int frames) {
     p.rc.i_bitrate = kbps;
     p.rc.i_vbv_max_bitrate = kbps;
     p.rc.i_vbv_buffer_size = buffer_size(kbps, fps, frames);
-    return context->encoder_reconfig(context->encoder, &p);
+    int result = context->encoder_reconfig(context->encoder, &p);
+    if (result == 0) {
+        context->kbps = kbps;
+        context->fps = fps;
+        context->frames = frames;
+    }
+    return result;
 }
 
 int nano_x264_encode(NanoX264 *context, const uint8_t *y, const uint8_t *u,
@@ -190,6 +267,7 @@ typedef struct {
     int bitrate, buffer_kbit, crf_milli, qp_max, csp, threads, bframes, lookahead;
     int sync_lookahead, cabac, transform8x8, repeat_headers, annexb, fullrange;
     int primaries, transfer, matrix, chroma_location, keyint, rc_method;
+    int me, subme;
 } NanoX264Params;
 
 void nano_x264_parameters(NanoX264 *context, NanoX264Params *out) {
@@ -200,6 +278,7 @@ void nano_x264_parameters(NanoX264 *context, NanoX264Params *out) {
         p.rc.i_qp_max, p.i_csp, p.i_threads, p.i_bframe, p.rc.i_lookahead,
         p.i_sync_lookahead, p.b_cabac, p.analyse.b_transform_8x8, p.b_repeat_headers,
         p.b_annexb, p.vui.b_fullrange, p.vui.i_colorprim, p.vui.i_transfer,
-        p.vui.i_colmatrix, p.vui.i_chroma_loc, p.i_keyint_max, p.rc.i_rc_method
+        p.vui.i_colmatrix, p.vui.i_chroma_loc, p.i_keyint_max, p.rc.i_rc_method,
+        p.analyse.i_me_method, p.analyse.i_subpel_refine
     };
 }

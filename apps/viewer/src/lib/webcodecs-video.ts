@@ -163,9 +163,8 @@ function createVideoSink(
   };
   armPresentProbe();
 
-  const ensureDecoder = (annexB: Uint8Array) => {
-    if (decoder || typeof VideoDecoder !== "function") return;
-    // Derive the codec string from the first SPS we see (avc1.PPCCLL).
+  // Derive the codec string from the SPS in an access unit (avc1.PPCCLL).
+  const codecOf = (annexB: Uint8Array): string => {
     let codec = "avc1.640028";
     for (let i = 0; i + 7 < annexB.length; i++) {
       if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) {
@@ -177,6 +176,21 @@ function createVideoSink(
         }
       }
     }
+    return codec;
+  };
+
+  const decoderConfig = (codec: string) =>
+    ({
+      codec,
+      optimizeForLatency: true,
+      latencyMode: "realtime",
+    }) as VideoDecoderConfig & { latencyMode: "realtime" };
+
+  let configuredCodec: string | undefined;
+
+  const ensureDecoder = (annexB: Uint8Array) => {
+    if (decoder || typeof VideoDecoder !== "function") return;
+    const codec = codecOf(annexB);
     const next = new VideoDecoder({
       output: (frame) => {
         const dbg = (window as unknown as { __dcv?: Record<string, unknown> }).__dcv;
@@ -227,12 +241,9 @@ function createVideoSink(
       },
     });
     try {
-      next.configure({
-        codec,
-        optimizeForLatency: true,
-        latencyMode: "realtime",
-      } as VideoDecoderConfig & { latencyMode: "realtime" });
+      next.configure(decoderConfig(codec));
       decoder = next;
+      configuredCodec = codec;
     } catch (error) {
       console.warn("webcodecs video configure failed", error);
       teardown(true);
@@ -293,6 +304,22 @@ function createVideoSink(
       decoderConfigured = true;
     }
     if (!decoder) return;
+    // Adaptive encoders may switch H.264 profiles between IDRs (e.g. baseline
+    // under stress, high when the content is easy). Annex-B carries the new
+    // SPS in-band; re-configure the decoder so the codec string tracks it.
+    if (isKey || containsIdr(annexB)) {
+      const codec = codecOf(annexB);
+      if (codec !== configuredCodec) {
+        try {
+          decoder.reset();
+          decoder.configure(decoderConfig(codec));
+          configuredCodec = codec;
+        } catch {
+          decoderConfigured = false;
+          return;
+        }
+      }
+    }
     if (decoder.decodeQueueSize > 1 && !isKey) {
       dropped += 1;
       return;
