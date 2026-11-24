@@ -75,6 +75,7 @@ test("bundles viewer state, stats, events and the host report", async () => {
       powerEfficient: codec === "av1",
     }),
   });
+  expect(report).toContain("- viewer version: v3.0.0-alpha.6; protocol: 2");
   expect(report).toContain("- user agent: test-agent");
   expect(report).toContain("av1: supported=true hardware=true; hevc: supported=false");
   expect(report).toContain("- phase: connected");
