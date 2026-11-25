@@ -511,6 +511,12 @@ pub(super) fn start(
     Ok((latest, thread))
 }
 
+const RESUME_GAP: Duration = Duration::from_secs(2);
+
+fn capture_loop_resumed(previous_loop: Instant, loop_started: Instant) -> bool {
+    loop_started.duration_since(previous_loop) >= RESUME_GAP
+}
+
 fn recreate(h_monitor: HMONITOR, dup: &mut Option<Duplication>) -> bool {
     // Windows allows only one duplication of an output. Release the stale COM
     // objects before opening their replacement; creating the replacement first
@@ -561,25 +567,42 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
             return;
         }
         let loop_started = Instant::now();
-        let resumed = loop_started.duration_since(previous_loop) >= Duration::from_secs(2);
+        let resumed = capture_loop_resumed(previous_loop, loop_started);
         previous_loop = loop_started;
-        if (resumed || dup.is_none()) && !recreate_bounded(&mut dup) {
+        if dup.is_none() && !recreate_bounded(&mut dup) {
             tracing::warn!("DXGI duplication recovery failed repeatedly; capture thread exiting");
             return;
         }
         if dup.is_none() {
             continue;
         }
-        let active = dup.as_mut().expect("duplication checked above");
-        match active.acquire(100, &latest) {
+        let acquire_started = Instant::now();
+        let (acquired, emit_gen) = {
+            let active = dup.as_mut().expect("duplication checked above");
+            let acquired = active.acquire(100, &latest);
+            (acquired, active.emit_gen)
+        };
+        let resumed = resumed || capture_loop_resumed(acquire_started, Instant::now());
+        match acquired {
             Ok(Some(frame)) => {
                 // Backend-verified change: producer skips the memcmp.
-                let eg = active.emit_gen;
-                if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), eg) {
+                if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), emit_gen) {
                     return;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // Give the existing session one acquire after a resume: if
+                // the compositor can still deliver accumulated changes, no
+                // rebuild is needed. The stale post-suspend session observed
+                // in cycle 48 only timed out, so a timeout here is the safe
+                // signal to replace it.
+                if resumed && !recreate_bounded(&mut dup) {
+                    tracing::warn!(
+                        "DXGI duplication recovery failed repeatedly; capture thread exiting"
+                    );
+                    return;
+                }
+            }
             Err(error) => {
                 let is_access_lost = error
                     .downcast_ref::<windows::core::Error>()
@@ -602,7 +625,7 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
 
 #[cfg(test)]
 mod tests {
-    use super::OutputPermit;
+    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use windows::Win32::Graphics::Gdi::HMONITOR;
@@ -634,5 +657,26 @@ mod tests {
         let second = OutputPermit::acquire(monitor).expect("second permit");
         assert!(started.elapsed() >= Duration::from_millis(40));
         drop(second);
+    }
+
+    #[test]
+    fn resume_detection_ignores_normal_static_capture_cadence() {
+        let start = Instant::now();
+        assert!(!capture_loop_resumed(start, start));
+        assert!(!capture_loop_resumed(
+            start,
+            start + Duration::from_millis(100)
+        ));
+        assert!(!capture_loop_resumed(
+            start,
+            start + RESUME_GAP - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn resume_detection_catches_process_or_system_suspend() {
+        let start = Instant::now();
+        assert!(capture_loop_resumed(start, start + RESUME_GAP));
+        assert!(capture_loop_resumed(start, start + Duration::from_secs(7)));
     }
 }
