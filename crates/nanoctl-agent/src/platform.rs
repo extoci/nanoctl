@@ -30,6 +30,7 @@ pub struct Capabilities {
     readiness: &'static str,
     input: bool,
     remote_input: bool,
+    binary_input: bool,
     gamepad: bool,
     clipboard: bool,
     system_audio: bool,
@@ -131,6 +132,7 @@ pub fn capabilities(
         readiness,
         input: remote_input_enabled && input,
         remote_input: remote_input_enabled && input,
+        binary_input: cfg!(feature = "media"),
         gamepad: gamepad_available(remote_input_enabled && input),
         clipboard: clipboard_available(clipboard_enabled && remote_input_enabled && input),
         #[cfg(all(feature = "media", target_os = "windows"))]

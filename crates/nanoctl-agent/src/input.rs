@@ -187,6 +187,44 @@ enum KeyAction {
     Up,
 }
 
+pub(crate) const BINARY_INPUT_MAGIC: u8 = 0x4e;
+const BINARY_INPUT_VERSION: u8 = 1;
+const BINARY_POINTER_MOVE: u8 = 1;
+const BINARY_GAMEPAD: u8 = 2;
+
+pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&BINARY_INPUT_MAGIC)
+}
+
+/// Compact motion-report wire format: `'N'`, version 1, kind. Pointer moves
+/// carry normalized u16x/u16y; gamepads are decoded by `gamepad::Snapshot`.
+fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
+    if bytes.len() < 3 || bytes[1] != BINARY_INPUT_VERSION {
+        anyhow::bail!("unsupported binary input message");
+    }
+    match bytes[2] {
+        BINARY_POINTER_MOVE => {
+            if bytes.len() != 7 {
+                anyhow::bail!("invalid binary pointer move length");
+            }
+            let x = u16::from_le_bytes([bytes[3], bytes[4]]);
+            let y = u16::from_le_bytes([bytes[5], bytes[6]]);
+            Ok(ControlMessage::Pointer {
+                action: PointerAction::Move,
+                x: f64::from(x) / 65535.0,
+                y: f64::from(y) / 65535.0,
+                button: None,
+                delta_x: None,
+                delta_y: None,
+            })
+        }
+        BINARY_GAMEPAD => crate::gamepad::Snapshot::parse_binary(&bytes[3..])
+            .map(ControlMessage::Gamepad)
+            .map_err(anyhow::Error::msg),
+        _ => anyhow::bail!("unknown binary input message type"),
+    }
+}
+
 impl InputController {
     pub fn new() -> Result<Self> {
         let monitors = Monitor::all().context("cannot enumerate displays for input")?;
@@ -217,8 +255,11 @@ impl InputController {
         if bytes.len() > crate::rtc::MAX_CONTROL_MESSAGE_BYTES {
             anyhow::bail!("control message exceeds maximum size");
         }
-        let message: ControlMessage =
-            serde_json::from_slice(bytes).context("control message is invalid")?;
+        let message: ControlMessage = if is_binary_input_message(bytes) {
+            parse_binary_control(bytes)?
+        } else {
+            serde_json::from_slice(bytes).context("control message is invalid")?
+        };
         match (&message, lane) {
             (
                 ControlMessage::Pointer {
@@ -558,6 +599,23 @@ mod tests {
     use super::*;
     use crate::rtc::MAX_CONTROL_MESSAGE_BYTES;
     use proptest::prelude::*;
+
+    #[test]
+    fn decodes_binary_pointer_motion() {
+        let message =
+            parse_binary_control(&[BINARY_INPUT_MAGIC, 1, 1, 0x00, 0x80, 0xff, 0xff]).unwrap();
+        assert!(matches!(
+            message,
+            ControlMessage::Pointer {
+                action: PointerAction::Move,
+                x,
+                y,
+                ..
+            } if (x - 32768.0 / 65535.0).abs() < f64::EPSILON && y == 1.0
+        ));
+        assert!(parse_binary_control(&[BINARY_INPUT_MAGIC, 1, 1, 0]).is_err());
+        assert!(parse_binary_control(&[BINARY_INPUT_MAGIC, 2, 1, 0x00, 0x80, 0xff, 0xff]).is_err());
+    }
 
     #[test]
     fn maps_function_and_system_keys() {

@@ -36,6 +36,7 @@ Types and validators live in `packages/protocol`.
       "readiness": "ready",
       "input": true,
       "remoteInput": true,
+      "binaryInput": true,
       "clipboard": true,
       "systemAudio": true,
       "displays": []
@@ -145,6 +146,10 @@ text is not echoed back. The browser writes host text when focused, retaining on
 pending text otherwise. It reads local text on paste and focus/visibility regain, suppressing
 echoes. Clipboard permissions and a secure browser context are required; denied browser APIs
 are silently ignored. A remote paste shortcut sends local clipboard text before its key event.
+
+### Compact input
+
+When `capabilities.binaryInput` is true, the viewer may send compact binary messages on the same input channels. Each message starts with byte `0x4e`, version byte `1`, and a kind byte. Kind `1` is pointer motion with normalized unsigned little-endian u16 `x` and `y` coordinates (7 bytes total). Kind `2` is a gamepad snapshot: a pad count byte followed by 14 bytes per pad — slot, little-endian u16 buttons, u8 triggers, four little-endian i16 axes, and a flags byte. Flag bit 0 marks a DualShock 4; bits 1/2/3 are its left-trigger, right-trigger and touchpad pressed states. Malformed binary messages are invalid input. Hosts without `binaryInput` must receive the JSON representation instead.
 
 ### Gamepads
 

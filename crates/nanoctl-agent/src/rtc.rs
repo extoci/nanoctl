@@ -117,6 +117,11 @@ fn motion_channel() -> (
 
 #[cfg(any(feature = "media", test))]
 fn is_gamepad_report(bytes: &[u8]) -> bool {
+    // Binary v1 input: 'N', version, kind; kind 2 is a gamepad report. Keep
+    // this local because the input module exists only with the media feature.
+    if bytes.len() >= 3 && bytes[0] == 0x4e {
+        return bytes[2] == 2;
+    }
     #[derive(Deserialize)]
     struct Kind<'a> {
         #[serde(rename = "type", borrow)]
@@ -884,7 +889,10 @@ impl HostPeer {
                     let weak_channel = weak_channel.clone();
                     let input_revoked = input_revoked.clone();
                     Box::pin(async move {
-                        if !message.is_string || input_revoked.load(Ordering::Acquire) {
+                        let binary_input = crate::input::is_binary_input_message(&message.data);
+                        if (!message.is_string && !binary_input)
+                            || input_revoked.load(Ordering::Acquire)
+                        {
                             return;
                         }
                         let admission = admit_input_message(&sender, message.data.to_vec()).await;

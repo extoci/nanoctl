@@ -11,6 +11,7 @@ import {
 } from "@nanoctl/protocol";
 import { recordDebugEvent } from "./debug-report";
 import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
+import { encodeBinaryInput } from "./binary-input";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
@@ -90,6 +91,8 @@ export type RemoteSessionOptions = {
   remoteInputEnabled?: boolean;
   clipboardEnabled?: boolean;
   gamepadAvailable?: boolean;
+  /** Host understands compact binary motion reports. */
+  binaryInput?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
   preferences?: { inputEnabled: boolean; displayId?: string; gamepadEnabled?: boolean };
@@ -432,7 +435,9 @@ export class RemoteSessionController {
       )
         return false;
       try {
-        channel.send(JSON.stringify(payload));
+        const binary = this.options.binaryInput ? encodeBinaryInput(payload) : null;
+        if (binary) channel.send(binary);
+        else channel.send(JSON.stringify(payload));
         return true;
       } catch {
         return false;
@@ -457,7 +462,9 @@ export class RemoteSessionController {
       return false;
     }
     try {
-      channel.send(serialized);
+      const binary = isMotion && this.options.binaryInput ? encodeBinaryInput(payload) : null;
+      if (binary) channel.send(binary);
+      else channel.send(serialized);
       return true;
     } catch {
       if (!isMotion) {

@@ -183,6 +183,8 @@ export type DeviceCapabilities = {
   readonly audioOutputs?: readonly AudioOutput[];
   /** Whether the agent can accept remote input in this capability state. */
   readonly remoteInput?: boolean;
+  /** Compact binary pointer-motion/gamepad messages on the normal input channels. */
+  readonly binaryInput?: boolean;
   readonly gamepad?: boolean;
   readonly ready?: boolean;
   readonly readiness?: ReadinessState;
