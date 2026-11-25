@@ -73,15 +73,15 @@ const VIDEO_FLAG_TIMESTAMP: u8 = 4;
 
 fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
     let parts = data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
-    let timestamped = is_keyframe || seq % 16 == 0;
-    let sent_ms = timestamped
-        .then(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let timestamped = is_keyframe || seq.is_multiple_of(16);
+    let sent_ms = if timestamped {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default()
+    } else {
+        0
+    };
     let mut flags = if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
     if parts > 1 {
         flags |= VIDEO_FLAG_FRAGMENTED;
