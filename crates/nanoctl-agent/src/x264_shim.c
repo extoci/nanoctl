@@ -230,7 +230,7 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; threads = 2; refs = 1; break;
     case 2: preset = "veryfast"; high = 1; me = X264_ME_UMH; subme = 2; threads = 2; refs = 1; break;
     case 3: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 2; refs = 2; break;
-    case 4: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 1; refs = 3; break;
+    case 4: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 1; refs = 4; break;
     default: return -1;
     }
     if (context->pins & 1) high = context->want_high;

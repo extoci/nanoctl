@@ -108,13 +108,13 @@ try {
     refs: 2,
   });
   const tier4 = encode(directory, {
-    name: "tier4-single-slice-ref3",
+    name: "tier4-single-slice-ref4",
     preset: "fast",
     profile: "high",
     me: "umh",
     subme: 6,
     threads: 1,
-    refs: 3,
+    refs: 4,
   });
   const rows = [tier0, tier3, tier4].map((tier) => ({
     name: tier.output.split(/[\\/]/).pop()!,
