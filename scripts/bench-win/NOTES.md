@@ -788,3 +788,10 @@ G2G A-B, `band --clock`, same rig/session phase (n≈600-1300/run):
 | MMCSS  | **38 ms** | **39.4** | **63-65** |
 
 **−3.5 ms p50, −14 ms p99** — scheduling-jitter tail mostly gone. Noise fps unchanged (57.8); 60/60 media tests pass.
+
+## Cycle 42 — consolidated smoke table post-MMCSS + flash worst-case (2026-11-25)
+
+- `band --clock`: 58.1fps / 186kbps / enc p50 5.26ms / adapt→tier3
+- `band --motion`: 58.3fps / 149kbps / enc p50 5.13ms / adapt→tier3
+- `band --flash` (full-frame periodic flips): 58.2fps / ~8-32KB/s steady, enc max 13.2ms / adapt→tier3 — no bursts, recycle clone-fallback clean
+- Harness gotcha found: an occluded benchwin window emits nothing under DXGI (fake ~147kbps noise run vs real ~19Mbps) — scene must be visible on the composited screen for smoke numbers to count.
