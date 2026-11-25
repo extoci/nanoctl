@@ -190,9 +190,10 @@ impl LinuxEncoder {
             resolution,
             profile: Profile::Baseline,
             level,
-            pred_structure: PredictionStructure::LowDelay {
-                limit: self.max_fps.saturating_mul(2).max(1),
-            },
+            // Use the largest low-delay prediction window the encoder model
+            // exposes: recovery keyframes are already forced on loss, so a two-
+            // second periodic IDR cadence is pure overhead.
+            pred_structure: PredictionStructure::LowDelay { limit: u16::MAX },
             initial_tunings: self.tunings(),
         };
         let mut last_error = anyhow!("VA-API driver has no constrained-baseline H.264 entrypoint");

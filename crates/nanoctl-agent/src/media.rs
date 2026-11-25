@@ -2046,9 +2046,9 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate_kbps.saturating_mul(1_000)))
         .max_frame_rate(FrameRate::from_hz(max_fps as f32))
-        // A 30s GOP, not 2s: unrepairable IDRs already force a keyframe
-        // through the RTCP loss path, so periodic IDRs are pure overhead.
-        .intra_frame_period(IntraFramePeriod::from_num_frames(u32::from(max_fps) * 30))
+        // Unrepairable IDRs already force a keyframe through the RTCP loss
+        // path, so periodic IDRs are pure overhead.
+        .intra_frame_period(IntraFramePeriod::from_num_frames(u32::MAX))
         .usage_type(UsageType::CameraVideoRealTime)
         .vui(
             VuiConfig::srgb()
@@ -4933,6 +4933,21 @@ mod tests {
             assert_eq!((statistics.uiWidth, statistics.uiHeight), (32, 32));
             assert!(statistics.uiAverageFrameQP <= 51);
         }
+    }
+
+    #[test]
+    fn software_encoder_does_not_schedule_periodic_idrs() {
+        let mut encoder = super::create_encoder(4_000, 30, LatencyMode::Balanced).unwrap();
+        let mut frame = super::I420Frame::new(32, 32).unwrap();
+        frame.read_rgba(&[128; 32 * 32 * 4]).unwrap();
+        let mut idrs = 0;
+        for _ in 0..=30 * 30 {
+            let bytes = encoder.encode(&frame).unwrap().to_vec();
+            if !bytes.is_empty() && super::annex_b_nal_types(&bytes).unwrap().contains(&5) {
+                idrs += 1;
+            }
+        }
+        assert_eq!(idrs, 1);
     }
 
     #[test]

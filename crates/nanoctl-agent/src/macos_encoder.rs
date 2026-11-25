@@ -179,9 +179,10 @@ fn create_session(
                 .context("VideoToolbox bitrate exceeds i32")?,
         )
         .with_expected_frame_rate(f64::from(max_fps))
-        // A 30s GOP, not 2s: unrepairable IDRs already force a keyframe
-        // through the RTCP loss path, so periodic IDRs are pure overhead.
-        .with_max_keyframe_interval(i32::from(max_fps) * 30)
+        // Unrepairable IDRs already force a keyframe through the RTCP loss
+        // path, so periodic IDRs are pure overhead. Zero would mean encoder-
+        // chosen cadence rather than no cadence, so use the largest interval.
+        .with_max_keyframe_interval(i32::MAX)
         .with_quality(quality)
         .with_profile_level(if h264_high {
             ProfileLevel::H264ConstrainedHighAutoLevel
