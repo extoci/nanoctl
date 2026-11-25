@@ -8,9 +8,9 @@ Windows Program Files path, with `tailnet.tailscale_cli` as an override.
 
 ## Windows
 
-Target Windows 10 1903+ / Windows 11. The public installer places the binary under
-`%LOCALAPPDATA%\nanoctl` and registers a hidden, non-elevated interactive-user
-Scheduled Task via `wscript.exe`. Logs are owner-protected. PID/version/token ready
+Target x64 Windows 10 1903+ / Windows 11; Windows ARM64 is unsupported. The
+public installer places the binary under `%LOCALAPPDATA%\nanoctl` and registers
+a hidden, non-elevated interactive-user Scheduled Task via `wscript.exe`. Logs are owner-protected. PID/version/token ready
 markers and startup stability checks gate transactional upgrades.
 
 The managed `packaging/windows/install-service.ps1` helper supports Program Files
@@ -26,9 +26,9 @@ is not a claimed capability.
 
 ## macOS
 
-Target macOS 14+. A per-user LaunchAgent keeps capture/input in the correct login
-session. Grant Screen Recording and Accessibility to the installed binary; permission
-cannot be silently granted by the installer. Tailscale's CLI can be discovered at
+Target macOS 14+ on Apple Silicon; Intel macOS is unsupported. A per-user
+LaunchAgent keeps capture/input in the correct login session. Grant Screen
+Recording and Accessibility to the installed binary; permission cannot be silently granted by the installer. Tailscale's CLI can be discovered at
 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
 
 macOS 15+ prefers low-queue-depth ScreenCaptureKit, including cursor and click highlights.

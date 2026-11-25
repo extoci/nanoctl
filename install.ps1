@@ -43,7 +43,6 @@ $architecture = if ($env:PROCESSOR_ARCHITEW6432) {
 }
 $target = switch ($architecture.ToUpperInvariant()) {
   "AMD64" { "windows-x64" }
-  "ARM64" { "windows-arm64" }
   default { throw "Unsupported Windows architecture: $architecture" }
 }
 $resolvedVersion = if ($RequestedVersion -eq "latest") {

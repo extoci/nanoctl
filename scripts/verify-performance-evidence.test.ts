@@ -4,10 +4,8 @@ import { validatePerformanceEvidence } from "./verify-performance-evidence";
 const targets = [
   ["linux", "x86_64"],
   ["linux", "aarch64"],
-  ["macos", "x86_64"],
   ["macos", "aarch64"],
   ["windows", "x86_64"],
-  ["windows", "aarch64"],
 ] as const;
 const profiles = ["interactive-1080p60", "soak-1080p30"] as const;
 
@@ -56,6 +54,15 @@ describe("physical performance evidence", () => {
     expect(validatePerformanceEvidence(completeRecords())).toEqual([]);
   });
 
+  test("rejects unsupported release targets", () => {
+    expect(validatePerformanceEvidence([record("macos", "x86_64", "interactive-1080p60")])).toEqual(
+      expect.arrayContaining(["record 1: unexpected target macos-x64"]),
+    );
+    expect(
+      validatePerformanceEvidence([record("windows", "aarch64", "interactive-1080p60")]),
+    ).toEqual(expect.arrayContaining(["record 1: unexpected target windows-arm64"]));
+  });
+
   test("rejects short, slow, growing, duplicated, and missing runs", () => {
     const records = completeRecords().slice(0, -1);
     records[0] = {
@@ -73,8 +80,8 @@ describe("physical performance evidence", () => {
         "record 1: average_fps is below 54",
         "record 1: capture_queue_peak exceeds the one-frame bound",
         "record 1: monotonic memory growth was not ruled out",
-        "record 12: duplicate run linux-x64/interactive-1080p60",
-        "missing run windows-arm64/soak-1080p30",
+        "record 8: duplicate run linux-x64/interactive-1080p60",
+        "missing run windows-x64/soak-1080p30",
       ]),
     );
   });

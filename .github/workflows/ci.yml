@@ -200,7 +200,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # Master release candidates own the only exact-profile release build and
-    # cover all six platforms. This job keeps optimized media packaging covered
+    # cover all four release platforms. This job keeps optimized media packaging covered
     # on PRs and non-release branches with a faster release profile (more
     # codegen units, no LTO); a single Linux leg covers the build without
     # queueing extra macOS/Windows legs behind the tiny free macOS pool.
@@ -246,10 +246,6 @@ jobs:
             platform: linux
             architecture: arm64
             binary: nanoctl
-          - runner: macos-15-intel
-            platform: macos
-            architecture: x64
-            binary: nanoctl
           - runner: macos-15
             platform: macos
             architecture: arm64
@@ -257,10 +253,6 @@ jobs:
           - runner: windows-2025
             platform: windows
             architecture: x64
-            binary: nanoctl.exe
-          - runner: windows-11-arm
-            platform: windows
-            architecture: arm64
             binary: nanoctl.exe
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
