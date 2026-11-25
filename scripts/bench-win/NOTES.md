@@ -803,3 +803,9 @@ Measured on the media-smoke pipeline (in-process, 30s window under `band --motio
 - Agent pipeline: **8.6% CPU (of 8 cores) / 98MB RSS**, 58.1fps / 241kbps / encode p50 6.33ms.
 - Delta vs static clock scene (~5.6-6.1%): +2.5% is mostly x264 encode of the moving block — capture diff/copy path adds little under small dirty rects.
 - Tooling: `bench/cpu-agent.ps1` (agent by working set) and `bench/cpu-smoke.ps1` (smoke by command line) — cpu2.ps1 breaks when >1 nanoctl process exists (service + agent, or agent + smoke).
+
+## Cycle 45-46 — worst-case re-verification + wire under load (2026-11-25)
+
+- `band --noise --height 1200` (unoccluded): **57.6fps / 21.0Mbps / encode p50 11.46ms / 0 adapt switches** (tier 0 held — correct). No regression vs historical ~57-58fps/19-21Mbps.
+- Live DC under ~14Mbps sustained to a real viewer (noise strip visible above Chrome): **transit avg 4.08ms** (vs 1.4ms at low bitrate), decode 2.79ms, present 5.96ms, **0 seq gaps / 0 KF requests / 0 decode drops** — no send-queue backup at wire worst case.
+- Harness note: `--noise` fills below the 56px band; worst case needs `--height 1200`. `--height 600` + a non-overlapping Chrome window keeps both scene and viewer composited (an occluded scene emits nothing — see cycle 42).
