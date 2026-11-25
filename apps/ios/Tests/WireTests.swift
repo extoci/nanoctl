@@ -127,4 +127,19 @@ final class WireTests: XCTestCase {
         XCTAssertNil(GamepadMessage(pads: [[0, 0x10000, 0, 0, 0, 0, 0, 0]]).binary(sequence: 0))
         XCTAssertNil(GamepadMessage(pads: Array(repeating: [0, 0, 0, 0, 0, 0, 0, 0], count: 5)).binary(sequence: 0))
     }
+
+    func testMultiGamepadBinaryUsesIndependentSlotsInSortedOrder() {
+        let message = GamepadMessage(pads: [
+            [2, 0x2000, 9, 0, 0, 0, 0, 0],
+            [0, 0x1000, 7, 0, 100, -100, 0, 0],
+        ], dualShock4: [
+            .init(slot: 2, leftTriggerPressed: true, rightTriggerPressed: false, touchpadPressed: false),
+        ])
+        XCTAssertEqual(message.binary(sequence: 3), Data([
+            2, 3, 5,
+            0x00, 0x10, 7, 0, 100, 0, 0x9c, 0xff, 0, 0, 0, 0, 0,
+            0x00, 0x20, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+        ]))
+        XCTAssertEqual(message.sparseBinary(sequence: 3).map { Data($0.prefix(3)) }, Data([12, 3, 5]))
+    }
 }

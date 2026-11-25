@@ -5,7 +5,10 @@ import UIKit
 final class Gamepad {
     private let session: Session
     private var active = false
-    private var controller: GCController?
+    /// Stable host slots. A controller keeps its slot across other controllers
+    /// connecting or disconnecting; slot identity matters because Windows sees
+    /// these as independent virtual gamepads.
+    private var controllers: [GCController?] = Array(repeating: nil, count: 4)
     private var keepalive: Timer?
     private var lastSent: GamepadMessage?
     private var changedAt: TimeInterval?
@@ -23,12 +26,15 @@ final class Gamepad {
     }
 
     var status: String {
-        guard let controller else { return "No gamepad paired" }
-        let profile = controller.extendedGamepad
-        let name: String
-        if profile is GCDualSenseGamepad { name = "DualSense → DualShock 4" }
-        else if profile is GCDualShockGamepad { name = "DualShock → DualShock 4" }
-        else { name = "\(controller.vendorName ?? "Gamepad") → Xbox 360" }
+        let connected = controllers.compactMap { $0 }
+        guard !connected.isEmpty else { return "No gamepad paired" }
+        let names = connected.map { controller in
+            let profile = controller.extendedGamepad
+            if profile is GCDualSenseGamepad { return "DualSense → DualShock 4" }
+            if profile is GCDualShockGamepad { return "DualShock → DualShock 4" }
+            return "\(controller.vendorName ?? "Gamepad") → Xbox 360"
+        }
+        let name = names.count == 1 ? names[0] : "\(names.count) gamepads · \(names.joined(separator: " + "))"
         return session.gamepadAllowed ? name : "\(name) · host gamepad unavailable"
     }
 
@@ -56,28 +62,52 @@ final class Gamepad {
 
     private func controllersChanged() {
         let available = GCController.controllers().filter { $0.extendedGamepad != nil }
-        if let controller, available.contains(controller) { return }
-        release()
-        controller?.extendedGamepad?.valueChangedHandler = nil
-        controller = available.first
-        controller?.handlerQueue = .main
-        controller?.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in
-            MainActor.assumeIsolated { self?.send() }
+        var next: [GCController?] = Array(repeating: nil, count: controllers.count)
+
+        // Keep existing controllers in their old slots so a second player
+        // joining does not move the first player's virtual controller.
+        for (slot, controller) in controllers.enumerated() {
+            if let controller, available.contains(controller) { next[slot] = controller }
         }
+        for controller in available where !next.contains(where: { $0 === controller }) {
+            guard let slot = next.firstIndex(where: { $0 == nil }) else { break }
+            next[slot] = controller
+        }
+
+        let unchanged = controllers.map { $0.map(ObjectIdentifier.init) } == next.map { $0.map(ObjectIdentifier.init) }
+        if unchanged { return }
+        let retained = Set(next.compactMap { $0 }.map(ObjectIdentifier.init))
+        for controller in controllers.compactMap({ $0 }) where !retained.contains(ObjectIdentifier(controller)) {
+            controller.extendedGamepad?.valueChangedHandler = nil
+        }
+        controllers = next
+        for controller in controllers.compactMap({ $0 }) {
+            controller.handlerQueue = .main
+            controller.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.send() }
+            }
+        }
+
+        // The next report must be full: it is both the sparse baseline and the
+        // host's detach signal for any slot that disappeared.
+        resetState()
         send(force: true)
         onChange?()
     }
 
-    private func release() {
-        if lastSent != nil { session.sendGamepad(GamepadMessage(pads: [])) }
+    private func resetState() {
         lastSent = nil
         changedAt = nil
         fullAt = nil
         heartbeatAt = nil
     }
 
-    private func send(force: Bool = false) {
-        guard active, let pad = controller?.extendedGamepad else { return }
+    private func release() {
+        if lastSent != nil { session.sendGamepad(GamepadMessage(pads: [])) }
+        resetState()
+    }
+
+    private func report(_ pad: GCExtendedGamepad, slot: Int) -> [Int] {
         let digital: [(GCControllerButtonInput?, Int)] = [
             (pad.buttonA, 0x1000), (pad.buttonB, 0x2000), (pad.buttonX, 0x4000), (pad.buttonY, 0x8000),
             (pad.leftShoulder, 0x0100), (pad.rightShoulder, 0x0200),
@@ -86,14 +116,42 @@ final class Gamepad {
             (pad.dpad.up, 0x0001), (pad.dpad.down, 0x0002), (pad.dpad.left, 0x0004), (pad.dpad.right, 0x0008),
         ]
         let mask = digital.reduce(0) { $0 | ($1.0?.isPressed == true ? $1.1 : 0) }
-        let report = [0, mask, GamepadMessage.trigger(pad.leftTrigger.value), GamepadMessage.trigger(pad.rightTrigger.value),
-                      GamepadMessage.axis(pad.leftThumbstick.xAxis.value), GamepadMessage.axis(pad.leftThumbstick.yAxis.value),
-                      GamepadMessage.axis(pad.rightThumbstick.xAxis.value), GamepadMessage.axis(pad.rightThumbstick.yAxis.value)]
-        var message = GamepadMessage(pads: [report])
-        if pad is GCDualSenseGamepad || pad is GCDualShockGamepad {
-            message.dualShock4 = [.init(slot: 0, leftTriggerPressed: pad.leftTrigger.isPressed,
-                                       rightTriggerPressed: pad.rightTrigger.isPressed, touchpadPressed: false)]
+        return [slot, mask, GamepadMessage.trigger(pad.leftTrigger.value), GamepadMessage.trigger(pad.rightTrigger.value),
+                GamepadMessage.axis(pad.leftThumbstick.xAxis.value), GamepadMessage.axis(pad.leftThumbstick.yAxis.value),
+                GamepadMessage.axis(pad.rightThumbstick.xAxis.value), GamepadMessage.axis(pad.rightThumbstick.yAxis.value)]
+    }
+
+    private func currentMessage() -> GamepadMessage {
+        var pads: [[Int]] = []
+        var sony: [GamepadMessage.DualShock4] = []
+        for (slot, controller) in controllers.enumerated() {
+            guard let pad = controller?.extendedGamepad else { continue }
+            pads.append(report(pad, slot: slot))
+            if pad is GCDualSenseGamepad || pad is GCDualShockGamepad {
+                sony.append(.init(slot: slot, leftTriggerPressed: pad.leftTrigger.isPressed,
+                                  rightTriggerPressed: pad.rightTrigger.isPressed, touchpadPressed: false))
+            }
         }
+        var message = GamepadMessage(pads: pads)
+        if !sony.isEmpty { message.dualShock4 = sony }
+        return message
+    }
+
+    private func send(force: Bool = false) {
+        guard active else { return }
+        let message = currentMessage()
+        if message.pads.isEmpty {
+            // A full empty report is the host-side detach for every slot. Send
+            // it once after the last controller disappears, then stay quiet.
+            guard lastSent == nil else { return }
+            if session.sendGamepad(message) {
+                lastSent = message
+                fullAt = Date.timeIntervalSinceReferenceDate
+                heartbeatAt = fullAt
+            }
+            return
+        }
+
         let now = Date.timeIntervalSinceReferenceDate
         let changed = message != lastSent
         if changed { changedAt = now }

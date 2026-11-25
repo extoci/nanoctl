@@ -29,12 +29,14 @@ display, stream limits (frame rate, bitrate, codec, stats) and disconnect.
 Touch defaults to **trackpad** mode, like the web viewer: drag to move the cursor,
 tap to click, double-tap and hold to drag, two fingers to scroll or right-click,
 three fingers to middle-click, pinch to zoom. **Direct touch** (tap where you want to
-click, hold to right-click) is one tap away and remembered. Pair a controller with
-iOS to forward its standard controls. The app uses native controller change events
-instead of polling; only idle keepalive uses a timer. A DualSense or DualShock profile
-requests a **virtual DualShock 4** on a Windows host with ViGEm; other supported
-profiles request an Xbox 360. This is not a native DualSense device on the host, and
-does not forward rumble, adaptive triggers, touchpad, or motion.
+click, hold to right-click) is one tap away and remembered. Pair up to four
+controllers with iOS to forward them as independent host gamepads; each controller
+keeps a stable player slot while others join or leave. The app uses native
+controller change events instead of polling; only active-input liveness and idle
+keepalive use a timer. A DualSense or DualShock profile requests a **virtual
+DualShock 4** on a Windows host with ViGEm; other supported profiles request an
+Xbox 360. This is not a native DualSense device on the host, and does not forward
+rumble, adaptive triggers, touchpad, or motion.
 
 ## External display, no tvOS app
 
