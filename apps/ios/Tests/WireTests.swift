@@ -113,10 +113,10 @@ final class WireTests: XCTestCase {
             .init(slot: 2, leftTriggerPressed: true, rightTriggerPressed: false, touchpadPressed: true)
         ])
         XCTAssertEqual(report.binary, Data([
-            0x4e, 1, 2, 1,
+            2, 1,
             2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
         ]))
-        XCTAssertEqual(GamepadMessage(pads: []).binary, Data([0x4e, 1, 2, 0]))
+        XCTAssertEqual(GamepadMessage(pads: []).binary, Data([2, 0]))
         XCTAssertNil(GamepadMessage(pads: [[0, 0x10000, 0, 0, 0, 0, 0, 0]]).binary)
         XCTAssertNil(GamepadMessage(pads: Array(repeating: [0, 0, 0, 0, 0, 0, 0, 0], count: 5)).binary)
     }
