@@ -196,6 +196,14 @@ impl Gamepads {
         error.map_or(Ok(()), Err)
     }
 
+    /// A heartbeat proves the viewer is alive but carries no replacement
+    /// state. Once pads have been neutralized it must not resurrect them.
+    pub fn heartbeat(&mut self) {
+        if self.last_snapshot.is_some() {
+            self.last_snapshot = Some(Instant::now());
+        }
+    }
+
     /// Zero every attached pad without unplugging it, so a transient channel
     /// loss does not look like the controller was removed.
     pub fn neutralize(&mut self) {

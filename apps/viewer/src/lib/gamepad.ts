@@ -8,13 +8,17 @@ const MAX_SLOTS = 4;
 /** Every poll within this window after a change repeats the snapshot to repair loss. */
 const REPEAT_MS = 100;
 /**
- * Unchanged snapshots are re-sent at this interval once the repeat window ends.
- * The host neutralizes pads after 150 ms of silence, so two consecutive lost
- * keepalives are still tolerated.
+ * Unchanged pads send a three-byte heartbeat at this interval once the repeat
+ * window ends. The host neutralizes pads after 225 ms of silence, so two
+ * consecutive lost heartbeats are still tolerated.
  */
-const KEEPALIVE_MS = 50;
+const KEEPALIVE_MS = 75;
+/** Full snapshots still refresh periodically so loss cannot wedge stick/button state. */
+const FULL_REFRESH_MS = 225;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
 type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
+type GamepadHeartbeat = { type: "gamepad-heartbeat" };
+type GamepadWireMessage = GamepadMessage | GamepadHeartbeat;
 type DualShock4Pad = NonNullable<GamepadMessage["dualShock4"]>[number];
 export type GamepadStatus = "waiting" | "connected" | "unsupported";
 
@@ -93,14 +97,24 @@ type TrackedPad = { index: number; id: string };
  * `detach` is the opposite and is reserved for an explicit "gamepad off"/session end.
  */
 export class GamepadForwarder {
-  private readonly slots: (TrackedPad | undefined)[] = Array.from({ length: MAX_SLOTS });
+  private readonly slots: (TrackedPad | undefined)[] = Array.from({
+    length: MAX_SLOTS,
+  });
   private sentSlots = new Set<number>();
   private lastSentEmpty = true;
   private lastSent: GamepadMessage | null = null;
   private changedAt = -Infinity;
   private sentAt = -Infinity;
+  private fullAt = -Infinity;
 
-  constructor(private readonly send: (message: GamepadMessage) => boolean) {}
+  constructor(
+    private readonly send: (message: GamepadWireMessage) => boolean,
+    private readonly timing = {
+      repeatMs: REPEAT_MS,
+      keepaliveMs: KEEPALIVE_MS,
+      heartbeat: true,
+    },
+  ) {}
 
   sample(pads: ArrayLike<InputPad | null>, now: number): GamepadStatus {
     const available = new Map<number, InputPad>();
@@ -149,8 +163,23 @@ export class GamepadForwarder {
         });
       }
     });
-    this.flush({ type: "gamepad", pads: reports, ...(dualShock4.length && { dualShock4 }) }, now);
+    this.flush(
+      {
+        type: "gamepad",
+        pads: reports,
+        ...(dualShock4.length && { dualShock4 }),
+      },
+      now,
+    );
     return available.size ? "connected" : unsupported ? "unsupported" : "waiting";
+  }
+
+  /** Force the next sample to publish full state after a transport or input restart. */
+  resume(): void {
+    this.lastSent = null;
+    this.changedAt = -Infinity;
+    this.sentAt = -Infinity;
+    this.fullAt = -Infinity;
   }
 
   /** Zero every occupied slot without detaching it: the host keeps an idle controller. */
@@ -189,12 +218,25 @@ export class GamepadForwarder {
     if (!pads.length && this.lastSentEmpty) return;
     if (pads.length) {
       if (!this.lastSent || !sameMessage(message, this.lastSent)) this.changedAt = now;
-      else if (now - this.changedAt >= REPEAT_MS && now - this.sentAt < KEEPALIVE_MS) return;
+      else if (
+        now - this.changedAt >= this.timing.repeatMs &&
+        now - this.sentAt < this.timing.keepaliveMs
+      )
+        return;
+      else if (
+        this.timing.heartbeat &&
+        now - this.changedAt >= this.timing.repeatMs &&
+        now - this.fullAt < FULL_REFRESH_MS
+      ) {
+        if (this.send({ type: "gamepad-heartbeat" })) this.sentAt = now;
+        return;
+      }
     }
     if (this.send(message)) {
       this.lastSentEmpty = !pads.length;
       this.lastSent = pads.length ? structuredClone(message) : null;
       this.sentAt = now;
+      this.fullAt = now;
       this.sentSlots = new Set(pads.map(([slot]) => slot));
     }
   }

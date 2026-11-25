@@ -13,14 +13,11 @@ const RELEASE = 7;
 const PING = 8;
 const AUDIO = 9;
 const DISPLAY = 10;
+const GAMEPAD_HEARTBEAT = 11;
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 const textEncoder = new TextEncoder();
 
-function header(
-  version: number,
-  kind: number,
-  length: number,
-): DataView<ArrayBuffer> {
+function header(version: number, kind: number, length: number): DataView<ArrayBuffer> {
   const out = new DataView(new ArrayBuffer(length));
   out.setUint8(0, MAGIC);
   out.setUint8(1, version);
@@ -28,12 +25,7 @@ function header(
   return out;
 }
 
-function putPosition(
-  out: DataView,
-  offset: number,
-  x: number,
-  y: number,
-): void {
+function putPosition(out: DataView, offset: number, x: number, y: number): void {
   out.setUint16(offset, Math.round(clamp01(x) * 65535), true);
   out.setUint16(offset + 2, Math.round(clamp01(y) * 65535), true);
 }
@@ -41,6 +33,11 @@ function putPosition(
 function utf8(value: string, maxBytes = 65535): Uint8Array | null {
   const bytes = textEncoder.encode(value);
   return bytes.length <= maxBytes ? bytes : null;
+}
+
+/** Three-byte unchanged-gamepad liveness report; it carries no input state. */
+export function encodeGamepadHeartbeat(): ArrayBuffer {
+  return header(VERSION_2, GAMEPAD_HEARTBEAT, 3).buffer;
 }
 
 /**
@@ -55,15 +52,9 @@ export function encodeBinaryInput(payload: ControlMessage): ArrayBuffer | null {
     putPosition(out, 3, payload.x, payload.y);
     return out.buffer;
   }
-  if (
-    payload.type === "pointer" &&
-    (payload.action === "down" || payload.action === "up")
-  ) {
+  if (payload.type === "pointer" && (payload.action === "down" || payload.action === "up")) {
     const out = header(VERSION_2, POINTER_BUTTON, 8);
-    out.setUint8(
-      3,
-      (payload.action === "up" ? 0x80 : 0) | (payload.button ?? 0),
-    );
+    out.setUint8(3, (payload.action === "up" ? 0x80 : 0) | (payload.button ?? 0));
     putPosition(out, 4, payload.x, payload.y);
     return out.buffer;
   }
@@ -79,10 +70,7 @@ export function encodeBinaryInput(payload: ControlMessage): ArrayBuffer | null {
     const key = utf8(payload.key, 255);
     if (!code || !key) return null;
     const out = header(VERSION_2, KEY, 6 + code.length + key.length);
-    out.setUint8(
-      3,
-      (payload.action === "up" ? 1 : 0) | (payload.repeat ? 2 : 0),
-    );
+    out.setUint8(3, (payload.action === "up" ? 1 : 0) | (payload.repeat ? 2 : 0));
     out.setUint8(4, code.length);
     out.setUint8(5, key.length);
     new Uint8Array(out.buffer, 6, code.length).set(code);
@@ -118,23 +106,12 @@ export function encodeBinaryInput(payload: ControlMessage): ArrayBuffer | null {
     return out.buffer;
   }
   if (payload.type !== "gamepad" || payload.pads.length > 4) return null;
-  const dualShock4 = new Map(
-    payload.dualShock4?.map((pad) => [pad.slot, pad]) ?? [],
-  );
+  const dualShock4 = new Map(payload.dualShock4?.map((pad) => [pad.slot, pad]) ?? []);
   const out = header(VERSION, GAMEPAD, 4 + payload.pads.length * 14);
   out.setUint8(3, payload.pads.length);
   payload.pads.forEach((pad, index) => {
     const offset = 4 + index * 14;
-    const [
-      slot,
-      buttons,
-      leftTrigger,
-      rightTrigger,
-      leftX,
-      leftY,
-      rightX,
-      rightY,
-    ] = pad;
+    const [slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY] = pad;
     out.setUint8(offset, slot);
     out.setUint16(offset + 1, buttons, true);
     out.setUint8(offset + 3, leftTrigger);

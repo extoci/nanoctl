@@ -29,7 +29,10 @@ test("maps standard controls and repeats active snapshots every poll", () => {
   const controller = pad(10);
   gamepad.sample([null, controller, pad(12, "")], 0);
   gamepad.sample([controller], 16);
-  const state = { type: "gamepad", pads: [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]] };
+  const state = {
+    type: "gamepad",
+    pads: [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]],
+  };
   expect(messages).toEqual([state, state]);
   gamepad.sample([controller], 32);
   gamepad.sample([{ ...controller, axes: [NaN] }], 48);
@@ -67,19 +70,31 @@ test.each([
     1,
   );
   const reports = [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]];
-  const extra = { slot: 0, leftTriggerPressed: true, rightTriggerPressed: false };
+  const extra = {
+    slot: 0,
+    leftTriggerPressed: true,
+    rightTriggerPressed: false,
+  };
   expect(messages).toEqual([
-    { type: "gamepad", pads: reports, dualShock4: [{ ...extra, touchpadPressed: false }] },
-    { type: "gamepad", pads: reports, dualShock4: [{ ...extra, touchpadPressed: true }] },
+    {
+      type: "gamepad",
+      pads: reports,
+      dualShock4: [{ ...extra, touchpadPressed: false }],
+    },
+    {
+      type: "gamepad",
+      pads: reports,
+      dualShock4: [{ ...extra, touchpadPressed: true }],
+    },
   ]);
 });
 
 test("bounds to four controllers, preserves slots, and retries a blocked release", () => {
   let blocked = false;
   const slots: number[][] = [];
-  const gamepad = new GamepadForwarder(({ pads }) => {
-    if (blocked) return false;
-    slots.push(pads.map((pad) => pad[0]));
+  const gamepad = new GamepadForwarder((message) => {
+    if (message.type !== "gamepad" || blocked) return false;
+    slots.push(message.pads.map((pad) => pad[0] ?? -1));
     return true;
   });
   gamepad.sample([pad(2), pad(3), pad(4), pad(8), pad(9)], 0);
@@ -98,14 +113,14 @@ test("bounds to four controllers, preserves slots, and retries a blocked release
   ]);
 });
 
-test("repeats a change for 100ms, then sends an unchanged pad every 50ms", () => {
+test("repeats a change for 100ms, then heartbeats an unchanged pad every 75ms", () => {
   const sentAt: number[] = [];
   const gamepad = new GamepadForwarder(() => Boolean(sentAt.push(now)));
   const controller = pad(0);
   let now = 0;
   for (; now <= 400; now += 20) gamepad.sample([controller], now);
-  expect(sentAt).toEqual([0, 20, 40, 60, 80, 140, 200, 260, 320, 380]);
+  expect(sentAt).toEqual([0, 20, 40, 60, 80, 160, 240, 320, 400]);
   const pressed = { ...controller, axes: [0, 0, 0, 0] };
-  for (; now <= 560; now += 20) gamepad.sample([pressed], now);
-  expect(sentAt.slice(10)).toEqual([420, 440, 460, 480, 500, 560]);
+  for (; now <= 600; now += 20) gamepad.sample([pressed], now);
+  expect(sentAt.slice(9)).toEqual([420, 440, 460, 480, 500, 580]);
 });

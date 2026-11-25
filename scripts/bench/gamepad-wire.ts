@@ -1,7 +1,7 @@
 // Gamepad uplink wire cost for synthetic 60 Hz traces: messages and bytes per
 // second through the real GamepadForwarder and binary encoder, versus sending
 // a snapshot on every poll. Run: bun scripts/bench/gamepad-wire.ts
-import { encodeBinaryInput } from "../../apps/viewer/src/lib/binary-input";
+import { encodeBinaryInput, encodeGamepadHeartbeat } from "../../apps/viewer/src/lib/binary-input";
 import { GamepadForwarder } from "../../apps/viewer/src/lib/gamepad";
 
 // IPv4 + UDP + DTLS 1.2 AES-GCM record + SCTP common header + DATA chunk.
@@ -11,7 +11,10 @@ const FRAME_MS = 1000 / 60;
 
 type State = { axes: number[]; pressed: number[] };
 const traces: Record<string, (frame: number) => State> = {
-  "idle pad (connected, untouched)": () => ({ axes: [0, 0, 0, 0], pressed: [] }),
+  "idle pad (connected, untouched)": () => ({
+    axes: [0, 0, 0, 0],
+    pressed: [],
+  }),
   "menu navigation (d-pad tap every 1s)": (frame) => ({
     axes: [0, 0, 0, 0],
     pressed: frame % 60 < 6 ? [13] : [],
@@ -41,27 +44,34 @@ function pad({ axes, pressed }: State) {
   };
 }
 
-for (const [name, trace] of Object.entries(traces)) {
+const measure = (heartbeat: boolean, keepaliveMs: number, trace: (frame: number) => State) => {
   let messages = 0;
   let bytes = 0;
-  let polls = 0;
-  let pollBytes = 0;
-  const forwarder = new GamepadForwarder((message) => {
-    messages++;
-    bytes += (encodeBinaryInput(message)?.byteLength ?? 0) + OVERHEAD;
-    return true;
-  });
-  for (let frame = 0; frame < SECONDS * 60; frame++) {
-    const sampled = [pad(trace(frame))];
-    forwarder.sample(sampled, frame * FRAME_MS);
-    // Baseline: the previous forwarder sent an 18-byte snapshot every poll.
-    polls++;
-    pollBytes += 18 + OVERHEAD;
-  }
-  const kbps = (value: number) => ((value * 8) / SECONDS / 1000).toFixed(2);
-  console.log(
-    `${name}: ${(polls / SECONDS).toFixed(1)} -> ${(messages / SECONDS).toFixed(1)} msg/s, ` +
-      `${kbps(pollBytes)} -> ${kbps(bytes)} kbps ` +
-      `(${((bytes / pollBytes - 1) * 100).toFixed(1)}%)`,
+  const forwarder = new GamepadForwarder(
+    (message) => {
+      messages++;
+      bytes +=
+        (message.type === "gamepad-heartbeat"
+          ? encodeGamepadHeartbeat().byteLength
+          : (encodeBinaryInput(message)?.byteLength ?? 0)) + OVERHEAD;
+      return true;
+    },
+    { repeatMs: 100, keepaliveMs, heartbeat },
   );
+  for (let frame = 0; frame < SECONDS * 60; frame++) {
+    forwarder.sample([pad(trace(frame))], frame * FRAME_MS);
+  }
+  return { messages, bytes };
+};
+
+for (const [name, trace] of Object.entries(traces)) {
+  const before = measure(false, 50, trace);
+  const after = measure(true, 75, trace);
+  const kbps = (value: number) => ((value * 8) / SECONDS / 1000).toFixed(2);
+  const improvement = (1 - after.bytes / before.bytes) * 100;
+  console.log(
+    `${name}: ${(before.messages / SECONDS).toFixed(1)} -> ${(after.messages / SECONDS).toFixed(1)} msg/s, ` +
+      `${kbps(before.bytes)} -> ${kbps(after.bytes)} kbps (-${improvement.toFixed(1)}%)`,
+  );
+  if (improvement < 20 && name !== "shooter (both sticks always moving)") process.exitCode = 1;
 }

@@ -163,6 +163,7 @@ enum ControlMessage {
     },
     Ping,
     Gamepad(crate::gamepad::Snapshot),
+    GamepadHeartbeat,
     Display {
         #[serde(rename = "displayId")]
         display_id: String,
@@ -198,8 +199,8 @@ const BINARY_KEY: u8 = 5;
 const BINARY_TEXT: u8 = 6;
 const BINARY_RELEASE: u8 = 7;
 const BINARY_PING: u8 = 8;
-pub(crate) const BINARY_AUDIO: u8 = 9;
 const BINARY_DISPLAY: u8 = 10;
+const BINARY_GAMEPAD_HEARTBEAT: u8 = 11;
 
 pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
     bytes.first() == Some(&BINARY_INPUT_MAGIC)
@@ -332,6 +333,12 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
             }
             Ok(ControlMessage::Release)
         }
+        (BINARY_INPUT_VERSION_2, BINARY_GAMEPAD_HEARTBEAT) => {
+            if bytes.len() != 3 {
+                anyhow::bail!("invalid binary gamepad heartbeat length");
+            }
+            Ok(ControlMessage::GamepadHeartbeat)
+        }
         (BINARY_INPUT_VERSION_2, BINARY_PING) => {
             if bytes.len() != 19 {
                 anyhow::bail!("invalid binary ping length");
@@ -399,7 +406,10 @@ impl InputController {
                 },
                 InputLane::PointerMotion,
             )
-            | (ControlMessage::Gamepad(_), InputLane::PointerMotion) => {}
+            | (
+                ControlMessage::Gamepad(_) | ControlMessage::GamepadHeartbeat,
+                InputLane::PointerMotion,
+            ) => {}
             (
                 ControlMessage::Pointer {
                     action: PointerAction::Move,
@@ -421,6 +431,7 @@ impl InputController {
             ControlMessage::Ping
                 | ControlMessage::Release
                 | ControlMessage::Gamepad(_)
+                | ControlMessage::GamepadHeartbeat
                 | ControlMessage::Unsupported
         ) {
             self.last_physical_input = Instant::now();
@@ -465,6 +476,12 @@ impl InputController {
             ControlMessage::Gamepad(snapshot) => {
                 if !self.gamepads_revoked {
                     self.gamepads.update(snapshot)?;
+                }
+                Ok(None)
+            }
+            ControlMessage::GamepadHeartbeat => {
+                if !self.gamepads_revoked {
+                    self.gamepads.heartbeat();
                 }
                 Ok(None)
             }
@@ -746,6 +763,17 @@ mod tests {
         ));
         assert!(parse_binary_control(&[BINARY_INPUT_MAGIC, 1, 1, 0]).is_err());
         assert!(parse_binary_control(&[BINARY_INPUT_MAGIC, 2, 1, 0x00, 0x80, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn decodes_binary_gamepad_heartbeat_without_state() {
+        assert!(matches!(
+            parse_binary_control(&[BINARY_INPUT_MAGIC, 2, BINARY_GAMEPAD_HEARTBEAT]).unwrap(),
+            ControlMessage::GamepadHeartbeat
+        ));
+        assert!(
+            parse_binary_control(&[BINARY_INPUT_MAGIC, 2, BINARY_GAMEPAD_HEARTBEAT, 0]).is_err()
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ import {
 } from "@nanoctl/protocol";
 import { recordDebugEvent } from "./debug-report";
 import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
-import { encodeBinaryInput } from "./binary-input";
+import { encodeBinaryInput, encodeGamepadHeartbeat } from "./binary-input";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
@@ -155,7 +155,9 @@ export class RemoteSessionController {
   private clipboard: ClipboardSync | null = null;
   private gamepadFrame: number | null = null;
   private gamepadStatus: GamepadStatus = "waiting";
-  private readonly gamepad = new GamepadForwarder((message) => this.sendControl(message));
+  private readonly gamepad = new GamepadForwarder((message) =>
+    message.type === "gamepad" ? this.sendControl(message) : this.sendGamepadHeartbeat(),
+  );
   private keyQueue: Promise<void> = Promise.resolve();
   private readonly onClipboardFocus = () => {
     void this.clipboard?.focus();
@@ -380,6 +382,7 @@ export class RemoteSessionController {
       typeof navigator.getGamepads !== "function"
     )
       return;
+    this.gamepad.resume();
     this.gamepadFrame = window.requestAnimationFrame(this.pollGamepads);
   }
 
@@ -411,6 +414,25 @@ export class RemoteSessionController {
     this.gamepadFrame = null;
     this.gamepadStatus = "waiting";
     this.gamepad.release();
+  }
+
+  private sendGamepadHeartbeat(): boolean {
+    const channel = this.pointerChannel;
+    if (
+      !this.options.binaryInput ||
+      !this.inputEnabled ||
+      !this.remoteInputAllowed ||
+      !channel ||
+      channel.readyState !== "open" ||
+      channel.bufferedAmount > 4 * 1024
+    )
+      return false;
+    try {
+      channel.send(encodeGamepadHeartbeat());
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Applies live without renegotiation; muted viewers do not receive Opus packets. */

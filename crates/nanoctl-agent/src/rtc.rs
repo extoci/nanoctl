@@ -120,7 +120,7 @@ fn is_gamepad_report(bytes: &[u8]) -> bool {
     // Binary v1 input: 'N', version, kind; kind 2 is a gamepad report. Keep
     // this local because the input module exists only with the media feature.
     if bytes.len() >= 3 && bytes[0] == 0x4e {
-        return bytes[2] == 2;
+        return bytes[2] == 2 || bytes[2] == 11;
     }
     #[derive(Deserialize)]
     struct Kind<'a> {
@@ -169,11 +169,7 @@ fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
         kind: std::borrow::Cow<'a, str>,
         enabled: bool,
     }
-    if bytes.len() == 4
-        && bytes[0] == 0x4e
-        && bytes[1] == 2
-        && bytes[2] == 9
-    {
+    if bytes.len() == 4 && bytes[0] == 0x4e && bytes[1] == 2 && bytes[2] == 9 {
         return Some(bytes[3] != 0);
     }
     serde_json::from_slice::<AudioControl>(bytes)
@@ -195,6 +191,11 @@ async fn admit_input_message(sender: &InputSender, bytes: Bytes) -> InputAdmissi
             } else {
                 &slots.pointer
             };
+            // A heartbeat carries no state, so it must never evict a pending
+            // full snapshot from the lossy lane's single coalescing slot.
+            if bytes.len() >= 3 && bytes[0] == 0x4e && bytes[2] == 11 && slot.borrow().is_some() {
+                return InputAdmission::Accepted;
+            }
             slot.send(Some(bytes)).is_ok()
         }
     };
@@ -734,11 +735,11 @@ impl HostPeer {
                                 };
                                 if let Ok(mut input) = input.lock() {
                                     // Gamepad viewers send full-state snapshots every frame,
-                                    // so 150ms of silence means the transport is badly impaired;
+                                    // so 225ms of silence means the transport is badly impaired;
                                     // don't let a held stick/button keep driving for seconds.
                                     input.release_if_idle(
                                         Duration::from_secs(2),
-                                        Duration::from_millis(150),
+                                        Duration::from_millis(225),
                                     );
                                 }
                             }
@@ -869,13 +870,12 @@ impl HostPeer {
                     if reliable {
                         let audio_enabled = audio_enabled_for_channel.clone();
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
-                            if message.is_string {
-                                if let Some(limits) =
+                            if message.is_string
+                                && let Some(limits) =
                                     crate::adaptive::ViewerLimits::parse(&message.data)
-                                {
-                                    viewer_limits.send_replace(limits);
-                                    return Box::pin(async {});
-                                }
+                            {
+                                viewer_limits.send_replace(limits);
+                                return Box::pin(async {});
                             }
                             if let Some(enabled) = parse_audio_enabled(&message.data) {
                                 audio_enabled.send_replace(enabled);
@@ -898,11 +898,11 @@ impl HostPeer {
                 let audio_enabled = audio_enabled_for_channel.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
                     if reliable {
-                        if message.is_string {
-                            if let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data) {
-                                viewer_limits.send_replace(limits);
-                                return Box::pin(async {});
-                            }
+                        if message.is_string
+                            && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
+                        {
+                            viewer_limits.send_replace(limits);
+                            return Box::pin(async {});
                         }
                         if let Some(enabled) = parse_audio_enabled(&message.data) {
                             audio_enabled.send_replace(enabled);
