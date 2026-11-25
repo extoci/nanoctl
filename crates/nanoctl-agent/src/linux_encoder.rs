@@ -8,7 +8,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use cros_codecs::backend::vaapi::encoder::VaapiBackend;
 use cros_codecs::codec::h264::parser::{Level, Profile};
 use cros_codecs::encoder::h264::EncoderConfig;
@@ -358,57 +358,7 @@ fn upload_nv12_img<M: SurfaceMemoryDescriptor>(
 }
 
 fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) -> Result<()> {
-    let width = width as usize;
-    let height = height as usize;
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        bail!("NV12 dimensions must be non-zero and even");
-    }
-    let pixels = width
-        .checked_mul(height)
-        .context("frame dimensions overflow")?;
-    if rgba.len() != pixels.checked_mul(4).context("RGBA frame size overflow")? {
-        bail!("RGBA frame length does not match its dimensions");
-    }
-    output.clear();
-    output.resize(pixels + pixels / 2, 0);
-    for row in 0..height {
-        for column in 0..width {
-            let offset = (row * width + column) * 4;
-            let r = i32::from(rgba[offset]);
-            let g = i32::from(rgba[offset + 1]);
-            let b = i32::from(rgba[offset + 2]);
-            output[row * width + column] = ((66 * r + 129 * g + 25 * b + 128) >> 8)
-                .saturating_add(16)
-                .clamp(0, 255) as u8;
-        }
-    }
-    let uv_offset = pixels;
-    for row in (0..height).step_by(2) {
-        for column in (0..width).step_by(2) {
-            let mut r = 0_i32;
-            let mut g = 0_i32;
-            let mut b = 0_i32;
-            for y in 0..2 {
-                for x in 0..2 {
-                    let offset = ((row + y) * width + column + x) * 4;
-                    r += i32::from(rgba[offset]);
-                    g += i32::from(rgba[offset + 1]);
-                    b += i32::from(rgba[offset + 2]);
-                }
-            }
-            r /= 4;
-            g /= 4;
-            b /= 4;
-            let chroma = uv_offset + (row / 2) * width + column;
-            output[chroma] = ((-38 * r - 74 * g + 112 * b + 128) >> 8)
-                .saturating_add(128)
-                .clamp(0, 255) as u8;
-            output[chroma + 1] = ((112 * r - 94 * g - 18 * b + 128) >> 8)
-                .saturating_add(128)
-                .clamp(0, 255) as u8;
-        }
-    }
-    Ok(())
+    crate::nv12::pixels_to_nv12(rgba, width, height, crate::media::PixelFormat::Rgba, output)
 }
 
 #[cfg(test)]
