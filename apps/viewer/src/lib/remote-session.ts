@@ -79,6 +79,8 @@ export type HostSignalRow = {
 
 export type QualityLimits = { maxFps?: number; maxBitrateKbps?: number };
 
+const controlTextEncoder = new TextEncoder();
+
 export type RemoteSessionOptions = {
   sessionId: string;
   controllerEpoch: string;
@@ -451,8 +453,13 @@ export class RemoteSessionController {
     }
     if (payload.type === "display" && !this.remoteInputAllowed) return false;
     const isMotion = payload.type === "pointer" && payload.action === "move";
-    const serialized = JSON.stringify(payload);
-    if (new TextEncoder().encode(serialized).byteLength > MAX_CONTROL_MESSAGE_BYTES) return false;
+    const binary = isMotion && this.options.binaryInput ? encodeBinaryInput(payload) : null;
+    let serialized: string | null = null;
+    if (!binary) {
+      serialized = JSON.stringify(payload);
+      if (controlTextEncoder.encode(serialized).byteLength > MAX_CONTROL_MESSAGE_BYTES)
+        return false;
+    }
     if (isMotion && channel.bufferedAmount > 64 * 1024) return false;
     if (!isMotion && reliableControlBufferIsSaturated(channel.bufferedAmount)) {
       this.inputEnabled = false;
@@ -462,9 +469,8 @@ export class RemoteSessionController {
       return false;
     }
     try {
-      const binary = isMotion && this.options.binaryInput ? encodeBinaryInput(payload) : null;
       if (binary) channel.send(binary);
-      else channel.send(serialized);
+      else channel.send(serialized!);
       return true;
     } catch {
       if (!isMotion) {
