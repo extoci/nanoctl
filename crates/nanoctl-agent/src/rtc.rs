@@ -77,18 +77,18 @@ const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 1024;
 #[cfg(any(feature = "media", test))]
 #[derive(Clone)]
 enum InputSender {
-    Reliable(tokio::sync::mpsc::Sender<Vec<u8>>),
+    Reliable(tokio::sync::mpsc::Sender<Bytes>),
     Motion(MotionSlots<tokio::sync::watch::Sender<LatestReport>>),
 }
 
 #[cfg(any(feature = "media", test))]
 enum InputReceiver {
-    Reliable(tokio::sync::mpsc::Receiver<Vec<u8>>),
+    Reliable(tokio::sync::mpsc::Receiver<Bytes>),
     Motion(MotionSlots<tokio::sync::watch::Receiver<LatestReport>>),
 }
 
 #[cfg(any(feature = "media", test))]
-type LatestReport = Option<Vec<u8>>;
+type LatestReport = Option<Bytes>;
 
 /// The pointer lane keeps the latest report per kind: one shared slot would let a per-frame
 /// gamepad snapshot overwrite the pointer move sent in the same frame, and vice versa.
@@ -133,7 +133,7 @@ fn is_gamepad_report(bytes: &[u8]) -> bool {
 
 #[cfg(any(feature = "media", test))]
 impl InputReceiver {
-    async fn recv(&mut self) -> Option<Vec<u8>> {
+    async fn recv(&mut self) -> Option<Bytes> {
         match self {
             Self::Reliable(receiver) => receiver.recv().await,
             Self::Motion(slots) => {
@@ -176,7 +176,7 @@ fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
 }
 
 #[cfg(any(feature = "media", test))]
-async fn admit_input_message(sender: &InputSender, bytes: Vec<u8>) -> InputAdmission {
+async fn admit_input_message(sender: &InputSender, bytes: Bytes) -> InputAdmission {
     if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return InputAdmission::Oversized;
     }
@@ -922,7 +922,7 @@ impl HostPeer {
                         {
                             return;
                         }
-                        let admission = admit_input_message(&sender, message.data.to_vec()).await;
+                        let admission = admit_input_message(&sender, message.data).await;
                         if admission != InputAdmission::Accepted {
                             input_revoked.store(true, Ordering::Release);
                             tracing::warn!(?admission, "input rejected; closing control channel");
@@ -2094,10 +2094,10 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let sender = InputSender::Reliable(sender);
         assert_eq!(
-            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES]).await,
+            admit_input_message(&sender, Bytes::from(vec![0; MAX_CONTROL_MESSAGE_BYTES])).await,
             InputAdmission::Accepted
         );
-        let pending = admit_input_message(&sender, vec![1]);
+        let pending = admit_input_message(&sender, Bytes::from_static(&[1]));
         tokio::pin!(pending);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
@@ -2111,12 +2111,12 @@ mod tests {
         assert_eq!(pending.await, InputAdmission::Accepted);
         assert_eq!(receiver.recv().await.unwrap(), vec![1]);
         assert_eq!(
-            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES + 1]).await,
+            admit_input_message(&sender, Bytes::from(vec![0; MAX_CONTROL_MESSAGE_BYTES + 1])).await,
             InputAdmission::Oversized
         );
         drop(receiver);
         assert_eq!(
-            admit_input_message(&sender, vec![0; 1]).await,
+            admit_input_message(&sender, Bytes::from_static(&[0])).await,
             InputAdmission::Closed
         );
     }
@@ -2136,7 +2136,7 @@ mod tests {
         }).collect();
         for event in &events[..1000] {
             assert_eq!(
-                admit_input_message(&sender, event.clone()).await,
+                admit_input_message(&sender, Bytes::from(event.clone())).await,
                 InputAdmission::Accepted
             );
         }
@@ -2144,7 +2144,7 @@ mod tests {
         let producer = tokio::spawn(async move {
             for event in &events[1000..] {
                 assert_eq!(
-                    admit_input_message(&sender, event.clone()).await,
+                    admit_input_message(&sender, Bytes::from(event.clone())).await,
                     InputAdmission::Accepted
                 );
             }
@@ -2167,11 +2167,14 @@ mod tests {
         let mut receiver = InputReceiver::Motion(receiver);
         for index in 0_u32..500 {
             assert_eq!(
-                admit_input_message(&sender, index.to_be_bytes().to_vec()).await,
+                admit_input_message(&sender, Bytes::from(index.to_be_bytes().to_vec())).await,
                 InputAdmission::Accepted
             );
         }
-        assert_eq!(receiver.recv().await.unwrap(), 499_u32.to_be_bytes());
+        assert_eq!(
+            receiver.recv().await.unwrap().as_ref(),
+            499_u32.to_be_bytes()
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
                 .await
@@ -2190,14 +2193,14 @@ mod tests {
         for frame in 1_u32..=100 {
             for message in [pointer(frame), gamepad(frame)] {
                 assert_eq!(
-                    admit_input_message(&sender, message.into_bytes()).await,
+                    admit_input_message(&sender, Bytes::from(message.into_bytes())).await,
                     InputAdmission::Accepted
                 );
             }
         }
         let mut delivered = vec![
-            String::from_utf8(receiver.recv().await.unwrap()).unwrap(),
-            String::from_utf8(receiver.recv().await.unwrap()).unwrap(),
+            String::from_utf8(receiver.recv().await.unwrap().to_vec()).unwrap(),
+            String::from_utf8(receiver.recv().await.unwrap().to_vec()).unwrap(),
         ];
         delivered.sort();
         assert_eq!(delivered, [gamepad(100), pointer(100)]);
