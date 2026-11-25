@@ -5,7 +5,8 @@
 //! dirty/move rects instead of the whole texture, and tags the frame as
 //! backend-verified changed so the producer can skip its full-frame memcmp.
 
-use std::sync::{Arc, Weak, atomic::Ordering};
+use std::collections::HashSet;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, atomic::Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -34,10 +35,69 @@ type Patch = (RECT, Vec<u8>);
 /// Dirty-region pixels of a contiguous run of small-dirty emits.
 type PatchLog = std::collections::VecDeque<(u64, Vec<Patch>)>;
 
+static ACTIVE_OUTPUTS: OnceLock<(Mutex<HashSet<usize>>, Condvar)> = OnceLock::new();
+
+fn active_outputs() -> &'static (Mutex<HashSet<usize>>, Condvar) {
+    ACTIVE_OUTPUTS.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+}
+
+fn lock_active_outputs() -> MutexGuard<'static, HashSet<usize>> {
+    active_outputs()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Exclusive process-local ownership of one output's duplication session.
+/// Windows rejects a second `DuplicateOutput` while another session for the
+/// same output exists; this includes nanoctl's replay warmup racing its real
+/// capture pipeline. The permit is stored after `duplication` below so struct
+/// drop order releases the COM session before another waiter may open one.
+struct OutputPermit(usize);
+
+impl OutputPermit {
+    fn acquire(h_monitor: HMONITOR) -> Result<Self> {
+        let key = h_monitor.0 as usize;
+        let started = Instant::now();
+        let mut active = lock_active_outputs();
+        loop {
+            if active.insert(key) {
+                return Ok(Self(key));
+            }
+            let remaining = Duration::from_secs(3).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                bail!("timed out waiting for the active DXGI output duplication");
+            }
+            let (guard, _) = active_outputs()
+                .1
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = guard;
+        }
+    }
+
+    fn try_acquire(h_monitor: HMONITOR) -> Result<Self> {
+        let key = h_monitor.0 as usize;
+        if lock_active_outputs().insert(key) {
+            Ok(Self(key))
+        } else {
+            bail!("DXGI output duplication is already active")
+        }
+    }
+}
+
+impl Drop for OutputPermit {
+    fn drop(&mut self) {
+        lock_active_outputs().remove(&self.0);
+        active_outputs().1.notify_one();
+    }
+}
+
 struct Duplication {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: ID3D11Texture2D,
+    _permit: OutputPermit,
     width: u32,
     height: u32,
     /// Latest full BGRA image; dirty rects are patched into it between emits.
@@ -81,6 +141,14 @@ fn create_device() -> Result<ID3D11Device> {
 
 impl Duplication {
     fn new(h_monitor: HMONITOR) -> Result<Self> {
+        Self::with_permit(h_monitor, OutputPermit::acquire(h_monitor)?)
+    }
+
+    fn try_new(h_monitor: HMONITOR) -> Result<Self> {
+        Self::with_permit(h_monitor, OutputPermit::try_acquire(h_monitor)?)
+    }
+
+    fn with_permit(h_monitor: HMONITOR, permit: OutputPermit) -> Result<Self> {
         unsafe {
             let device = create_device()?;
             let dxgi_device = device.cast::<IDXGIDevice>()?;
@@ -124,6 +192,7 @@ impl Duplication {
                         context,
                         duplication,
                         staging,
+                        _permit: permit,
                         width,
                         height,
                         accum: vec![0; (width * height * 4) as usize],
@@ -401,7 +470,7 @@ impl Duplication {
 /// agent with 0xc0000005.
 pub(super) fn capture_once(monitor: &Monitor) -> Result<Frame> {
     let h_monitor = HMONITOR(monitor.id()? as usize as *mut _);
-    let mut dup = Duplication::new(h_monitor)?;
+    let mut dup = Duplication::try_new(h_monitor)?;
     let latest = Arc::new(LatestFrame::default());
     for _ in 0..8 {
         if let Some(frame) = dup.acquire(125, &latest)? {
@@ -450,7 +519,7 @@ fn recreate(h_monitor: HMONITOR, dup: &mut Option<Duplication>) {
     match Duplication::new(h_monitor) {
         Ok(next) => *dup = Some(next),
         Err(recreate_error) => {
-            tracing::warn!(%recreate_error, "DXGI duplication recreate failed");
+            tracing::warn!("DXGI duplication recreate failed: {recreate_error:#}");
             std::thread::sleep(Duration::from_secs(1));
         }
     }
@@ -477,9 +546,7 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
         let loop_started = Instant::now();
         let resumed = loop_started.duration_since(previous_loop) >= Duration::from_secs(2);
         previous_loop = loop_started;
-        if resumed {
-            recreate(h_monitor, &mut dup);
-        } else if dup.is_none() {
+        if resumed || dup.is_none() {
             recreate(h_monitor, &mut dup);
         }
         if dup.is_none() {

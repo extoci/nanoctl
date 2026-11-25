@@ -900,6 +900,9 @@ impl CaptureEncoder {
     }
 
     pub fn select_display(&mut self, display_id: &str) -> Result<()> {
+        if display_id == self.display_id {
+            return Ok(());
+        }
         if display_id.len() > 128 {
             bail!("display identifier is too long");
         }
