@@ -832,3 +832,25 @@ Measured on the media-smoke pipeline (in-process, 30s window under `band --motio
 
 - **fps fidelity is perfect, ceiling is the VM**: smoke fresh_frames 530/698 (44.2 fresh/s) matches live agent capture ~45/s exactly — capture ≈ encode ≈ deliver end-to-end with no internal drops. Smoke's 58fps headline counts stale re-encodes. Display is 60Hz; the compositor delivers ~45fps under streaming load on this GPU-less box. Lifting fps needs real hardware, not pipeline work.
 - **Multi-viewer measured: one active stream, newest attach wins.** 3 concurrent tabs: first streams 45.6fps, others frozen — `DataChannelVideo.channel`/`idr_channel` are single `Mutex<Option<…>>` slots in rtc.rs, so each new viewer's channel replaces the previous one. Older viewers never error; their seq just stops. No fanout today — a real fix is architectural (per-channel fanout), recorded here as the baseline before any multi-client work.
+
+## Cycle 50 — adaptive tier-dependent x264 thread count
+
+Axis: worst-case encode time. Prior sweeps showed threads=4 wins everything on
+incompressible noise (−34% encode, equal quality/bits) but costs ~1dB/+8% bits
+on easy motion content — neither fixed default is no-trade. The adaptive
+negotiator already re-opens the encoder on tier transitions, so thread count
+is now tier-dependent: tier 0 (stress/worst-case) → 4 slice threads, tiers 1-3
+→ 2. `NANOCTL_X264_THREADS` still pins and opts out of adaptation.
+
+Measured (same binary, env-pinned A-B, noise 1600x1200 worst case):
+
+| config                     | fps  | encode p50 | capture→encode p50 | bitrate  | PSNR p50 |
+| -------------------------- | ---- | ---------- | ------------------ | -------- | -------- |
+| tier0 threads=4 (adaptive) | 46.5 | 8.28ms     | 18.1ms             | 17.0Mbps | 17.3dB   |
+| threads=2 pinned           | 46.0 | 11.21ms    | 19.96ms            | 16.9Mbps | 17.3dB   |
+
+Encode −26%, capture→encode −1.9ms, quality/bitrate identical — pure win.
+Motion (band --height 600): promotes to tier 3 within the window, 57.5fps,
+284kbps, PSNR p05 57.1dB — threads back to 2 on easy content, no regression.
+Clock: 58fps, 219kbps, tier 3. x264 clamps slice threads on short frames
+(~64 rows/thread); unit tests assert at height 320.

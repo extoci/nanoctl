@@ -40,7 +40,7 @@ typedef struct {
     /* Effective adaptive knobs: preset, profile tier, motion-estimation,
        subpel refine. */
     const char *want_preset;
-    int want_high, want_me, want_subme;
+    int want_high, want_me, want_subme, want_threads;
     /* bit0 profile, bit1 me, bit2 subme, bit3 preset: env-pinned knobs adapt
        may not touch. */
     int pins;
@@ -88,7 +88,7 @@ static int fill_params(NanoX264 *context, x264_param_t *p) {
     p->i_csp = X264_CSP_I420;
     p->i_bitdepth = 8;
     const char *threads = getenv("NANOCTL_X264_THREADS");
-    p->i_threads = threads && threads[0] ? atoi(threads) : 2;
+    p->i_threads = threads && threads[0] ? atoi(threads) : context->want_threads;
     p->b_sliced_threads = 1;
     p->i_fps_num = context->fps;
     p->i_fps_den = 1;
@@ -164,6 +164,7 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     context->want_preset = "veryfast";
     context->want_me = X264_ME_HEX;
     context->want_subme = 2;
+    context->want_threads = 4;
     const char *profile_env = getenv("NANOCTL_X264_PROFILE");
     if (profile_env && profile_env[0]) context->pins |= 1;
     if (env_me() >= 0) context->pins |= 2;
@@ -171,6 +172,8 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     if (subme_env && subme_env[0]) context->pins |= 4;
     const char *preset_env = getenv("NANOCTL_X264_PRESET");
     if (preset_env && preset_env[0]) context->pins |= 8;
+    const char *threads_env = getenv("NANOCTL_X264_THREADS");
+    if (threads_env && threads_env[0]) context->pins |= 16;
     if (library) {
         context->library = load(library);
     } else {
@@ -204,7 +207,9 @@ fail:
     return NULL;
 }
 
-/* Adaptive parameter tiers: 0 = baseline/hex/subme2 (worst-case safe),
+/* Adaptive parameter tiers: 0 = baseline/hex/subme2/threads4 (worst-case safe:
+   incompressible content is encode-time-bound, and threads4 halves it at no
+   measured quality cost there),
    1 = +CABAC/8x8 (high profile), 2 = +UMH, 3 = preset fast/subme6
    (only reachable after a long easy window). Env-pinned knobs are left
    alone. Returns 0 on a re-open, 1 when the masked target already
@@ -214,33 +219,37 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     const char *off = getenv("NANOCTL_X264_ADAPT");
     if (off && (!strcmp(off, "0") || !strcmp(off, "false"))) return -2;
     const char *preset;
-    int high, me, subme;
+    int high, me, subme, threads;
     switch (tier) {
-    case 0: preset = "veryfast"; high = 0; me = X264_ME_HEX; subme = 2; break;
-    case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; break;
-    case 2: preset = "veryfast"; high = 1; me = X264_ME_UMH; subme = 2; break;
-    case 3: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; break;
+    case 0: preset = "veryfast"; high = 0; me = X264_ME_HEX; subme = 2; threads = 4; break;
+    case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; threads = 2; break;
+    case 2: preset = "veryfast"; high = 1; me = X264_ME_UMH; subme = 2; threads = 2; break;
+    case 3: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 2; break;
     default: return -1;
     }
     if (context->pins & 1) high = context->want_high;
     if (context->pins & 2) me = context->want_me;
     if (context->pins & 4) subme = context->want_subme;
     if (context->pins & 8) preset = context->want_preset;
+    if (context->pins & 16) threads = context->want_threads;
     if (high == context->want_high && me == context->want_me &&
-        subme == context->want_subme && !strcmp(preset, context->want_preset))
+        subme == context->want_subme && !strcmp(preset, context->want_preset) &&
+        threads == context->want_threads)
         return 1;
     const char *prev_preset = context->want_preset;
     int prev_high = context->want_high, prev_me = context->want_me,
-        prev_subme = context->want_subme;
+        prev_subme = context->want_subme, prev_threads = context->want_threads;
     context->want_preset = preset;
     context->want_high = high;
     context->want_me = me;
     context->want_subme = subme;
+    context->want_threads = threads;
     if (reopen(context) == 0) return 0;
     context->want_preset = prev_preset;
     context->want_high = prev_high;
     context->want_me = prev_me;
     context->want_subme = prev_subme;
+    context->want_threads = prev_threads;
     reopen(context);
     return -1;
 }
