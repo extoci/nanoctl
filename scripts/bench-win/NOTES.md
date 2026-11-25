@@ -760,3 +760,14 @@ so worst case degenerates to the clone, never worse).
 Same `band --clock` A-B: agent CPU **6.1% → 5.6%**; cumulative vs xcap path
 **10.9% → 5.6% (−49%)**. fps/bitrate unchanged (58.1 / 108kbps); noise
 worst case unchanged (57.3fps / 19.2Mbps / tier 0).
+
+## Cycle 39 — G2G A-B: DXGI dirty-rect emit-on-present vs xcap poll (2026-11-25)
+
+Same rig/scene (`band --clock --height 80 --fps 120`), same agent binary, only `NANOCTL_DXGI_CAPTURE` toggled. g2g-probe, n≈600-1000 per run:
+
+| capture                       | G2G p50  | mean      | p99   | agent CPU (clock scene) |
+| ----------------------------- | -------- | --------- | ----- | ----------------------- |
+| DXGI dirty-rect (default)     | 41-42 ms | 43.1-43.6 | 78-79 | ~5.6 %                  |
+| xcap (NANOCTL_DXGI_CAPTURE=0) | 48 ms    | 48.7      | 73    | ~15.7 %                 |
+
+**DXGI path is also a glass-to-glass win: −6.4 ms p50 vs xcap** — emitting on present beats xcap's fixed-poll cadence. Absolute p50 drifts run-to-run (~34-42 ms across cycles on this ~30 Hz composite VM); only same-rig A-B deltas are comparable.
