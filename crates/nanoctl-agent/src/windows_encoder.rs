@@ -256,14 +256,6 @@ impl FrameEncoder for WindowsEncoder {
     }
 
     fn encode(&mut self, image: &crate::media::RgbaFrame<'_>) -> Result<EncodedFrame> {
-        self.encode_format(image, crate::media::PixelFormat::Rgba)
-    }
-
-    fn encode_format(
-        &mut self,
-        image: &crate::media::RgbaFrame<'_>,
-        format: crate::media::PixelFormat,
-    ) -> Result<EncodedFrame> {
         let width = image.width();
         let height = image.height();
         let dimensions_changed = self
@@ -286,7 +278,7 @@ impl FrameEncoder for WindowsEncoder {
             }
             self.force_keyframe = false;
         }
-        crate::nv12::pixels_to_nv12(image.as_raw(), width, height, format, &mut self.nv12)?;
+        crate::nv12::rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
         let duration = 10_000_000_i64 / i64::from(self.max_fps);
         let sample = create_input_sample(&self.nv12, self.timestamp, duration)?;
         self.timestamp = self.timestamp.saturating_add(duration);

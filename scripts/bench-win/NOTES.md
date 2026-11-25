@@ -795,3 +795,11 @@ G2G A-B, `band --clock`, same rig/session phase (n≈600-1300/run):
 - `band --motion`: 58.3fps / 149kbps / enc p50 5.13ms / adapt→tier3
 - `band --flash` (full-frame periodic flips): 58.2fps / ~8-32KB/s steady, enc max 13.2ms / adapt→tier3 — no bursts, recycle clone-fallback clean
 - Harness gotcha found: an occluded benchwin window emits nothing under DXGI (fake ~147kbps noise run vs real ~19Mbps) — scene must be visible on the composited screen for smoke numbers to count.
+
+## Cycle 43 — pipeline CPU/RSS under small-dirty motion scene (2026-11-25)
+
+Measured on the media-smoke pipeline (in-process, 30s window under `band --motion --fps 120`):
+
+- Agent pipeline: **8.6% CPU (of 8 cores) / 98MB RSS**, 58.1fps / 241kbps / encode p50 6.33ms.
+- Delta vs static clock scene (~5.6-6.1%): +2.5% is mostly x264 encode of the moving block — capture diff/copy path adds little under small dirty rects.
+- Tooling: `bench/cpu-agent.ps1` (agent by working set) and `bench/cpu-smoke.ps1` (smoke by command line) — cpu2.ps1 breaks when >1 nanoctl process exists (service + agent, or agent + smoke).

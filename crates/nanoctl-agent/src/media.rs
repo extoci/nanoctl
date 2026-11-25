@@ -317,7 +317,6 @@ struct LatestFrame {
 #[derive(Clone)]
 struct CapturedFrame {
     frame: xcap::Frame,
-    format: PixelFormat,
     captured_at: Instant,
     /// `Some(true)`/`Some(false)` when the capture backend itself knows whether
     /// the pixels changed (e.g. DXGI dirty rects) — the expensive full-frame
@@ -345,10 +344,7 @@ impl Drop for CapturedFrame {
 
 impl CapturedFrame {
     fn differs_from(&self, previous: &Self) -> bool {
-        if self.frame.width != previous.frame.width
-            || self.frame.height != previous.frame.height
-            || self.format != previous.format
-        {
+        if self.frame.width != previous.frame.width || self.frame.height != previous.frame.height {
             return true;
         }
         if let Some(changed) = self.backend_changed {
@@ -360,7 +356,7 @@ impl CapturedFrame {
 
 impl LatestFrame {
     fn replace(&self, frame: xcap::Frame) -> bool {
-        self.replace_hint(frame, PixelFormat::Rgba, None, 0)
+        self.replace_hint(frame, None, 0)
     }
 
     /// Drains the recycled pixel-buffer stash — (emit generation, buffer)
@@ -376,7 +372,6 @@ impl LatestFrame {
     fn replace_hint(
         &self,
         frame: xcap::Frame,
-        format: PixelFormat,
         backend_changed: Option<bool>,
         emit_gen: u64,
     ) -> bool {
@@ -385,7 +380,6 @@ impl LatestFrame {
         };
         let captured = Arc::new(CapturedFrame {
             frame,
-            format,
             captured_at: Instant::now(),
             backend_changed,
             emit_gen,
@@ -502,8 +496,6 @@ impl CaptureRecorder {
     }
 }
 
-pub(crate) use crate::pixel_format::PixelFormat;
-
 pub(crate) type RgbaFrame<'a> = xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &'a [u8]>;
 
 pub(crate) trait FrameEncoder {
@@ -513,25 +505,6 @@ pub(crate) trait FrameEncoder {
         0
     }
     fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame>;
-    /// Encodes a frame whose packed channel order is `format`. Encoders without
-    /// native support pay a correctness-preserving swizzle here; hot Windows
-    /// backends override this to consume native DXGI BGRA directly.
-    fn encode_format(
-        &mut self,
-        image: &RgbaFrame<'_>,
-        format: PixelFormat,
-    ) -> Result<EncodedFrame> {
-        if format == PixelFormat::Rgba {
-            return self.encode(image);
-        }
-        let mut rgba = Vec::with_capacity(image.as_raw().len());
-        for pixel in image.as_raw().chunks_exact(4) {
-            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-        }
-        let converted = RgbaFrame::from_raw(image.width(), image.height(), rgba.as_slice())
-            .context("invalid BGRA frame dimensions")?;
-        self.encode(&converted)
-    }
     /// (tier, switches) for encoders with content-driven parameter negotiation.
     fn adapt_state(&self) -> Option<(u8, u32)> {
         None
@@ -668,15 +641,10 @@ impl I420Frame {
         })
     }
 
-    #[cfg(test)]
     fn read_rgba(&mut self, rgba: &[u8]) -> Result<()> {
-        self.read_pixels(rgba, PixelFormat::Rgba)
-    }
-
-    fn read_pixels(&mut self, pixels_in: &[u8], format: PixelFormat) -> Result<()> {
         let pixels = self.width * self.height;
-        if Some(pixels_in.len()) != pixels.checked_mul(4) {
-            bail!("pixel buffer does not match I420 dimensions");
+        if Some(rgba.len()) != pixels.checked_mul(4) {
+            bail!("RGBA pixel buffer does not match I420 dimensions");
         }
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
@@ -690,26 +658,15 @@ impl I420Frame {
             width: self.width as u32,
             height: self.height as u32,
         };
-        let stride = (self.width * 4) as u32;
-        let result = match format {
-            PixelFormat::Rgba => yuv::rgba_to_yuv420(
-                &mut planar,
-                pixels_in,
-                stride,
-                yuv::YuvRange::Limited,
-                yuv::YuvStandardMatrix::Bt601,
-                yuv::YuvConversionMode::Balanced,
-            ),
-            PixelFormat::Bgra => yuv::bgra_to_yuv420(
-                &mut planar,
-                pixels_in,
-                stride,
-                yuv::YuvRange::Limited,
-                yuv::YuvStandardMatrix::Bt601,
-                yuv::YuvConversionMode::Balanced,
-            ),
-        };
-        result.map_err(|error| anyhow!("pixel input to I420 conversion failed: {error}"))?;
+        yuv::rgba_to_yuv420(
+            &mut planar,
+            rgba,
+            (self.width * 4) as u32,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )
+        .map_err(|error| anyhow!("RGBA to I420 conversion failed: {error}"))?;
         Ok(())
     }
 }
@@ -752,18 +709,13 @@ impl PsnrProbe {
         })
     }
 
-    fn observe(&mut self, image: &RgbaFrame<'_>, format: PixelFormat, access_unit: &[u8]) {
-        if let Err(error) = self.observe_inner(image, format, access_unit) {
+    fn observe(&mut self, image: &RgbaFrame<'_>, access_unit: &[u8]) {
+        if let Err(error) = self.observe_inner(image, access_unit) {
             tracing::debug!(%error, "psnr probe skipped a frame");
         }
     }
 
-    fn observe_inner(
-        &mut self,
-        image: &RgbaFrame<'_>,
-        format: PixelFormat,
-        access_unit: &[u8],
-    ) -> Result<()> {
+    fn observe_inner(&mut self, image: &RgbaFrame<'_>, access_unit: &[u8]) -> Result<()> {
         let dimensions = (image.width() as usize, image.height() as usize);
         if self
             .scratch
@@ -776,7 +728,7 @@ impl PsnrProbe {
             .scratch
             .as_mut()
             .context("I420 buffer is unavailable")?;
-        source.read_pixels(image.as_raw(), format)?;
+        source.read_rgba(image.as_raw())?;
         let Some(decoded) = self
             .decoder
             .decode(access_unit)
@@ -973,10 +925,7 @@ impl CaptureEncoder {
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let CapturedFrame {
-            frame,
-            format,
-            captured_at,
-            ..
+            frame, captured_at, ..
         } = captured;
         #[cfg(target_os = "linux")]
         let trace_started = trace::now();
@@ -1036,17 +985,7 @@ impl CaptureEncoder {
                 let n = DUMPED.fetch_add(1, Ordering::Relaxed);
                 if n < 3 {
                     let p = path.replace(".png", &format!("{n}.png"));
-                    if *format == PixelFormat::Bgra {
-                        let mut rgba = image.as_raw().to_vec();
-                        for pixel in rgba.chunks_exact_mut(4) {
-                            pixel.swap(0, 2);
-                        }
-                        if let Some(debug_image) = RgbaFrame::from_raw(width, height, &rgba) {
-                            let _ = debug_image.save(&p);
-                        }
-                    } else {
-                        let _ = image.save(&p);
-                    }
+                    let _ = image.save(&p);
                 }
             }
         }
@@ -1060,10 +999,10 @@ impl CaptureEncoder {
             .encode_attempts
             .fetch_add(1, Ordering::Relaxed);
         let color_before = self.encoder.color_convert_ns();
-        let encoded = self.encoder.encode_format(&image, *format)?;
+        let encoded = self.encoder.encode(&image)?;
         let encoded_at = Instant::now();
         if let Some(probe) = self.psnr.as_mut() {
-            probe.observe(&image, *format, &encoded.bytes);
+            probe.observe(&image, &encoded.bytes);
         }
         #[cfg(target_os = "linux")]
         trace::encoded(frame, &encoded.bytes, trace_started, trace::now());
@@ -1317,17 +1256,6 @@ impl EncoderBackend {
             impl std::ops::Deref<Target = [u8]>,
         >,
     ) -> Result<EncodedFrame> {
-        self.encode_format(image, PixelFormat::Rgba)
-    }
-
-    fn encode_format(
-        &mut self,
-        image: &xcap::image::ImageBuffer<
-            xcap::image::Rgba<u8>,
-            impl std::ops::Deref<Target = [u8]>,
-        >,
-        format: PixelFormat,
-    ) -> Result<EncodedFrame> {
         let view = xcap::image::ImageBuffer::from_raw(
             image.width(),
             image.height(),
@@ -1343,19 +1271,13 @@ impl EncoderBackend {
         self.dimensions = image.dimensions();
         loop {
             let active = self.active.as_mut().context("no active video encoder")?;
-            let encoded = active
-                .encoder
-                .encode_format(image, format)
-                .and_then(|frame| {
-                    if active.needs_initial_idr {
-                        crate::codec::validate_initial_access_unit(
-                            self.settings.codec,
-                            &frame.bytes,
-                        )?;
-                        active.needs_initial_idr = false;
-                    }
-                    Ok(frame)
-                });
+            let encoded = active.encoder.encode(image).and_then(|frame| {
+                if active.needs_initial_idr {
+                    crate::codec::validate_initial_access_unit(self.settings.codec, &frame.bytes)?;
+                    active.needs_initial_idr = false;
+                }
+                Ok(frame)
+            });
             match encoded {
                 Ok(frame) => return Ok(frame),
                 Err(error) => {
@@ -1441,13 +1363,7 @@ mod software_selection_tests {
         assert_eq!(backend.name(), "OpenH264");
         let image =
             xcap::image::RgbaImage::from_pixel(64, 64, xcap::image::Rgba([64, 128, 192, 255]));
-        assert!(
-            !backend
-                .encode_format(&image, PixelFormat::Rgba)
-                .unwrap()
-                .bytes
-                .is_empty()
-        );
+        assert!(!backend.encode(&image).unwrap().bytes.is_empty());
     }
 }
 
@@ -1515,14 +1431,6 @@ impl FrameEncoder for SoftwareEncoder {
     }
 
     fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame> {
-        self.encode_format(image, PixelFormat::Rgba)
-    }
-
-    fn encode_format(
-        &mut self,
-        image: &RgbaFrame<'_>,
-        format: PixelFormat,
-    ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.dimensions != Some(dimensions) {
             // OpenH264 does not promise dynamic resolution changes. Recreate the software
@@ -1542,7 +1450,7 @@ impl FrameEncoder for SoftwareEncoder {
             self.yuv = Some(I420Frame::new(dimensions.0, dimensions.1)?);
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
-        yuv.read_pixels(image.as_raw(), format)?;
+        yuv.read_rgba(image.as_raw())?;
         let color_elapsed = color_started.elapsed();
         self.color_convert_ns += color_elapsed.as_nanos() as u64;
         let bytes = self
@@ -3212,10 +3120,9 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 mod tests {
     use super::{
         EncodedFrame, EncodedFrameSlot, EncoderBackend, EncoderSettings, FrameEncoder,
-        HARDWARE_BACKENDS, HardwareBackend, LatestFrame, PixelFormat, SoftwareEncoder,
-        TimingSample, TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types,
-        avcc_to_annex_b, await_video_delivery, bitrate_target, delivery_failure_grace_elapsed,
-        fit_dimensions,
+        HARDWARE_BACKENDS, HardwareBackend, LatestFrame, SoftwareEncoder, TimingSample,
+        TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b,
+        await_video_delivery, bitrate_target, delivery_failure_grace_elapsed, fit_dimensions,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
@@ -3487,7 +3394,6 @@ mod tests {
         let now = Instant::now();
         let previous = super::CapturedFrame {
             frame: xcap::Frame::new(2, 2, vec![0; 16]),
-            format: PixelFormat::Rgba,
             captured_at: now,
             backend_changed: None,
             emit_gen: 0,
@@ -3496,9 +3402,6 @@ mod tests {
         let mut next = previous.clone();
         next.captured_at += Duration::from_secs(1);
         assert!(!next.differs_from(&previous));
-        next.format = PixelFormat::Bgra;
-        assert!(next.differs_from(&previous));
-        next.format = PixelFormat::Rgba;
         next.frame.raw[15] = 1;
         assert!(next.differs_from(&previous));
         next.frame.raw.clear();
@@ -3646,33 +3549,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_bgra_conversion_matches_swizzled_rgba_input() {
-        let mut seed = 0x8765_4321_u32;
-        let bgra: Vec<_> = (0..32 * 18 * 4)
-            .map(|_| {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (seed >> 24) as u8
-            })
-            .collect();
-        let mut rgba = bgra.clone();
-        for pixel in rgba.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-        let mut from_bgra = super::I420Frame::new(32, 18).unwrap();
-        let mut expected = super::I420Frame::new(32, 18).unwrap();
-        from_bgra.read_pixels(&bgra, PixelFormat::Bgra).unwrap();
-        expected.read_rgba(&rgba).unwrap();
-        let max_delta = from_bgra
-            .bytes
-            .iter()
-            .zip(expected.bytes.iter())
-            .map(|(a, b)| a.abs_diff(*b))
-            .max()
-            .unwrap_or(0);
-        assert!(max_delta <= 1, "max channel delta {max_delta}");
-    }
-
-    #[test]
     fn direct_rgba_conversion_rejects_invalid_layouts() {
         for (width, height) in [(0, 0), (1, 2), (2, 3), (usize::MAX - 1, 2)] {
             assert!(super::I420Frame::new(width, height).is_err());
@@ -3710,7 +3586,6 @@ mod tests {
         };
         let mut captured = super::CapturedFrame {
             frame: xcap::Frame::new(64, 64, vec![128; 64 * 64 * 4]),
-            format: PixelFormat::Rgba,
             captured_at: Instant::now() - Duration::from_secs(10),
             backend_changed: None,
             emit_gen: 0,

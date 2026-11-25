@@ -29,7 +29,7 @@ use xcap::{Frame, Monitor};
 
 use super::{LatestFrame, PipelineStats};
 
-/// Native BGRA bytes of one dirty rect.
+/// Swizzled RGBA bytes of one dirty rect.
 type Patch = (RECT, Vec<u8>);
 /// Dirty-region pixels of a contiguous run of small-dirty emits.
 type PatchLog = std::collections::VecDeque<(u64, Vec<Patch>)>;
@@ -40,13 +40,13 @@ struct Duplication {
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
-    /// Latest full BGRA image; dirty rects are patched into it between emits.
+    /// Latest full RGBA image; dirty rects are patched into it between emits.
     accum: Vec<u8>,
     /// Number of frames emitted so far — recycled buffers older than this
     /// generation need the logged patches below to catch up.
     emit_gen: u64,
     /// Pixel data of recent emits' dirty regions: (emit generation, per-rect
-    /// (rect, native BGRA bytes)) for a contiguous run of small-dirty
+    /// (rect, swizzled RGBA bytes)) for a contiguous run of small-dirty
     /// emits. A high-dirty emit clears it (storing patches would cost more
     /// than the clone it saves), so entries are a gap-free run.
     patch_log: PatchLog,
@@ -138,7 +138,7 @@ impl Duplication {
 
     /// Waits up to `timeout_ms` for a compositor frame; when one arrives and it
     /// carries changed pixels, patches the dirty regions into `accum` and
-    /// returns a full BGRA frame. Returns `None` on timeout or metadata-only
+    /// returns a full RGBA frame. Returns `None` on timeout or metadata-only
     /// frames (cursor moves without pixel changes).
     /// `latest` supplies recycled emit buffers: the frame this thread emitted
     /// last (emit_gen == self.emit_gen) comes back once every Arc is dropped,
@@ -324,8 +324,8 @@ impl Duplication {
     }
 
     /// Copies each dirty rect GPU→staging (sub-resource copies, so only dirty
-    /// data crosses the bus), then copies native BGRA into `accum` and the
-    /// emit buffer. When `log_patches` is set the rect bytes are
+    /// data crosses the bus), then swizzles BGRA→RGBA into `accum` and the
+    /// emit buffer. When `log_patches` is set the swizzled rect bytes are
     /// retained so future recycled buffers can catch up cheaply.
     fn copy_dirty(
         &mut self,
@@ -370,13 +370,21 @@ impl Duplication {
                 let top = (rect.top.max(0) as usize).min(self.height as usize);
                 let bottom = (rect.bottom as usize).min(self.height as usize);
                 for y in top..bottom {
-                    let row_bytes = (right - left) * 4;
-                    let src_row =
-                        std::slice::from_raw_parts(src.add(y * row_pitch + left * 4), row_bytes);
+                    let src_row = src.add(y * row_pitch + left * 4);
                     let dst_start = (y * self.width as usize + left) * 4;
-                    let dst_end = dst_start + row_bytes;
-                    self.accum[dst_start..dst_end].copy_from_slice(src_row);
-                    emit[dst_start..dst_end].copy_from_slice(src_row);
+                    let dst_row = &mut self.accum[dst_start..dst_start + (right - left) * 4];
+                    let emit_row = &mut emit[dst_start..dst_start + (right - left) * 4];
+                    for x in 0..(right - left) {
+                        let b = *src_row.add(x * 4);
+                        let g = *src_row.add(x * 4 + 1);
+                        let r = *src_row.add(x * 4 + 2);
+                        let a = *src_row.add(x * 4 + 3);
+                        dst_row[x * 4] = r;
+                        dst_row[x * 4 + 1] = g;
+                        dst_row[x * 4 + 2] = b;
+                        dst_row[x * 4 + 3] = a;
+                    }
+                    emit_row.copy_from_slice(dst_row);
                 }
                 if let Some(log) = &mut logged {
                     let cols = (right - left) * 4;
@@ -440,7 +448,7 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
             Ok(Some(frame)) => {
                 // Backend-verified change: producer skips the memcmp.
                 let eg = dup.emit_gen;
-                if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), eg) {
+                if !latest.replace_hint(frame, Some(true), eg) {
                     return;
                 }
             }

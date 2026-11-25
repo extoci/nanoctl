@@ -51,127 +51,22 @@ export function createVideoEncodedStreams(receiver: RTCRtpReceiver): EncodedStre
   }
 }
 
-export type AnnexBVideoCodec = "h264" | "hevc";
-
 /**
- * True when an Annex-B access unit starts a random-access picture. Every
- * slice of a picture shares its keyframe-ness and parameter sets precede the
- * first slice, so the scan stops at the first VCL NAL instead of walking the
- * whole (often tens of KB) slice payload of every delta frame.
+ * True when an Annex-B access unit starts an IDR (SPS or IDR slice). Every
+ * slice of a picture shares its IDR-ness and parameter sets precede the
+ * first slice, so the scan stops at the first VCL NAL instead of walking
+ * the whole (often tens of KB) slice payload of every delta frame.
  */
-export function containsIdr(annexB: Uint8Array, codec: AnnexBVideoCodec = "h264"): boolean {
+export function containsIdr(annexB: Uint8Array): boolean {
   for (let i = 0; i + 4 < annexB.length; i++) {
     if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) {
-      if (codec === "h264") {
-        const type = annexB[i + 3]! & 0x1f;
-        if (type === 5 || type === 7) return true;
-        if (type >= 1 && type <= 4) return false;
-      } else {
-        const type = (annexB[i + 3]! >> 1) & 0x3f;
-        // BLA/IDR/CRA pictures and the VPS/SPS/PPS that precede them.
-        if ((type >= 16 && type <= 21) || (type >= 32 && type <= 34)) return true;
-        if (type <= 18) return false;
-      }
+      const type = annexB[i + 3]! & 0x1f;
+      if (type === 5 || type === 7) return true;
+      if (type >= 1 && type <= 4) return false;
       i += 3;
     }
   }
   return false;
-}
-
-function stripEmulationPrevention(bytes: Uint8Array): Uint8Array {
-  const out = new Uint8Array(bytes.length);
-  let n = 0;
-  for (let i = 0; i < bytes.length; i++) {
-    if (i + 2 < bytes.length && bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 3) {
-      out[n++] = 0;
-      out[n++] = 0;
-      i += 2;
-    } else {
-      out[n++] = bytes[i]!;
-    }
-  }
-  return out.subarray(0, n);
-}
-
-class BitReader {
-  private bit = 0;
-
-  constructor(private readonly bytes: Uint8Array) {}
-
-  read(width: number): number | null {
-    let value = 0;
-    for (let i = 0; i < width; i++) {
-      const byte = this.bytes[this.bit >> 3];
-      if (byte === undefined) return null;
-      value = (value << 1) | ((byte >> (7 - (this.bit & 7))) & 1);
-      this.bit += 1;
-    }
-    return value >>> 0;
-  }
-
-  skip(width: number): boolean {
-    if (this.bit + width > this.bytes.length * 8) return false;
-    this.bit += width;
-    return true;
-  }
-}
-
-/**
- * Derives the fully-qualified HEVC codec string from the profile_tier_level
- * at the start of an SPS NAL. HEVC's Annex-B wire format carries that SPS
- * in-band, so no out-of-band HEVCDecoderConfigurationRecord is needed.
- */
-export function hevcCodecOf(annexB: Uint8Array): string {
-  const fallback = "hev1.1.6.L153.B0";
-  for (let i = 0; i + 5 < annexB.length; i++) {
-    if (!(annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1)) continue;
-    const header = i + 3;
-    if (((annexB[header]! >> 1) & 0x3f) !== 33) {
-      i += 3;
-      continue;
-    }
-    let end = annexB.length;
-    for (let j = header + 2; j + 2 < annexB.length; j++) {
-      if (annexB[j] === 0 && annexB[j + 1] === 0 && annexB[j + 2] === 1) {
-        end = j;
-        break;
-      }
-    }
-    const rbsp = stripEmulationPrevention(annexB.subarray(header + 2, end));
-    const bits = new BitReader(rbsp);
-    if (!bits.skip(8)) return fallback; // vps id, max sub layers, temporal nesting
-    const profileSpace = bits.read(2);
-    const tier = bits.read(1);
-    const profileIdc = bits.read(5);
-    const rawCompat = bits.read(32);
-    if (profileSpace === null || tier === null || profileIdc === null || rawCompat === null) {
-      return fallback;
-    }
-    let compat = 0;
-    for (let flag = 0; flag < 32; flag++) {
-      if ((rawCompat & (1 << (31 - flag))) !== 0) compat |= 1 << flag;
-    }
-    compat >>>= 0;
-    const constraint: number[] = [];
-    for (let byte = 0; byte < 6; byte++) {
-      const value = bits.read(8);
-      if (value === null) return fallback;
-      constraint.push(value);
-    }
-    const level = bits.read(8);
-    if (level === null) return fallback;
-    let lastConstraint = constraint.length - 1;
-    while (lastConstraint > 0 && constraint[lastConstraint] === 0) lastConstraint -= 1;
-    const constraintText = constraint
-      .slice(0, lastConstraint + 1)
-      .map((value) => value.toString(16).padStart(2, "0").toUpperCase())
-      .join(".");
-    const space = profileSpace === 0 ? "" : String.fromCharCode(64 + profileSpace);
-    return `hev1.${space}${profileIdc}.${compat.toString(16).toUpperCase()}.${
-      tier === 0 ? "L" : "H"
-    }${level}.${constraintText}`;
-  }
-  return fallback;
 }
 
 interface VideoSink {
@@ -190,7 +85,6 @@ function createVideoSink(
   video: HTMLVideoElement,
   onTeardown?: () => void,
   joinAt?: number,
-  annexBCodec: AnnexBVideoCodec = "h264",
 ): VideoSink {
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
@@ -237,10 +131,10 @@ function createVideoSink(
   // Decode latency probe: chunk timestampUs -> performance.now() at decode().
   const decodeSubmit = new Map<number, number>();
   // Present latency probe: decoder-output times keyed by frame timestamp.
-  // A track-generator video element reports mediaTime as seconds since the
-  // first frame, so firstOutTs + mediaTime*1e6 maps back to frame.timestamp.
+  // rVFC mediaTime is seconds; its timeline base and fractional precision
+  // vary, so match the nearest decoded-frame timestamp within 5ms instead
+  // of an exact key.
   const decodeOutput = new Map<number, number>();
-  let firstOutTs: number | undefined;
   const armPresentProbe = () => {
     if (
       typeof (video as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback !==
@@ -250,11 +144,20 @@ function createVideoSink(
     }
     const onFrame = (now: number, meta: { mediaTime?: number }) => {
       const dbg = ((window as unknown as { __dcv?: Record<string, unknown> }).__dcv ??= {});
-      if (firstOutTs !== undefined && meta.mediaTime !== undefined) {
-        const stamp = firstOutTs + Math.round(meta.mediaTime * 1e6);
-        const out = decodeOutput.get(stamp);
-        if (out !== undefined) {
-          decodeOutput.delete(stamp);
+      if (meta.mediaTime !== undefined && decodeOutput.size > 0) {
+        const stampUs = Math.round(meta.mediaTime * 1e6);
+        let bestKey = 0;
+        let bestDiff = Number.POSITIVE_INFINITY;
+        for (const key of decodeOutput.keys()) {
+          const d = Math.abs(key - stampUs);
+          if (d < bestDiff) {
+            bestDiff = d;
+            bestKey = key;
+          }
+        }
+        if (bestDiff <= 5000) {
+          const out = decodeOutput.get(bestKey)!;
+          decodeOutput.delete(bestKey);
           const ms = now - out;
           dbg.presentSum = ((dbg.presentSum as number) ?? 0) + ms;
           dbg.presentN = ((dbg.presentN as number) ?? 0) + 1;
@@ -277,9 +180,8 @@ function createVideoSink(
   };
   armPresentProbe();
 
-  // Derive the codec string from parameter sets in an access unit.
+  // Derive the codec string from the SPS in an access unit (avc1.PPCCLL).
   const codecOf = (annexB: Uint8Array): string => {
-    if (annexBCodec === "hevc") return hevcCodecOf(annexB);
     let codec = "avc1.640028";
     for (let i = 0; i + 7 < annexB.length; i++) {
       if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) {
@@ -323,7 +225,6 @@ function createVideoSink(
           }
         }
         if (decodeSubmit.size > 64) decodeSubmit.clear();
-        if (firstOutTs === undefined) firstOutTs = frame.timestamp;
         decodeOutput.set(frame.timestamp, performance.now());
         if (decodeOutput.size > 256) {
           decodeOutput.delete(decodeOutput.keys().next().value!);
@@ -410,7 +311,7 @@ function createVideoSink(
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number) => {
     const annexB = toAnnexB(data);
     if (!decoderConfigured) {
-      if (!isKey && !containsIdr(annexB, annexBCodec)) {
+      if (!isKey && !containsIdr(annexB)) {
         dropped += 1;
         return;
       }
@@ -422,7 +323,7 @@ function createVideoSink(
     // Adaptive encoders may switch H.264 profiles between IDRs (e.g. baseline
     // under stress, high when the content is easy). Annex-B carries the new
     // SPS in-band; re-configure the decoder so the codec string tracks it.
-    if (isKey || containsIdr(annexB, annexBCodec)) {
+    if (isKey || containsIdr(annexB)) {
       const codec = codecOf(annexB);
       if (codec !== configuredCodec) {
         try {
@@ -513,11 +414,10 @@ export function attachDataChannelVideo(
   idrChannel: RTCDataChannel | null,
   video: HTMLVideoElement,
   onTeardown?: () => void,
-  annexBCodec: AnnexBVideoCodec = "h264",
 ): WebCodecsVideoHandle {
   // Join latency: attach -> first keyframe fed to the decoder.
   const joinAt = performance.now();
-  const sink = createVideoSink(video, onTeardown, joinAt, annexBCodec);
+  const sink = createVideoSink(video, onTeardown, joinAt);
   // Wire format: [u32 seq][u8 flags][annex-b au]. Deltas ride the unordered,
   // unreliable channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
