@@ -50,8 +50,9 @@ final class Session {
     private var timeout: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var statsTask: Task<Void, Never>?
-    private var endpoint: HostEndpoint?
-    private var wantsConnection = false
+    private(set) var endpoint: HostEndpoint?
+    /// The user wants a session (connecting, live or retrying).
+    private(set) var wantsConnection = false
     private var reconnectAttempts = 0
 
     private(set) var track: RTCVideoTrack?
@@ -75,6 +76,9 @@ final class Session {
             _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
         }
     }
+    /// Viewer caps below the host's maximums; nil means the maximum.
+    var maxFps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
+    var maxBitrateKbps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
     var onChange: (() -> Void)?
     var onClipboard: ((String) -> Void)?
 
@@ -150,6 +154,12 @@ final class Session {
                 if connection === current { fail(error.localizedDescription, current) }
             }
         }
+    }
+
+    /// Reconnects to the last host, e.g. after a codec change or returning
+    /// from the background.
+    func restart() {
+        if let endpoint { start(endpoint) }
     }
 
     /// Stops the connection and cancels auto-reconnect (user-initiated).
@@ -565,6 +575,7 @@ final class Session {
         guard current.control?.readyState == .open else { return }
         _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
         guard statsTask == nil else { return }
+        if maxFps != nil || maxBitrateKbps != nil { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) }
         statsTask = nil
         statsTask = Task { [weak self, weak current] in
             var ticks = 0

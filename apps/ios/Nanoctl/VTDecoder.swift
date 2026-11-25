@@ -26,6 +26,7 @@ final class VTDecoder {
     /// Decoder or bitstream failure; caller should drop deltas until a keyframe.
     var onFault: (() -> Void)?
 
+    private var faultPending = false
     private(set) var decoded = 0
     private(set) var dropped = 0
     private(set) var faults = 0
@@ -45,6 +46,7 @@ final class VTDecoder {
     /// Feeds one Annex-B access unit. `seq` drives presentation ordering and
     /// timestamps, mirroring the browser's `seq * 16_000` microseconds.
     func decode(_ au: Data, isKey: Bool, seq: UInt32) {
+        if faultPending { fault() }
         var parameters: [Data] = []
         guard let avcc = Self.avcc(au, codec: codec, parameters: &parameters) else {
             dropped += 1
@@ -115,7 +117,8 @@ final class VTDecoder {
             self.inflight -= 1
             guard status == noErr else {
                 log.error("decode callback status=\(status, privacy: .public)")
-                self.fault()
+                // Invalidating here would wait on this very callback.
+                self.faultPending = true
                 return
             }
             guard let buffer else { return }
@@ -124,6 +127,8 @@ final class VTDecoder {
         }
         if status != noErr {
             inflight -= 1
+            fault()
+        } else if faultPending {
             fault()
         }
     }
@@ -137,6 +142,7 @@ final class VTDecoder {
     }
 
     private func fault() {
+        faultPending = false
         faults += 1
         invalidate()
         onFault?()
