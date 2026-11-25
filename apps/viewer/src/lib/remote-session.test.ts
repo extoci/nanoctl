@@ -1065,6 +1065,39 @@ describe("webcodecs video gating and teardown", () => {
     expect(resets).toBeGreaterThan(0);
   });
 
+  test("keyframe requests use the reliable idr channel when present", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const idrChannel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      idrChannel as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+    );
+    expect(idrChannel.sent).toContain("KF");
+    expect(channel.sent).not.toContain("KF");
+  });
+
   test("data-channel loss requests recovery as soon as the reorder window overflows", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
