@@ -461,7 +461,12 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
     let _mmcss = crate::media::register_mmcss();
     let h_monitor = HMONITOR(h_monitor_raw as *mut _);
     let mut dup = Some(dup);
-    let mut last_frame = Instant::now();
+    // A process/system suspend can invalidate the desktop-duplication session
+    // without returning ACCESS_LOST: after resume AcquireNextFrame only times
+    // out. Do not infer staleness from a static desktop — timeouts are normal
+    // there. Infer suspension from the capture loop itself missing its normal
+    // ~100ms cadence by a wide margin instead.
+    let mut previous_loop = Instant::now();
     loop {
         let Some(latest) = slot.upgrade() else {
             return;
@@ -469,36 +474,27 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
         if latest.stopped.load(Ordering::Acquire) {
             return;
         }
-        if dup.is_none() {
+        let loop_started = Instant::now();
+        let resumed = loop_started.duration_since(previous_loop) >= Duration::from_secs(2);
+        previous_loop = loop_started;
+        if resumed {
             recreate(h_monitor, &mut dup);
-            if dup.is_none() {
-                continue;
-            }
+        } else if dup.is_none() {
+            recreate(h_monitor, &mut dup);
+        }
+        if dup.is_none() {
+            continue;
         }
         let active = dup.as_mut().expect("duplication checked above");
         match active.acquire(100, &latest) {
             Ok(Some(frame)) => {
-                last_frame = Instant::now();
                 // Backend-verified change: producer skips the memcmp.
                 let eg = active.emit_gen;
                 if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), eg) {
                     return;
                 }
             }
-            Ok(None) => {
-                // A frozen/then-resumed pipeline (process suspend, network
-                // partition) leaves the duplication session stale:
-                // AcquireNextFrame keeps timing out without ever returning
-                // ACCESS_LOST, so the error path never rebuilds it and the
-                // stream sits on keepalives until the session happens to
-                // unstick (~15s observed). Rebuild after sustained
-                // starvation — idempotent; a truly static desktop just
-                // re-emits one frame on roughly the keepalive cadence.
-                if last_frame.elapsed() >= Duration::from_secs(4) {
-                    recreate(h_monitor, &mut dup);
-                    last_frame = Instant::now();
-                }
-            }
+            Ok(None) => {}
             Err(error) => {
                 let is_access_lost = error
                     .downcast_ref::<windows::core::Error>()
