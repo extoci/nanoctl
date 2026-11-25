@@ -156,7 +156,7 @@ try {
     me: "umh",
     subme: 6,
     threads: 2,
-    refs: 2,
+    refs: 4,
   };
   const tier4: Tier = {
     name: "tier4-single-slice-ref4",
@@ -169,7 +169,7 @@ try {
   };
   const rows = [tier0, tier3, tier4].flatMap((tier) => [
     measure(directory, tier, stress),
-    ...(tier === tier0 ? [] : [measure(directory, tier, scroll)]),
+    measure(directory, tier, scroll),
   ]);
   for (const row of rows) {
     console.log(
@@ -186,9 +186,12 @@ try {
   );
   const scroll3 = rows.find((row) => row.name === "tier3-high-umh-scroll")!;
   const scroll4 = rows.find((row) => row.name === "tier4-single-slice-ref4-scroll")!;
+  const scroll0 = rows.find((row) => row.name === "tier0-baseline-hex-scroll")!;
   console.log(
     `tier4 vs tier3 scrolling screen: ${((1 - scroll4.bytes / scroll3.bytes) * 100).toFixed(1)}% fewer bytes, ` +
-      `${(scroll4.ssim - scroll3.ssim).toFixed(6)} SSIM`,
+      `${(scroll4.ssim - scroll3.ssim).toFixed(6)} SSIM; tier3 vs tier0: ` +
+      `${((1 - scroll3.bytes / scroll0.bytes) * 100).toFixed(1)}% fewer; tier4 vs tier0: ` +
+      `${((1 - scroll4.bytes / scroll0.bytes) * 100).toFixed(1)}% fewer`,
   );
   if (current.bytes >= before.bytes || current.ssim + 0.0002 < before.ssim) process.exitCode = 1;
   if (next.bytes >= current.bytes || next.ssim + 0.0002 < current.ssim) process.exitCode = 1;

@@ -738,7 +738,7 @@ mod tests {
         let p = encoder.active.parameters();
         assert_eq!(
             (p.cabac, p.me, p.subme, p.threads, p.refs),
-            (1, ME_UMH, 6, 2, 2)
+            (1, ME_UMH, 6, 2, 4)
         );
         assert_eq!(encoder.active.adapt(4), 0);
         let p = encoder.active.parameters();
