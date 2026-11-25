@@ -2489,21 +2489,38 @@ pub fn prime_replay(
         .context("no display is available")?;
     // A single-shot grab, not a recorder: a second capture session starves
     // the real pipeline's recorder (its first-frame wait timed out at 5s).
-    let image = monitor.capture_image()?;
-    let (source_width, source_height) = image.dimensions();
+    // On Windows this must use DXGI rather than xcap/WGC: one-shot WGC teardown
+    // intermittently unloads GraphicsCapture.dll beneath its own async cleanup.
+    #[cfg(target_os = "windows")]
+    let captured = media_dxgi::capture_once(&monitor)?;
+    #[cfg(not(target_os = "windows"))]
+    let captured = {
+        let image = monitor.capture_image()?;
+        let (width, height) = image.dimensions();
+        xcap::Frame::new(width, height, image.into_raw())
+    };
+    #[cfg(target_os = "windows")]
+    let pixel_format = PixelFormat::Bgra;
+    #[cfg(not(target_os = "windows"))]
+    let pixel_format = PixelFormat::Rgba;
+    let (source_width, source_height) = (captured.width, captured.height);
     let (target_width, target_height) =
         fit_dimensions(source_width, source_height, max_width, max_height);
-    let image = if target_width == source_width && target_height == source_height {
-        image
+    let resized = if target_width == source_width && target_height == source_height {
+        None
     } else {
-        xcap::image::imageops::resize(
-            &image,
+        let source = rgba_view(&captured)?;
+        Some(xcap::image::imageops::resize(
+            &source,
             target_width,
             target_height,
             xcap::image::imageops::FilterType::Triangle,
-        )
+        ))
     };
-    let (width, height) = image.dimensions();
+    let (width, height) = resized
+        .as_ref()
+        .map(|image| image.dimensions())
+        .unwrap_or((source_width, source_height));
     if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
         bail!("captured display dimensions must be non-zero and even");
     }
@@ -2518,7 +2535,13 @@ pub fn prime_replay(
         latency_mode,
         (width, height),
     )?;
-    let frame = backend.encode(&image)?;
+    let frame = if let Some(resized) = &resized {
+        let view = xcap::image::ImageBuffer::from_raw(width, height, resized.as_raw().as_slice())
+            .context("resized display capture is invalid")?;
+        backend.encode_format(&view, pixel_format)?
+    } else {
+        backend.encode_format(&rgba_view(&captured)?, pixel_format)?
+    };
     const CHUNK: usize = 48 * 1024;
     let parts = frame.bytes.len().div_ceil(CHUNK).max(1) as u16;
     let sent_ms = std::time::SystemTime::now()

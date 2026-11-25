@@ -394,6 +394,23 @@ impl Duplication {
     }
 }
 
+/// Captures one full desktop frame through DXGI. This exists for startup
+/// warmup paths that must not instantiate xcap's Windows Graphics Capture:
+/// dropping a one-shot WGC session can let Windows unload GraphicsCapture.dll
+/// while its async teardown is still active, intermittently crashing the whole
+/// agent with 0xc0000005.
+pub(super) fn capture_once(monitor: &Monitor) -> Result<Frame> {
+    let h_monitor = HMONITOR(monitor.id()? as usize as *mut _);
+    let mut dup = Duplication::new(h_monitor)?;
+    let latest = Arc::new(LatestFrame::default());
+    for _ in 0..8 {
+        if let Some(frame) = dup.acquire(125, &latest)? {
+            return Ok(frame);
+        }
+    }
+    bail!("DXGI duplication produced no initial frame")
+}
+
 /// Starts a DXGI duplication capture loop for `monitor`. Returns the latest
 /// frame slot and the owning thread; mirrors `linux_damage::start`. On failure
 /// the caller falls back to the xcap recorder path.
