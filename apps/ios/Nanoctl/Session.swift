@@ -130,6 +130,8 @@ final class Session {
             _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
         }
     }
+    private var viewportWidth: Int?
+    private var viewportHeight: Int?
     /// Viewer caps below the host's maximums; nil means the maximum.
     var maxFps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
     var maxBitrateKbps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
@@ -325,11 +327,22 @@ final class Session {
         sendControl(["type": "display", "displayId": displayId])
     }
 
+    /// Reports the physical pixels visible to the rendered video. Nil restores
+    /// the host's configured dimensions while zoomed or using external output.
+    func setViewportSize(width: Int?, height: Int?) {
+        guard width != viewportWidth || height != viewportHeight else { return }
+        viewportWidth = width
+        viewportHeight = height
+        _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps)
+    }
+
     @discardableResult
     func setQuality(maxFps: Int?, maxBitrateKbps: Int?) -> Bool {
         var value: [String: Any] = ["type": "quality"]
         if let maxFps { value["maxFps"] = maxFps }
         if let maxBitrateKbps { value["maxBitrateKbps"] = maxBitrateKbps }
+        if let viewportWidth { value["maxWidth"] = viewportWidth }
+        if let viewportHeight { value["maxHeight"] = viewportHeight }
         // Viewer quality limits are view-only safe on the host; they must not
         // depend on input admission.
         return sendControlFree(value)

@@ -43,6 +43,7 @@ final class Stage: UIView {
             self?.video.transform = CGAffineTransform(translationX: zoom.offsetX, y: zoom.offsetY)
                 .scaledBy(x: zoom.scale, y: zoom.scale)
             self?.placeCursor()
+            self?.publishViewportSize()
         }
         cursor.isUserInteractionEnabled = false
         cursor.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
@@ -73,6 +74,7 @@ final class Stage: UIView {
         video.show(hasVideo && !external && session.transport == .rtp ? desktop.mailbox : nil)
         video.show(pixels: hasVideo && !external && session.transport == .dataChannel ? session.pixelMailbox : nil)
         placeCursor()
+        publishViewportSize()
     }
 
     /// The letterboxed video rect in surface coordinates, including zoom.
@@ -92,6 +94,30 @@ final class Stage: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         placeCursor()
+        publishViewportSize()
+    }
+
+    private func publishViewportSize() {
+        guard let desktop else { return }
+        // Zooming and external output can expose detail outside the nominal
+        // letterboxed viewport, so they must not ask the host to downscale.
+        guard !external, gestures.zoom.scale <= 1.01 else {
+            desktop.session.setViewportSize(width: nil, height: nil)
+            return
+        }
+        let area = video.inputArea
+        guard !area.isEmpty else {
+            desktop.session.setViewportSize(width: nil, height: nil)
+            return
+        }
+        let scale = window?.windowScene?.screen.scale ?? traitCollection.displayScale
+        func evenPhysicalPixels(_ points: CGFloat) -> Int {
+            max(2, Int((points * scale / 2).rounded(.up)) * 2)
+        }
+        desktop.session.setViewportSize(
+            width: evenPhysicalPixels(area.width),
+            height: evenPhysicalPixels(area.height)
+        )
     }
 }
 
