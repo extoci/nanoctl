@@ -23,7 +23,8 @@ WireGuard transport, NAT traversal and, when needed, DERP relay.
   checks daily and renews within 14 days of expiry. Native HTTPS is the default;
   issuance failure without a valid certificate produces a warned HTTP fallback.
 - `service.rs` owns shutdown and the ready marker. One WebSocket owns one session;
-  replacement or socket closure tears down and joins media/input work.
+  up to four identified client endpoints may be active concurrently. Reconnecting an
+  endpoint or socket closure tears down and joins that session's media/input work.
 - `rtc.rs` retains v2 epochs, ICE generations, input lanes and bounded recovery.
   ICE has no servers and only gathers tailnet host candidates.
 - The media pipeline captures the interactive desktop, bounds its newest-frame queue,
