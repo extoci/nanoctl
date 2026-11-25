@@ -619,6 +619,11 @@ pub(crate) type RgbaFrame<'a> = xcap::image::ImageBuffer<xcap::image::Rgba<u8>, 
 pub(crate) trait FrameEncoder {
     fn force_keyframe(&mut self);
     fn set_bitrate(&mut self, target_kbps: u32) -> Result<()>;
+    /// Whether the current bitrate target is below the session ceiling because
+    /// network probing has not proved more egress. Encoders with expensive
+    /// compression knobs use this to avoid mistaking a network cap for content
+    /// that needs a faster, less efficient parameter tier.
+    fn set_network_constrained(&mut self, _constrained: bool) {}
     fn color_convert_ns(&self) -> u64 {
         0
     }
@@ -753,6 +758,7 @@ struct EncoderBackend {
     preference: EncoderPreference,
     settings: EncoderSettings,
     dimensions: (u32, u32),
+    network_constrained: bool,
 }
 
 struct SoftwareEncoder {
@@ -1436,6 +1442,7 @@ impl EncoderBackend {
             preference,
             settings,
             dimensions,
+            network_constrained: false,
         };
         backend.activate_next(None)?;
         Ok(backend)
@@ -1450,7 +1457,8 @@ impl EncoderBackend {
                 continue;
             }
             match (hardware.open)(self.settings, self.dimensions) {
-                Ok(encoder) => {
+                Ok(mut encoder) => {
+                    encoder.set_network_constrained(self.network_constrained);
                     self.active = Some(ActiveEncoder {
                         hardware: Some(hardware),
                         encoder,
@@ -1485,13 +1493,15 @@ impl EncoderBackend {
         if let Some(error) = last_error {
             tracing::debug!(%error, "no usable hardware encoder; using software encoding");
         }
+        let mut encoder = Self::software_encoder(
+            force_openh264(std::env::var("NANOCTL_SOFTWARE_ENCODER").ok().as_deref())?,
+            self.settings,
+            self.dimensions,
+        )?;
+        encoder.set_network_constrained(self.network_constrained);
         self.active = Some(ActiveEncoder {
             hardware: None,
-            encoder: Self::software_encoder(
-                force_openh264(std::env::var("NANOCTL_SOFTWARE_ENCODER").ok().as_deref())?,
-                self.settings,
-                self.dimensions,
-            )?,
+            encoder,
             needs_initial_idr: true,
         });
         Ok(())
@@ -1558,10 +1568,18 @@ impl EncoderBackend {
             preference: EncoderPreference::Software,
             settings,
             dimensions,
+            network_constrained: false,
         })
     }
 
     fn apply_bitrate_estimate(&mut self, estimate_kbps: u32, ceiling_kbps: u32) -> Result<bool> {
+        let network_constrained = estimate_kbps < ceiling_kbps;
+        if self.network_constrained != network_constrained {
+            self.network_constrained = network_constrained;
+            if let Some(active) = self.active.as_mut() {
+                active.encoder.set_network_constrained(network_constrained);
+            }
+        }
         let Some(target_kbps) = bitrate_target(
             self.settings.bitrate_kbps,
             estimate_kbps,
@@ -4548,6 +4566,7 @@ mod tests {
         struct AdaptiveHardware {
             bitrate_kbps: u32,
             pixels: usize,
+            network_constrained: std::sync::Arc<std::sync::atomic::AtomicBool>,
         }
 
         impl FrameEncoder for AdaptiveHardware {
@@ -4556,6 +4575,11 @@ mod tests {
             fn set_bitrate(&mut self, target_kbps: u32) -> anyhow::Result<()> {
                 self.bitrate_kbps = target_kbps;
                 Ok(())
+            }
+
+            fn set_network_constrained(&mut self, constrained: bool) {
+                self.network_constrained
+                    .store(constrained, std::sync::atomic::Ordering::Relaxed);
             }
 
             fn encode(&mut self, image: &super::RgbaFrame<'_>) -> anyhow::Result<EncodedFrame> {
@@ -4570,12 +4594,14 @@ mod tests {
         }
 
         let mut image = RgbaImage::from_pixel(64, 64, Rgba([40, 96, 160, 255]));
+        let hardware_constrained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut encoder = EncoderBackend {
             active: Some(super::ActiveEncoder {
                 hardware: Some(&FAILING_HARDWARE),
                 encoder: Box::new(AdaptiveHardware {
                     bitrate_kbps: TEST_SETTINGS.bitrate_kbps,
                     pixels: image.as_raw().as_ptr() as usize,
+                    network_constrained: hardware_constrained.clone(),
                 }),
                 needs_initial_idr: true,
             }),
@@ -4583,10 +4609,16 @@ mod tests {
             preference: EncoderPreference::Auto,
             settings: TEST_SETTINGS,
             dimensions: image.dimensions(),
+            network_constrained: false,
         };
         encoder.encode(&image).unwrap();
-        for target in [2_000, 6_000] {
+        for (target, constrained) in [(2_000, true), (6_000, true), (8_000, false)] {
             assert!(encoder.apply_bitrate_estimate(target, 8_000).unwrap());
+            assert_eq!(encoder.network_constrained, constrained);
+            assert_eq!(
+                hardware_constrained.load(std::sync::atomic::Ordering::Relaxed),
+                constrained
+            );
             image.get_pixel_mut(0, 0)[0] = (target / 100) as u8;
             encoder.encode(&image).unwrap();
             assert_eq!(encoder.id(), "first");

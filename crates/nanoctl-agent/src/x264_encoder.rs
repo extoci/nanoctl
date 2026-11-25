@@ -159,6 +159,7 @@ struct AdaptPolicy {
     stress_frames: u32,
     cooldown: u32,
     switches: u32,
+    network_constrained: bool,
 }
 
 impl AdaptPolicy {
@@ -196,7 +197,14 @@ impl AdaptPolicy {
         if self.tier > 0 && self.encode_ewma_ns > 0.85 * budget_ns {
             return Some(0);
         }
-        if self.encode_ewma_ns > 0.55 * budget_ns || self.bytes_ewma > 0.85 * cap_bytes {
+        let byte_stress = self.bytes_ewma > 0.85 * cap_bytes;
+        // A full rate-control bucket means two very different things. With
+        // network headroom it is content stress, so falling back to cheaper
+        // analysis protects fps. When the network itself is the constraint,
+        // the bucket is expected to be full; falling back would spend the
+        // scarce bytes less efficiently for no latency benefit. CPU overload
+        // remains a hard stress signal in both cases.
+        if self.encode_ewma_ns > 0.55 * budget_ns || (byte_stress && !self.network_constrained) {
             self.ease_frames = 0;
             self.stress_frames = self.stress_frames.saturating_add(1);
             if self.tier > 0 && self.stress_frames >= Self::STRESS_FRAMES {
@@ -210,7 +218,7 @@ impl AdaptPolicy {
             && self.ease_frames >= Self::EASE_FRAMES[self.tier as usize]
             && self.cooldown >= Self::SWITCH_COOLDOWN
             && self.encode_ewma_ns < 0.30 * budget_ns
-            && self.bytes_ewma < 0.50 * cap_bytes
+            && (self.bytes_ewma < 0.50 * cap_bytes || self.network_constrained)
         {
             // Trivially easy content skips intermediate tiers entirely —
             // one re-open/IDR instead of one per rung.
@@ -277,12 +285,17 @@ impl X264Encoder {
                 stress_frames: 0,
                 cooldown: 0,
                 switches: 0,
+                network_constrained: false,
             },
             adapt_enabled: !matches!(
                 std::env::var("NANOCTL_X264_ADAPT").as_deref(),
                 Ok("0") | Ok("false")
             ),
         })
+    }
+
+    pub(super) fn set_network_constrained(&mut self, constrained: bool) {
+        self.adapt.network_constrained = constrained;
     }
 
     /// Current negotiation tier and how many switches have fired — consumed by
@@ -439,6 +452,12 @@ impl FrameEncoder for ResilientX264 {
         match self {
             Self::Native(encoder) => encoder.set_bitrate(target_kbps),
             Self::Fallback(encoder) => encoder.set_bitrate(target_kbps),
+        }
+    }
+
+    fn set_network_constrained(&mut self, constrained: bool) {
+        if let Self::Native(encoder) = self {
+            encoder.set_network_constrained(constrained);
         }
     }
 
@@ -738,6 +757,7 @@ mod tests {
             stress_frames: 0,
             cooldown: 0,
             switches: 0,
+            network_constrained: false,
         };
         let budget = 1_000_000_000.0 / 60.0;
         let cap = 4_000.0 * 125.0 / 60.0;
@@ -769,6 +789,47 @@ mod tests {
             policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap),
             Some(1)
         );
+    }
+
+    #[test]
+    fn adapt_policy_network_pressure_does_not_look_like_content_stress() {
+        let mut policy = AdaptPolicy {
+            tier: 1,
+            encode_ewma_ns: 0.0,
+            bytes_ewma: 0.0,
+            ease_frames: 0,
+            stress_frames: 0,
+            cooldown: 0,
+            switches: 0,
+            network_constrained: true,
+        };
+        let budget = 1_000_000_000.0 / 60.0;
+        let cap = 4_000.0 * 125.0 / 60.0;
+        // Full-rate frames under a network cap neither demote efficient tiers
+        // nor block promotion when the CPU has headroom.
+        for _ in 0..AdaptPolicy::EASE_FRAMES[0] + AdaptPolicy::SWITCH_COOLDOWN - 1 {
+            assert_ne!(
+                policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap),
+            Some(2)
+        );
+
+        // Once the network proves headroom, the same full bucket is content
+        // stress again and cheap analysis returns after the stress window.
+        policy.committed(2);
+        policy.network_constrained = false;
+        let mut demoted = None;
+        for _ in 0..120 {
+            if let Some(tier) = policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap) {
+                demoted = Some(tier);
+                break;
+            }
+        }
+        assert_eq!(demoted, Some(1));
     }
 
     #[test]
