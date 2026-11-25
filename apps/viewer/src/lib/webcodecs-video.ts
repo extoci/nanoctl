@@ -730,10 +730,22 @@ export function attachDataChannelVideo(
           off += g.length;
         }
         au = joined;
-        // Drop stale partials that can never complete.
-        for (const key of pending.keys()) {
-          if (((seq - key) | 0) > 0) pending.delete(key);
+      }
+      // Drop stale partials that can never complete. An incomplete delta
+      // means the reference chain is already broken, so start keyframe
+      // recovery now instead of waiting for the reorder window to overflow.
+      let lostIncomplete = false;
+      for (const key of pending.keys()) {
+        if (((seq - key) | 0) > 0) {
+          pending.delete(key);
+          lostIncomplete = true;
         }
+      }
+      if (lostIncomplete && !waitingForKey) {
+        waitingForKey = true;
+        dbg.gaps = (dbg.gaps as number) + 1;
+        reordered.clear();
+        requestKeyframe();
       }
       if (!au) return;
       if (expectedSeq === null) {
