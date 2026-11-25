@@ -1074,11 +1074,10 @@ describe("webcodecs video gating and teardown", () => {
     );
     const message = (seq: number, key: boolean) => {
       const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
-      const bytes = new Uint8Array(17 + au.length);
+      const bytes = new Uint8Array(5 + au.length);
       bytes[0] = seq;
       bytes[4] = key ? 1 : 0;
-      bytes[7] = 1;
-      bytes.set(au, 17);
+      bytes.set(au, 5);
       return bytes.buffer;
     };
     const receive = (seq: number, key = false) =>
@@ -1212,12 +1211,17 @@ describe("webcodecs video gating and teardown", () => {
     );
     const message = (seq: number, key: boolean, part = 0, parts = 1) => {
       const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
-      const bytes = new Uint8Array(17 + au.length);
+      const fragmented = parts > 1;
+      const bytes = new Uint8Array((fragmented ? 9 : 5) + au.length);
       bytes[0] = seq;
-      bytes[4] = key ? 1 : 0;
-      bytes[5] = part;
-      bytes[7] = parts;
-      bytes.set(au, 17);
+      bytes[4] = (key ? 1 : 0) | (fragmented ? 2 : 0);
+      let offset = 5;
+      if (fragmented) {
+        bytes[5] = part;
+        bytes[7] = parts;
+        offset = 9;
+      }
+      bytes.set(au, offset);
       return bytes.buffer;
     };
     const receive = (seq: number, key = false, part = 0, parts = 1) =>
