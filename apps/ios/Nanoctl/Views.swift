@@ -253,10 +253,14 @@ struct SessionView: View {
                     ChromeButton(model.touchMode == .trackpad ? "Trackpad" : "Direct touch",
                                  systemImage: model.touchMode == .trackpad ? "rectangle.and.hand.point.up.left"
                                                                            : "hand.point.up.left") {
-                        desktop.setTouchMode(model.touchMode == .trackpad ? .direct : .trackpad)
-                        desktop.show(model.touchMode == .trackpad
-                                     ? "Trackpad: drag to move, tap to click"
-                                     : "Direct touch: tap where you want to click")
+                        if model.external {
+                            desktop.show("Trackpad input is required on an external display")
+                        } else {
+                            desktop.setTouchMode(model.touchMode == .trackpad ? .direct : .trackpad)
+                            desktop.show(model.touchMode == .trackpad
+                                         ? "Trackpad: drag to move, tap to click"
+                                         : "Direct touch: tap where you want to click")
+                        }
                         poke()
                     }
                     .glassID("touch", in: glass)
@@ -305,6 +309,7 @@ struct SessionView: View {
             Label("Trackpad", systemImage: "rectangle.and.hand.point.up.left").tag(TouchMode.trackpad)
             Label("Direct touch", systemImage: "hand.point.up.left").tag(TouchMode.direct)
         }
+        .disabled(model.external)
 
         Section {
             if model.audioAvailable {

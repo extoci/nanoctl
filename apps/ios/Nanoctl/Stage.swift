@@ -10,6 +10,7 @@ final class Stage: UIView {
     private weak var desktop: Desktop?
     private var external = false
     private var inputWasReady = false
+    private var touchModeBeforeExternal: TouchMode?
     private(set) lazy var keyboardForwarder = KeyboardForwarder(
         sendKey: { [weak self] down, key, repeating in
             self?.desktop?.session.sendKey(down, key: key, repeating: repeating) ?? false
@@ -30,8 +31,10 @@ final class Stage: UIView {
     var touchMode: TouchMode {
         get { gestures.mode }
         set {
+            let effective = external ? .trackpad : newValue
+            touchModeBeforeExternal = external && newValue == .direct ? .direct : nil
             gestures.reset()
-            gestures.mode = newValue
+            gestures.mode = effective
             UserDefaults.standard.set(newValue.rawValue, forKey: "touchMode")
             placeCursor()
         }
@@ -81,6 +84,17 @@ final class Stage: UIView {
     func update(external: Bool) {
         guard let desktop else { return }
         self.external = external
+        if external, gestures.mode == .direct {
+            touchModeBeforeExternal = .direct
+            gestures.reset()
+            gestures.mode = .trackpad
+        } else if !external, let restore = touchModeBeforeExternal {
+            touchModeBeforeExternal = nil
+            if UserDefaults.standard.string(forKey: "touchMode") == restore.rawValue {
+                gestures.reset()
+                gestures.mode = restore
+            }
+        }
         let session = desktop.session
         let hasVideo = desktop.hasVideo
         surface.isUserInteractionEnabled = session.inputReady

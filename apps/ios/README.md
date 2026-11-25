@@ -47,8 +47,10 @@ binary wire format as the web viewer.
 ## External display, no tvOS app
 
 When iOS provides a separate external-display scene, nanoctl sends only video there
-and keeps the touchpad, gamepad and connection controls on the phone. When the display
-disconnects, playback returns to the phone without a second WebRTC session.
+and keeps the touchpad, gamepad and connection controls on the phone. Direct touch is
+temporarily translated to trackpad input while mirroring because the phone no longer
+shares the video's geometry; the saved touch mode returns when the external display
+disconnects. Playback returns to the phone without a second WebRTC session.
 
 For AirPlay, use **Control Center › Screen Mirroring**; the AirPlay button in the
 session controls routes sound and explains this if no second screen appears. The split view requires iOS to
