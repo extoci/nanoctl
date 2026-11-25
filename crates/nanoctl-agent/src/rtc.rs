@@ -870,7 +870,9 @@ impl HostPeer {
                 }
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
-                    "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
+                    "nanoctl.pointer.v1" | "nanoctl.gamepad.v1" => {
+                        InputSender::Motion(pointer_sender.clone())
+                    }
                     _ => return Box::pin(async {}),
                 };
                 let message_input = input.clone();

@@ -6,8 +6,11 @@ const XINPUT_BUTTONS = [
   0x0002, 0x0004, 0x0008, 0x0400,
 ];
 const MAX_SLOTS = 4;
-/** Every poll within this window after a change repeats the snapshot to repair loss. */
-const REPEAT_MS = 100;
+/**
+ * Briefly repeat a changed snapshot while bounded SCTP retransmission handles
+ * loss. The window only anchors final state if every transport repair expires.
+ */
+const REPEAT_MS = 30;
 /**
  * Unchanged pads send a one-byte heartbeat at this interval once the repeat
  * window ends. The host neutralizes pads after 750 ms of silence, so two

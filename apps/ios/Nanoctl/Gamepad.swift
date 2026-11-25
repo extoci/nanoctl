@@ -97,7 +97,8 @@ final class Gamepad {
         let now = Date.timeIntervalSinceReferenceDate
         let changed = message != lastSent
         if changed { changedAt = now }
-        let repeating = changedAt.map { now - $0 < 0.1 } ?? false
+        // Bounded SCTP retransmission now repairs loss; keep only a brief final-state anchor.
+        let repeating = changedAt.map { now - $0 < 0.03 } ?? false
         let needsFull = fullAt.map { now - $0 >= 2.0 } ?? true
         let heartbeatDue = heartbeatAt.map { now - $0 >= 0.25 } ?? true
         var sent = false

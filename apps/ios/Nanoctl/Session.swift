@@ -269,19 +269,19 @@ final class Session {
 
     @discardableResult
     func sendGamepad(_ report: GamepadMessage, sparse: Bool = false) -> Bool {
-        // Sparse reports self-repair individual slots and ride the unordered
-        // zero-retransmit pointer channel. Full reports are the sparse baseline,
-        // so they stay reliable even when they carry pads.
+        // Sparse reports self-repair individual slots and use the bounded-loss
+        // gamepad lane. Full reports are the sparse baseline, so they stay
+        // reliable even when they carry pads.
         let wire = sparse ? report.sparseBinary(sequence: gamepadSequence) : report.binary(sequence: gamepadSequence)
         guard gamepadAllowed, let data = wire else { return false }
-        guard send(data, pointer: sparse && !report.pads.isEmpty, limitBacklog: true, binary: true) else { return false }
+        guard send(data, pointer: false, gamepad: sparse && !report.pads.isEmpty, limitBacklog: true, binary: true) else { return false }
         gamepadSequence &+= 1
         return true
     }
 
     func sendGamepadHeartbeat() -> Bool {
         guard gamepadAllowed else { return false }
-        return send(Data([11]), pointer: true, limitBacklog: true, binary: true)
+        return send(Data([11]), pointer: false, gamepad: true, limitBacklog: true, binary: true)
     }
 
     private func appendPosition(_ data: inout Data, x: Double, y: Double) {
@@ -403,8 +403,8 @@ final class Session {
         return send(data)
     }
 
-    private func send(_ data: Data, pointer: Bool = false, limitBacklog: Bool = false, binary: Bool = false) -> Bool {
-        guard inputReady, let channel = pointer ? connection?.pointer : connection?.control,
+    private func send(_ data: Data, pointer: Bool = false, gamepad: Bool = false, limitBacklog: Bool = false, binary: Bool = false) -> Bool {
+        guard inputReady, let channel = gamepad ? connection?.gamepad : pointer ? connection?.pointer : connection?.control,
               channel.readyState == .open, !limitBacklog || channel.bufferedAmount < 4096 else { return false }
         return channel.sendData(RTCDataBuffer(data: data, isBinary: binary))
     }
@@ -616,8 +616,14 @@ final class Session {
         pointer.isOrdered = false
         pointer.maxRetransmits = 0
         current.pointer = peer.dataChannel(forLabel: "nanoctl.pointer.v1", configuration: pointer)
+        let gamepad = RTCDataChannelConfiguration()
+        gamepad.isOrdered = false
+        // Sparse reports are sequenced absolute state, so bounded retransmission
+        // cannot regress newer input and replaces most always-on duplicates.
+        gamepad.maxPacketLifeTime = 100
+        current.gamepad = peer.dataChannel(forLabel: "nanoctl.gamepad.v1", configuration: gamepad)
         current.control = peer.dataChannel(forLabel: "nanoctl.control.v1", configuration: RTCDataChannelConfiguration())
-        guard let control = current.control, current.pointer != nil else {
+        guard let control = current.control, current.pointer != nil, current.gamepad != nil else {
             throw ViewerError("Could not create the input channels.")
         }
         control.delegate = delegate
@@ -803,6 +809,7 @@ private final class Connection {
     var delegate: PeerEvents?
     var control: RTCDataChannel?
     var pointer: RTCDataChannel?
+    var gamepad: RTCDataChannel?
     var video: RTCDataChannel?
     var videoIdr: RTCDataChannel?
     var clipboard: RTCDataChannel?

@@ -174,8 +174,8 @@ When `capabilities.gamepad` is true, an opted-in viewer with control permission 
 binary gamepad snapshots with a u8 sequence; stale or reordered snapshots are discarded.
 Kind-2 full snapshots rebase all four slots and unplug slots absent from the mask. They ride
 the reliable control channel (`nanoctl.control.v1`) because they are the baseline for sparse
-state. Kind-12 sparse snapshots ride the unordered zero-retransmit pointer channel
-(`nanoctl.pointer.v1`); they name only slots whose state differs from the last full baseline,
+state. Kind-12 sparse snapshots and heartbeats ride the unordered bounded-retransmit gamepad channel
+(`nanoctl.gamepad.v1`, `maxPacketLifeTime: 100`); sparse snapshots name only slots whose state differs from the last full baseline,
 and omitted slots keep their current host state. Each sparse slot entry remains absolute
 rather than delta-encoded: zero-valued buttons, triggers, and axes are omitted behind the
 field mask, so any received entry completely repairs that slot even after earlier packet
@@ -187,8 +187,8 @@ pointer move sent in the same frame.
 Slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes are
 signed 16-bit values with positive Y up. The host presents slots with DualShock flags as
 DualShock 4 controllers and all other slots as Xbox 360 controllers. The viewer sends a
-change immediately, repeats it on every poll for 100 ms so a lost report is repaired on the
-next frame, then keeps an unchanged pad alive with heartbeats every 250 ms and reliable full
+change immediately and repeats it only briefly as a final-state anchor while bounded SCTP
+retransmission repairs loss, then keeps an unchanged pad alive with heartbeats every 250 ms and reliable full
 snapshots at least every 2 s; after 750 ms without a report the host neutralizes the current
 pads. Sparse snapshots received before any full baseline are ignored without consuming their
 sequence, so a delayed reliable baseline can still reset the stream. Channel or session

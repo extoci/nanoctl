@@ -1,6 +1,7 @@
-// Gamepad uplink wire cost for synthetic 60 Hz traces: messages and bytes per
-// second through the real GamepadForwarder and binary encoder, versus sending
-// a snapshot on every poll. Run: bun scripts/bench/gamepad-wire.ts
+// Gamepad uplink wire cost for synthetic 60 Hz traces through the real
+// GamepadForwarder and binary encoder. The comparison isolates shrinking the
+// always-on application duplicate window now that SCTP performs bounded loss
+// repair on the gamepad lane. Run: bun scripts/bench/gamepad-wire.ts
 import { encodeBinaryInput, encodeGamepadHeartbeat } from "../../apps/viewer/src/lib/binary-input";
 import { GamepadForwarder } from "../../apps/viewer/src/lib/gamepad";
 
@@ -51,6 +52,7 @@ const measure = (
   padCount: number,
   trace: (frame: number) => State,
   fullRefreshMs: number,
+  repeatMs: number,
 ) => {
   let messages = 0;
   let bytes = 0;
@@ -63,7 +65,7 @@ const measure = (
           : (encodeBinaryInput(message)?.byteLength ?? 0)) + OVERHEAD;
       return true;
     },
-    { repeatMs: 100, keepaliveMs, heartbeat, sparse, fullRefreshMs },
+    { repeatMs, keepaliveMs, heartbeat, sparse, fullRefreshMs },
   );
   for (let frame = 0; frame < SECONDS * 60; frame++) {
     forwarder.sample(
@@ -77,8 +79,8 @@ const measure = (
 };
 
 for (const [name, trace] of Object.entries(traces)) {
-  const before = measure(true, 75, true, 4, trace, 225);
-  const after = measure(true, 250, true, 4, trace, 2_000);
+  const before = measure(true, 250, true, 4, trace, 2_000, 100);
+  const after = measure(true, 250, true, 4, trace, 2_000, 30);
   const kbps = (value: number) => ((value * 8) / SECONDS / 1000).toFixed(2);
   const improvement = (1 - after.bytes / before.bytes) * 100;
   console.log(

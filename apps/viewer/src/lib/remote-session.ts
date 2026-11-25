@@ -154,6 +154,7 @@ export class RemoteSessionController {
     writable: WritableStream;
   } | null = null;
   private pointerChannel: RTCDataChannel | null = null;
+  private gamepadChannel: RTCDataChannel | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private clipboardChannel: RTCDataChannel | null = null;
   private clipboard: ClipboardSync | null = null;
@@ -426,7 +427,7 @@ export class RemoteSessionController {
   }
 
   private sendGamepadHeartbeat(): boolean {
-    const channel = this.pointerChannel;
+    const channel = this.gamepadChannel;
     if (
       !this.options.binaryInput ||
       !this.inputEnabled ||
@@ -467,12 +468,13 @@ export class RemoteSessionController {
 
   sendControl(payload: ControlMessage | GamepadStateInput): boolean {
     const gamepadState = payload.type === "gamepad" || payload.type === "gamepad-sparse";
-    // Sparse snapshots self-repair individual slots and belong on the lossy
-    // lane. Full snapshots are the sparse baseline, so they must not be dropped;
-    // they ride the reliable control lane even when they carry pads.
+    // Sparse snapshots self-repair individual slots and use the bounded-loss
+    // gamepad lane. Full snapshots are the sparse baseline, so they must not be
+    // dropped; they ride the reliable control lane even when they carry pads.
     const lossyGamepadSnapshot = payload.type === "gamepad-sparse" && payload.pads.length > 0;
-    const channel =
-      lossyGamepadSnapshot || (payload.type === "pointer" && payload.action === "move")
+    const channel = lossyGamepadSnapshot
+      ? this.gamepadChannel
+      : payload.type === "pointer" && payload.action === "move"
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
@@ -561,6 +563,7 @@ export class RemoteSessionController {
         this.viewportObserver?.disconnect();
         this.viewportObserver = null;
         this.pointerChannel?.close();
+        this.gamepadChannel?.close();
         this.controlChannel?.close();
         this.clipboardChannel?.close();
         this.clipboardChannel = null;
@@ -571,6 +574,7 @@ export class RemoteSessionController {
           this.options.onAudioTrackChange?.();
         }
         this.pointerChannel = null;
+        this.gamepadChannel = null;
         this.controlChannel = null;
         peer.close();
       }
@@ -629,6 +633,14 @@ export class RemoteSessionController {
     this.pointerChannel = peer.createDataChannel("nanoctl.pointer.v1", {
       ordered: false,
       maxRetransmits: 0,
+    });
+    this.gamepadChannel = peer.createDataChannel("nanoctl.gamepad.v1", {
+      ordered: false,
+      // Sparse gamepad reports are sequenced absolute slot state, so delayed
+      // retransmits cannot regress newer input. Bounded repair replaces the
+      // expensive always-on application duplicate window; expired copies are
+      // too stale to matter for game input.
+      maxPacketLifeTime: 100,
     });
     this.controlChannel = peer.createDataChannel("nanoctl.control.v1", {
       ordered: true,
