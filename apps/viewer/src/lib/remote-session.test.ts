@@ -1199,6 +1199,57 @@ describe("webcodecs video gating and teardown", () => {
     expect(channel.sent).toContain("KF");
   });
 
+  test("idle heartbeat sequence watermarks expose a lost final delta", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const frame = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const heartbeat = (seq: number) => {
+      const bytes = new Uint8Array(5);
+      bytes[0] = seq;
+      bytes[4] = 8;
+      return bytes.buffer;
+    };
+    const receive = (data: ArrayBuffer) => channel.onmessage?.({ data } as MessageEvent);
+    receive(frame(0, true));
+    channel.sent = [];
+    receive(heartbeat(1));
+    expect(channel.sent).not.toContain("KF");
+    receive(heartbeat(2));
+    expect(channel.sent).toContain("KF");
+  });
+
   test("incomplete access-unit loss requests keyframe recovery immediately", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {

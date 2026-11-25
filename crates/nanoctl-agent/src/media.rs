@@ -50,7 +50,7 @@ mod macos_capture;
 #[path = "media_dxgi.rs"]
 mod media_dxgi;
 
-use crate::adaptive::{DamagePacer, PaceAction, RateController, frame_changed};
+use crate::adaptive::{DamagePacer, IDLE_KEEPALIVE, PaceAction, RateController, frame_changed};
 use crate::codec::{VideoCodec, is_keyframe};
 use crate::config::QualityConfig;
 use crate::config::{EncoderPreference, LatencyMode};
@@ -70,6 +70,7 @@ const VIDEO_DC_CHUNK: usize = 48 * 1024;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_FRAGMENTED: u8 = 2;
 const VIDEO_FLAG_TIMESTAMP: u8 = 4;
+const VIDEO_FLAG_HEARTBEAT: u8 = 8;
 
 fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
     let parts = data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
@@ -111,6 +112,13 @@ fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
         messages.push(Bytes::from(msg));
     }
     messages
+}
+
+fn video_heartbeat_message(next_seq: u32) -> Bytes {
+    let mut msg = Vec::with_capacity(5);
+    msg.extend_from_slice(&next_seq.to_le_bytes());
+    msg.push(VIDEO_FLAG_HEARTBEAT);
+    Bytes::from(msg)
 }
 
 fn video_playout_delay(mode: LatencyMode) -> HeaderExtension {
@@ -3176,6 +3184,15 @@ pub fn spawn_video(
                         producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    // While the unordered data channel is the video transport,
+                    // idle liveness is a five-byte sequence watermark emitted
+                    // by the writer. Encoding the unchanged desktop again only
+                    // paid for loss detection, not new image data. RTP fallback
+                    // still needs a real frame because it has no such watermark.
+                    if keepalive && producer_video_channel.channel.lock().unwrap().is_some() {
+                        producer_stats.keepalives.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     if forced_keyframe {
                         encoder.encoder.force_keyframe();
                         forced_keyframe = false;
@@ -3310,9 +3327,36 @@ pub fn spawn_video(
         let mut write_result = Ok(());
         let mut attach_poll = tokio::time::interval(Duration::from_millis(5));
         attach_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut heartbeat_poll = tokio::time::interval(Duration::from_millis(100));
+        heartbeat_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_dc_activity: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = stats_tick.tick() => writer_stats.log(),
+                _ = heartbeat_poll.tick() => {
+                    let now = Instant::now();
+                    if last_dc_activity.is_some_and(|last| {
+                        now.saturating_duration_since(last) >= IDLE_KEEPALIVE
+                    }) {
+                        // Heartbeats do not consume a video sequence number.
+                        // Their header carries the next live sequence as a
+                        // watermark, letting the viewer detect a lost final
+                        // delta without reordering hazards or a redundant AU.
+                        last_dc_activity = Some(now);
+                        let channel = video_data_channel.channel.lock().unwrap().clone();
+                        if let Some(channel) = channel
+                            && channel.buffered_amount().await <= 64 * 1024
+                        {
+                            let msg = video_heartbeat_message(dc_seq);
+                            if let Err(error) = channel.send(&msg).await {
+                                tracing::warn!(%error, "video data channel heartbeat failed");
+                            } else {
+                                writer_stats.bytes_sent.fetch_add(msg.len() as u64, Ordering::Relaxed);
+                                writer_stats.send_window.lock().unwrap().writes.push_back((now, msg.len()));
+                            }
+                        }
+                    }
+                },
                 _ = attach_poll.tick() => {
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
@@ -3387,6 +3431,7 @@ pub fn spawn_video(
                                 queue.clear();
                                 break;
                             }
+                            last_dc_activity = Some(Instant::now());
                         }
                         if queue.is_empty() {
                             dc_replay = None;
@@ -3523,6 +3568,7 @@ pub fn spawn_video(
                                 // just the RTP share.
                                 writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
                                 writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
+                                last_dc_activity = Some(Instant::now());
                             }
                         }
                     } else if dc_backed_up {
@@ -3700,7 +3746,7 @@ mod tests {
         HARDWARE_BACKENDS, HardwareBackend, LatestFrame, PixelFormat, SoftwareEncoder,
         TimingSample, TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types,
         avcc_to_annex_b, await_video_delivery, bitrate_target, delivery_failure_grace_elapsed,
-        fit_dimensions, video_data_messages, viewport_scaled_rate,
+        fit_dimensions, video_data_messages, video_heartbeat_message, viewport_scaled_rate,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
@@ -3722,6 +3768,9 @@ mod tests {
         assert_eq!(&keyframe[0][5..9], &[0, 0, 3, 0]);
         assert_eq!(keyframe[0].len(), 17 + 48 * 1024);
         assert_eq!(keyframe[2].len(), 17 + (100_000 - 2 * 48 * 1024));
+
+        let heartbeat = video_heartbeat_message(0x0102_0304);
+        assert_eq!(&heartbeat[..], &[4, 3, 2, 1, 8]);
     }
 
     #[test]

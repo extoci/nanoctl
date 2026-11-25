@@ -6,7 +6,7 @@ import Foundation
 /// `attachDataChannelVideo` in the browser viewer.
 ///
 /// Wire format: `[u32 seq][u8 flags (bit0 keyframe, bit1 fragmented,
-/// bit2 timestamped)]`, then optional u16 part/parts and u64 sent_ms before the
+/// bit2 timestamped, bit3 heartbeat)]`, then optional u16 part/parts and u64 sent_ms before the
 /// payload chunk, all little-endian. Deltas ride the unordered
 /// bounded-retransmit channel; keyframes ride the reliable IDR channel. A sequence gap
 /// breaks the reference chain: deltas after the gap are dropped and the viewer
@@ -103,7 +103,7 @@ final class DCVideoReceiver {
     }
 
     private func process(_ data: Data) {
-        guard data.count >= 6 else { return }
+        guard data.count >= 5 else { return }
         stats.msgs += 1
         let seq = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
         let flags = data[4]
@@ -123,6 +123,27 @@ final class DCVideoReceiver {
             let sentMs = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
             stats.transitMs = Date().timeIntervalSince1970 * 1000 - Double(sentMs)
             offset += 8
+        }
+        if flags & 8 != 0 {
+            // Heartbeats carry the next live sequence as a watermark rather
+            // than consuming it. A watermark ahead of the decoder means the
+            // final delta before the idle period was lost even though no newer
+            // frame exists to expose the gap.
+            guard data.count == offset else { return }
+            guard let expected = expectedSeq else { return }
+            let diff = Int32(bitPattern: seq &- expected)
+            if diff > 0, !waitingForKey {
+                waitingForKey = true
+                stats.gaps += 1
+                lost += Int(diff)
+                reordered.removeAll()
+                if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
+                    kfRequestedAt = CFAbsoluteTimeGetCurrent()
+                    stats.kfRequests += 1
+                    requestKeyframe()
+                }
+            }
+            return
         }
         guard data.count > offset else { return }
         var chunk = data.subdata(in: offset..<data.count)

@@ -689,7 +689,7 @@ export function attachDataChannelVideo(
   const onFrame = (event: MessageEvent) => {
     try {
       const data = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
-      if (!data || data.length < 6) {
+      if (!data || data.length < 5) {
         dbg.nonArrayBuffer = (dbg.nonArrayBuffer as number) + 1;
         return;
       }
@@ -718,6 +718,23 @@ export function attachDataChannelVideo(
         dbg.transitMs = transitMs;
         dbg.transitSum = ((dbg.transitSum as number) || 0) + transitMs;
         offset += 8;
+      }
+      if ((flags & 8) !== 0) {
+        // Idle heartbeats carry the host's next live sequence as a watermark;
+        // they are not frames and do not advance it themselves. If that
+        // watermark is ahead, the final delta before the idle period was lost
+        // even though no newer video frame exists to expose the gap.
+        if (data.length !== offset) return;
+        if (expectedSeq === null) return;
+        const heartbeatDiff = (seq - expectedSeq) | 0;
+        if (heartbeatDiff > 0 && !waitingForKey) {
+          waitingForKey = true;
+          dbg.waitingForKey = true;
+          dbg.gaps = (dbg.gaps as number) + 1;
+          reordered.clear();
+          requestKeyframe();
+        }
+        return;
       }
       if (data.length <= offset) return;
       const chunk = data.subarray(offset);

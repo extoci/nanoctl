@@ -117,9 +117,14 @@ bypassing the RTP jitter buffer. H.264 and HEVC payloads use Annex-B; AV1 payloa
 low-overhead OBU temporal units (the formats WebCodecs consumes). Each message is
 `[u32 seq][u8 flags][optional u16 part][optional u16 parts][optional u64 sent_ms][payload chunk]`
 with all integers little-endian. Flags bit0 marks a keyframe, bit1 marks fragmentation (the
-part fields are present), and bit2 marks a sender timestamp. Unfragmented delta frames
-normally cost only five header bytes; keyframes and every sixteenth delta carry `sent_ms`
-for transit telemetry. `parts` splits large access units into ~48 KiB chunks.
+part fields are present), bit2 marks a sender timestamp, and bit3 marks an idle heartbeat.
+Unfragmented delta frames normally cost only five header bytes; keyframes and every sixteenth
+delta carry `sent_ms` for transit telemetry. `parts` splits large access units into ~48 KiB chunks.
+A heartbeat is exactly the five-byte header: its sequence field is the host's next live
+sequence watermark rather than a frame sequence, so it does not advance the expected sequence.
+While the desktop is unchanged the agent sends these heartbeats instead of re-encoding and
+transmitting identical frames; if the watermark is ahead of the decoder, the final delta before
+the idle period was lost.
 Deltas ride the unordered bounded-retransmit channel and keyframes the reliable one. A sequence gap breaks
 the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
 video channel until a keyframe arrives. While `nanoctl.video.v1` is open the agent
