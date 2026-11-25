@@ -65,7 +65,7 @@ final class DCVideoReceiver {
     }
 
     /// Rolling loss fraction plus the counters since the last call.
-    func takeLinkStats() -> (fractionLost: Double, transitMs: Double) {
+    func takeLinkStats() -> (fractionLost: Double, transitMs: Double, frames: Int) {
         var lost = 0
         var received = 0
         var transit = 0.0
@@ -77,7 +77,7 @@ final class DCVideoReceiver {
             self.received = 0
         }
         let total = lost + received
-        return (total > 0 ? Double(lost) / Double(total) : 0, transit)
+        return (total > 0 ? Double(lost) / Double(total) : 0, transit, received)
     }
 
     var decodedCount: Int { decoder?.decoded ?? 0 }
