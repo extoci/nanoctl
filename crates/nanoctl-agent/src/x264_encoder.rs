@@ -322,6 +322,16 @@ impl X264Encoder {
             xcap::image::Rgba<u8>,
             impl std::ops::Deref<Target = [u8]>,
         >,
+    ) -> Result<EncodedFrame> {
+        self.encode_format(image, PixelFormat::Rgba)
+    }
+
+    pub(super) fn encode_format(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
         format: PixelFormat,
     ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
@@ -423,7 +433,7 @@ impl FrameEncoder for ResilientX264 {
 
     fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame> {
         match self {
-            Self::Native(encoder) => match encoder.encode(image, PixelFormat::Rgba) {
+            Self::Native(encoder) => match encoder.encode(image) {
                 Ok(frame) => Ok(frame),
                 Err(error) => {
                     tracing::warn!(%error, "x264 failed; switching session to OpenH264");
@@ -447,7 +457,7 @@ impl FrameEncoder for ResilientX264 {
         format: PixelFormat,
     ) -> Result<EncodedFrame> {
         match self {
-            Self::Native(encoder) => match encoder.encode(image, format) {
+            Self::Native(encoder) => match encoder.encode_format(image, format) {
                 Ok(frame) => Ok(frame),
                 Err(error) => {
                     tracing::warn!(%error, "x264 failed; switching session to OpenH264");
