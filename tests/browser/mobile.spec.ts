@@ -33,7 +33,7 @@ test("iPhone session options explain standalone launch in a narrow viewport", as
     Object.defineProperty(document, "fullscreenEnabled", { value: false });
   });
   await page.setViewportSize({ width: 375, height: 667 });
-  await page.routeWebSocket("**/v1/connect", () => {});
+  await page.routeWebSocket(/\/v1\/connect(?:\?.*)?$/, () => {});
   await page.goto("/");
   const tab = page.getByRole("button", { name: "Session options" });
   const card = page.locator(".status-card");
@@ -82,7 +82,7 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
       },
     }),
   );
-  await page.routeWebSocket("**/v1/connect", (socket) => {
+  await page.routeWebSocket(/\/v1\/connect(?:\?.*)?$/, (socket) => {
     const server = socket.connectToServer();
     server.onMessage((data) => {
       const message = JSON.parse(String(data));
@@ -164,7 +164,7 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
 });
 
 test("the sound panel explains when the host has no available audio", async ({ page }) => {
-  await page.routeWebSocket("**/v1/connect", (socket) => {
+  await page.routeWebSocket(/\/v1\/connect(?:\?.*)?$/, (socket) => {
     const server = socket.connectToServer();
     server.onMessage((data) => {
       const message = JSON.parse(String(data));
@@ -189,7 +189,7 @@ test("a view-only viewer selects Windows audio and sees outputs appear without r
   let outputs: AudioOutput[] = [];
   let publish = (_selectedId: string | null) => {};
   const selections: (string | null)[] = [];
-  await page.routeWebSocket("**/v1/connect", (socket) => {
+  await page.routeWebSocket(/\/v1\/connect(?:\?.*)?$/, (socket) => {
     const server = socket.connectToServer();
     publish = (selectedId) =>
       socket.send(JSON.stringify({ type: "audio-outputs", outputs, selectedId }));

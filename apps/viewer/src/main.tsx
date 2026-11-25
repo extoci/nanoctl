@@ -99,6 +99,7 @@ function Viewer() {
   const [fullscreen, setFullscreen] = useState(false);
   const [keyboardLocked, setKeyboardLocked] = useState(false);
   const [notice, setNotice] = useState("");
+  const [clientNotice, setClientNotice] = useState("");
   const [panelOpen, setPanelOpen] = useState(false);
   const [scale, setScaleState] = useState<"fit" | "original">(() => {
     try {
@@ -224,6 +225,13 @@ function Viewer() {
         setDetail(message ?? "");
         if (next !== "online") setSnapshot(initial);
       },
+      onClientPresence: (message) => {
+        const client = message.client;
+        const name = client.machineName || client.displayName || client.login || "Another client";
+        const event = message.type === "client-connected" ? "connected" : "disconnected";
+        recordDebugEvent(`client ${event}`, name);
+        setClientNotice(`${name} ${event}`);
+      },
     });
     transport.current = session;
     session.connect();
@@ -254,6 +262,12 @@ function Viewer() {
   useEffect(() => {
     if (snapshot.firstFrameReceived) recordDebugEvent("first frame");
   }, [snapshot.firstFrameReceived]);
+
+  useEffect(() => {
+    if (!clientNotice) return;
+    const timeout = setTimeout(() => setClientNotice(""), 4_000);
+    return () => clearTimeout(timeout);
+  }, [clientNotice]);
 
   const copyDebugInfo = async () => {
     setDebugCopy("Collecting…");
@@ -478,6 +492,11 @@ function Viewer() {
         {notice && (
           <button className="notice" onClick={() => setNotice("")}>
             {notice} ×
+          </button>
+        )}
+        {clientNotice && (
+          <button className="notice client-notice" onClick={() => setClientNotice("")}>
+            {clientNotice} ×
           </button>
         )}
       </section>

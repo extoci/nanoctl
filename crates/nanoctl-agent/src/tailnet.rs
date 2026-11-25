@@ -41,6 +41,7 @@ pub struct Peer {
 pub struct Identity {
     pub login: String,
     pub display_name: String,
+    pub machine_name: String,
     pub tags: Vec<String>,
     #[serde(skip)]
     pub grants: Option<Vec<Value>>,
@@ -296,6 +297,11 @@ pub fn parse_whois(value: Value) -> Result<Identity> {
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
     )?;
+    let machine_name = value
+        .pointer("/Node/HostName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let grants = value
         .get("CapMap")
         .and_then(|caps| caps.get(CAPABILITY))
@@ -307,6 +313,7 @@ pub fn parse_whois(value: Value) -> Result<Identity> {
     Ok(Identity {
         login: profile.login_name,
         display_name: profile.display_name,
+        machine_name,
         tags,
         grants,
     })
@@ -428,8 +435,9 @@ mod tests {
         assert_eq!(node.owner, "owner@example.com");
         assert_eq!(node.dns_name, "host.tail123.ts.net");
         assert_eq!(node.ips.len(), 2);
-        let peer = parse_whois(json!({"Node":{"Tags": ["tag:ops"]},"UserProfile":{"LoginName":"tagged-devices","DisplayName":"Tagged Devices"},"CapMap":{CAPABILITY:[{"control":false}]}})).unwrap();
+        let peer = parse_whois(json!({"Node":{"HostName":"friend-laptop","Tags": ["tag:ops"]},"UserProfile":{"LoginName":"tagged-devices","DisplayName":"Tagged Devices"},"CapMap":{CAPABILITY:[{"control":false}]}})).unwrap();
         assert_eq!(peer.tags, ["tag:ops"]);
+        assert_eq!(peer.machine_name, "friend-laptop");
         assert!(peer.grants.is_some());
         assert!(parse_whois(json!({})).is_err());
         assert!(parse_status(json!({"BackendState":"Stopped"})).is_err());

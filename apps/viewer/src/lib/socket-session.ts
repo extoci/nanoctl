@@ -5,6 +5,7 @@ import {
   type HostInfo,
   type AgentClientMessage,
   type AudioOutputState,
+  type ClientPresenceMessage,
 } from "@nanoctl/protocol";
 import {
   RemoteSessionController,
@@ -23,6 +24,29 @@ export type SocketStatus =
   | "error";
 export const reconnectDelay = (attempt: number): number | null =>
   attempt >= 5 ? null : Math.min(500 * 2 ** attempt, 8_000);
+
+const CLIENT_ID_KEY = "nanoctl.client-id";
+let ephemeralClientId = "";
+
+function newClientId(): string {
+  return typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/** Stable browser-instance hint used only to replace this endpoint's own old session. */
+export function clientInstanceId(): string {
+  try {
+    const stored = window.localStorage.getItem(CLIENT_ID_KEY);
+    if (stored && stored.length <= 128) return stored;
+    const created = newClientId();
+    window.localStorage.setItem(CLIENT_ID_KEY, created);
+    return created;
+  } catch {
+    if (!ephemeralClientId) ephemeralClientId = newClientId();
+    return ephemeralClientId;
+  }
+}
 
 export class SocketSession {
   controller: RemoteSessionController | null = null;
@@ -46,6 +70,7 @@ export class SocketSession {
       onInfo: (info: HostInfo) => void;
       onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
       onStatus: (status: SocketStatus, detail?: string) => void;
+      onClientPresence?: (message: ClientPresenceMessage) => void;
       createController?: (options: RemoteSessionOptions) => RemoteSessionController;
       codecChoice?: () => CodecChoice;
       qualityLimits?: () => QualityLimits;
@@ -123,10 +148,12 @@ export class SocketSession {
     };
     const url = new URL("/v1/connect", window.location.href);
     url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    url.searchParams.set("client", clientInstanceId());
     try {
       const socket = new WebSocket(url);
       this.socket = socket;
       let localFailure: string | undefined;
+      let sessionId = "";
       socket.onmessage = (event: MessageEvent<string>) => {
         if (!current()) return;
         try {
@@ -144,6 +171,7 @@ export class SocketSession {
           if (message.type === "hello") {
             if (welcomed) throw new Error("Duplicate server hello");
             welcomed = true;
+            sessionId = message.sessionId;
             if (this.timer !== null) clearTimeout(this.timer);
             this.timer = null;
             this.options.onInfo(message.host);
@@ -213,6 +241,11 @@ export class SocketSession {
             if (!welcomed || !this.controller) throw new Error("Message arrived before hello");
             if (message.type === "audio-outputs") {
               this.options.onAudioOutputs?.(message);
+            } else if (
+              message.type === "client-connected" ||
+              message.type === "client-disconnected"
+            ) {
+              if (message.client.sessionId !== sessionId) this.options.onClientPresence?.(message);
             } else {
               this.controller.ingestHostSignals([
                 {
