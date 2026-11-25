@@ -4,7 +4,7 @@ import Foundation
 ///
 /// The bundled WebRTC build cannot express H.265 in its codec lists, so HEVC
 /// negotiation is done by rewriting the local offer: an `H265` payload type is
-/// injected at the negotiated preference position. The host answers with the
+/// injected at the front of the video m-section. The host answers with the
 /// first offered codec it can encode, so first position means "preferred".
 /// libwebrtc ignores the unknown payload type in the answer — the RTP stream it
 /// describes is suppressed automatically once the data channels are open anyway.
@@ -13,28 +13,10 @@ enum SDP {
     /// unassigned in RTP/AVP and unused by libwebrtc's offer.
     static let hevcPayloadType = 35
 
-    /// Returns `sdp` with an H265 payload inserted into every video m-section
-    /// at the position requested by `order` (codec names, best first), or nil
-    /// when no video section exists.
-    static func injectHevc(_ sdp: String, order: [String]) -> String? {
+    /// Returns `sdp` with an H265 payload prepended to every video m-section,
+    /// or nil when no video section exists.
+    static func injectHevcFirst(_ sdp: String) -> String? {
         let lines = sdp.components(separatedBy: "\r\n")
-        var payloadNames: [String: String] = [:]
-        var scanVideo = false
-        for line in lines {
-            if line.hasPrefix("m=") {
-                if scanVideo { break }
-                scanVideo = line.hasPrefix("m=video ")
-                continue
-            }
-            guard scanVideo, line.hasPrefix("a=rtpmap:") else { continue }
-            let body = line.dropFirst("a=rtpmap:".count)
-            guard let space = body.firstIndex(of: " ") else { continue }
-            let pt = String(body[..<space])
-            guard let name = body[body.index(after: space)...].split(separator: "/").first else { continue }
-            let lowercase = name.lowercased()
-            payloadNames[pt] = lowercase == "h265" ? "hevc" : lowercase
-        }
-
         var output: [String] = []
         output.reserveCapacity(lines.count + 8)
         var changed = false
@@ -48,9 +30,8 @@ enum SDP {
                 }
                 inVideo = line.hasPrefix("m=video ")
                 insertedAttributes = false
-                if inVideo, let rewritten = insertHevcPayload(line, order: order, payloadNames: payloadNames) {
+                if inVideo, let rewritten = prependPayload(line) {
                     output.append(rewritten)
-                    changed = true
                 } else {
                     output.append(line)
                 }
@@ -68,11 +49,6 @@ enum SDP {
             changed = true
         }
         return changed ? output.joined(separator: "\r\n") : nil
-    }
-
-    /// Legacy spelling used by older callers/tests.
-    static func injectHevcFirst(_ sdp: String) -> String? {
-        injectHevc(sdp, order: ["hevc", "h264", "av1"])
     }
 
     /// Removes payload type `pt` from every m=video section along with its
@@ -137,32 +113,12 @@ enum SDP {
         return name == "h265" ? "hevc" : name
     }
 
-    private static func insertHevcPayload(
-        _ mLine: String,
-        order: [String],
-        payloadNames: [String: String]
-    ) -> String? {
+    private static func prependPayload(_ mLine: String) -> String? {
         // m=video <port> <proto> <pt> <pt>...
         var parts = mLine.split(separator: " ", omittingEmptySubsequences: false)
-        guard parts.count > 3, parts[3] != String(hevcPayloadType),
-              let hevcRank = order.firstIndex(of: "hevc") else { return nil }
-        // Reorder the wire offer, not just the insertion point: if WebRTC did
-        // not honour `setCodecPreferences`, inserting HEVC merely before H.264
-        // could still place it ahead of a higher-ranked AV1 payload.
-        let prefix = parts[..<3]
-        var payloads = parts[3...].map(String.init)
-        if !payloads.contains(String(hevcPayloadType)) {
-            payloads.insert(String(hevcPayloadType), at: 0)
-        }
-        let rank: (String) -> Int = { pt in
-            if pt == String(hevcPayloadType) { return hevcRank }
-            guard let name = payloadNames[pt] else { return order.count }
-            return order.firstIndex(of: name) ?? order.count
-        }
-        payloads = payloads.enumerated().sorted { left, right in
-            rank(left.element) == rank(right.element) ? left.offset < right.offset : rank(left.element) < rank(right.element)
-        }.map(\.element)
-        return (prefix.map(String.init) + payloads).joined(separator: " ")
+        guard parts.count > 3, parts[3] != String(hevcPayloadType) else { return nil }
+        parts.insert(Substring(String(hevcPayloadType)), at: 3)
+        return parts.joined(separator: " ")
     }
 
     private static func hevcAttributeLines() -> [String] {

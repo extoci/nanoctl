@@ -32,7 +32,7 @@ final class DecoderTimings {
 }
 
 final class TimedDecoderFactory: NSObject, RTCVideoDecoderFactory {
-    private let factory = NanoctlDecoderFactory()
+    private let factory = RTCDefaultVideoDecoderFactory()
 
     func supportedCodecs() -> [RTCVideoCodecInfo] { factory.supportedCodecs() }
 

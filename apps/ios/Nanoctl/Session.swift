@@ -1,12 +1,11 @@
 import AVFAudio
 import Foundation
 import UIKit
-import VideoToolbox
 import WebRTC
 
 enum CodecPreference: String, CaseIterable {
-    /// Best efficient hardware-decoded codec first, falling back through H.264
-    /// and then software-decoded choices, matching the browser viewer.
+    /// HEVC first (data-channel + VideoToolbox), falling back to H.264, then
+    /// anything else the host can encode over the RTP path.
     case auto
     case hevc
     case h264
@@ -21,59 +20,9 @@ enum CodecPreference: String, CaseIterable {
         }
     }
 
-    /// Whether this preference can use the Annex-B data-channel video path.
-    var dataChannelCapable: Bool { true }
+    /// VideoToolbox-decodable codecs for the data-channel path.
+    var dataChannelCapable: Bool { self != .av1 }
     var injectHevc: Bool { self == .auto || self == .hevc }
-
-    var wireName: String? {
-        switch self {
-        case .auto: return nil
-        case .hevc: return "hevc"
-        case .h264: return "h264"
-        case .av1: return "av1"
-        }
-    }
-
-    /// Highest compression efficiency first, matching the browser viewer.
-    static let efficiency = ["av1", "hevc", "h264"]
-
-    /// Orders codecs by what both sides support, preferring hardware decode in
-    /// auto mode. HEVC is representable through SDP injection even though the
-    /// bundled WebRTC codec list cannot express it.
-    static func orderedCodecs(
-        preference: CodecPreference,
-        hostCodecs: [String],
-        receivableCodecs: [String],
-        hardwareDecode: (String) -> Bool = hardwareDecodes
-    ) -> [String] {
-        var host = Set(hostCodecs.map { $0.lowercased() })
-        host.insert("h264") // The agent's software H.264 fallback is always available.
-        let receivable = Set(receivableCodecs.map { $0.lowercased() })
-        let offered = efficiency.filter { codec in
-            host.contains(codec) && (codec == "hevc" || receivable.contains(codec))
-        }
-        guard !offered.isEmpty else { return [] }
-        if let explicit = preference.wireName, offered.contains(explicit) {
-            return [explicit] + offered.filter { $0 != explicit }
-        }
-        let hardware = offered.filter { hardwareDecode($0) }
-        return hardware
-            + (offered.contains("h264") && !hardware.contains("h264") ? ["h264"] : [])
-            + offered.filter { !hardware.contains($0) && $0 != "h264" }
-    }
-
-    static func hardwareDecodes(_ codec: String) -> Bool {
-        switch codec {
-        case "av1":
-            if #available(iOS 26.2, *) {
-                VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
-            }
-            return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
-        case "hevc": return VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
-        case "h264": return VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)
-        default: return false
-        }
-    }
 }
 
 enum VideoTransport {
@@ -85,9 +34,9 @@ enum VideoTransport {
 final class Session {
     private let factory: RTCPeerConnectionFactory = {
         #if DEBUG && targetEnvironment(simulator)
-        let decoder: RTCVideoDecoderFactory = LatencyProbe.enabled ? TimedDecoderFactory() : NanoctlDecoderFactory()
+        let decoder: RTCVideoDecoderFactory = LatencyProbe.enabled ? TimedDecoderFactory() : RTCDefaultVideoDecoderFactory()
         #else
-        let decoder = NanoctlDecoderFactory()
+        let decoder = RTCDefaultVideoDecoderFactory()
         #endif
         return RTCPeerConnectionFactory(
             encoderFactory: RTCDefaultVideoEncoderFactory(),
@@ -284,20 +233,6 @@ final class Session {
 
     func sendPointer(x: Double, y: Double, action: String, button: Int = 0,
                      deltaX: Double = 0, deltaY: Double = 0) {
-        if action == "move", connection?.host?.capabilities.binaryInput == true {
-            var data = Data(count: 7)
-            data[0] = 0x4e
-            data[1] = 1
-            data[2] = 1
-            let xu = UInt16((min(1, max(0, x)) * 65535).rounded())
-            let yu = UInt16((min(1, max(0, y)) * 65535).rounded())
-            data[3] = UInt8(xu & 0xff)
-            data[4] = UInt8(xu >> 8)
-            data[5] = UInt8(yu & 0xff)
-            data[6] = UInt8(yu >> 8)
-            _ = send(data, pointer: true, limitBacklog: true, binary: true)
-            return
-        }
         var value: [String: Any] = ["type": "pointer", "action": action, "x": x, "y": y]
         if action == "wheel" {
             value["deltaX"] = deltaX
@@ -319,9 +254,7 @@ final class Session {
         var value: [String: Any] = ["type": "quality"]
         if let maxFps { value["maxFps"] = maxFps }
         if let maxBitrateKbps { value["maxBitrateKbps"] = maxBitrateKbps }
-        // Viewer quality limits are view-only safe on the host; they must not
-        // depend on input admission.
-        return sendControlFree(value)
+        return sendControl(value)
     }
 
     @discardableResult
@@ -353,10 +286,10 @@ final class Session {
         return send(data)
     }
 
-    private func send(_ data: Data, pointer: Bool = false, limitBacklog: Bool = false, binary: Bool = false) -> Bool {
+    private func send(_ data: Data, pointer: Bool = false, limitBacklog: Bool = false) -> Bool {
         guard inputReady, let channel = pointer ? connection?.pointer : connection?.control,
               channel.readyState == .open, !limitBacklog || channel.bufferedAmount < 4096 else { return false }
-        return channel.sendData(RTCDataBuffer(data: data, isBinary: binary))
+        return channel.sendData(RTCDataBuffer(data: data, isBinary: false))
     }
 
     /// Control-channel send that does not require input admission (used for
@@ -523,7 +456,7 @@ final class Session {
         guard let video = peer.addTransceiver(of: .video, init: videoInit) else {
             throw ViewerError("Could not add the video receiver.")
         }
-        applyCodecPreferences(to: video, host: current.host)
+        applyCodecPreferences(to: video)
 
         if current.host?.audioAvailable == true {
             let audio = RTCRtpTransceiverInit()
@@ -531,9 +464,9 @@ final class Session {
             _ = peer.addTransceiver(of: .audio, init: audio)
         }
 
-        // Low-latency raw-video data channels. H.264/HEVC ride as Annex-B
-        // access units and AV1 as low-overhead OBU temporal units; all three
-        // decode through VideoToolbox on hardware that supports them.
+        // Low-latency raw-video data channels for codecs VideoToolbox can
+        // decode. Not created for AV1: the wire format is Annex-B and AV1 over
+        // RTP uses the libwebrtc path instead.
         if codecPreference.dataChannelCapable {
             let videoConfig = RTCDataChannelConfiguration()
             videoConfig.isOrdered = false
@@ -567,43 +500,34 @@ final class Session {
         try requireCurrent(current)
         // The local description stays what libwebrtc generated; only the wire
         // offer carries the injected H265 payload.
-        let wire = injectHevc ? (SDP.injectHevc(offer.sdp, order: codecOrder(for: current.host)) ?? offer.sdp) : offer.sdp
+        let wire = injectHevc ? (SDP.injectHevcFirst(offer.sdp) ?? offer.sdp) : offer.sdp
         try await publish(SignalPayload(type: "offer", sdp: wire), current)
         current.offerSent = true
         flush(current)
     }
 
-    /// Orders the video transceiver's codec preferences for the RTP path;
-    /// auxiliary payloads (rtx/red/fec) keep their positions at the end.
-    private func codecOrder(for host: HostInfo?) -> [String] {
-        let receivable = factory.rtpReceiverCapabilities(forKind: "video").codecs.map { $0.name }
-        return CodecPreference.orderedCodecs(
-            preference: codecPreference,
-            hostCodecs: host?.capabilities.codecs ?? ["h264"],
-            receivableCodecs: receivable
-        )
-    }
-
-    private func applyCodecPreferences(to transceiver: RTCRtpTransceiver, host: HostInfo?) {
+    /// Orders the video transceiver's codec preferences for the RTP path.
+    /// H.264 leads unless the user picked another codec; auxiliary payloads
+    /// (rtx/red/fec) keep their positions at the end.
+    private func applyCodecPreferences(to transceiver: RTCRtpTransceiver) {
         var caps = factory.rtpReceiverCapabilities(forKind: "video").codecs
         guard !caps.isEmpty else { return }
-        let order = codecOrder(for: host)
+        let preferredName: String
+        switch codecPreference {
+        case .av1: preferredName = "av1"
+        case .hevc: preferredName = "h265"
+        default: preferredName = "h264"
+        }
+        let preferred = caps.filter { $0.name.lowercased() == preferredName }
         let auxiliary = caps.filter {
             let name = $0.name.lowercased()
             return name == "rtx" || name == "red" || name == "fec" || name == "ulpfec"
         }
-        let media = caps.filter { cap in
+        let rest = caps.filter { cap in
+            !preferred.contains { $0.name == cap.name } &&
             !auxiliary.contains { $0.name == cap.name }
         }
-        let rank: (RTCRtpCodecCapability) -> Int = { cap in
-            order.firstIndex(of: cap.name.lowercased()) ?? order.count
-        }
-        let sortedMedia = media.enumerated().sorted { left, right in
-            let leftRank = rank(left.element)
-            let rightRank = rank(right.element)
-            return leftRank == rightRank ? left.offset < right.offset : leftRank < rightRank
-        }
-        caps = sortedMedia.map { $0.element } + auxiliary
+        caps = preferred + rest + auxiliary
         // The error-taking overload is not visible to Swift in stasel's build;
         // codec preference failures are non-fatal either way.
         transceiver.setCodecPreferences(caps)
@@ -622,18 +546,10 @@ final class Session {
         receiver.onBuffer = { [weak self] buffer in
             self?.pixelMailbox.put(buffer)
         }
-        receiver.onPersistentFault = { [weak self, weak current] in
-            Task { @MainActor in
-                guard let session = self, let current = current ?? session.connection else { return }
-                current.video?.close()
-                current.videoIdr?.close()
-                session.deactivateDataChannelVideo(current)
-            }
-        }
         receiver.onUnsupported = { [weak self, weak current] in
-            // The wire stream is none of H.264/HEVC/AV1: close the data
-            // channels so the host keeps the RTP leg, which libwebrtc
-            // decodes for every negotiated codec.
+            // The wire stream is not H.264/HEVC (e.g. AV1 won negotiation):
+            // close the data channels so the host keeps the RTP leg, which
+            // libwebrtc decodes for every negotiated codec.
             Task { @MainActor in
                 guard let session = self, let current = current ?? session.connection else { return }
                 session.deactivateDataChannelVideo(current)
@@ -658,10 +574,6 @@ final class Session {
     private func onControlOpen(_ current: Connection) {
         guard current.control?.readyState == .open else { return }
         _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
-        if !current.sentDisplayQualityCap {
-            current.sentDisplayQualityCap = true
-            _ = setQuality(maxFps: UIScreen.main.maximumFramesPerSecond, maxBitrateKbps: nil)
-        }
         guard statsTask == nil else { return }
         if maxFps != nil || maxBitrateKbps != nil { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) }
         statsTask = nil
@@ -689,13 +601,14 @@ final class Session {
             onChange?()
             return
         }
-        let (_, transit, frames) = receiver.takeLinkStats()
-        statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount)"
+        let (_, transit) = receiver.takeLinkStats()
+        let s = receiver.stats
+        statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(s.fed) fps-ish · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount)"
         onChange?()
 
         // Fallback: if the decoder faulted and never produced a frame after
         // plenty of traffic, restore RTP so the user still gets video.
-        if receiver.decodedCount == 0, receiver.stats.msgs > 90, receiver.hasFaulted {
+        if receiver.decodedCount == 0, s.msgs > 90, receiver.hasFaulted {
             current.video?.close()
             current.videoIdr?.close()
             deactivateDataChannelVideo(current)
@@ -758,7 +671,6 @@ private final class Connection {
     var flushing = false
     var sequence = 0
     var injectHevcAttempted = false
-    var sentDisplayQualityCap = false
 
     init(socket: URLSessionWebSocketTask) { self.socket = socket }
 }

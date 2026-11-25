@@ -59,7 +59,6 @@ struct HostInfo: Decodable {
         let input: Bool?
         let clipboard: Bool?
         let displays: [DisplayInfo]?
-        let binaryInput: Bool?
     }
 
     let hostName: String

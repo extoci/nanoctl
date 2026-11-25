@@ -1,6 +1,6 @@
 {
   "name": "nanoctl",
-  "version": "3.0.0-alpha.8",
+  "version": "3.0.0-alpha.7",
   "private": true,
   "description": "Fast, secure, browser-based remote desktop.",
   "license": "MIT",

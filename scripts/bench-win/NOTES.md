@@ -827,3 +827,8 @@ Measured on the media-smoke pipeline (in-process, 30s window under `band --motio
 - Caveat: a process freeze also stops the producer (a pure network partition would let the encoder keep filling the DC backlog → `dc_skips` → seq gaps → KF resync — untested; needs two machines).
 - Also on this branch: `EncoderBackend::encode` gated `#[cfg(test)]` (windows-2025 clippy `dead_code` on a newer toolchain; its one runtime caller now uses `encode_format` directly).
 - Noted during the same run: decoded ~47/s vs ~58 emitted/s = negotiated-fps pacer, not a drop defect.
+
+## Cycle 49 — fps "gap" debunked + multi-viewer baseline (2026-11-25)
+
+- **fps fidelity is perfect, ceiling is the VM**: smoke fresh_frames 530/698 (44.2 fresh/s) matches live agent capture ~45/s exactly — capture ≈ encode ≈ deliver end-to-end with no internal drops. Smoke's 58fps headline counts stale re-encodes. Display is 60Hz; the compositor delivers ~45fps under streaming load on this GPU-less box. Lifting fps needs real hardware, not pipeline work.
+- **Multi-viewer measured: one active stream, newest attach wins.** 3 concurrent tabs: first streams 45.6fps, others frozen — `DataChannelVideo.channel`/`idr_channel` are single `Mutex<Option<…>>` slots in rtc.rs, so each new viewer's channel replaces the previous one. Older viewers never error; their seq just stops. No fanout today — a real fix is architectural (per-channel fanout), recorded here as the baseline before any multi-client work.
