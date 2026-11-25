@@ -1757,6 +1757,15 @@ impl FrameEncoder for SoftwareEncoder {
         image: &RgbaFrame<'_>,
         format: PixelFormat,
     ) -> Result<EncodedFrame> {
+        self.encode_format_with_constant_mb(image, format, None)
+    }
+
+    fn encode_format_with_constant_mb(
+        &mut self,
+        image: &RgbaFrame<'_>,
+        format: PixelFormat,
+        constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.dimensions != Some(dimensions) {
             // OpenH264 does not promise dynamic resolution changes. Recreate the software
@@ -1776,7 +1785,11 @@ impl FrameEncoder for SoftwareEncoder {
             self.yuv = Some(I420Frame::new(dimensions.0, dimensions.1)?);
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
-        yuv.read_pixels(image.as_raw(), format)?;
+        if let Some(constant_mb) = constant_mb {
+            yuv.read_pixels_constant_mb(image.as_raw(), format, constant_mb)?;
+        } else {
+            yuv.read_pixels(image.as_raw(), format)?;
+        }
         let color_elapsed = color_started.elapsed();
         self.color_convert_ns += color_elapsed.as_nanos() as u64;
         let bytes = self
