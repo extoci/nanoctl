@@ -102,6 +102,13 @@ underlying encrypted transport through DERP. Reliable control carries discrete c
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
 host input or clipboard access. System audio is available to view-only sessions too.
 
+A `quality` control message may include optional positive `maxWidth`/`maxHeight`
+physical-pixel caps in addition to rate caps. They describe the viewer's rendered video
+viewport. Hosts clamp them to configured encode dimensions, fit the source aspect ratio
+inside them, scale the bitrate ceiling by the square root of the viewport/source pixel
+ratio, and force a keyframe when they change. Omitted dimensions preserve the configured
+encode size, so older iOS and web viewers remain compatible.
+
 ### Video over data channel
 
 A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and

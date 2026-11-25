@@ -160,6 +160,40 @@ describe("remote session lifecycle", () => {
     }
   });
 
+  test("publishes physical viewport dimensions when control opens", async () => {
+    installBrowserGlobals();
+    Object.assign(window, { devicePixelRatio: 2 });
+    const peer = new FakePeer();
+    const video = Object.assign(new FakeVideo(), {
+      getBoundingClientRect: () => ({ width: 640, height: 360 }),
+    });
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [
+        {
+          id: "display",
+          name: "Display",
+          width: 1920,
+          height: 1080,
+          scaleFactor: 1,
+          primary: true,
+        },
+      ],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    peer.channels.get("nanoctl.control.v1")!.onopen?.();
+    expect(
+      peer.channels.get("nanoctl.control.v1")!.sent.map((message) => JSON.parse(message)),
+    ).toContainEqual({ type: "quality", maxWidth: 1280, maxHeight: 720 });
+    await controller.stop();
+  });
+
   test("clipboard is control-only and sends text before a remote paste key", async () => {
     installBrowserGlobals();
     Object.assign(document, { hasFocus: () => true });

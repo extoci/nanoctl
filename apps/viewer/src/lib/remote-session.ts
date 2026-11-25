@@ -78,7 +78,12 @@ export type HostSignalRow = {
   envelope: string;
 };
 
-export type QualityLimits = { maxFps?: number; maxBitrateKbps?: number };
+export type QualityLimits = {
+  maxFps?: number;
+  maxBitrateKbps?: number;
+  maxWidth?: number;
+  maxHeight?: number;
+};
 
 const controlTextEncoder = new TextEncoder();
 
@@ -210,6 +215,8 @@ export class RemoteSessionController {
   private metrics: RemoteSessionMetrics | null = null;
   private videoTransceiver: RTCRtpTransceiver | null = null;
   private qualityLimits: QualityLimits = {};
+  private viewportObserver: ResizeObserver | null = null;
+  private lastViewportQualityKey = "";
   private codecPreferencesApplied = false;
   private previousDecode: { id: string; time: number; frames: number } | null = null;
   private previousLoss: { id: string; lost: number; received: number } | null = null;
@@ -263,6 +270,7 @@ export class RemoteSessionController {
     if (this.phase === "ending" || this.phase === "ended" || this.phase === "failed") return;
     this.firstFrameReceived = true;
     this.clearFirstFrameTimer();
+    this.sendQualityLimits();
     this.publishSnapshot();
   };
 
@@ -279,6 +287,10 @@ export class RemoteSessionController {
     this.nextSequence = safeSequenceSeed();
     this.peerFactory =
       options.peerFactory ?? ((configuration) => new RTCPeerConnection(configuration));
+    if (typeof ResizeObserver !== "undefined") {
+      this.viewportObserver = new ResizeObserver(() => this.sendQualityLimits());
+      this.viewportObserver.observe(options.video);
+    }
   }
 
   get snapshot(): RemoteSessionSnapshot {
@@ -444,7 +456,8 @@ export class RemoteSessionController {
   /** Applies live without renegotiation; the host clamps to its configured maximums. */
   setQualityLimits(limits: QualityLimits): boolean {
     this.qualityLimits = { ...limits };
-    return this.sendControl({ type: "quality", ...this.qualityLimits });
+    this.lastViewportQualityKey = "";
+    return this.sendQualityLimits() !== false;
   }
 
   selectDisplay(displayId: string): boolean {
@@ -544,6 +557,8 @@ export class RemoteSessionController {
         peer.onicecandidate = null;
         peer.ontrack = null;
         this.options.video.removeEventListener("loadeddata", this.onVideoLoadedData);
+        this.viewportObserver?.disconnect();
+        this.viewportObserver = null;
         this.pointerChannel?.close();
         this.controlChannel?.close();
         this.clipboardChannel?.close();
@@ -1384,14 +1399,59 @@ export class RemoteSessionController {
     return this.controlChannel?.readyState === "open";
   }
 
+  private viewportEncodeLimits(): { maxWidth?: number; maxHeight?: number } {
+    const video = this.options.video;
+    if (typeof video.getBoundingClientRect !== "function") return {};
+    const rect = video.getBoundingClientRect();
+    const display =
+      this.displays.find((candidate) => candidate.id === this.preferences.displayId) ??
+      this.displays.find((candidate) => candidate.primary) ??
+      this.displays[0];
+    const sourceWidth = video.videoWidth || display?.width || 0;
+    const sourceHeight = video.videoHeight || display?.height || 0;
+    if (!rect.width || !rect.height || !sourceWidth || !sourceHeight) return {};
+    const fit =
+      typeof getComputedStyle === "function" ? getComputedStyle(video).objectFit : "contain";
+    if (fit === "none") return {};
+    let width = rect.width;
+    let height = rect.height;
+    if (fit === "contain" || fit === "cover" || fit === "scale-down") {
+      const xScale = rect.width / sourceWidth;
+      const yScale = rect.height / sourceHeight;
+      const scale = fit === "cover" ? Math.max(xScale, yScale) : Math.min(xScale, yScale);
+      width = sourceWidth * scale;
+      height = sourceHeight * scale;
+    }
+    const density = window.devicePixelRatio || 1;
+    const even = (value: number) => Math.max(2, Math.ceil((value * density) / 2) * 2);
+    return { maxWidth: even(width), maxHeight: even(height) };
+  }
+
+  private sendQualityLimits(): boolean {
+    if (!this.isControlOpen()) return false;
+    const viewport = this.viewportEncodeLimits();
+    const limits: QualityLimits = { ...this.qualityLimits, ...viewport };
+    if (this.qualityLimits.maxWidth)
+      limits.maxWidth = Math.min(this.qualityLimits.maxWidth, viewport.maxWidth ?? Infinity);
+    if (this.qualityLimits.maxHeight)
+      limits.maxHeight = Math.min(this.qualityLimits.maxHeight, viewport.maxHeight ?? Infinity);
+    const key = `${limits.maxFps ?? ""}:${limits.maxBitrateKbps ?? ""}:${limits.maxWidth ?? ""}:${limits.maxHeight ?? ""}`;
+    if (key === this.lastViewportQualityKey) return true;
+    if (limits.maxFps || limits.maxBitrateKbps || (limits.maxWidth && limits.maxHeight)) {
+      this.lastViewportQualityKey = key;
+      return this.sendControl({ type: "quality", ...limits });
+    }
+    return true;
+  }
+
   private onControlReady(): void {
     if (!this.isControlOpen()) return;
+    this.lastViewportQualityKey = "";
     this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
     const displayId = this.preferences.displayId;
     if (displayId && this.displays.some((display) => display.id === displayId))
       this.sendControl({ type: "display", displayId });
-    if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
-      this.sendControl({ type: "quality", ...this.qualityLimits });
+    this.sendQualityLimits();
     this.sendControl({ type: "audio", enabled: this.audioEnabled });
     this.startGamepadPolling();
     this.publishSnapshot();

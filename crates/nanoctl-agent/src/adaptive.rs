@@ -41,6 +41,10 @@ struct DelaySignal {
 pub struct ViewerLimits {
     pub max_fps: Option<u16>,
     pub max_bitrate_kbps: Option<u32>,
+    /// Physical pixels available to the rendered video. They can lower the
+    /// configured encode dimensions for one session, never exceed them.
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
 }
 
 impl ViewerLimits {
@@ -58,6 +62,18 @@ impl ViewerLimits {
         }
         let envelope: Envelope = serde_json::from_slice(data).ok()?;
         (envelope.kind == "quality").then_some(envelope.limits)
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn resolve_dimensions(self, max_width: u32, max_height: u32) -> (u32, u32) {
+        (
+            self.max_width
+                .filter(|cap| *cap >= 2)
+                .map_or(max_width, |cap| cap.min(max_width) & !1),
+            self.max_height
+                .filter(|cap| *cap >= 2)
+                .map_or(max_height, |cap| cap.min(max_height) & !1),
+        )
     }
 
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
@@ -591,6 +607,20 @@ mod tests {
         );
         assert!(ViewerLimits::parse(br#"{"type":"key","code":"quality"}"#).is_none());
         assert!(ViewerLimits::parse(br#"{"type":"display","displayId":"1"}"#).is_none());
+    }
+
+    #[test]
+    fn viewer_dimension_limits_are_even_and_never_exceed_configured_maximums() {
+        let limits =
+            ViewerLimits::parse(br#"{"type":"quality","maxWidth":1281,"maxHeight":719}"#).unwrap();
+        assert_eq!(limits.resolve_dimensions(3840, 2160), (1280, 718));
+        let raised =
+            ViewerLimits::parse(br#"{"type":"quality","maxWidth":7680,"maxHeight":4320}"#).unwrap();
+        assert_eq!(raised.resolve_dimensions(3840, 2160), (3840, 2160));
+        assert_eq!(
+            ViewerLimits::default().resolve_dimensions(3840, 2160),
+            (3840, 2160)
+        );
     }
 
     #[test]

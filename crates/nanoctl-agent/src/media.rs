@@ -225,6 +225,20 @@ impl EncodeScale {
     }
 }
 
+fn viewport_scaled_rate(bitrate_kbps: u32, ceiling_kbps: u32, pixel_ratio: f64) -> (u32, u32) {
+    if pixel_ratio >= 1.0 {
+        return (bitrate_kbps, ceiling_kbps);
+    }
+    // Bitrate needs fall off more slowly than pixel count: the smaller encode has
+    // less redundant area and needs more bits per output pixel to remain transparent
+    // at the physical size the viewer actually renders.
+    let rate_scale = pixel_ratio.sqrt();
+    (
+        (f64::from(bitrate_kbps) * rate_scale).round().max(1.0) as u32,
+        (f64::from(ceiling_kbps) * rate_scale).round().max(1.0) as u32,
+    )
+}
+
 fn sample_duration(previous: Option<Instant>, now: Instant, fps: u16) -> Duration {
     previous
         .map_or_else(
@@ -2660,6 +2674,8 @@ pub fn spawn_video(
                 let mut last: Option<Arc<CapturedFrame>> = None;
                 let mut last_encoded: Option<Arc<CapturedFrame>> = None;
                 let mut forced_keyframe = false;
+                let mut viewer_dimensions = (quality.max_width, quality.max_height);
+                let mut viewport_bitrate_scale = 1.0;
                 let mut waiting_since = Instant::now();
                 loop {
                     if producer_stopped.load(Ordering::Acquire) {
@@ -2732,38 +2748,51 @@ pub fn spawn_video(
                             sample.remb_kbps = None;
                         }
                         if let Some(decision) = controller.observe(sample) {
-                            encoder
-                                .apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
+                            let (target_kbps, target_ceiling) = viewport_scaled_rate(
+                                decision.bitrate_kbps,
+                                bitrate_ceiling,
+                                viewport_bitrate_scale,
+                            );
+                            encoder.apply_bitrate_estimate(target_kbps, target_ceiling)?;
                             fps = decision.fps;
                             pacer.set_fps(fps);
                             forced_keyframe |= scale.changed_limits(
-                                decision.bitrate_kbps,
+                                target_kbps,
                                 quality.max_width,
                                 quality.max_height,
                             );
                             producer_stats
                                 .target_kbps
-                                .store(decision.bitrate_kbps, Ordering::Relaxed);
+                                .store(target_kbps, Ordering::Relaxed);
                             producer_stats.target_fps.store(fps, Ordering::Relaxed);
                         }
                     }
                     if viewer_limits.has_changed().unwrap_or(false) {
-                        let (ceiling, max_fps) = viewer_limits
-                            .borrow_and_update()
-                            .resolve(quality.max_bitrate_kbps, quality.max_fps);
+                        let limits = *viewer_limits.borrow_and_update();
+                        let dimensions =
+                            limits.resolve_dimensions(quality.max_width, quality.max_height);
+                        forced_keyframe |= dimensions != viewer_dimensions;
+                        viewer_dimensions = dimensions;
+                        let (ceiling, max_fps) =
+                            limits.resolve(quality.max_bitrate_kbps, quality.max_fps);
                         let decision = controller.set_limits(ceiling, max_fps);
                         bitrate_ceiling = ceiling;
-                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
+                        let (target_kbps, target_ceiling) = viewport_scaled_rate(
+                            decision.bitrate_kbps,
+                            bitrate_ceiling,
+                            viewport_bitrate_scale,
+                        );
+                        encoder.apply_bitrate_estimate(target_kbps, target_ceiling)?;
                         fps = decision.fps;
                         pacer.set_fps(fps);
                         forced_keyframe |= scale.changed_limits(
-                            decision.bitrate_kbps,
+                            target_kbps,
                             quality.max_width,
                             quality.max_height,
                         );
                         producer_stats
                             .target_kbps
-                            .store(decision.bitrate_kbps, Ordering::Relaxed);
+                            .store(target_kbps, Ordering::Relaxed);
                         producer_stats.target_fps.store(fps, Ordering::Relaxed);
                     }
                     let mut switched = false;
@@ -2834,8 +2863,33 @@ pub fn spawn_video(
                         encoder.encoder.force_keyframe();
                         forced_keyframe = false;
                     }
-                    let (max_width, max_height) =
+                    let (scale_width, scale_height) =
                         scale.limits(quality.max_width, quality.max_height);
+                    let max_width = scale_width.min(viewer_dimensions.0);
+                    let max_height = scale_height.min(viewer_dimensions.1);
+                    let (viewer_fit_width, viewer_fit_height) = fit_dimensions(
+                        captured.frame.width,
+                        captured.frame.height,
+                        viewer_dimensions.0,
+                        viewer_dimensions.1,
+                    );
+                    let viewport_scale = (f64::from(viewer_fit_width)
+                        * f64::from(viewer_fit_height)
+                        / (f64::from(captured.frame.width) * f64::from(captured.frame.height)))
+                    .min(1.0);
+                    if (viewport_scale - viewport_bitrate_scale).abs() >= 0.005 {
+                        viewport_bitrate_scale = viewport_scale;
+                        let decision = controller.decision();
+                        let (target_kbps, target_ceiling) = viewport_scaled_rate(
+                            decision.bitrate_kbps,
+                            bitrate_ceiling,
+                            viewport_bitrate_scale,
+                        );
+                        encoder.apply_bitrate_estimate(target_kbps, target_ceiling)?;
+                        producer_stats
+                            .target_kbps
+                            .store(target_kbps, Ordering::Relaxed);
+                    }
                     let (frame, _timing) =
                         encoder.encode_captured_frame(captured, max_width, max_height)?;
                     if frame.bytes.is_empty() {
@@ -3292,10 +3346,22 @@ mod tests {
         HARDWARE_BACKENDS, HardwareBackend, LatestFrame, PixelFormat, SoftwareEncoder,
         TimingSample, TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types,
         avcc_to_annex_b, await_video_delivery, bitrate_target, delivery_failure_grace_elapsed,
-        fit_dimensions,
+        fit_dimensions, viewport_scaled_rate,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+
+    #[test]
+    fn viewport_bitrate_scaling_preserves_more_bits_per_pixel() {
+        assert_eq!(viewport_scaled_rate(12_000, 12_000, 1.0), (12_000, 12_000));
+        // 1080p in a 720p viewport has 4/9 of the pixels. The square-root
+        // rate scale still halves bandwidth while giving the smaller encode
+        // more bits per visible pixel than a linear pixel-ratio cut.
+        assert_eq!(
+            viewport_scaled_rate(12_000, 12_000, 4.0 / 9.0),
+            (8_000, 8_000)
+        );
+    }
     use std::time::{Duration, Instant};
     use xcap::image::{Rgba, RgbaImage};
 

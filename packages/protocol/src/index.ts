@@ -154,6 +154,9 @@ export type ControlMessage =
       readonly type: "quality";
       readonly maxFps?: number;
       readonly maxBitrateKbps?: number;
+      /** Physical pixels available to the rendered video; caps host encode dimensions. */
+      readonly maxWidth?: number;
+      readonly maxHeight?: number;
     }
   | {
       readonly type: "gamepad";
