@@ -12,10 +12,13 @@ type Tier = {
   profile: string;
   me: string;
   subme: number;
+  threads: number;
+  refs: number;
 };
 
-const encode = (directory: string, tier: Tier): string => {
+const encode = (directory: string, tier: Tier): { output: string; seconds: number } => {
   const output = join(directory, `${tier.name}.h264`);
+  const started = performance.now();
   execFileSync(
     "ffmpeg",
     [
@@ -46,7 +49,8 @@ const encode = (directory: string, tier: Tier): string => {
       "-profile:v",
       tier.profile,
       "-x264-params",
-      `keyint=2147483647:scenecut=0:me=${tier.me}:subme=${tier.subme}`,
+      `keyint=2147483647:scenecut=0:me=${tier.me}:subme=${tier.subme}:` +
+        `threads=${tier.threads}:sliced-threads=1:ref=${tier.refs}`,
       "-f",
       "h264",
       "-y",
@@ -54,7 +58,7 @@ const encode = (directory: string, tier: Tier): string => {
     ],
     { stdio: ["ignore", "ignore", "inherit"] },
   );
-  return output;
+  return { output, seconds: (performance.now() - started) / 1000 };
 };
 
 const ssim = (encoded: string): number => {
@@ -91,6 +95,8 @@ try {
     profile: "baseline",
     me: "hex",
     subme: 2,
+    threads: 0,
+    refs: 1,
   });
   const tier3 = encode(directory, {
     name: "tier3-high-umh",
@@ -98,18 +104,38 @@ try {
     profile: "high",
     me: "umh",
     subme: 6,
+    threads: 2,
+    refs: 2,
   });
-  const beforeBytes = statSync(tier0).size;
-  const afterBytes = statSync(tier3).size;
-  const beforeSsim = ssim(tier0);
-  const afterSsim = ssim(tier3);
-  const saved = (1 - afterBytes / beforeBytes) * 100;
+  const tier4 = encode(directory, {
+    name: "tier4-single-slice-ref3",
+    preset: "fast",
+    profile: "high",
+    me: "umh",
+    subme: 6,
+    threads: 1,
+    refs: 3,
+  });
+  const rows = [tier0, tier3, tier4].map((tier) => ({
+    name: tier.output.split(/[\\/]/).pop()!,
+    bytes: statSync(tier.output).size,
+    ssim: ssim(tier.output),
+    seconds: tier.seconds,
+  }));
+  const [before, current, next] = rows;
+  for (const row of rows) {
+    console.log(
+      `${row.name}: ${row.bytes} bytes @ SSIM ${row.ssim.toFixed(6)}, encode ${row.seconds.toFixed(2)}s`,
+    );
+  }
+  const totalSaved = (1 - next.bytes / before.bytes) * 100;
+  const incrementalSaved = (1 - next.bytes / current.bytes) * 100;
   console.log(
-    `testsrc2 motion: ${beforeBytes} bytes @ SSIM ${beforeSsim.toFixed(6)} -> ` +
-      `${afterBytes} bytes @ SSIM ${afterSsim.toFixed(6)} ` +
-      `(${saved.toFixed(1)}% fewer bytes, ${(afterSsim - beforeSsim).toFixed(6)} SSIM)`,
+    `tier4 vs tier3: ${incrementalSaved.toFixed(1)}% fewer bytes, ` +
+      `${(next.ssim - current.ssim).toFixed(6)} SSIM; tier4 vs tier0: ${totalSaved.toFixed(1)}% fewer bytes`,
   );
-  if (afterBytes >= beforeBytes || afterSsim + 0.0002 < beforeSsim) process.exitCode = 1;
+  if (current.bytes >= before.bytes || current.ssim + 0.0002 < before.ssim) process.exitCode = 1;
+  if (next.bytes >= current.bytes || next.ssim + 0.0002 < current.ssim) process.exitCode = 1;
 } finally {
   rmSync(directory, { recursive: true, force: true });
 }
