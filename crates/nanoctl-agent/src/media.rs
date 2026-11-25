@@ -2529,13 +2529,31 @@ pub fn spawn_video(
                     {
                         bail!("display capture forwarding thread stopped");
                     }
+                    // Surface pending keyframe/recovery requests before
+                    // blocking on the next capture so an attach or recovery
+                    // IDR encodes the frame already in hand instead of
+                    // waiting out the pacer deadline (up to 50ms).
+                    if keyframe_requests.has_changed().unwrap_or(false) {
+                        keyframe_requests.borrow_and_update();
+                        forced_keyframe = true;
+                    }
+                    if delivery_recovery_requests.has_changed().unwrap_or(false) {
+                        delivery_recovery_requests.borrow_and_update();
+                        forced_keyframe = true;
+                    }
                     let now = Instant::now();
-                    let wait = if last.is_some() {
+                    // The 16ms cap bounds how long a keyframe request stays
+                    // unseen while the producer is blocked here: the channel
+                    // is only polled after `take` returns. Idle wakeups are
+                    // a few atomic ops, so the tighter cap is cheap.
+                    let wait = if forced_keyframe && last.is_some() {
+                        Duration::ZERO
+                    } else if last.is_some() {
                         pacer.next_deadline(now, fps).saturating_duration_since(now)
                     } else {
                         Duration::from_millis(50)
                     }
-                    .min(Duration::from_millis(50));
+                    .min(Duration::from_millis(16));
                     let wait_started = Instant::now();
                     let fresh = encoder
                         .latest_frame
