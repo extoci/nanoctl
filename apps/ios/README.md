@@ -22,7 +22,14 @@ control messages the agent understands.
    and direct WebRTC UDP in tailnet policy and host firewalls. There is no STUN or TURN
    fallback, and the app does not bypass TLS validation.
 
-Touch the video to click or swipe to move the remote pointer. Pair a controller with
+The desktop fills the screen as soon as you connect. A single glass button in the
+top-right corner expands into AirPlay, touch mode and a menu for sound, paste,
+display, stream limits (frame rate, bitrate, codec, stats) and disconnect.
+
+Touch defaults to **trackpad** mode, like the web viewer: drag to move the cursor,
+tap to click, double-tap and hold to drag, two fingers to scroll or right-click,
+three fingers to middle-click, pinch to zoom. **Direct touch** (tap where you want to
+click, hold to right-click) is one tap away and remembered. Pair a controller with
 iOS to forward its standard controls. The app uses native controller change events
 instead of polling; only idle keepalive uses a timer. A DualSense or DualShock profile
 requests a **virtual DualShock 4** on a Windows host with ViGEm; other supported
@@ -35,7 +42,8 @@ When iOS provides a separate external-display scene, nanoctl sends only video th
 and keeps the touchpad, gamepad and connection controls on the phone. When the display
 disconnects, playback returns to the phone without a second WebRTC session.
 
-For AirPlay, select the TV from iOS Control Center. The split view requires iOS to
+For AirPlay, use **Control Center › Screen Mirroring**; the AirPlay button in the
+session controls routes sound and explains this if no second screen appears. The split view requires iOS to
 expose that AirPlay route as a separate screen. A mirrored-only route cannot show
 different phone and TV content; this prototype does not implement a separate AirPlay
 transport or promise split view on all receivers. The Simulator can exercise the
