@@ -161,6 +161,57 @@ struct GamepadMessage: Encodable, Equatable {
         return data
     }
 
+    /// Sparse input v3 gamepad report (`12, sequence, slot mask, then field-masked
+    /// slots`). Zero-valued fields are omitted but each slot remains absolute state.
+    func sparseBinary(sequence: UInt8) -> Data? {
+        guard pads.count <= 4, pads.allSatisfy({ $0.count == 8 }) else { return nil }
+        let sony = Dictionary((dualShock4 ?? []).map { ($0.slot, $0) }, uniquingKeysWith: { $1 })
+        var mask: UInt8 = 0
+        for pad in pads {
+            guard (0...3).contains(pad[0]), mask & UInt8(1 << pad[0]) == 0 else { return nil }
+            mask |= UInt8(1 << pad[0])
+        }
+        var data = Data([12, sequence, mask])
+        for pad in pads.sorted(by: { $0[0] < $1[0] }) {
+            guard let buttons = UInt16(exactly: pad[1]),
+                  let left = UInt8(exactly: pad[2]), let right = UInt8(exactly: pad[3]) else { return nil }
+            var axes = [UInt16]()
+            for value in pad[4...] {
+                guard let axis = Int16(exactly: value) else { return nil }
+                axes.append(UInt16(bitPattern: axis))
+            }
+            let ds4 = sony[pad[0]]
+            var fields: UInt8 = 0
+            if buttons != 0 { fields |= 1 }
+            if left != 0 { fields |= 2 }
+            if right != 0 { fields |= 4 }
+            for (bit, axis) in axes.enumerated() where axis != 0 { fields |= UInt8(8 << bit) }
+            if ds4 != nil { fields |= 128 }
+            data.append(fields)
+            if buttons != 0 {
+                var compact = buttons
+                repeat {
+                    let byte = UInt8(compact & 0x7f)
+                    compact >>= 7
+                    data.append(compact != 0 ? byte | 0x80 : byte)
+                } while compact != 0
+            }
+            if left != 0 { data.append(left) }
+            if right != 0 { data.append(right) }
+            for axis in axes where axis != 0 {
+                data.append(contentsOf: [UInt8(axis & 0xff), UInt8(axis >> 8)])
+            }
+            if let ds4 {
+                var flags: UInt8 = 1
+                if ds4.leftTriggerPressed { flags |= 2 }
+                if ds4.rightTriggerPressed { flags |= 4 }
+                if ds4.touchpadPressed { flags |= 8 }
+                data.append(flags)
+            }
+        }
+        return data
+    }
+
     static func axis(_ value: Float) -> Int {
         guard value.isFinite else { return 0 }
         let unit = min(1, max(-1, value))

@@ -116,6 +116,13 @@ final class WireTests: XCTestCase {
             2, 9, 4,
             0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
         ]))
+        XCTAssertEqual(report.sparseBinary(sequence: 9), Data([
+            12, 9, 4,
+            0xff, 0x81, 0x20, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+        ]))
+        XCTAssertEqual(GamepadMessage(pads: [[1, 0, 0, 7, -2, 0, 0, 0]]).sparseBinary(sequence: 10), Data([
+            12, 10, 2, 12, 7, 0xfe, 0xff,
+        ]))
         XCTAssertEqual(GamepadMessage(pads: []).binary(sequence: 0), Data([2, 0, 0]))
         XCTAssertNil(GamepadMessage(pads: [[0, 0x10000, 0, 0, 0, 0, 0, 0]]).binary(sequence: 0))
         XCTAssertNil(GamepadMessage(pads: Array(repeating: [0, 0, 0, 0, 0, 0, 0, 0], count: 5)).binary(sequence: 0))

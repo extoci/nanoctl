@@ -8,6 +8,9 @@ final class Gamepad {
     private var controller: GCController?
     private var keepalive: Timer?
     private var lastSent: GamepadMessage?
+    private var changedAt: TimeInterval?
+    private var fullAt: TimeInterval?
+    private var heartbeatAt: TimeInterval?
     var onChange: (() -> Void)?
 
     init(session: Session) {
@@ -34,8 +37,8 @@ final class Gamepad {
         keepalive?.invalidate()
         keepalive = nil
         if active {
-            // The host neutralizes pads after 150 ms without a snapshot; a
-            // 50 ms keepalive survives two consecutive lost reports.
+            // The host neutralizes pads after 225 ms without a report. The
+            // 50 ms timer supplies repeat, heartbeat, and refresh deadlines.
             let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.send(force: true) }
             }
@@ -68,6 +71,9 @@ final class Gamepad {
     private func release() {
         if lastSent != nil { session.sendGamepad(GamepadMessage(pads: [])) }
         lastSent = nil
+        changedAt = nil
+        fullAt = nil
+        heartbeatAt = nil
     }
 
     private func send(force: Bool = false) {
@@ -88,6 +94,28 @@ final class Gamepad {
             message.dualShock4 = [.init(slot: 0, leftTriggerPressed: pad.leftTrigger.isPressed,
                                        rightTriggerPressed: pad.rightTrigger.isPressed, touchpadPressed: false)]
         }
-        if (force || message != lastSent), session.sendGamepad(message) { lastSent = message }
+        let now = Date.timeIntervalSinceReferenceDate
+        let changed = message != lastSent
+        if changed { changedAt = now }
+        let repeating = changedAt.map { now - $0 < 0.1 } ?? false
+        let needsFull = fullAt.map { now - $0 >= 0.225 } ?? true
+        let heartbeatDue = heartbeatAt.map { now - $0 >= 0.075 } ?? true
+        var sent = false
+        if changed || repeating || needsFull {
+            let sparse = !needsFull
+            sent = session.sendGamepad(message, sparse: sparse)
+            if sent {
+                if !sparse { fullAt = now }
+                heartbeatAt = now
+            } else {
+                // Rebase after a transport outage: a new host-side gamepad stream
+                // cannot use sparse state until it receives a full snapshot.
+                fullAt = nil
+            }
+        } else if force && heartbeatDue {
+            sent = session.sendGamepadHeartbeat()
+            if sent { heartbeatAt = now }
+        }
+        if sent { lastSent = message }
     }
 }

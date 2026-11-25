@@ -268,13 +268,19 @@ final class Session {
     }
 
     @discardableResult
-    func sendGamepad(_ report: GamepadMessage) -> Bool {
+    func sendGamepad(_ report: GamepadMessage, sparse: Bool = false) -> Bool {
         // Gamepad reports ride the unordered zero-retransmit pointer channel so
-        // a lost report never delays the next one. The agent accepts gamepad on this lane.
-        guard gamepadAllowed, let data = report.binary(sequence: gamepadSequence) else { return false }
+        // a lost report never delays the next one. Empty detaches stay reliable.
+        let wire = sparse ? report.sparseBinary(sequence: gamepadSequence) : report.binary(sequence: gamepadSequence)
+        guard gamepadAllowed, let data = wire else { return false }
         guard send(data, pointer: !report.pads.isEmpty, limitBacklog: true, binary: true) else { return false }
         gamepadSequence &+= 1
         return true
+    }
+
+    func sendGamepadHeartbeat() -> Bool {
+        guard gamepadAllowed else { return false }
+        return send(Data([11]), pointer: true, limitBacklog: true, binary: true)
     }
 
     private func appendPosition(_ data: inout Data, x: Double, y: Double) {
