@@ -56,6 +56,9 @@ Types and validators live in `packages/protocol`.
 
 Upgrade `GET /v1/connect` using `wss:` for HTTPS, otherwise `ws:`, with matching Host
 and Origin. Each message/frame is capped at 64 KiB. One socket is one session.
+The viewer includes a stable browser-instance `client` query parameter. It is only a
+replacement hint that lets a reconnect retire its own earlier socket; it is not an
+authentication or authorization credential.
 
 Server hello has shape `{type:"hello", sessionId:string, host:HostInfo}`, where
 `host` is the complete info **object**, not a serialized string.
@@ -86,7 +89,11 @@ lifecycle; socket reconnect creates a new session.
 Payloads: `offer` / `answer` with `sdp`; `ice-candidate` with `candidate`,
 `sdpMid`, `sdpMLineIndex`, `usernameFragment`; `ice-complete`; `end` with `reason`.
 Terminal socket messages are `{"type":"end","reason":"replaced"}` (or another reason).
-A newer authorized socket replaces the active session. Socket closure ends the session.
+Socket closure ends the session. Presence notifications are
+`{"type":"client-connected","client":SessionClient}` and
+`{"type":"client-disconnected","client":SessionClient}`; `SessionClient` carries the
+session id, browser client id, Tailscale login/display/machine names, and control
+permission. They are informational only and do not alter authorization.
 
 ## Media and input
 
