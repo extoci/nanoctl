@@ -3,5 +3,6 @@
 pub(crate) enum PixelFormat {
     #[default]
     Rgba,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Bgra,
 }
