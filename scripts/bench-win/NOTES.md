@@ -771,3 +771,7 @@ Same rig/scene (`band --clock --height 80 --fps 120`), same agent binary, only `
 | xcap (NANOCTL_DXGI_CAPTURE=0) | 48 ms    | 48.7      | 73    | ~15.7 %                 |
 
 **DXGI path is also a glass-to-glass win: −6.4 ms p50 vs xcap** — emitting on present beats xcap's fixed-poll cadence. Absolute p50 drifts run-to-run (~34-42 ms across cycles on this ~30 Hz composite VM); only same-rig A-B deltas are comparable.
+
+## Cycle 40 — wire jitter under motion (2026-11-25)
+
+dcv-snap, `band --motion`, 20 s window: 926 deltas, **0 gaps, 0 KF resyncs, 0 decode-drops**; transit avg 1.43 ms, decode avg 1.09 ms (~46 fps consumed). No queueing behind IDR bursts or decode backlog — axis verified clean, nothing to climb.
