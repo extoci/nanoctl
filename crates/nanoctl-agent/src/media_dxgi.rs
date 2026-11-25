@@ -511,16 +511,20 @@ pub(super) fn start(
     Ok((latest, thread))
 }
 
-fn recreate(h_monitor: HMONITOR, dup: &mut Option<Duplication>) {
+fn recreate(h_monitor: HMONITOR, dup: &mut Option<Duplication>) -> bool {
     // Windows allows only one duplication of an output. Release the stale COM
     // objects before opening their replacement; creating the replacement first
     // makes every recovery fail with DuplicateOutput/access-denied.
     drop(dup.take());
     match Duplication::new(h_monitor) {
-        Ok(next) => *dup = Some(next),
+        Ok(next) => {
+            *dup = Some(next);
+            true
+        }
         Err(recreate_error) => {
             tracing::warn!("DXGI duplication recreate failed: {recreate_error:#}");
             std::thread::sleep(Duration::from_secs(1));
+            false
         }
     }
 }
@@ -536,6 +540,19 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
     // there. Infer suspension from the capture loop itself missing its normal
     // ~100ms cadence by a wide margin instead.
     let mut previous_loop = Instant::now();
+    let mut recreate_failures = 0_u8;
+    let mut recreate_bounded = |dup: &mut Option<Duplication>| {
+        if recreate(h_monitor, dup) {
+            recreate_failures = 0;
+            true
+        } else {
+            recreate_failures += 1;
+            // A permanently unavailable duplication session must not leave the
+            // stream on indefinite keepalives. Exit so the caller can rebuild
+            // the pipeline and fall back to the continuous capture backend.
+            recreate_failures < 5
+        }
+    };
     loop {
         let Some(latest) = slot.upgrade() else {
             return;
@@ -546,8 +563,9 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
         let loop_started = Instant::now();
         let resumed = loop_started.duration_since(previous_loop) >= Duration::from_secs(2);
         previous_loop = loop_started;
-        if resumed || dup.is_none() {
-            recreate(h_monitor, &mut dup);
+        if (resumed || dup.is_none()) && !recreate_bounded(&mut dup) {
+            tracing::warn!("DXGI duplication recovery failed repeatedly; capture thread exiting");
+            return;
         }
         if dup.is_none() {
             continue;
@@ -571,7 +589,12 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
                     return;
                 }
                 // Desktop switch / mode change: rebuild the duplication.
-                recreate(h_monitor, &mut dup);
+                if !recreate_bounded(&mut dup) {
+                    tracing::warn!(
+                        "DXGI duplication recovery failed repeatedly; capture thread exiting"
+                    );
+                    return;
+                }
             }
         }
     }
