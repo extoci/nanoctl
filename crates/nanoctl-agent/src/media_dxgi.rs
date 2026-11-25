@@ -576,3 +576,40 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputPermit, active_outputs};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Gdi::HMONITOR;
+
+    static NEXT_TEST_OUTPUT: AtomicUsize = AtomicUsize::new(0x7000_0000);
+
+    fn test_monitor() -> HMONITOR {
+        HMONITOR(NEXT_TEST_OUTPUT.fetch_add(0x10, Ordering::Relaxed) as *mut _)
+    }
+
+    #[test]
+    fn output_permit_rejects_overlapping_try_acquire() {
+        let monitor = test_monitor();
+        let first = OutputPermit::try_acquire(monitor).expect("first permit");
+        assert!(OutputPermit::try_acquire(monitor).is_err());
+        drop(first);
+        assert!(OutputPermit::try_acquire(monitor).is_ok());
+    }
+
+    #[test]
+    fn output_permit_waits_for_release() {
+        let monitor = test_monitor();
+        let first = OutputPermit::try_acquire(monitor).expect("first permit");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(first);
+        });
+        let started = Instant::now();
+        let second = OutputPermit::acquire(monitor).expect("second permit");
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        drop(second);
+    }
+}
