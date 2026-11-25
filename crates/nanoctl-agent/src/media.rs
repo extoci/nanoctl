@@ -2468,6 +2468,8 @@ pub struct MediaSmokeReport {
     /// Per-second buckets: frames, bytes, and encode mean/max for that second.
     /// Ordered by `second`; trailing partial second included.
     pub per_second: Vec<SmokeSecond>,
+    /// Mean capture-backend CPU copy time per emitted frame.
+    pub capture_copy_mean_milliseconds: f64,
     /// Mean RGBA→I420 conversion time per encoded frame (inside encode time).
     pub color_convert_mean_milliseconds: f64,
     /// Final adaptive-negotiation tier and cumulative tier switches (x264 only).
@@ -2696,6 +2698,24 @@ pub fn run_smoke(
         sps_units,
         pps_units,
         per_second,
+        capture_copy_mean_milliseconds: {
+            let captures = encoder
+                .latest_frame
+                .stats
+                .frames_captured
+                .load(Ordering::Relaxed);
+            if captures > 0 {
+                encoder
+                    .latest_frame
+                    .stats
+                    .capture_ns
+                    .load(Ordering::Relaxed) as f64
+                    / captures as f64
+                    / 1_000_000.0
+            } else {
+                0.0
+            }
+        },
         color_convert_mean_milliseconds: if frames > 0 {
             encoder.color_convert_ns() as f64 / frames as f64 / 1_000_000.0
         } else {

@@ -936,3 +936,45 @@ conversion means there is no encoder-input quality or compression change.
 Noise fallback regression check (`band --noise --height 1200`, 10s, two runs
 each): fps 57.32→57.02, bitrate 20.96→20.74Mbps, encode p50 5.551→5.528ms,
 PSNR 17.186→17.193dB — within noise-run variance, no regression.
+
+## Cycle 56 — duplicate DXGI dirty copies removed (2026-11-25)
+
+DXGI capture kept a persistent full-frame accumulation buffer and copied every
+dirty row twice: once into that buffer and once into the emitted frame. The
+recycled emit-buffer generation/patch log already carries the same image state,
+so the steady path now copies dirty rows only into the emit buffer. The cold
+path (first frame, mode change, or no recyclable emission) reads the complete
+current texture once instead of cloning the accumulator. `media-smoke` now
+reports mean capture-backend copy time.
+
+Noise worst case (`band --noise --height 1200`, 10s, two runs each, x264 adapt
+pinned to tier 0; bitrate rises with fps because the scene remains VBV-capped):
+
+| path      | fps   | bitrate | encode p50 | copy mean | convert mean | capture→encode p50 | PSNR p50 |
+| --------- | ----- | ------- | ---------- | --------- | ------------ | ------------------ | -------- |
+| baseline  | 55.71 | 20.59M  | 6.249ms    | 4.010ms   | 0.533ms      | 14.696ms           | 17.156dB |
+| optimized | 57.50 | 21.31M  | 5.936ms    | 3.891ms   | 0.490ms      | 14.657ms           | 17.152dB |
+
+Clock motion (`band --clock --height 80`, 10s, two valid optimized runs):
+
+| path      | fps   | bitrate | encode p50 | copy mean | convert mean | capture→encode p50 | PSNR p50 |
+| --------- | ----- | ------- | ---------- | --------- | ------------ | ------------------ | -------- |
+| baseline  | 57.73 | 204kbps | 2.563ms    | 0.728ms   | 0.055ms      | 11.116ms           | 55.21dB  |
+| optimized | 58.14 | 180kbps | 2.384ms    | 0.598ms   | 0.036ms      | 10.764ms           | 55.74dB  |
+
+Clock capture copy is **−17.9%**, encode p50 **−7.0%**, capture→encode
+**−0.35ms**, with fps/PSNR not regressed. Noise is a smaller but positive copy
+and encode delta at PSNR parity; the large encode variance on this VM means the
+trustworthy invariant is the eliminated row copy itself.
+
+## Cycle 57 — full-frame parallel RGBA→I420 conversion rejected (2026-11-25)
+
+A custom even-row-band rayon conversion was bit-identical to serial conversion,
+but it was not a pipeline win at the 1920x1200 test resolution. Isolated
+back-to-back conversion looked faster because rayon workers stayed warm;
+realistic 16ms-spaced conversion exposed wake-up overhead. End-to-end noise
+conversion means were 0.475ms serial, 0.718ms with four workers, and 0.585ms
+with eight workers. Small dirty-strip conversion would remain serial by design,
+so there was no compensating clock-motion win. The experiment was rejected and
+not merged; do not retry parallel conversion at desktop resolutions without a
+wakeup-free design or a measured 4K end-to-end pipeline.

@@ -100,8 +100,6 @@ struct Duplication {
     _permit: OutputPermit,
     width: u32,
     height: u32,
-    /// Latest full BGRA image; dirty rects are patched into it between emits.
-    accum: Vec<u8>,
     /// Number of frames emitted so far — recycled buffers older than this
     /// generation need the logged patches below to catch up.
     emit_gen: u64,
@@ -195,7 +193,6 @@ impl Duplication {
                         _permit: permit,
                         width,
                         height,
-                        accum: vec![0; (width * height * 4) as usize],
                         emit_gen: 0,
                         patch_log: PatchLog::new(),
                         log_base: 0,
@@ -206,13 +203,12 @@ impl Duplication {
     }
 
     /// Waits up to `timeout_ms` for a compositor frame; when one arrives and it
-    /// carries changed pixels, patches the dirty regions into `accum` and
-    /// returns a full BGRA frame. Returns `None` on timeout or metadata-only
-    /// frames (cursor moves without pixel changes).
+    /// carries changed pixels, returns a full BGRA frame. Returns `None` on
+    /// timeout or metadata-only frames (cursor moves without pixel changes).
     /// `latest` supplies recycled emit buffers: the frame this thread emitted
     /// last (emit_gen == self.emit_gen) comes back once every Arc is dropped,
-    /// still holding the previous image — patching the current dirty rects
-    /// makes it identical to `accum` without a full-frame clone.
+    /// still holding the previous image — patching intervening and current
+    /// dirty rects makes it current without a full-frame copy.
     fn acquire(
         &mut self,
         timeout_ms: u32,
@@ -250,7 +246,6 @@ impl Duplication {
             if desc.Width != self.width || desc.Height != self.height {
                 self.width = desc.Width;
                 self.height = desc.Height;
-                self.accum = vec![0; (desc.Width * desc.Height * 4) as usize];
                 // Mode change: treat the whole frame as dirty.
                 rects = vec![RECT {
                     left: 0,
@@ -262,19 +257,14 @@ impl Duplication {
             // A recycled buffer emitted at gen g already contains the image
             // through emit g; it can be brought current iff every emit in
             // (g, emit_gen] was logged — i.e. g + 1 >= log_base.
+            let frame_len = self.width as usize * self.height as usize * 4;
             let recycled = latest
                 .take_recycled()
                 .into_iter()
-                .filter(|(_, buf)| buf.len() == self.accum.len())
+                .filter(|(_, buf)| buf.len() == frame_len)
                 .filter(|(eg, _)| *eg + 1 >= self.log_base && *eg <= self.emit_gen)
                 .max_by_key(|(eg, _)| *eg)
                 .map(|(_, buf)| buf);
-            let mut emit = if let Some(mut buf) = recycled {
-                self.replay_patches(&mut buf);
-                buf
-            } else {
-                self.accum.clone()
-            };
             let dirty_pixels: u64 = rects
                 .iter()
                 .map(|r| {
@@ -282,8 +272,27 @@ impl Duplication {
                         * (r.bottom.max(0) - r.top.max(0)).max(0) as u64
                 })
                 .sum();
-            let log_patches = dirty_pixels * 4 < self.accum.len() as u64;
-            let logged = self.copy_dirty(&texture, &rects, &mut emit, log_patches)?;
+            let log_patches = dirty_pixels * 4 < frame_len as u64;
+            let (emit, logged, copy_elapsed) = if let Some(mut buf) = recycled {
+                self.replay_patches(&mut buf);
+                let copy_started = Instant::now();
+                let logged = self.copy_dirty(&texture, &rects, &mut buf, log_patches)?;
+                (buf, logged, copy_started.elapsed())
+            } else {
+                // Without a recyclable previous emission, read the complete
+                // current texture once. This replaces both the old full-frame
+                // clone and the second dirty-rect copy into a persistent
+                // accumulation buffer.
+                let mut buf = vec![0; frame_len];
+                let copy_started = Instant::now();
+                self.copy_full(&texture, &mut buf)?;
+                let logged = log_patches.then(|| self.frame_patches(&rects, &buf));
+                (buf, logged, copy_started.elapsed())
+            };
+            latest
+                .stats
+                .capture_ns
+                .fetch_add(copy_elapsed.as_nanos() as u64, Ordering::Relaxed);
             self.emit_gen += 1;
             match logged {
                 Some(patches) => {
@@ -411,10 +420,54 @@ impl Duplication {
         }
     }
 
+    /// Copies the complete current texture into a newly allocated emit buffer.
+    /// This is the cold path used when no recyclable previous emission exists.
+    fn copy_full(&mut self, texture: &ID3D11Texture2D, emit: &mut [u8]) -> Result<()> {
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&self.staging, 0, 0, 0, 0, texture, 0, None);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let src = mapped.pData as *const u8;
+            let row_pitch = mapped.RowPitch as usize;
+            let width = self.width as usize;
+            let row_bytes = width * 4;
+            for y in 0..self.height as usize {
+                let src_row = std::slice::from_raw_parts(src.add(y * row_pitch), row_bytes);
+                let start = y * row_bytes;
+                emit[start..start + row_bytes].copy_from_slice(src_row);
+            }
+            self.context.Unmap(&self.staging, 0);
+        }
+        Ok(())
+    }
+
+    /// Extracts dirty-region bytes from a complete frame for future recycled
+    /// buffers. The rectangles are clipped the same way as `copy_dirty`.
+    fn frame_patches(&self, rects: &[RECT], frame: &[u8]) -> Vec<Patch> {
+        rects
+            .iter()
+            .map(|rect| {
+                let left = (rect.left.max(0) as usize).min(self.width as usize);
+                let right = (rect.right as usize).min(self.width as usize);
+                let top = (rect.top.max(0) as usize).min(self.height as usize);
+                let bottom = (rect.bottom as usize).min(self.height as usize);
+                let cols = (right - left) * 4;
+                let mut bytes = Vec::with_capacity(cols * (bottom - top));
+                for y in top..bottom {
+                    let start = (y * self.width as usize + left) * 4;
+                    bytes.extend_from_slice(&frame[start..start + cols]);
+                }
+                (*rect, bytes)
+            })
+            .collect()
+    }
+
     /// Copies each dirty rect GPU→staging (sub-resource copies, so only dirty
-    /// data crosses the bus), then copies native BGRA into `accum` and the
-    /// emit buffer. When `log_patches` is set the rect bytes are
-    /// retained so future recycled buffers can catch up cheaply.
+    /// data crosses the bus), then copies native BGRA once into the emit
+    /// buffer. When `log_patches` is set the rect bytes are retained so future
+    /// recycled buffers can catch up cheaply.
     fn copy_dirty(
         &mut self,
         texture: &ID3D11Texture2D,
@@ -463,7 +516,6 @@ impl Duplication {
                         std::slice::from_raw_parts(src.add(y * row_pitch + left * 4), row_bytes);
                     let dst_start = (y * self.width as usize + left) * 4;
                     let dst_end = dst_start + row_bytes;
-                    self.accum[dst_start..dst_end].copy_from_slice(src_row);
                     emit[dst_start..dst_end].copy_from_slice(src_row);
                 }
                 if let Some(log) = &mut logged {
@@ -471,7 +523,7 @@ impl Duplication {
                     let mut bytes = Vec::with_capacity(cols * (bottom - top));
                     for y in top..bottom {
                         let start = (y * self.width as usize + left) * 4;
-                        bytes.extend_from_slice(&self.accum[start..start + cols]);
+                        bytes.extend_from_slice(&emit[start..start + cols]);
                     }
                     log.push((*rect, bytes));
                 }
