@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use anyhow::Context;
@@ -94,14 +94,68 @@ impl OutputSelection {
 }
 
 fn encoder() -> Result<opus::Encoder> {
+    encoder_with_bitrate(128)
+}
+
+fn encoder_with_bitrate(kbps: u32) -> Result<opus::Encoder> {
     let mut encoder =
         opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::LowDelay)?;
-    encoder.set_bitrate(opus::Bitrate::Bits(128_000))?;
+    encoder.set_bitrate(opus::Bitrate::Bits(kbps.saturating_mul(1_000) as i32))?;
     // Discontinuous transmission: silence sends a tiny comfort-noise frame
     // instead of a full 128kbps encode. A muted desktop stops paying for
     // audio it never had.
     encoder.set_dtx(true)?;
     Ok(encoder)
+}
+
+/// Audio is a constant share of the same association the video congestion
+/// controller is measuring. Keep full quality while the link has comfortable
+/// headroom, but spend scarce capacity on video first: below these REMB tiers
+/// 128kbps stereo audio would otherwise crowd out the pictures the input is
+/// reacting to. Opus bitrate changes are in-band and need no decoder reset.
+#[derive(Debug)]
+struct AdaptiveAudioBitrate {
+    bitrate_kbps: u32,
+    raise_since: Option<Instant>,
+}
+
+impl Default for AdaptiveAudioBitrate {
+    fn default() -> Self {
+        Self {
+            bitrate_kbps: 128,
+            raise_since: None,
+        }
+    }
+}
+
+impl AdaptiveAudioBitrate {
+    const RAISE_DELAY: Duration = Duration::from_secs(5);
+
+    fn target(sample: crate::adaptive::LinkSample) -> u32 {
+        match sample.remb_kbps.unwrap_or(u32::MAX) {
+            2_500.. => 128,
+            1_500.. => 96,
+            700.. => 64,
+            _ => 48,
+        }
+    }
+
+    fn observe(&mut self, sample: crate::adaptive::LinkSample) -> u32 {
+        let target = Self::target(sample);
+        if target < self.bitrate_kbps {
+            self.bitrate_kbps = target;
+            self.raise_since = None;
+        } else if target > self.bitrate_kbps {
+            let since = *self.raise_since.get_or_insert(sample.at);
+            if sample.at.duration_since(since) >= Self::RAISE_DELAY {
+                self.bitrate_kbps = target;
+                self.raise_since = None;
+            }
+        } else {
+            self.raise_since = None;
+        }
+        self.bitrate_kbps
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -444,6 +498,7 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
     output: watch::Receiver<Option<String>>,
     enabled: watch::Receiver<bool>,
+    link_feedback: watch::Receiver<Option<crate::adaptive::LinkSample>>,
 ) {
     if *shutdown.borrow() {
         return;
@@ -461,7 +516,7 @@ pub async fn run(
         Ok((_capture, pcm)) => {
             tokio::select! {
                 _ = shutdown.changed() => {},
-                _ = stream(&track, pcm, enabled.clone()) => {},
+                _ = stream(&track, pcm, enabled.clone(), link_feedback.clone()) => {},
             }
         }
         Err(error) => tracing::warn!(%error, "system audio stopped"),
@@ -481,7 +536,7 @@ pub async fn run(
                             if result.is_err() { return; }
                             continue;
                         },
-                        _ = stream(&track, pcm, enabled.clone()) => {},
+                        _ = stream(&track, pcm, enabled.clone(), link_feedback.clone()) => {},
                         _ = &mut capture.failed => {},
                     }
                 }
@@ -505,8 +560,9 @@ async fn stream(
     track: &TrackLocalStaticRTP,
     pcm: mpsc::Receiver<Vec<i16>>,
     enabled: watch::Receiver<bool>,
+    link_feedback: watch::Receiver<Option<crate::adaptive::LinkSample>>,
 ) {
-    if let Err(error) = stream_inner(track, pcm, enabled).await {
+    if let Err(error) = stream_inner(track, pcm, enabled, link_feedback).await {
         tracing::warn!(%error, "system audio stopped");
     }
 }
@@ -515,6 +571,7 @@ async fn stream_inner(
     track: &TrackLocalStaticRTP,
     mut pcm: mpsc::Receiver<Vec<i16>>,
     enabled: watch::Receiver<bool>,
+    link_feedback: watch::Receiver<Option<crate::adaptive::LinkSample>>,
 ) -> Result<()> {
     let mut encoder = encoder()?;
     let (encoded, mut packets) = mpsc::channel(2);
@@ -523,6 +580,8 @@ async fn stream_inner(
         #[cfg(target_os = "windows")]
         let _mmcss = crate::media::register_mmcss();
         let mut output = [0; 4000];
+        let mut adaptive = AdaptiveAudioBitrate::default();
+        let mut encoder_kbps = 128;
         while let Some(frame) = pcm.blocking_recv() {
             if encoded.is_closed() {
                 break;
@@ -532,6 +591,15 @@ async fn stream_inner(
             }
             if !*encode_enabled.borrow() {
                 continue;
+            }
+            if let Some(sample) = *link_feedback.borrow() {
+                let target = adaptive.observe(sample);
+                if target != encoder_kbps {
+                    match encoder.set_bitrate(opus::Bitrate::Bits(target as i32 * 1_000)) {
+                        Ok(()) => encoder_kbps = target,
+                        Err(error) => tracing::warn!(%error, target, "Opus bitrate update failed"),
+                    }
+                }
             }
             match encoder.encode(&frame, &mut output) {
                 Ok(size) => {
@@ -681,6 +749,64 @@ mod tests {
         assert_eq!(resumed.header.timestamp, 3 * RTP_FRAME_TICKS);
         assert!(resumed.header.marker);
         assert!(!rtp.packet(vec![1; 40]).unwrap().header.marker);
+    }
+
+    #[test]
+    fn adaptive_audio_bitrate_drops_fast_and_recovers_only_after_headroom() {
+        let start = Instant::now();
+        let sample = |remb_kbps, seconds| crate::adaptive::LinkSample {
+            fraction_lost: 0.0,
+            rtt: None,
+            remb_kbps: Some(remb_kbps),
+            at: start + Duration::from_secs(seconds),
+            receiver_report_at: None,
+        };
+        let mut adaptive = AdaptiveAudioBitrate::default();
+        assert_eq!(adaptive.observe(sample(4_000, 0)), 128);
+        assert_eq!(adaptive.observe(sample(800, 1)), 64);
+        assert_eq!(adaptive.observe(sample(4_000, 2)), 64);
+        assert_eq!(adaptive.observe(sample(4_000, 6)), 64);
+        assert_eq!(adaptive.observe(sample(4_000, 7)), 128);
+    }
+
+    /// Payload + RTP wire rate for adaptive Opus bitrate tiers on loud,
+    /// wideband game-like audio. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_adaptive_audio_wire_bytes() {
+        const OVERHEAD: usize = 20 + 8 + 12 + 10;
+        const SECONDS: usize = 20;
+        let frames = SECONDS * 50;
+        let noise = |frame: usize, state: &mut u32| -> Vec<i16> {
+            (0..SAMPLES / 2)
+                .flat_map(|i| {
+                    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let noise = ((*state >> 16) as i16).wrapping_div(3);
+                    let t = (frame * SAMPLES / 2 + i) as f64 / 48_000.0;
+                    let tone = (2_000.0 * (t * 220.0 * std::f64::consts::TAU).sin()) as i16;
+                    let left = noise.saturating_add(tone);
+                    let right = noise.saturating_add((tone as i32 * 4 / 5) as i16);
+                    [left, right]
+                })
+                .collect()
+        };
+        let mut output = [0; 4000];
+        for kbps in [128, 96, 64, 48] {
+            let mut encoder = encoder_with_bitrate(kbps).unwrap();
+            let mut local_state = 1_u32;
+            let mut payload = 0;
+            for frame in 0..frames {
+                payload += encoder
+                    .encode(&noise(frame, &mut local_state), &mut output)
+                    .unwrap();
+            }
+            let wire = payload + frames * OVERHEAD;
+            println!(
+                "{kbps}kbps target: payload {:.1} kbps, wire {:.1} kbps",
+                payload as f64 * 8.0 / SECONDS as f64 / 1000.0,
+                wire as f64 * 8.0 / SECONDS as f64 / 1000.0,
+            );
+        }
     }
 
     /// Wire bytes per second for synthetic system-audio scenes, before and

@@ -1163,6 +1163,7 @@ impl HostPeer {
                 input_shutdown.subscribe(),
                 output,
                 audio_enabled.subscribe(),
+                link_feedback.subscribe(),
             )));
             let mut shutdown = input_shutdown.subscribe();
             input_tasks.push(tokio::spawn(async move {

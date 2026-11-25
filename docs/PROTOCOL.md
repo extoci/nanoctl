@@ -138,8 +138,11 @@ a keyframe so the resumed track's reference chain is fresh.
 
 When `capabilities.systemAudio` is true, the viewer offers an additional recvonly audio
 transceiver. The agent sends a separate Opus RTP track: 48 kHz stereo, 20 ms frames,
-128 kbps restricted-lowdelay encoding, fmtp `minptime=10;useinbandfec=1;stereo=1`.
-RTCP is drained independently, and bounded audio queues drop stale work rather than
+restricted-lowdelay encoding, fmtp `minptime=10;useinbandfec=1;stereo=1`.
+The Opus target stays at 128 kbps with comfortable network headroom and steps down to
+96/64/48 kbps when video REMB feedback shows a constrained link, so scarce capacity is
+spent on video first; bitrate changes are in-band and need no decoder reset. RTCP is
+drained independently, and bounded audio queues drop stale work rather than
 blocking video. Capture starts after the peer connects and stops with the session.
 
 `features.system_audio` defaults to true. Configuration files saved by control-plane releases
