@@ -233,6 +233,20 @@ final class Session {
 
     func sendPointer(x: Double, y: Double, action: String, button: Int = 0,
                      deltaX: Double = 0, deltaY: Double = 0) {
+        if action == "move", connection?.host?.capabilities.binaryInput == true {
+            var data = Data(count: 7)
+            data[0] = 0x4e
+            data[1] = 1
+            data[2] = 1
+            let xu = UInt16((min(1, max(0, x)) * 65535).rounded())
+            let yu = UInt16((min(1, max(0, y)) * 65535).rounded())
+            data[3] = UInt8(xu & 0xff)
+            data[4] = UInt8(xu >> 8)
+            data[5] = UInt8(yu & 0xff)
+            data[6] = UInt8(yu >> 8)
+            _ = send(data, pointer: true, limitBacklog: true, binary: true)
+            return
+        }
         var value: [String: Any] = ["type": "pointer", "action": action, "x": x, "y": y]
         if action == "wheel" {
             value["deltaX"] = deltaX
@@ -286,10 +300,10 @@ final class Session {
         return send(data)
     }
 
-    private func send(_ data: Data, pointer: Bool = false, limitBacklog: Bool = false) -> Bool {
+    private func send(_ data: Data, pointer: Bool = false, limitBacklog: Bool = false, binary: Bool = false) -> Bool {
         guard inputReady, let channel = pointer ? connection?.pointer : connection?.control,
               channel.readyState == .open, !limitBacklog || channel.bufferedAmount < 4096 else { return false }
-        return channel.sendData(RTCDataBuffer(data: data, isBinary: false))
+        return channel.sendData(RTCDataBuffer(data: data, isBinary: binary))
     }
 
     /// Control-channel send that does not require input admission (used for
