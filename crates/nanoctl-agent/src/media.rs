@@ -3421,6 +3421,7 @@ pub fn spawn_video(
     video_data_channel: Arc<crate::rtc::DataChannelVideo>,
     keyframe_requests: tokio::sync::watch::Receiver<u64>,
     link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    video_network: tokio::sync::watch::Sender<Option<crate::adaptive::VideoNetworkSample>>,
     viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
@@ -3676,6 +3677,12 @@ pub fn spawn_video(
                                 .store(target_kbps, Ordering::Relaxed);
                             producer_stats.target_fps.store(fps, Ordering::Relaxed);
                         }
+                        let video_decision = controller.decision();
+                        let _ = video_network.send(Some(crate::adaptive::VideoNetworkSample {
+                            video_kbps: video_decision.bitrate_kbps,
+                            constrained: controller.network_constrained(),
+                            at: now,
+                        }));
                     }
                     if viewer_limits.has_changed().unwrap_or(false) {
                         let limits = *viewer_limits.borrow_and_update();

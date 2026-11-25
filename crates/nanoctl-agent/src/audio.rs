@@ -131,8 +131,11 @@ impl Default for AdaptiveAudioBitrate {
 impl AdaptiveAudioBitrate {
     const RAISE_DELAY: Duration = Duration::from_secs(5);
 
-    fn target(sample: crate::adaptive::LinkSample) -> u32 {
-        match sample.remb_kbps.unwrap_or(u32::MAX) {
+    fn target(sample: crate::adaptive::VideoNetworkSample) -> u32 {
+        if !sample.constrained {
+            return 128;
+        }
+        match sample.video_kbps {
             2_500.. => 128,
             1_500.. => 96,
             700.. => 64,
@@ -140,7 +143,7 @@ impl AdaptiveAudioBitrate {
         }
     }
 
-    fn observe(&mut self, sample: crate::adaptive::LinkSample) -> u32 {
+    fn observe(&mut self, sample: crate::adaptive::VideoNetworkSample) -> u32 {
         let target = Self::target(sample);
         if target < self.bitrate_kbps {
             self.bitrate_kbps = target;
@@ -498,7 +501,7 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
     output: watch::Receiver<Option<String>>,
     enabled: watch::Receiver<bool>,
-    link_feedback: watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    video_network: watch::Receiver<Option<crate::adaptive::VideoNetworkSample>>,
 ) {
     if *shutdown.borrow() {
         return;
@@ -516,7 +519,7 @@ pub async fn run(
         Ok((_capture, pcm)) => {
             tokio::select! {
                 _ = shutdown.changed() => {},
-                _ = stream(&track, pcm, enabled.clone(), link_feedback.clone()) => {},
+                _ = stream(&track, pcm, enabled.clone(), video_network.clone()) => {},
             }
         }
         Err(error) => tracing::warn!(%error, "system audio stopped"),
@@ -536,7 +539,7 @@ pub async fn run(
                             if result.is_err() { return; }
                             continue;
                         },
-                        _ = stream(&track, pcm, enabled.clone(), link_feedback.clone()) => {},
+                        _ = stream(&track, pcm, enabled.clone(), video_network.clone()) => {},
                         _ = &mut capture.failed => {},
                     }
                 }
@@ -560,9 +563,9 @@ async fn stream(
     track: &TrackLocalStaticRTP,
     pcm: mpsc::Receiver<Vec<i16>>,
     enabled: watch::Receiver<bool>,
-    link_feedback: watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    video_network: watch::Receiver<Option<crate::adaptive::VideoNetworkSample>>,
 ) {
-    if let Err(error) = stream_inner(track, pcm, enabled, link_feedback).await {
+    if let Err(error) = stream_inner(track, pcm, enabled, video_network).await {
         tracing::warn!(%error, "system audio stopped");
     }
 }
@@ -571,7 +574,7 @@ async fn stream_inner(
     track: &TrackLocalStaticRTP,
     mut pcm: mpsc::Receiver<Vec<i16>>,
     enabled: watch::Receiver<bool>,
-    link_feedback: watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    video_network: watch::Receiver<Option<crate::adaptive::VideoNetworkSample>>,
 ) -> Result<()> {
     let mut encoder = encoder()?;
     let (encoded, mut packets) = mpsc::channel(2);
@@ -592,7 +595,7 @@ async fn stream_inner(
             if !*encode_enabled.borrow() {
                 continue;
             }
-            if let Some(sample) = *link_feedback.borrow() {
+            if let Some(sample) = *video_network.borrow() {
                 let target = adaptive.observe(sample);
                 if target != encoder_kbps {
                     match encoder.set_bitrate(opus::Bitrate::Bits(target as i32 * 1_000)) {
@@ -754,15 +757,16 @@ mod tests {
     #[test]
     fn adaptive_audio_bitrate_drops_fast_and_recovers_only_after_headroom() {
         let start = Instant::now();
-        let sample = |remb_kbps, seconds| crate::adaptive::LinkSample {
-            fraction_lost: 0.0,
-            rtt: None,
-            remb_kbps: Some(remb_kbps),
+        let sample = |video_kbps, seconds| crate::adaptive::VideoNetworkSample {
+            video_kbps,
+            constrained: true,
             at: start + Duration::from_secs(seconds),
-            receiver_report_at: None,
         };
         let mut adaptive = AdaptiveAudioBitrate::default();
         assert_eq!(adaptive.observe(sample(4_000, 0)), 128);
+        let mut unconstrained = sample(100, 1);
+        unconstrained.constrained = false;
+        assert_eq!(adaptive.observe(unconstrained), 128);
         assert_eq!(adaptive.observe(sample(800, 1)), 64);
         assert_eq!(adaptive.observe(sample(4_000, 2)), 64);
         assert_eq!(adaptive.observe(sample(4_000, 6)), 64);

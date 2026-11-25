@@ -37,7 +37,7 @@ use webrtc::rtp_transceiver::rtp_codec::{
 };
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use crate::adaptive::LinkSample;
+use crate::adaptive::{LinkSample, VideoNetworkSample};
 
 fn reception_report_sample(
     report: &ReceptionReport,
@@ -206,6 +206,8 @@ pub struct HostPeer {
     keyframe_requests: tokio::sync::watch::Sender<u64>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     link_feedback: tokio::sync::watch::Sender<Option<LinkSample>>,
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    video_network: tokio::sync::watch::Sender<Option<VideoNetworkSample>>,
     #[cfg(feature = "media")]
     display_selection: tokio::sync::watch::Sender<String>,
     #[cfg(feature = "media")]
@@ -817,6 +819,7 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (audio_enabled, _) = tokio::sync::watch::channel(true);
         let (link_feedback, _) = tokio::sync::watch::channel(None);
+        let (video_network, _) = tokio::sync::watch::channel(None);
         #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
             tokio::sync::watch::channel(String::new());
@@ -1163,7 +1166,7 @@ impl HostPeer {
                 input_shutdown.subscribe(),
                 output,
                 audio_enabled.subscribe(),
-                link_feedback.subscribe(),
+                video_network.subscribe(),
             )));
             let mut shutdown = input_shutdown.subscribe();
             input_tasks.push(tokio::spawn(async move {
@@ -1448,6 +1451,7 @@ impl HostPeer {
             #[cfg(feature = "media")]
             keyframe_requests,
             link_feedback,
+            video_network,
             #[cfg(feature = "media")]
             display_selection,
             #[cfg(feature = "media")]
@@ -1696,6 +1700,11 @@ impl HostPeer {
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub fn link_feedback(&self) -> tokio::sync::watch::Receiver<Option<LinkSample>> {
         self.link_feedback.subscribe()
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn video_network_sender(&self) -> tokio::sync::watch::Sender<Option<VideoNetworkSample>> {
+        self.video_network.clone()
     }
 
     #[cfg(feature = "media")]

@@ -159,6 +159,7 @@ pub(crate) fn spawn_media(
         peer.video_data_channel(),
         peer.keyframe_requests(),
         peer.link_feedback(),
+        peer.video_network_sender(),
         peer.viewer_limits(),
         peer.display_selection(),
         peer.display_selection_feedback_sender(),

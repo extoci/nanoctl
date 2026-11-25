@@ -18,6 +18,17 @@ pub struct LinkSample {
     pub receiver_report_at: Option<Instant>,
 }
 
+/// The video rate controller's current view of network pressure, shared with
+/// lower-priority streams. `video_kbps` is the controller's video target before
+/// viewport scaling; `constrained` means that target is below the session's
+/// configured ceiling because of network feedback rather than a viewer cap.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoNetworkSample {
+    pub video_kbps: u32,
+    pub constrained: bool,
+    pub at: Instant,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateDecision {
     pub bitrate_kbps: u32,
@@ -186,6 +197,13 @@ impl RateController {
             bitrate_kbps: self.rate.floor() as u32,
             fps: self.fps,
         }
+    }
+
+    /// Whether congestion feedback has actually driven video below the
+    /// configured ceiling. Startup probing and viewer-selected caps are not
+    /// evidence of a constrained network.
+    pub fn network_constrained(&self) -> bool {
+        self.rate < self.ceiling as f64 && self.last_congestion.is_some()
     }
 
     pub fn update_sender(&mut self, kbps: f64, app_limited: bool, at: Instant) {
@@ -712,6 +730,17 @@ mod tests {
             last < start,
             "sustained receiver-reported loss must cut bitrate: start={start} end={last}"
         );
+    }
+
+    #[test]
+    fn network_constrained_requires_congestion_evidence() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        assert!(!controller.network_constrained());
+        controller.last_congestion = Some(now);
+        assert!(controller.network_constrained());
+        controller.rate = 8_000.0;
+        assert!(!controller.network_constrained());
     }
 
     #[test]
