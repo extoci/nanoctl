@@ -892,3 +892,20 @@ presets are nearly free latency; when congested, compression efficiency wins.
 That coupling (adapt tiers are content-driven today, RateController is
 network-driven) is the next structural axis. Also learned: single-run noise
 fps/bitrate swing ±20% on this VM — worst-case comparisons need 3-run means.
+
+## Cycle 54 — responsiveness becomes the default latency mode (2026-11-25)
+
+Cycle 30 had already shown Responsiveness dominating Balanced with the adaptive
+encoder, but the configuration default still said Balanced. Re-ran the worst
+case on this rig (`band --noise --height 1200`, 15s, two runs per mode,
+24Mbps ceiling, x264 tier 0 with 0 switches in every run):
+
+| mode           | fps  | bitrate | encode p50 | capture→encode p50 | PSNR p50 |
+| -------------- | ---- | ------- | ---------- | ------------------ | -------- |
+| balanced       | 56.0 | 22.38M  | 6.08ms     | 14.39ms            | 17.27dB  |
+| responsiveness | 57.3 | 20.96M  | 5.55ms     | 13.95ms            | 17.19dB  |
+
+Responsiveness is **+2.3% fps, −6.3% bitrate, −8.7% encode time and −0.44ms
+capture→encode** for a negligible −0.09dB on uncompressible noise; realistic
+motion was already measured better in cycle 30. It is now the default.
+`latency_mode = "balanced"` and `"quality"` remain available explicitly.
