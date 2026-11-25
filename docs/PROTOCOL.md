@@ -101,8 +101,9 @@ host input or clipboard access. System audio is available to view-only sessions 
 ### Video over data channel
 
 A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and
-`nanoctl.video-idr.v1` (reliable, ordered) to receive Annex-B access units directly,
-bypassing the RTP jitter buffer. Each message is
+`nanoctl.video-idr.v1` (reliable, ordered) to receive compressed access units directly,
+bypassing the RTP jitter buffer. H.264 and HEVC payloads use Annex-B; AV1 payloads use
+low-overhead OBU temporal units (the formats WebCodecs consumes). Each message is
 `[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts][u64 sent_ms][payload chunk]`
 with all integers little-endian; `parts` splits large access units into ~48 KiB chunks.
 Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks

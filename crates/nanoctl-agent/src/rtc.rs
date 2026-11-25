@@ -214,7 +214,7 @@ pub struct HostPeer {
     input_revoked: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
-    /// Optional viewer-created unreliable channel carrying H.264 access
+    /// Optional viewer-created unreliable channel carrying compressed access
     /// units straight to WebCodecs, bypassing the track's jitter buffer.
     #[cfg(feature = "media")]
     video_data_channel: Arc<DataChannelVideo>,
@@ -224,7 +224,7 @@ pub struct HostPeer {
     h264_high: bool,
 }
 
-/// Viewer-created unreliable data channel carrying raw Annex-B access units
+/// Viewer-created unreliable data channel carrying raw compressed access units
 /// straight to WebCodecs. The viewer can request a keyframe by sending `KF`
 /// when it detects a sequence gap. `idr_channel` is the reliable channel
 /// (`nanoctl.video-idr.v1`) used to deliver keyframes, which are too large
@@ -772,14 +772,15 @@ impl HostPeer {
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
-            // The data-channel video path decodes Annex-B access units: the
-            // browser viewer handles H.264 and the iOS app adds HEVC via
-            // VideoToolbox. A viewer in "auto" may open the channels before
-            // negotiation decides the codec, so they are honoured solely when
-            // an Annex-B codec won (anything else, e.g. AV1, keeps RTP only).
+            // The data-channel video path carries the encoder's exact
+            // temporal units: H.264/HEVC Annex-B or AV1 low-overhead OBUs.
+            // A viewer in "auto" may open the channels before negotiation
+            // decides the codec, so they are closed again when unsupported.
             let video_dc_codec_ok = matches!(
                 negotiated.codec,
-                crate::codec::VideoCodec::H264 | crate::codec::VideoCodec::Hevc
+                crate::codec::VideoCodec::H264
+                    | crate::codec::VideoCodec::Hevc
+                    | crate::codec::VideoCodec::Av1
             );
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
@@ -791,7 +792,7 @@ impl HostPeer {
                     if !video_dc_codec_ok {
                         tracing::info!(
                             codec = negotiated.codec.id(),
-                            "video data channel ignored: negotiated codec is not Annex-B"
+                            "video data channel ignored: negotiated codec cannot use data-channel video"
                         );
                         return Box::pin(async {});
                     }

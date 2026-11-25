@@ -2878,7 +2878,7 @@ pub fn spawn_video(
                     // A broken transport must not hold capture/encoder teardown hostage forever.
                     // Cancelling the packetizer future is safe; the next successful delivery is
                     // followed by a forced recovery keyframe.
-                    // Low-latency path: also ship the same Annex-B access unit
+                    // Low-latency path: also ship the same compressed access unit
                     // over the viewer's unreliable data channel when present,
                     // skipping it while its SCTP buffer backs up. Skipped
                     // deltas would wedge the decoder, so a stall requests a
@@ -2914,7 +2914,7 @@ pub fn spawn_video(
                             });
                         }
                     }
-                    // [u32 seq][u8 flags][annex-b au]; the viewer drops
+                    // [u32 seq][u8 flags][access unit]; the viewer drops
                     // post-gap deltas and asks for a keyframe on "KF".
                     // Keyframes go over the reliable channel: they are
                     // large and cannot survive partial reliability.
