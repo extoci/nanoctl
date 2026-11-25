@@ -229,15 +229,23 @@ describe("remote session lifecycle", () => {
     await controller.start();
     peer.connectionState = "connected";
     peer.onconnectionstatechange?.();
-    const channel = peer.channels.get("nanoctl.control.v1")!;
+    const controlChannel = peer.channels.get("nanoctl.control.v1")!;
+    const channel = peer.channels.get("nanoctl.pointer.v1")!;
     controller.setGamepadEnabled(true);
     expect(controller.snapshot.gamepadEnabled).toBe(true);
+    controlChannel.sent = [];
     channel.sent = [];
     flushAnimationFrame(1_000);
     expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+    expect(controlChannel.sent).toEqual([]);
+    channel.sent = [];
+    expect(controller.sendControl({ type: "gamepad", pads: [] })).toBe(true);
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toEqual({ type: "gamepad", pads: [] });
+    expect(channel.sent).toEqual([]);
+    controlChannel.sent = [];
 
     peer.connectionState = "disconnected";
     peer.onconnectionstatechange?.();
