@@ -127,7 +127,8 @@ export function parseH264AnnexB(bitstream: Uint8Array): H264Nal[] {
   for (let k = 0; k < starts.length; k++) {
     const start = starts[k]! + lens[k]!;
     const end = k + 1 < starts.length ? starts[k + 1]! : bitstream.length;
-    if (end > start) nals.push({ type: bitstream[start]! & 0x1f, data: bitstream.subarray(start, end) });
+    if (end > start)
+      nals.push({ type: bitstream[start]! & 0x1f, data: bitstream.subarray(start, end) });
   }
   return nals;
 }
@@ -656,10 +657,11 @@ function createVideoSink(
         const pps = nals.find((nal) => nal.type === 8)?.data;
         if (sps && pps && sps.length >= 4) {
           const discovered = buildAvcCDescription(sps, pps);
+          const current = avcDescription;
           const unchanged =
-            avcDescription !== null &&
-            discovered.length === avcDescription.length &&
-            discovered.every((byte, index) => byte === avcDescription[index]);
+            current !== null &&
+            discovered.length === current.length &&
+            discovered.every((byte, index) => byte === current[index]);
           if (!unchanged) {
             avcDescription = discovered;
             descriptionDirty = true;
@@ -765,9 +767,7 @@ export function attachWebCodecsVideo(
   onTeardown?: () => void,
   onFirstFrame?: () => void,
 ): WebCodecsVideoHandle {
-  const sink = createVideoSink(video, onTeardown, performance.now(), "h264", {
-    ...(onFirstFrame ? { onFirstFrame } : {}),
-  });
+  const sink = createVideoSink(video, onTeardown, performance.now(), "h264", { onFirstFrame });
   const wrappedTransform = new TransformStream<EncodedVideoFrameLike, EncodedVideoFrameLike>({
     transform: (frame, controller) => {
       try {
@@ -805,7 +805,7 @@ export function attachDataChannelVideo(
   // A decoder that fails beyond recovery must not keep the RTP leg suppressed:
   // closing the channels tells the agent to resume normal RTP video.
   const sink = createVideoSink(video, onTeardown, joinAt, videoCodec, {
-    ...(onFirstFrame ? { onFirstFrame } : {}),
+    onFirstFrame,
     onFatal: () => {
       try {
         channel.close();
