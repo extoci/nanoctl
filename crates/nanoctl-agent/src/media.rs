@@ -2992,16 +2992,24 @@ pub fn spawn_video(
                     // skipping it while its SCTP buffer backs up. Skipped
                     // deltas would wedge the decoder, so a stall requests a
                     // fresh keyframe once throughput recovers.
+                    let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_kf = video_data_channel.keyframe_requests.load(Ordering::Relaxed);
                     if dc_kf != dc_kf_seen {
                         dc_kf_seen = dc_kf;
-                        delivery_recovery.send_modify(|generation| {
-                            *generation = generation.wrapping_add(1);
-                        });
+                        // The encoded queue is capacity one, so an IDR already
+                        // in hand is at most one frame old and satisfies the
+                        // request when delivered. Forcing another one here is
+                        // what produced back-to-back startup IDRs: the encoder's
+                        // natural first keyframe followed immediately by a
+                        // forced copy of nearly the same picture.
+                        if !is_idr {
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                        }
                     }
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
-                    let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_live = video_channel.is_some();
                     if dc_live != dc_was_live {
                         dc_was_live = dc_live;
