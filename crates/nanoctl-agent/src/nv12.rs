@@ -2,11 +2,23 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::pixel_format::PixelFormat;
 /// Below this size a frame converts faster on one thread than it takes to start more.
 const PARALLEL_MIN_PIXELS: usize = 640 * 360;
 const MAX_THREADS: usize = 8;
 
+#[cfg(test)]
 pub fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) -> Result<()> {
+    pixels_to_nv12(rgba, width, height, PixelFormat::Rgba, output)
+}
+
+pub fn pixels_to_nv12(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    output: &mut Vec<u8>,
+) -> Result<()> {
     let width = width as usize;
     let height = height as usize;
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -36,14 +48,34 @@ pub fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) 
     };
     std::thread::scope(|scope| {
         for ((rgba, luma), chroma) in bands {
-            scope.spawn(move || convert_band(rgba, luma, chroma, width));
+            scope.spawn(move || convert_band(rgba, luma, chroma, width, format));
         }
-        convert_band(first_rgba, first_luma, first_chroma, width);
+        convert_band(first_rgba, first_luma, first_chroma, width, format);
     });
     Ok(())
 }
 
-fn convert_band(rgba: &[u8], luma: &mut [u8], chroma: &mut [u8], width: usize) {
+fn convert_band(
+    rgba: &[u8],
+    luma: &mut [u8],
+    chroma: &mut [u8],
+    width: usize,
+    format: PixelFormat,
+) {
+    match format {
+        PixelFormat::Rgba => convert_band_impl::<false>(rgba, luma, chroma, width),
+        PixelFormat::Bgra => convert_band_impl::<true>(rgba, luma, chroma, width),
+    }
+}
+
+fn convert_band_impl<const BGRA: bool>(
+    rgba: &[u8],
+    luma: &mut [u8],
+    chroma: &mut [u8],
+    width: usize,
+) {
+    let (r, g, b) = if BGRA { (2, 1, 0) } else { (0, 1, 2) };
+
     for ((rows, luma_rows), uv) in rgba
         .chunks_exact(width * 8)
         .zip(luma.chunks_exact_mut(width * 2))
@@ -59,10 +91,10 @@ fn convert_band(rgba: &[u8], luma: &mut [u8], chroma: &mut [u8], width: usize) {
             .zip(uv.chunks_exact_mut(2))
         {
             let pixels = [&top[..4], &top[4..], &bottom[..4], &bottom[4..]];
-            y_top[0] = luma_of(pixels[0]);
-            y_top[1] = luma_of(pixels[1]);
-            y_bottom[0] = luma_of(pixels[2]);
-            y_bottom[1] = luma_of(pixels[3]);
+            y_top[0] = luma_of(pixels[0], r, g, b);
+            y_top[1] = luma_of(pixels[1], r, g, b);
+            y_bottom[0] = luma_of(pixels[2], r, g, b);
+            y_bottom[1] = luma_of(pixels[3], r, g, b);
             let sum = |channel: usize| -> i32 {
                 pixels
                     .iter()
@@ -70,7 +102,7 @@ fn convert_band(rgba: &[u8], luma: &mut [u8], chroma: &mut [u8], width: usize) {
                     .sum::<i32>()
                     / 4
             };
-            let (r, g, b) = (sum(0), sum(1), sum(2));
+            let (r, g, b) = (sum(r), sum(g), sum(b));
             uv[0] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
             uv[1] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
         }
@@ -78,16 +110,16 @@ fn convert_band(rgba: &[u8], luma: &mut [u8], chroma: &mut [u8], width: usize) {
 }
 
 #[inline(always)]
-fn luma_of(pixel: &[u8]) -> u8 {
-    let r = i32::from(pixel[0]);
-    let g = i32::from(pixel[1]);
-    let b = i32::from(pixel[2]);
+fn luma_of(pixel: &[u8], ri: usize, gi: usize, bi: usize) -> u8 {
+    let r = i32::from(pixel[ri]);
+    let g = i32::from(pixel[gi]);
+    let b = i32::from(pixel[bi]);
     (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rgba_to_nv12;
+    use super::{PixelFormat, pixels_to_nv12, rgba_to_nv12};
 
     /// The previous two-pass scalar conversion, kept as the bit-exact reference.
     fn reference(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
@@ -154,6 +186,29 @@ mod tests {
             let rgba = noise(width * height * 4);
             rgba_to_nv12(&rgba, width as u32, height as u32, &mut output).unwrap();
             assert_eq!(output, reference(&rgba, width, height), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn bgra_input_matches_swizzled_rgba_reference() {
+        for (width, height) in [(6, 4), (1_280, 720)] {
+            let bgra = noise(width * height * 4);
+            let mut rgba = bgra.clone();
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            let mut from_bgra = Vec::new();
+            let mut expected = Vec::new();
+            pixels_to_nv12(
+                &bgra,
+                width as u32,
+                height as u32,
+                PixelFormat::Bgra,
+                &mut from_bgra,
+            )
+            .unwrap();
+            rgba_to_nv12(&rgba, width as u32, height as u32, &mut expected).unwrap();
+            assert_eq!(from_bgra, expected, "{width}x{height}");
         }
     }
 
