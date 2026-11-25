@@ -546,6 +546,14 @@ final class Session {
         receiver.onBuffer = { [weak self] buffer in
             self?.pixelMailbox.put(buffer)
         }
+        receiver.onPersistentFault = { [weak self, weak current] in
+            Task { @MainActor in
+                guard let session = self, let current = current ?? session.connection else { return }
+                current.video?.close()
+                current.videoIdr?.close()
+                session.deactivateDataChannelVideo(current)
+            }
+        }
         receiver.onUnsupported = { [weak self, weak current] in
             // The wire stream is not H.264/HEVC (e.g. AV1 won negotiation):
             // close the data channels so the host keeps the RTP leg, which

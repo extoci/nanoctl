@@ -36,6 +36,9 @@ final class DCVideoReceiver {
     /// negotiated while the data channels are still up) — the caller should
     /// close the channels and fall back to the RTP path.
     var onUnsupported: () -> Void = {}
+    /// Repeated decoder failure even across replacement keyframes; the caller
+    /// should close the channels and use the RTP video track instead.
+    var onPersistentFault: () -> Void = {}
 
     private(set) var stats = Stats()
     // Link-quality counters drained by `takeLinkStats`.
@@ -48,6 +51,8 @@ final class DCVideoReceiver {
     private var kfRequestedAt: CFAbsoluteTime = 0
     private var pending: [UInt32: (isKey: Bool, parts: Int, got: [Data?], n: Int)] = [:]
     private var reordered: [UInt32: (au: Data, isKey: Bool)] = [:]
+    private var consecutiveFaults = 0
+    private let maxConsecutiveFaults = 3
     private let queue = DispatchQueue(label: "nanoctl.dcvideo", qos: .userInteractive)
 
     init(codec hint: VTDecoder.Codec? = nil) {
@@ -82,6 +87,11 @@ final class DCVideoReceiver {
     private func onDecoderFault() {
         waitingForKey = true
         reordered.removeAll()
+        consecutiveFaults += 1
+        if consecutiveFaults >= maxConsecutiveFaults {
+            consecutiveFaults = 0
+            onPersistentFault()
+        }
     }
 
     private func process(_ data: Data) {
@@ -177,7 +187,10 @@ final class DCVideoReceiver {
         }
         let decoder = VTDecoder(codec: detected)
         decoder.onFault = { [weak self] in self?.queue.async { self?.onDecoderFault() } }
-        decoder.onFrame = { [weak self] buffer in self?.onBuffer(buffer) }
+        decoder.onFrame = { [weak self] buffer in
+            self?.onBuffer(buffer)
+            self?.queue.async { self?.consecutiveFaults = 0 }
+        }
         codec = detected
         self.decoder = decoder
         return decoder
