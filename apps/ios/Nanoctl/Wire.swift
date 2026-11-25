@@ -128,15 +128,19 @@ struct GamepadMessage: Encodable, Equatable {
     let pads: [[Int]]
     var dualShock4: [DualShock4]? = nil
 
-    /// Binary input v3 gamepad report (`2, count, 14 bytes per pad`), matching
-    /// the viewer and the agent's `Snapshot::parse_binary`; nil when it cannot
-    /// represent the report.
-    var binary: Data? {
+    /// Binary input v3 full gamepad report (`2, sequence, slot mask, then
+    /// 13 bytes per masked slot`), matching the viewer and the agent.
+    func binary(sequence: UInt8) -> Data? {
         guard pads.count <= 4, pads.allSatisfy({ $0.count == 8 }) else { return nil }
         let sony = Dictionary((dualShock4 ?? []).map { ($0.slot, $0) }, uniquingKeysWith: { $1 })
-        var data = Data([2, UInt8(pads.count)])
+        var mask: UInt8 = 0
         for pad in pads {
-            guard let slot = UInt8(exactly: pad[0]), let buttons = UInt16(exactly: pad[1]),
+            guard (0...3).contains(pad[0]), mask & UInt8(1 << pad[0]) == 0 else { return nil }
+            mask |= UInt8(1 << pad[0])
+        }
+        var data = Data([2, sequence, mask])
+        for pad in pads.sorted(by: { $0[0] < $1[0] }) {
+            guard let buttons = UInt16(exactly: pad[1]),
                   let left = UInt8(exactly: pad[2]), let right = UInt8(exactly: pad[3]) else { return nil }
             var axes = [UInt16]()
             for value in pad[4...] {
@@ -150,7 +154,7 @@ struct GamepadMessage: Encodable, Equatable {
                 if ds4.rightTriggerPressed { flags |= 4 }
                 if ds4.touchpadPressed { flags |= 8 }
             }
-            data.append(contentsOf: [slot, UInt8(buttons & 0xff), UInt8(buttons >> 8), left, right])
+            data.append(contentsOf: [UInt8(buttons & 0xff), UInt8(buttons >> 8), left, right])
             for axis in axes { data.append(contentsOf: [UInt8(axis & 0xff), UInt8(axis >> 8)]) }
             data.append(flags)
         }

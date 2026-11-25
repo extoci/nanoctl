@@ -70,22 +70,36 @@ describe("encodeBinaryInput", () => {
   });
 
   test("encodes compact gamepad reports including DualShock flags", () => {
-    const bytes = new Uint8Array(
+    const report = {
+      sequence: 9,
+      pads: [[2, 0x1001, 7, 8, -32768, 32767, -1, 1]] as const,
+      dualShock4: [
+        {
+          slot: 2,
+          leftTriggerPressed: true,
+          rightTriggerPressed: false,
+          touchpadPressed: true,
+        },
+      ],
+    };
+    const bytes = new Uint8Array(encodeBinaryInput({ type: "gamepad", ...report })!);
+    expect([...bytes]).toEqual([
+      2, 9, 4, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+    ]);
+    const sparse = new Uint8Array(encodeBinaryInput({ type: "gamepad-sparse", ...report })!);
+    expect([...sparse]).toEqual([
+      12, 9, 4, 0xff, 0x81, 0x20, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+    ]);
+  });
+
+  test("omits zero fields from sparse gamepad reports", () => {
+    const sparse = new Uint8Array(
       encodeBinaryInput({
-        type: "gamepad",
-        pads: [[2, 0x1001, 7, 8, -32768, 32767, -1, 1]],
-        dualShock4: [
-          {
-            slot: 2,
-            leftTriggerPressed: true,
-            rightTriggerPressed: false,
-            touchpadPressed: true,
-          },
-        ],
+        type: "gamepad-sparse",
+        sequence: 10,
+        pads: [[1, 0, 0, 7, -2, 0, 0, 0]] as const,
       })!,
     );
-    expect([...bytes]).toEqual([
-      2, 1, 2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
-    ]);
+    expect([...sparse]).toEqual([12, 10, 2, 12, 7, 0xfe, 0xff]);
   });
 });

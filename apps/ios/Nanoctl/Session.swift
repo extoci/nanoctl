@@ -132,6 +132,7 @@ final class Session {
     }
     private var viewportWidth: Int?
     private var viewportHeight: Int?
+    private var gamepadSequence: UInt8 = 0
     /// Viewer caps below the host's maximums; nil means the maximum.
     var maxFps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
     var maxBitrateKbps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
@@ -270,8 +271,10 @@ final class Session {
     func sendGamepad(_ report: GamepadMessage) -> Bool {
         // Gamepad reports ride the unordered zero-retransmit pointer channel so
         // a lost report never delays the next one. The agent accepts gamepad on this lane.
-        guard gamepadAllowed, let data = report.binary else { return false }
-        return send(data, pointer: true, limitBacklog: true, binary: true)
+        guard gamepadAllowed, let data = report.binary(sequence: gamepadSequence) else { return false }
+        guard send(data, pointer: !report.pads.isEmpty, limitBacklog: true, binary: true) else { return false }
+        gamepadSequence &+= 1
+        return true
     }
 
     private func appendPosition(_ data: inout Data, x: Double, y: Double) {

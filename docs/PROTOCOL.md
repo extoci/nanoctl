@@ -163,23 +163,28 @@ are silently ignored. A remote paste shortcut sends local clipboard text before 
 
 Input uses compact binary wire v3 when `capabilities.binaryInput` is true. SCTP datagrams already preserve message boundaries, so byte zero is the kind; there is no magic or version framing. Integers are little-endian except wheel deltas, which use the exact significant big-endian bytes of each IEEE-754 f64 with trailing zero bytes omitted; a packed nibble byte stores the two 0–8 byte lengths. Malformed binary messages are invalid input.
 
-Kinds: `1` pointer motion with normalized unsigned u16 `x`/`y` (5 bytes); `2` gamepad snapshot — pad count, then 14 bytes per pad: slot, u16 buttons, u8 triggers, four i16 axes, and DualShock flags (bit 0 present, bits 1/2/3 left-trigger/right-trigger/touchpad); `3` pointer button down/up (6 bytes); `4` wheel input with exact compact f64 deltas (6–22 bytes); `5` keyboard input — flags byte (bit0 up, bit1 repeat, bit2 named-key form), followed by either a named-key id or the UTF-8 `key` bytes; `6` text input with a u16 byte length; `7` release-all (1 byte); `8` optional keepalive probe (1 byte — current clients do not send periodic application probes because SCTP and media traffic already keep the association alive); `9` audio enablement (2 bytes); `10` display selection with a u8 identifier length. Kind `11` is a one-byte gamepad heartbeat: it proves the viewer is alive without replacing controller state. Unchanged pads mix heartbeats with periodic full snapshots so loss cannot wedge inputs; hosts neutralize active pads after 225 ms without reports. JSON input forms are not part of wire v3.
+Kinds: `1` pointer motion with normalized unsigned u16 `x`/`y` (5 bytes); `2` full gamepad snapshot — u8 sequence, 4-bit slot mask, then 13 bytes per masked slot in ascending order: u16 buttons, u8 triggers, four i16 axes, and DualShock flags (bit 0 present, bits 1/2/3 left-trigger/right-trigger/touchpad); `3` pointer button down/up (6 bytes); `4` wheel input with exact compact f64 deltas (6–22 bytes); `5` keyboard input — flags byte (bit0 up, bit1 repeat, bit2 named-key form), followed by either a named-key id or the UTF-8 `key` bytes; `6` text input with a u16 byte length; `7` release-all (1 byte); `8` optional keepalive probe (1 byte — current clients do not send periodic application probes because SCTP and media traffic already keep the association alive); `9` audio enablement (2 bytes); `10` display selection with a u8 identifier length. Kind `11` is a one-byte gamepad heartbeat: it proves the viewer is alive without replacing controller state. Kind `12` is a sparse gamepad snapshot with the same sequence and slot-mask header; each masked slot starts with a field mask and encodes only nonzero fields (bit0 buttons as unsigned LEB128, bits1/2 nonzero triggers, bits3–6 nonzero i16 axes little-endian, bit7 DualShock flags). Unchanged pads mix heartbeats with periodic full snapshots so loss cannot wedge inputs; hosts neutralize active pads after 225 ms without reports. JSON input forms are not part of wire v3.
 
 ### Gamepads
 
 When `capabilities.gamepad` is true, an opted-in viewer with control permission sends
-binary kind-2 snapshots on the unordered pointer channel (`nanoctl.pointer.v1`) — snapshots
-carry full state, so the unordered lane drops stale reports instead of delaying fresh ones.
-Empty detach snapshots use the reliable control channel because they are one-shot control
-transitions rather than repeatable state. The host keeps the latest pointer move and the
-latest gamepad snapshot in separate slots, so a per-frame snapshot never replaces the pointer
-move sent in the same frame. Each binary pad entry is
-`[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY, dualShockFlags]`:
-slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
-are signed 16-bit values with positive Y up. The host presents slots with DualShock flags
-as DualShock 4 controllers and all other slots as Xbox 360 controllers. Each message is a
-full snapshot; the host unplugs slots not present. An empty snapshot detaches all pads. The
-viewer sends a change immediately, repeats it on every poll for 100 ms so a lost report is
-repaired on the next frame, then keeps an unchanged pad alive with heartbeats every 75 ms
-and full snapshots at least every 225 ms; after 225 ms without a report the host neutralizes
-the current pads. Channel or session teardown unplugs them.
+binary gamepad snapshots on the unordered pointer channel (`nanoctl.pointer.v1`). A u8
+sequence orders the circular stream; stale or reordered snapshots are discarded. Kind-2
+full snapshots rebase all four slots and unplug slots absent from the mask. Kind-12 sparse
+snapshots name only slots whose state differs from the last full baseline; omitted slots keep
+their current host state. Each sparse slot entry remains absolute rather than delta-encoded:
+zero-valued buttons, triggers, and axes are omitted behind the field mask, so any received
+entry completely repairs that slot even after earlier packet loss. Empty detach snapshots
+use the reliable control channel because they are one-shot control transitions rather than
+repeatable state. The host keeps the latest pointer move and latest gamepad snapshot in
+separate slots, so a per-frame snapshot never replaces the pointer move sent in the same
+frame.
+
+Slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes are
+signed 16-bit values with positive Y up. The host presents slots with DualShock flags as
+DualShock 4 controllers and all other slots as Xbox 360 controllers. The viewer sends a
+change immediately, repeats it on every poll for 100 ms so a lost report is repaired on the
+next frame, then keeps an unchanged pad alive with heartbeats every 75 ms and full snapshots
+at least every 225 ms; after 225 ms without a report the host neutralizes the current pads.
+Sparse snapshots received before any full baseline are ignored until the next full snapshot.
+Channel or session teardown unplugs all pads.

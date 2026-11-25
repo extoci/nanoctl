@@ -1,4 +1,5 @@
 import type { ControlMessage, GamepadReport } from "@nanoctl/protocol";
+import type { GamepadStateInput } from "./binary-input";
 
 const XINPUT_BUTTONS = [
   0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, 0, 0, 0x0020, 0x0010, 0x0040, 0x0080, 0x0001,
@@ -18,7 +19,7 @@ const FULL_REFRESH_MS = 225;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
 type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
 type GamepadHeartbeat = { type: "gamepad-heartbeat" };
-type GamepadWireMessage = GamepadMessage | GamepadHeartbeat;
+type GamepadWireMessage = GamepadStateInput | GamepadHeartbeat;
 type DualShock4Pad = NonNullable<GamepadMessage["dualShock4"]>[number];
 export type GamepadStatus = "waiting" | "connected" | "unsupported";
 
@@ -58,27 +59,73 @@ function report(pad: InputPad, slot: number): GamepadReport {
   ];
 }
 
-function sameMessage(left: GamepadMessage, right: GamepadMessage): boolean {
-  const samePads =
-    left.pads.length === right.pads.length &&
-    left.pads.every((report, index) =>
-      report.every((value, field) => value === right.pads[index]?.[field]),
-    );
-  const leftDs4 = left.dualShock4 ?? [];
-  const rightDs4 = right.dualShock4 ?? [];
-  return (
-    samePads &&
-    leftDs4.length === rightDs4.length &&
-    leftDs4.every((pad, index) => {
-      const other = rightDs4[index];
-      return (
-        pad.slot === other?.slot &&
-        pad.leftTriggerPressed === other.leftTriggerPressed &&
-        pad.rightTriggerPressed === other.rightTriggerPressed &&
-        pad.touchpadPressed === other.touchpadPressed
-      );
-    })
+function slotStates(message: GamepadMessage) {
+  const ds4 = new Map(message.dualShock4?.map((pad) => [pad.slot, pad]) ?? []);
+  return new Map(
+    message.pads.map((report) => {
+      const slot = report[0];
+      const extension = ds4.get(slot);
+      return [
+        slot,
+        {
+          report,
+          flags: extension
+            ? 1 |
+              (extension.leftTriggerPressed ? 2 : 0) |
+              (extension.rightTriggerPressed ? 4 : 0) |
+              (extension.touchpadPressed ? 8 : 0)
+            : 0,
+        },
+      ];
+    }),
   );
+}
+
+function sameSlot(
+  left: { report: GamepadReport; flags: number } | undefined,
+  right: { report: GamepadReport; flags: number } | undefined,
+): boolean {
+  return (
+    left?.flags === right?.flags &&
+    !!left === !!right &&
+    (!left ||
+      !right ||
+      left.report.every((value, field) => field === 0 || value === right.report[field]))
+  );
+}
+
+function sameMessage(left: GamepadMessage, right: GamepadMessage): boolean {
+  const leftSlots = slotStates(left);
+  const rightSlots = slotStates(right);
+  return (
+    leftSlots.size === rightSlots.size &&
+    [...leftSlots].every(([slot, state]) => sameSlot(state, rightSlots.get(slot)))
+  );
+}
+
+function changedSlots(
+  baseline: GamepadMessage,
+  current: GamepadMessage,
+): { topology: boolean; slots: Set<number> } {
+  const before = slotStates(baseline);
+  const after = slotStates(current);
+  const slots = new Set<number>();
+  let topology = before.size !== after.size;
+  for (const slot of new Set([...before.keys(), ...after.keys()])) {
+    if (!before.has(slot) || !after.has(slot)) topology = true;
+    if (!sameSlot(before.get(slot), after.get(slot))) slots.add(slot);
+  }
+  return { topology, slots };
+}
+
+function subset(message: GamepadMessage, slots: Set<number>): GamepadMessage {
+  return {
+    type: "gamepad",
+    pads: message.pads.filter(([slot]) => slots.has(slot)),
+    ...(message.dualShock4?.length && {
+      dualShock4: message.dualShock4.filter(({ slot }) => slots.has(slot)),
+    }),
+  };
 }
 
 /**
@@ -103,13 +150,20 @@ export class GamepadForwarder {
   private sentSlots = new Set<number>();
   private lastSentEmpty = true;
   private lastSent: GamepadMessage | null = null;
+  private baseline: GamepadMessage | null = null;
+  private sequence = 0;
   private changedAt = -Infinity;
   private sentAt = -Infinity;
   private fullAt = -Infinity;
 
   constructor(
     private readonly send: (message: GamepadWireMessage) => boolean,
-    private readonly timing = {
+    private readonly timing: {
+      repeatMs: number;
+      keepaliveMs: number;
+      heartbeat: boolean;
+      sparse?: boolean;
+    } = {
       repeatMs: REPEAT_MS,
       keepaliveMs: KEEPALIVE_MS,
       heartbeat: true,
@@ -177,6 +231,7 @@ export class GamepadForwarder {
   /** Force the next sample to publish full state after a transport or input restart. */
   resume(): void {
     this.lastSent = null;
+    this.baseline = null;
     this.changedAt = -Infinity;
     this.sentAt = -Infinity;
     this.fullAt = -Infinity;
@@ -208,13 +263,23 @@ export class GamepadForwarder {
     this.sentSlots.clear();
   }
 
+  private sendState(message: GamepadMessage, sparse: boolean): boolean {
+    const wire = {
+      ...message,
+      type: sparse ? "gamepad-sparse" : "gamepad",
+      sequence: this.sequence,
+    } as GamepadStateInput;
+    if (!this.send(wire)) return false;
+    this.sequence = (this.sequence + 1) & 0xff;
+    return true;
+  }
+
   private flush(message: GamepadMessage, now: number): void {
     const { pads } = message;
-    // Active snapshots are full state on an unordered lossy lane. A change is
-    // repeated on every poll for REPEAT_MS, so one lost press or release is
-    // still repaired on the next frame; after that an unchanged pad only needs
-    // a keepalive. Empty detach snapshots are reliable one-shot transitions
-    // and stay deduplicated.
+    // Active state uses an unordered lossy lane. Full snapshots rebase the
+    // receiver; sparse snapshots carry only slots changed since that baseline
+    // (plus slots in the latest transition), so every received sparse packet
+    // repairs earlier sparse loss without giving up exact controller state.
     if (!pads.length && this.lastSentEmpty) return;
     if (pads.length) {
       if (!this.lastSent || !sameMessage(message, this.lastSent)) this.changedAt = now;
@@ -232,11 +297,35 @@ export class GamepadForwarder {
         return;
       }
     }
-    if (this.send(message)) {
+    const diff = this.baseline
+      ? changedSlots(this.baseline, message)
+      : { topology: true, slots: new Set<number>() };
+    const full =
+      !pads.length ||
+      !this.baseline ||
+      diff.topology ||
+      this.timing.sparse === false ||
+      now - this.fullAt >= FULL_REFRESH_MS;
+    let outgoing = message;
+    if (!full) {
+      const slots = new Set(diff.slots);
+      if (this.lastSent) {
+        for (const slot of changedSlots(this.lastSent, message).slots) slots.add(slot);
+      }
+      if (!slots.size) {
+        // The first full snapshot is repeated through the loss-repair window
+        // too; after that this branch is unreachable because either the state
+        // is unchanged (heartbeat/throttled) or a transition names its slots.
+        for (const [slot] of message.pads) slots.add(slot);
+      }
+      outgoing = subset(message, slots);
+    }
+    if (this.sendState(outgoing, !full)) {
       this.lastSentEmpty = !pads.length;
       this.lastSent = pads.length ? structuredClone(message) : null;
+      if (full) this.baseline = structuredClone(message);
       this.sentAt = now;
-      this.fullAt = now;
+      this.fullAt = full ? now : this.fullAt;
       this.sentSlots = new Set(pads.map(([slot]) => slot));
     }
   }

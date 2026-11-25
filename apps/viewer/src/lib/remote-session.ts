@@ -11,7 +11,7 @@ import {
 } from "@nanoctl/protocol";
 import { recordDebugEvent } from "./debug-report";
 import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
-import { encodeBinaryInput, encodeGamepadHeartbeat } from "./binary-input";
+import { encodeBinaryInput, encodeGamepadHeartbeat, type GamepadStateInput } from "./binary-input";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
@@ -160,7 +160,9 @@ export class RemoteSessionController {
   private gamepadFrame: number | null = null;
   private gamepadStatus: GamepadStatus = "waiting";
   private readonly gamepad = new GamepadForwarder((message) =>
-    message.type === "gamepad" ? this.sendControl(message) : this.sendGamepadHeartbeat(),
+    message.type === "gamepad" || message.type === "gamepad-sparse"
+      ? this.sendControl(message)
+      : this.sendGamepadHeartbeat(),
   );
   private keyQueue: Promise<void> = Promise.resolve();
   private readonly onClipboardFocus = () => {
@@ -463,14 +465,15 @@ export class RemoteSessionController {
     return true;
   }
 
-  sendControl(payload: ControlMessage): boolean {
-    const lossyGamepadSnapshot = payload.type === "gamepad" && payload.pads.length > 0;
+  sendControl(payload: ControlMessage | GamepadStateInput): boolean {
+    const gamepadState = payload.type === "gamepad" || payload.type === "gamepad-sparse";
+    const lossyGamepadSnapshot = gamepadState && payload.pads.length > 0;
     const channel =
       lossyGamepadSnapshot || (payload.type === "pointer" && payload.action === "move")
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
-    if (payload.type === "gamepad") {
+    if (gamepadState) {
       if (
         !this.options.gamepadAvailable ||
         (payload.pads.length > 0 && (!this.inputEnabled || !this.remoteInputAllowed)) ||

@@ -29,7 +29,7 @@ const traces: Record<string, (frame: number) => State> = {
   }),
 };
 
-function pad({ axes, pressed }: State) {
+function pad({ axes, pressed }: State, index = 0) {
   return {
     axes,
     buttons: Array.from({ length: 17 }, (_, button) => ({
@@ -38,13 +38,19 @@ function pad({ axes, pressed }: State) {
       value: pressed.includes(button) ? 1 : 0,
     })),
     connected: true,
-    id: "Xbox Wireless Controller",
-    index: 0,
+    id: `Xbox Wireless Controller ${index}`,
+    index,
     mapping: "standard" as const,
   };
 }
 
-const measure = (heartbeat: boolean, keepaliveMs: number, trace: (frame: number) => State) => {
+const measure = (
+  heartbeat: boolean,
+  keepaliveMs: number,
+  sparse: boolean,
+  padCount: number,
+  trace: (frame: number) => State,
+) => {
   let messages = 0;
   let bytes = 0;
   const forwarder = new GamepadForwarder(
@@ -56,22 +62,27 @@ const measure = (heartbeat: boolean, keepaliveMs: number, trace: (frame: number)
           : (encodeBinaryInput(message)?.byteLength ?? 0)) + OVERHEAD;
       return true;
     },
-    { repeatMs: 100, keepaliveMs, heartbeat },
+    { repeatMs: 100, keepaliveMs, heartbeat, sparse },
   );
   for (let frame = 0; frame < SECONDS * 60; frame++) {
-    forwarder.sample([pad(trace(frame))], frame * FRAME_MS);
+    forwarder.sample(
+      Array.from({ length: padCount }, (_, index) =>
+        pad(index === 0 ? trace(frame) : { axes: [0, 0, 0, 0], pressed: [] }, index),
+      ),
+      frame * FRAME_MS,
+    );
   }
   return { messages, bytes };
 };
 
 for (const [name, trace] of Object.entries(traces)) {
-  const before = measure(false, 50, trace);
-  const after = measure(true, 75, trace);
+  const before = measure(true, 75, false, 4, trace);
+  const after = measure(true, 75, true, 4, trace);
   const kbps = (value: number) => ((value * 8) / SECONDS / 1000).toFixed(2);
   const improvement = (1 - after.bytes / before.bytes) * 100;
   console.log(
     `${name}: ${(before.messages / SECONDS).toFixed(1)} -> ${(after.messages / SECONDS).toFixed(1)} msg/s, ` +
       `${kbps(before.bytes)} -> ${kbps(after.bytes)} kbps (-${improvement.toFixed(1)}%)`,
   );
-  if (improvement < 20 && name !== "shooter (both sticks always moving)") process.exitCode = 1;
+  if (after.bytes > before.bytes) process.exitCode = 1;
 }

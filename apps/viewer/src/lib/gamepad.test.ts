@@ -29,21 +29,21 @@ test("maps standard controls and repeats active snapshots every poll", () => {
   const controller = pad(10);
   gamepad.sample([null, controller, pad(12, "")], 0);
   gamepad.sample([controller], 16);
-  const state = {
-    type: "gamepad",
-    pads: [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]],
-  };
-  expect(messages).toEqual([state, state]);
+  const pads = [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]];
+  expect(messages).toEqual([
+    { type: "gamepad", sequence: 0, pads },
+    { type: "gamepad-sparse", sequence: 1, pads },
+  ]);
   gamepad.sample([controller], 32);
   gamepad.sample([{ ...controller, axes: [NaN] }], 48);
   gamepad.sample([], 64);
   gamepad.release();
   expect(messages).toEqual([
-    state,
-    state,
-    state,
-    { type: "gamepad", pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
-    { type: "gamepad", pads: [] },
+    { type: "gamepad", sequence: 0, pads },
+    { type: "gamepad-sparse", sequence: 1, pads },
+    { type: "gamepad-sparse", sequence: 2, pads },
+    { type: "gamepad-sparse", sequence: 3, pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
+    { type: "gamepad", sequence: 4, pads: [] },
   ]);
 });
 
@@ -78,11 +78,13 @@ test.each([
   expect(messages).toEqual([
     {
       type: "gamepad",
+      sequence: 0,
       pads: reports,
       dualShock4: [{ ...extra, touchpadPressed: false }],
     },
     {
-      type: "gamepad",
+      type: "gamepad-sparse",
+      sequence: 1,
       pads: reports,
       dualShock4: [{ ...extra, touchpadPressed: true }],
     },
@@ -93,7 +95,7 @@ test("bounds to four controllers, preserves slots, and retries a blocked release
   let blocked = false;
   const slots: number[][] = [];
   const gamepad = new GamepadForwarder((message) => {
-    if (message.type !== "gamepad" || blocked) return false;
+    if ((message.type !== "gamepad" && message.type !== "gamepad-sparse") || blocked) return false;
     slots.push(message.pads.map((pad) => pad[0] ?? -1));
     return true;
   });

@@ -117,10 +117,10 @@ fn motion_channel() -> (
 
 #[cfg(any(feature = "media", test))]
 fn is_gamepad_report(bytes: &[u8]) -> bool {
-    // Input wire v3: byte zero is the kind; kind 2 is a gamepad report and
-    // kind 11 its heartbeat. Keep this local because the input module exists
+    // Input wire v3: byte zero is the kind; kinds 2/12 are gamepad reports
+    // and kind 11 their heartbeat. Keep this local because the input module exists
     // only with the media feature.
-    matches!(bytes.first().copied(), Some(2 | 11))
+    matches!(bytes.first().copied(), Some(2 | 11 | 12))
 }
 
 #[cfg(any(feature = "media", test))]

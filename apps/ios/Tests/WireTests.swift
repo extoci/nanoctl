@@ -112,12 +112,12 @@ final class WireTests: XCTestCase {
         let report = GamepadMessage(pads: [[2, 0x1001, 7, 8, -32768, 32767, -1, 1]], dualShock4: [
             .init(slot: 2, leftTriggerPressed: true, rightTriggerPressed: false, touchpadPressed: true)
         ])
-        XCTAssertEqual(report.binary, Data([
-            2, 1,
-            2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+        XCTAssertEqual(report.binary(sequence: 9), Data([
+            2, 9, 4,
+            0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
         ]))
-        XCTAssertEqual(GamepadMessage(pads: []).binary, Data([2, 0]))
-        XCTAssertNil(GamepadMessage(pads: [[0, 0x10000, 0, 0, 0, 0, 0, 0]]).binary)
-        XCTAssertNil(GamepadMessage(pads: Array(repeating: [0, 0, 0, 0, 0, 0, 0, 0], count: 5)).binary)
+        XCTAssertEqual(GamepadMessage(pads: []).binary(sequence: 0), Data([2, 0, 0]))
+        XCTAssertNil(GamepadMessage(pads: [[0, 0x10000, 0, 0, 0, 0, 0, 0]]).binary(sequence: 0))
+        XCTAssertNil(GamepadMessage(pads: Array(repeating: [0, 0, 0, 0, 0, 0, 0, 0], count: 5)).binary(sequence: 0))
     }
 }

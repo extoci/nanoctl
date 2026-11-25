@@ -199,12 +199,13 @@ const BINARY_PING: u8 = 8;
 const BINARY_AUDIO: u8 = 9;
 const BINARY_DISPLAY: u8 = 10;
 const BINARY_GAMEPAD_HEARTBEAT: u8 = 11;
+const BINARY_GAMEPAD_SPARSE: u8 = 12;
 const BINARY_KEY_NAMED: u8 = 4;
 
 pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
     bytes
         .first()
-        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_GAMEPAD_HEARTBEAT).contains(kind))
+        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_GAMEPAD_SPARSE).contains(kind))
 }
 
 fn binary_named_key(id: u8) -> Option<&'static str> {
@@ -285,9 +286,11 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                 delta_y: None,
             })
         }
-        BINARY_GAMEPAD => crate::gamepad::Snapshot::parse_binary(&bytes[1..])
-            .map(ControlMessage::Gamepad)
-            .map_err(anyhow::Error::msg),
+        BINARY_GAMEPAD | BINARY_GAMEPAD_SPARSE => {
+            crate::gamepad::Snapshot::parse_binary(&bytes[1..], bytes[0] == BINARY_GAMEPAD_SPARSE)
+                .map(ControlMessage::Gamepad)
+                .map_err(anyhow::Error::msg)
+        }
         BINARY_POINTER_BUTTON => {
             if bytes.len() != 6 {
                 anyhow::bail!("invalid binary pointer button length");
