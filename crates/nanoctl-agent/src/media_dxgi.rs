@@ -579,7 +579,7 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputPermit, active_outputs};
+    use super::OutputPermit;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use windows::Win32::Graphics::Gdi::HMONITOR;
