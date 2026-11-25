@@ -70,7 +70,10 @@ final class Session {
         didSet { UserDefaults.standard.set(codecPreference.rawValue, forKey: "codec") }
     }
     var audioEnabled = true {
-        didSet { audioTrack?.isEnabled = audioEnabled }
+        didSet {
+            audioTrack?.isEnabled = audioEnabled
+            _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
+        }
     }
     var onChange: (() -> Void)?
     var onClipboard: ((String) -> Void)?
@@ -560,6 +563,7 @@ final class Session {
 
     private func onControlOpen(_ current: Connection) {
         guard current.control?.readyState == .open else { return }
+        _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
         guard statsTask == nil else { return }
         statsTask = nil
         statsTask = Task { [weak self, weak current] in

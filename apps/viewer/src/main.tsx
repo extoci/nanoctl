@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { AudioOutputState, ControlMessage, HostInfo } from "@nanoctl/protocol";
 import type { QualityLimits, RemoteSessionSnapshot } from "./lib/remote-session";
@@ -49,6 +49,11 @@ function Viewer() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const soundPlayback = useRef<SoundPlayback | null>(null);
   const [sound, setSound] = useState<SoundState>("muted");
+  const soundStateRef = useRef<SoundState>("muted");
+  const updateSound = useCallback((next: SoundState) => {
+    soundStateRef.current = next;
+    setSound(next);
+  }, []);
   const [audioOutputState, setAudioOutputState] = useState<AudioOutputState | null>(null);
   const [soundPromptDismissed, setSoundPromptDismissed] = useState(false);
   const transport = useRef<SocketSession | null>(null);
@@ -191,7 +196,7 @@ function Viewer() {
       return;
     }
     const audio = audioRef.current;
-    if (audio) soundPlayback.current = new SoundPlayback(audio, setSound);
+    if (audio) soundPlayback.current = new SoundPlayback(audio, updateSound);
     const session = new SocketSession({
       video: videoRef.current,
       audio: audio ?? undefined,
@@ -212,6 +217,7 @@ function Viewer() {
       },
       codecChoice: () => codecChoiceRef.current,
       qualityLimits: () => qualityLimitsRef.current,
+      audioEnabled: () => !["muted", "blocked"].includes(soundStateRef.current),
       onStatus: (next, message) => {
         recordDebugEvent(`socket ${next}`, message);
         setStatus(next);
@@ -226,7 +232,15 @@ function Viewer() {
       session.dispose();
       transport.current = null;
     };
-  }, []);
+  }, [updateSound]);
+
+  const soundEnabledRef = useRef(false);
+  useEffect(() => {
+    const enabled = !["muted", "blocked"].includes(sound);
+    if (soundEnabledRef.current === enabled) return;
+    soundEnabledRef.current = enabled;
+    transport.current?.controller?.setAudioEnabled(enabled);
+  }, [sound]);
 
   useEffect(() => {
     recordDebugEvent(

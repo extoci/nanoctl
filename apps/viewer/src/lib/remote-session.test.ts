@@ -127,6 +127,39 @@ describe("remote session lifecycle", () => {
     }
   });
 
+  test("publishes audio preference when control opens and when it changes", async () => {
+    installBrowserGlobals();
+    for (const initialAudioEnabled of [false, true]) {
+      const peer = new FakePeer();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: new FakeVideo() as unknown as HTMLVideoElement,
+        initialAudioEnabled,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      const channel = peer.channels.get("nanoctl.control.v1")!;
+      channel.sent = [];
+      channel.onopen?.();
+      expect(channel.sent.map((message) => JSON.parse(message))).toContainEqual({
+        type: "audio",
+        enabled: initialAudioEnabled,
+      });
+      channel.sent = [];
+      expect(controller.setAudioEnabled(!initialAudioEnabled)).toBe(true);
+      expect(channel.sent.map((message) => JSON.parse(message))).toContainEqual({
+        type: "audio",
+        enabled: !initialAudioEnabled,
+      });
+      await controller.stop();
+    }
+  });
+
   test("clipboard is control-only and sends text before a remote paste key", async () => {
     installBrowserGlobals();
     Object.assign(document, { hasFocus: () => true });
@@ -403,10 +436,11 @@ describe("remote session lifecycle", () => {
       peer.channels.get("nanoctl.control.v1")!.sent = [];
       peer.channels.get("nanoctl.control.v1")!.onopen?.();
       expect(controller.snapshot.inputEnabled).toBe(false);
+      const audio = JSON.stringify({ type: "audio", enabled: true });
       expect(peer.channels.get("nanoctl.control.v1")!.sent).toEqual(
         mayControl && displays.length
-          ? [JSON.stringify({ type: "display", displayId: "secondary" })]
-          : [],
+          ? [JSON.stringify({ type: "display", displayId: "secondary" }), audio]
+          : [audio],
       );
       await controller.stop();
     }

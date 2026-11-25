@@ -433,6 +433,7 @@ pub async fn run(
     peer: Arc<RTCPeerConnection>,
     mut shutdown: watch::Receiver<bool>,
     output: watch::Receiver<Option<String>>,
+    enabled: watch::Receiver<bool>,
 ) {
     if *shutdown.borrow() {
         return;
@@ -450,7 +451,7 @@ pub async fn run(
         Ok((_capture, pcm)) => {
             tokio::select! {
                 _ = shutdown.changed() => {},
-                _ = stream(&track, pcm) => {},
+                _ = stream(&track, pcm, enabled.clone()) => {},
             }
         }
         Err(error) => tracing::warn!(%error, "system audio stopped"),
@@ -470,7 +471,7 @@ pub async fn run(
                             if result.is_err() { return; }
                             continue;
                         },
-                        _ = stream(&track, pcm) => {},
+                        _ = stream(&track, pcm, enabled.clone()) => {},
                         _ = &mut capture.failed => {},
                     }
                 }
@@ -490,8 +491,12 @@ pub async fn run(
     }
 }
 
-async fn stream(track: &TrackLocalStaticSample, pcm: mpsc::Receiver<Vec<i16>>) {
-    if let Err(error) = stream_inner(track, pcm).await {
+async fn stream(
+    track: &TrackLocalStaticSample,
+    pcm: mpsc::Receiver<Vec<i16>>,
+    enabled: watch::Receiver<bool>,
+) {
+    if let Err(error) = stream_inner(track, pcm, enabled).await {
         tracing::warn!(%error, "system audio stopped");
     }
 }
@@ -499,9 +504,11 @@ async fn stream(track: &TrackLocalStaticSample, pcm: mpsc::Receiver<Vec<i16>>) {
 async fn stream_inner(
     track: &TrackLocalStaticSample,
     mut pcm: mpsc::Receiver<Vec<i16>>,
+    enabled: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut encoder = encoder()?;
     let (encoded, mut packets) = mpsc::channel(2);
+    let encode_enabled = enabled.clone();
     tokio::task::spawn_blocking(move || {
         let mut output = [0; 4000];
         while let Some(frame) = pcm.blocking_recv() {
@@ -509,6 +516,9 @@ async fn stream_inner(
                 break;
             }
             if frame.len() != SAMPLES {
+                continue;
+            }
+            if !*encode_enabled.borrow() {
                 continue;
             }
             match encoder.encode(&frame, &mut output) {
@@ -523,6 +533,9 @@ async fn stream_inner(
         }
     });
     while let Some(packet) = packets.recv().await {
+        if !*enabled.borrow() {
+            continue;
+        }
         let sample = webrtc::media::Sample {
             data: packet.into(),
             duration: FRAME_DURATION,

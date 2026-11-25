@@ -162,6 +162,20 @@ enum InputAdmission {
 }
 
 #[cfg(any(feature = "media", test))]
+fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
+    #[derive(Deserialize)]
+    struct AudioControl<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        enabled: bool,
+    }
+    serde_json::from_slice::<AudioControl>(bytes)
+        .ok()
+        .filter(|message| message.kind == "audio")
+        .map(|message| message.enabled)
+}
+
+#[cfg(any(feature = "media", test))]
 async fn admit_input_message(sender: &InputSender, bytes: Vec<u8>) -> InputAdmission {
     if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return InputAdmission::Oversized;
@@ -687,6 +701,8 @@ impl HostPeer {
         #[cfg(feature = "media")]
         let (viewer_limits, _) =
             tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
+        #[cfg(feature = "media")]
+        let (audio_enabled, _) = tokio::sync::watch::channel(true);
         let (link_feedback, _) = tokio::sync::watch::channel(None);
         #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
@@ -772,6 +788,7 @@ impl HostPeer {
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
+            let audio_enabled_for_channel = audio_enabled.clone();
             // The data-channel video path carries the encoder's exact
             // temporal units: H.264/HEVC Annex-B or AV1 low-overhead OBUs.
             // A viewer in "auto" may open the channels before negotiation
@@ -853,12 +870,17 @@ impl HostPeer {
                 if input.is_none() {
                     // View-only sessions still adjust stream quality and transport.
                     if reliable {
+                        let audio_enabled = audio_enabled_for_channel.clone();
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
-                            if message.is_string
-                                && let Some(limits) =
-                                    crate::adaptive::ViewerLimits::parse(&message.data)
+                            if !message.is_string {
+                                return Box::pin(async {});
+                            }
+                            if let Some(limits) =
+                                crate::adaptive::ViewerLimits::parse(&message.data)
                             {
                                 viewer_limits.send_replace(limits);
+                            } else if let Some(enabled) = parse_audio_enabled(&message.data) {
+                                audio_enabled.send_replace(enabled);
                             }
                             Box::pin(async {})
                         }));
@@ -875,13 +897,17 @@ impl HostPeer {
                 };
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
+                let audio_enabled = audio_enabled_for_channel.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    if reliable
-                        && message.is_string
-                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
-                    {
-                        viewer_limits.send_replace(limits);
-                        return Box::pin(async {});
+                    if reliable && message.is_string {
+                        if let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data) {
+                            viewer_limits.send_replace(limits);
+                            return Box::pin(async {});
+                        }
+                        if let Some(enabled) = parse_audio_enabled(&message.data) {
+                            audio_enabled.send_replace(enabled);
+                            return Box::pin(async {});
+                        }
                     }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
@@ -955,6 +981,7 @@ impl HostPeer {
                 peer.clone(),
                 input_shutdown.subscribe(),
                 output,
+                audio_enabled.subscribe(),
             )));
             let mut shutdown = input_shutdown.subscribe();
             input_tasks.push(tokio::spawn(async move {
@@ -1829,6 +1856,24 @@ mod tests {
     use tokio::time::{Duration, Instant, timeout};
     use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+
+    #[test]
+    fn parses_audio_enabled_control() {
+        assert_eq!(
+            parse_audio_enabled(br#"{"type":"audio","enabled":false}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_audio_enabled(br#"{"type":"audio","enabled":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_audio_enabled(br#"{"type":"quality","enabled":false}"#),
+            None
+        );
+        assert_eq!(parse_audio_enabled(br#"{"type":"audio"}"#), None);
+        assert_eq!(parse_audio_enabled(b"not json"), None);
+    }
 
     #[test]
     fn video_replay_snapshot_shares_message_allocations() {

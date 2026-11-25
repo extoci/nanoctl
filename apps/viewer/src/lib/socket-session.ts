@@ -49,6 +49,7 @@ export class SocketSession {
       createController?: (options: RemoteSessionOptions) => RemoteSessionController;
       codecChoice?: () => CodecChoice;
       qualityLimits?: () => QualityLimits;
+      audioEnabled?: () => boolean;
     },
   ) {
     window.addEventListener("pageshow", this.restored);
@@ -166,6 +167,7 @@ export class SocketSession {
               onAudioTrackChange: this.options.onAudioTrackChange,
               systemAudioEnabled:
                 message.host.capabilities.systemAudio || audioOutputs !== undefined,
+              initialAudioEnabled: this.options.audioEnabled?.() ?? true,
               remoteInputEnabled: message.host.remoteInput,
               remoteInputPolicy: message.host.viewer.mayControl,
               gamepadAvailable: message.host.capabilities.gamepad === true,

@@ -91,6 +91,7 @@ export type RemoteSessionOptions = {
   audio?: HTMLAudioElement;
   onAudioTrackChange?: () => void;
   systemAudioEnabled?: boolean;
+  initialAudioEnabled?: boolean;
   remoteInputEnabled?: boolean;
   clipboardEnabled?: boolean;
   gamepadAvailable?: boolean;
@@ -178,6 +179,7 @@ export class RemoteSessionController {
   private lifecycleGeneration = 0;
   private inputEnabled = false;
   private inputBlocked = 0;
+  private audioEnabled: boolean;
   private readonly pressedKeys = new Set<string>();
   private readonly preferences: {
     inputEnabled: boolean;
@@ -270,6 +272,7 @@ export class RemoteSessionController {
     this.remoteInputPolicy = options.remoteInputPolicy !== false;
     this.displays = options.displays;
     this.remoteInputAllowed = this.remoteInputPolicy && options.remoteInputEnabled !== false;
+    this.audioEnabled = options.initialAudioEnabled !== false;
     // Keep sequence numbers fresh and exactly representable by JavaScript clients.
     this.nextSequence = safeSequenceSeed();
     this.peerFactory =
@@ -408,6 +411,12 @@ export class RemoteSessionController {
     this.gamepadFrame = null;
     this.gamepadStatus = "waiting";
     this.gamepad.release();
+  }
+
+  /** Applies live without renegotiation; muted viewers do not receive Opus packets. */
+  setAudioEnabled(enabled: boolean): boolean {
+    this.audioEnabled = enabled;
+    return this.sendControl({ type: "audio", enabled });
   }
 
   /** Applies live without renegotiation; the host clamps to its configured maximums. */
@@ -1355,6 +1364,7 @@ export class RemoteSessionController {
       this.sendControl({ type: "display", displayId });
     if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
       this.sendControl({ type: "quality", ...this.qualityLimits });
+    this.sendControl({ type: "audio", enabled: this.audioEnabled });
     this.startGamepadPolling();
     this.publishSnapshot();
   }
