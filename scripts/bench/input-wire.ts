@@ -6,12 +6,10 @@ const TRANSPORT = 20 + 8 + 37 + 12 + 16;
 const bytes = (message: ControlMessage) => {
   const binary = encodeBinaryInput(message);
   return {
-    json:
-      TRANSPORT + new TextEncoder().encode(JSON.stringify(message)).byteLength,
+    json: TRANSPORT + new TextEncoder().encode(JSON.stringify(message)).byteLength,
     binary:
       TRANSPORT +
-      (binary?.byteLength ??
-        new TextEncoder().encode(JSON.stringify(message)).byteLength),
+      (binary?.byteLength ?? new TextEncoder().encode(JSON.stringify(message)).byteLength),
   };
 };
 const total = (messages: ControlMessage[]) =>
@@ -51,10 +49,7 @@ report(
   "typing 120wpm key stream",
   [..."hello world"].flatMap((char) => [key(char, true), key(char, false)]),
 );
-report(
-  "mouse clicking",
-  Array.from({ length: 10 }, () => [pointer("down"), pointer("up")]).flat(),
-);
+report("mouse clicking", Array.from({ length: 10 }, () => [pointer("down"), pointer("up")]).flat());
 report(
   "precision wheel scrolling",
   Array.from({ length: 60 }, (_, index) => ({

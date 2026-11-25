@@ -33,9 +33,7 @@ describe("encodeBinaryInput", () => {
         })!,
       ),
     ]).toEqual([0x4e, 2, 3, 0x82, 0x00, 0x80, 0xff, 0xff]);
-    expect([
-      ...new Uint8Array(encodeBinaryInput({ type: "release" })!),
-    ]).toEqual([0x4e, 2, 7]);
+    expect([...new Uint8Array(encodeBinaryInput({ type: "release" })!)]).toEqual([0x4e, 2, 7]);
   });
 
   test("preserves wheel deltas as little-endian float64", () => {
@@ -69,8 +67,7 @@ describe("encodeBinaryInput", () => {
       })!,
     );
     expect([...bytes]).toEqual([
-      0x4e, 1, 2, 1, 2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff,
-      0x01, 0x00, 0x0b,
+      0x4e, 1, 2, 1, 2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
     ]);
   });
 });
