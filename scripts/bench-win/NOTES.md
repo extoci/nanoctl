@@ -809,3 +809,11 @@ Measured on the media-smoke pipeline (in-process, 30s window under `band --motio
 - `band --noise --height 1200` (unoccluded): **57.6fps / 21.0Mbps / encode p50 11.46ms / 0 adapt switches** (tier 0 held — correct). No regression vs historical ~57-58fps/19-21Mbps.
 - Live DC under ~14Mbps sustained to a real viewer (noise strip visible above Chrome): **transit avg 4.08ms** (vs 1.4ms at low bitrate), decode 2.79ms, present 5.96ms, **0 seq gaps / 0 KF requests / 0 decode drops** — no send-queue backup at wire worst case.
 - Harness note: `--noise` fills below the 56px band; worst case needs `--height 1200`. `--height 600` + a non-overlapping Chrome window keeps both scene and viewer composited (an occluded scene emits nothing — see cycle 42).
+
+## Cycle 47 — input lane under worst-case video load (2026-11-25)
+
+`band --clock --noise --height 600` (clock marker + noise load, ~16Mbps wire):
+
+- input→photon **p50 84ms** vs ~48ms idle — but G2G context also rose to p50 68ms (encode 11.5ms + transit 4.1 + decode 2.8 + present ~6 under load).
+- Input lane delta vs G2G ≈ +16ms ≈ idle (+~10ms) — **no SCTP head-of-line blocking**: input keeps pace with the video path under worst-case bitrate.
+- First G2G-under-noise datapoint: ~68ms p50 vs ~38ms clock-scene — worst-case inflation is encode-time dominated (11.5ms/frame), consistent with the swept x264 trade table.
