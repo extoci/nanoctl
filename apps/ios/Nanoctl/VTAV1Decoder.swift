@@ -5,7 +5,7 @@ import OSLog
 import VideoToolbox
 import WebRTC
 
-private let av1Log = Logger(subsystem: "ai.nanoctl.viewer", category: "vtav1")
+private let av1Log = AppLogger(subsystem: "ai.nanoctl.viewer", category: "vtav1")
 
 /// Low-overhead-OBU AV1 decoder backed by VideoToolbox. The same core serves
 /// the jitter-buffered RTP decoder and nanoctl's direct data-channel path.
@@ -121,7 +121,7 @@ final class VTAV1CoreDecoder {
             guard let self else { return }
             self.decrementInflight(generation: decodeGeneration)
             guard status == noErr else {
-                av1Log.error("AV1 decode callback status=\(status, privacy: .public)")
+                av1Log.error("AV1 decode callback status=\(status)")
                 self.markCallbackFault()
                 return
             }
@@ -131,7 +131,7 @@ final class VTAV1CoreDecoder {
         }
         if status != noErr {
             decrementInflight(generation: decodeGeneration)
-            av1Log.error("AV1 decode submit status=\(status, privacy: .public)")
+            av1Log.error("AV1 decode submit status=\(status)")
             return fault()
         }
         return true
@@ -166,7 +166,7 @@ final class VTAV1CoreDecoder {
             decompressionSessionOut: &session
         )
         guard status == noErr, let session else {
-            av1Log.error("AV1 session create status=\(status, privacy: .public)")
+            av1Log.error("AV1 session create status=\(status)")
             return false
         }
         VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)

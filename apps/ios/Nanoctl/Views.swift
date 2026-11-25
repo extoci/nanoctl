@@ -44,6 +44,7 @@ struct ConnectView: View {
 
     let desktop: Desktop
     @State private var address = UserDefaults.standard.string(forKey: "host") ?? ""
+    @State private var showLogs = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -138,11 +139,28 @@ struct ConnectView: View {
                         }
                         .frame(maxWidth: 420)
                     }
+                    HStack(spacing: 14) {
+                        Text(BuildInfo.versionLine)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                        Button {
+                            showLogs = true
+                        } label: {
+                            Label("Logs", systemImage: "doc.text.magnifyingglass")
+                                .font(.caption.weight(.medium))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
+                    .padding(.bottom, 8)
                 }
                 .padding(24)
                 .frame(maxWidth: .infinity)
             }
             .scrollDismissesKeyboard(.interactively)
+        }
+        .sheet(isPresented: $showLogs) {
+            DebugLogView()
         }
     }
 

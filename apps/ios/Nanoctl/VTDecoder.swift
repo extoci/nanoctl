@@ -4,7 +4,7 @@ import Foundation
 import OSLog
 import VideoToolbox
 
-private let log = Logger(subsystem: "ai.nanoctl.viewer", category: "vtdecoder")
+private let log = AppLogger(subsystem: "ai.nanoctl.viewer", category: "vtdecoder")
 
 /// Low-latency VideoToolbox decoder fed whole Annex-B access units from the
 /// `nanoctl.video.v1` data channels — the direct equivalent of the browser
@@ -77,7 +77,7 @@ final class VTDecoder {
         if session == nil {
             guard ensureSession(parameters: parameters) else {
                 let head = au.prefix(12).map { String(format: "%02x", $0) }.joined()
-                log.error("no session: \(parameters.count, privacy: .public) param sets, codec=\(self.codec.rawValue, privacy: .public), head=\(head, privacy: .public), isKey=\(isKey, privacy: .public)")
+                log.error("no session: \(parameters.count) param sets, codec=\(self.codec.rawValue), head=\(head), isKey=\(isKey)")
                 if isKey { fault() }
                 dropped += 1
                 return
@@ -144,7 +144,7 @@ final class VTDecoder {
             guard let self else { return }
             self.inflight -= 1
             guard status == noErr else {
-                log.error("decode callback status=\(status, privacy: .public)")
+                log.error("decode callback status=\(status)")
                 // Invalidating here would wait on this very callback.
                 self.faultPending = true
                 return
@@ -195,7 +195,7 @@ final class VTDecoder {
             outputCallback: nil, decompressionSessionOut: &session
         )
         guard status == noErr, let session else {
-            log.error("session create status=\(status, privacy: .public)")
+            log.error("session create status=\(status)")
             return false
         }
         VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -224,7 +224,7 @@ final class VTDecoder {
     private static func format(codec: Codec, sets: [Data]) -> CMFormatDescription? {
         var format: CMFormatDescription?
         let ordered = sets.sorted { parameterSetRank($0, codec: codec) < parameterSetRank($1, codec: codec) }
-        log.info("format: \(ordered.count, privacy: .public) sets")
+        log.info("format: \(ordered.count) sets")
         let status = ordered.withParameterSets { pointers, sizes in
             guard let pointers, let sizes else { return OSStatus(-1) }
             switch codec {
@@ -246,7 +246,7 @@ final class VTDecoder {
                     nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &format)
             }
         }
-        if status != noErr { log.error("format create status=\(status, privacy: .public)") }
+        if status != noErr { log.error("format create status=\(status)") }
         return status == noErr ? format : nil
     }
 

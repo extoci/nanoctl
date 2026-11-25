@@ -1,8 +1,11 @@
 import AVFAudio
 import Foundation
+import OSLog
 import UIKit
 import VideoToolbox
 import WebRTC
+
+private let sessionLog = AppLogger(subsystem: "ai.nanoctl.viewer", category: "session")
 
 enum CodecPreference: String, CaseIterable {
     /// Best efficient hardware-decoded codec first, falling back through H.264
@@ -175,8 +178,10 @@ final class Session {
         socket.maximumMessageSize = 1_100_000
         let current = Connection(socket: socket)
         connection = current
+        sessionLog.info("connecting to \(endpoint.socket.absoluteString)")
         state = "Connecting…"
         transport = .rtp
+        sessionLog.notice("video transport switched to RTP")
         codec = nil
         audioOutputs = []
         onChange?()
@@ -215,6 +220,7 @@ final class Session {
 
     /// Stops the connection and cancels auto-reconnect (user-initiated).
     func stop(_ status: String = "Disconnected") {
+        sessionLog.info("stopped (\(status))")
         wantsConnection = false
         teardown()
         state = status
@@ -225,6 +231,7 @@ final class Session {
     /// wants the session.
     private func fail(_ reason: String, _ current: Connection) {
         guard connection === current else { return }
+        sessionLog.error("connection failed: \(reason)")
         teardown()
         state = reason
         onChange?()
@@ -386,6 +393,7 @@ final class Session {
             try Self.checkHost(host)
             current.id = id
             current.host = host
+            sessionLog.info("host hello: \(host.hostName) codecs=\(host.capabilities.codecs?.joined(separator: ",") ?? "?") audio=\(host.audioAvailable)")
             audioOutputs = host.capabilities.audioOutputs ?? []
             if audioOutputs.isEmpty == false { _ = selectAudioOutput(nil) }
             try await negotiate(current, injectHevc: codecPreference.injectHevc)
@@ -412,6 +420,7 @@ final class Session {
                     try await peer.setRemoteDescription(clean)
                 } catch {
                     if current.injectHevcAttempted {
+                        sessionLog.error("HEVC negotiation failed; retrying as H.264")
                         // HEVC negotiation failed somewhere: retry as H.264 on
                         // a fresh peer.
                         current.peer?.close()
@@ -425,6 +434,7 @@ final class Session {
                 try requireCurrent(current)
                 current.answered = true
                 codec = negotiated
+                sessionLog.info("negotiated video codec: \(negotiated ?? "none")")
                 let candidates = current.remoteCandidates
                 current.remoteCandidates.removeAll()
                 for candidate in candidates { try await peer.add(candidate) }
@@ -641,6 +651,7 @@ final class Session {
         }
         current.dcVideo = receiver
         transport = .dataChannel
+        sessionLog.info("data-channel video active: codec=\(receiver.codec?.rawValue ?? "pending")")
         // The agent suppresses delta-frame RTP writes automatically while the
         // video channel is open; IDRs still flow so RTCP feedback survives.
         onControlOpen(current)
