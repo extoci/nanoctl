@@ -164,7 +164,7 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     context->want_preset = "veryfast";
     context->want_me = X264_ME_HEX;
     context->want_subme = 2;
-    context->want_threads = 4;
+    context->want_threads = 0; /* x264 auto: scales with cores */
     const char *profile_env = getenv("NANOCTL_X264_PROFILE");
     if (profile_env && profile_env[0]) context->pins |= 1;
     if (env_me() >= 0) context->pins |= 2;
@@ -208,7 +208,7 @@ fail:
 }
 
 /* Adaptive parameter tiers: 0 = baseline/hex/subme2/threads4 (worst-case safe:
-   incompressible content is encode-time-bound, and threads4 halves it at no
+   incompressible content is encode-time-bound, and auto threads cut it ~40% at no
    measured quality cost there),
    1 = +CABAC/8x8 (high profile), 2 = +UMH, 3 = preset fast/subme6
    (only reachable after a long easy window). Env-pinned knobs are left
@@ -221,7 +221,7 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     const char *preset;
     int high, me, subme, threads;
     switch (tier) {
-    case 0: preset = "veryfast"; high = 0; me = X264_ME_HEX; subme = 2; threads = 4; break;
+    case 0: preset = "veryfast"; high = 0; me = X264_ME_HEX; subme = 2; threads = 0; break;
     case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; threads = 2; break;
     case 2: preset = "veryfast"; high = 1; me = X264_ME_UMH; subme = 2; threads = 2; break;
     case 3: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 2; break;

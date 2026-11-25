@@ -550,7 +550,8 @@ mod tests {
                 (4_000, (4_000 * frames + 59) / 60)
             );
             assert_eq!((p.rc_method, p.crf_milli, p.qp_max), (1, 18_000, 51));
-            assert_eq!((p.csp, p.threads), (2, 4));
+            assert_eq!(p.csp, 2);
+            assert!(p.threads >= 2);
             assert_eq!((p.bframes, p.lookahead, p.sync_lookahead), (0, 0, 0));
             assert_eq!((p.cabac, p.transform8x8), (0, 0));
             assert_eq!((p.annexb, p.repeat_headers, p.keyint), (1, 1, 1 << 30));
@@ -657,11 +658,13 @@ mod tests {
         let mut encoder = X264Encoder::new(4_000, 60, LatencyMode::Balanced, (64, 320)).unwrap();
         let p = encoder.active.parameters();
         assert_eq!((p.cabac, p.transform8x8, p.me, p.subme), (0, 0, ME_HEX, 2));
-        assert_eq!(p.threads, 4);
+        assert!(p.threads >= 2);
+        let tier0_threads = p.threads;
         assert_eq!(encoder.active.adapt(1), 0);
         let p = encoder.active.parameters();
         assert_eq!((p.cabac, p.transform8x8, p.me, p.subme), (1, 1, ME_HEX, 2));
         assert_eq!(p.threads, 2);
+        assert!(tier0_threads >= p.threads);
         assert_eq!(encoder.active.adapt(1), 1);
         assert_eq!(encoder.active.adapt(2), 0);
         assert_eq!(encoder.active.parameters().me, ME_UMH);
@@ -671,7 +674,7 @@ mod tests {
         assert_eq!(encoder.active.adapt(0), 0);
         let p = encoder.active.parameters();
         assert_eq!((p.cabac, p.transform8x8, p.me), (0, 0, ME_HEX));
-        assert_eq!(p.threads, 4);
+        assert!(p.threads >= 2);
         assert_eq!(encoder.active.adapt(9), -1);
         // The stream is still valid after all the re-opens.
         encoder.force_keyframe();

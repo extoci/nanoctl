@@ -854,3 +854,19 @@ Motion (band --height 600): promotes to tier 3 within the window, 57.5fps,
 284kbps, PSNR p05 57.1dB — threads back to 2 on easy content, no regression.
 Clock: 58fps, 219kbps, tier 3. x264 clamps slice threads on short frames
 (~64 rows/thread); unit tests assert at height 320.
+
+## Cycle 51 — tier-0 thread count: fixed 4 → x264 auto
+
+Follow-up sweep on the noise worst case (same binary, env-pinned):
+
+| threads  | fps  | encode p50 | capture→encode p50 |
+| -------- | ---- | ---------- | ------------------ |
+| 4        | 58.2 | 8.04ms     | 16.8ms             |
+| 6        | 58.2 | 6.56ms     | 15.3ms             |
+| 8        | 58.0 | 5.91ms     | 14.7ms             |
+| 0 (auto) | 58.1 | 6.06ms     | 14.3ms             |
+
+PSNR identical (17.15 p50) at 4 vs 8, bitrate parity. Auto scales with core
+count, so tier 0 now uses x264 auto-threads (8 on this box) — cumulative
+worst-case encode 11.2→~6ms vs the pre-cycle-50 default. Tiers 1-3 stay at 2
+(bit-efficiency measured better on easy content).
