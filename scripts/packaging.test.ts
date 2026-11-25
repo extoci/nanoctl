@@ -17,7 +17,7 @@ afterEach(async () => {
   );
 });
 
-async function fixture(platform = "Linux", machine = platform === "Darwin" ? "arm64" : "x86_64") {
+async function fixture(platform = "Linux") {
   const directory = await mkdtemp(join(tmpdir(), "nanoctl-package-test-"));
   temporaryDirectories.push(directory);
   const home = join(directory, "home");
@@ -61,7 +61,7 @@ esac
 [ "\${NANOCTL_TEST_CLEANUP_EXIT:-0}" = 0 ] || exit 1
 case "$1" in get_persistent) echo 77 ;; search) echo 42 ;; esac`,
     ),
-    command("uname", `case "$1" in -s) echo ${platform} ;; -m) echo ${machine} ;; esac`),
+    command("uname", `case "$1" in -s) echo ${platform} ;; -m) echo x86_64 ;; esac`),
     command(
       "systemctl",
       `printf '%s\\n' "$*" >>"$HOME/service-calls"
@@ -199,13 +199,6 @@ describeUnix("one-command Linux installer", () => {
     expect((await first).exit).toBe(0);
     expect((await installUnix(environment, source)).exit).toBe(0);
   });
-});
-
-testUnix("rejects Intel macOS before installing", async () => {
-  const { source, environment } = await fixture("Darwin", "x86_64");
-  const install = await installUnix(environment, source);
-  expect(install.exit).not.toBe(0);
-  expect(install.stderr).toContain("unsupported platform: Darwin x86_64");
 });
 
 testUnix("prints the macOS URL from its stable launch path", async () => {
@@ -349,12 +342,6 @@ for (const [platform, registration] of [
 }
 
 describe("one-command Windows installer", () => {
-  test("publishes only the x64 Windows target", async () => {
-    const installer = await Bun.file(join(repository, "install.ps1")).text();
-    expect(installer).toContain('"AMD64" { "windows-x64" }');
-    expect(installer).not.toContain('"ARM64" { "windows-arm64" }');
-  });
-
   test.skipIf(process.platform !== "win32")(
     "checks native job lifetime and stop edge cases",
     async () => {

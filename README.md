@@ -16,9 +16,6 @@ WebRTC carries video and input between your browser and the host.
 
 ## Get started
 
-Host releases support Linux x64/arm64, macOS on Apple Silicon, and Windows x64.
-Intel macOS and Windows ARM64 are unsupported.
-
 1. [Install Tailscale](https://tailscale.com/download) on the host and controller device,
    sign into your tailnet, and leave Tailscale running.
 2. Run the nanoctl installer as the host's interactive desktop user:
@@ -41,7 +38,7 @@ Intel macOS and Windows ARM64 are unsupported.
    you don’t need to stop or restart nanoctl.
 
 During prereleases, use the install script from the selected release and set
-`NANOCTL_VERSION=v3.0.0-alpha.7` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.7"`).
+`NANOCTL_VERSION=v3.0.0-alpha.6` (PowerShell: `$env:NANOCTL_VERSION="v3.0.0-alpha.6"`).
 Run the installer again to upgrade. Downloads are checksum-verified; failed startup
 restores the previous installation. Existing config is preserved and legacy credentials
 are removed best-effort.

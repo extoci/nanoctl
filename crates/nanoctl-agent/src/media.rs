@@ -271,6 +271,31 @@ where
         .context("video sample delivery timed out")?
 }
 
+/// Registers the calling thread with MMCSS "Pro Audio" so the multimedia
+/// scheduler grants it low-latency timeslices - the same trick Sunshine uses
+/// for capture/encode threads on Windows. Returns a guard reverting on drop.
+#[cfg(windows)]
+fn register_mmcss() -> Option<MmcssGuard> {
+    use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+    let mut index = 0u32;
+    let handle =
+        unsafe { AvSetMmThreadCharacteristicsW(windows::core::w!("Pro Audio"), &mut index) }.ok();
+    let handle = handle?;
+    Some(MmcssGuard(handle))
+}
+
+#[cfg(windows)]
+struct MmcssGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0);
+        }
+    }
+}
+
 /// Stash of pixel buffers released by fully-dropped `CapturedFrame`s, each
 /// tagged with the emit generation it last carried.
 type RecycledFrames = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
@@ -1535,6 +1560,8 @@ fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<Started
     let forwarder = std::thread::Builder::new()
         .name("nanoctl-capture".to_owned())
         .spawn(move || {
+            #[cfg(windows)]
+            let _mmcss = register_mmcss();
             while let Some(latest_frame) = forwarding_slot.upgrade() {
                 if latest_frame.stopped.load(Ordering::Acquire) {
                     break;
@@ -2454,6 +2481,8 @@ pub fn spawn_video(
         let producer_stats = writer_stats.clone();
         let producer_video_channel = video_data_channel.clone();
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+            #[cfg(windows)]
+            let _mmcss = register_mmcss();
             let producer_slot = producer_slot;
             #[cfg(target_os = "linux")]
             producer_stats.producer_tid.store(

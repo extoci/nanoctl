@@ -1,6 +1,13 @@
 import { readFile } from "node:fs/promises";
 
-const requiredTargets = ["linux-x64", "linux-arm64", "macos-arm64", "windows-x64"] as const;
+const requiredTargets = [
+  "linux-x64",
+  "linux-arm64",
+  "macos-x64",
+  "macos-arm64",
+  "windows-x64",
+  "windows-arm64",
+] as const;
 const requiredProfiles = ["interactive-1080p60", "soak-1080p30"] as const;
 
 type Evidence = {

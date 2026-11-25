@@ -34,34 +34,6 @@ type Patch = (RECT, Vec<u8>);
 /// Dirty-region pixels of a contiguous run of small-dirty emits.
 type PatchLog = std::collections::VecDeque<(u64, Vec<Patch>)>;
 
-fn swizzle_bgra_row(src: &[u8], accum: &mut [u8], emit: &mut [u8]) {
-    let paired_len = src.len() & !7;
-    for (src, accum, emit) in src[..paired_len]
-        .chunks_exact(8)
-        .zip(accum[..paired_len].chunks_exact_mut(8))
-        .zip(emit[..paired_len].chunks_exact_mut(8))
-        .map(|((src, accum), emit)| (src, accum, emit))
-    {
-        let pixels = u64::from_le_bytes([
-            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
-        ]);
-        let rgba = ((pixels & 0x0000_00ff_0000_00ff) << 16)
-            | ((pixels >> 16) & 0x0000_00ff_0000_00ff)
-            | (pixels & 0xff00_ff00_ff00_ff00);
-        let bytes = rgba.to_le_bytes();
-        accum.copy_from_slice(&bytes);
-        emit.copy_from_slice(&bytes);
-    }
-    if paired_len + 4 == src.len() {
-        let src = &src[paired_len..];
-        let pixel = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-        let rgba = ((pixel & 0xff) << 16) | ((pixel >> 16) & 0xff) | (pixel & 0xff00_ff00);
-        let bytes = rgba.to_le_bytes();
-        accum[paired_len..].copy_from_slice(&bytes);
-        emit[paired_len..].copy_from_slice(&bytes);
-    }
-}
-
 struct Duplication {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
@@ -398,16 +370,21 @@ impl Duplication {
                 let top = (rect.top.max(0) as usize).min(self.height as usize);
                 let bottom = (rect.bottom as usize).min(self.height as usize);
                 for y in top..bottom {
-                    let row_bytes = (right - left) * 4;
-                    let src_row =
-                        std::slice::from_raw_parts(src.add(y * row_pitch + left * 4), row_bytes);
+                    let src_row = src.add(y * row_pitch + left * 4);
                     let dst_start = (y * self.width as usize + left) * 4;
-                    let dst_end = dst_start + row_bytes;
-                    swizzle_bgra_row(
-                        src_row,
-                        &mut self.accum[dst_start..dst_end],
-                        &mut emit[dst_start..dst_end],
-                    );
+                    let dst_row = &mut self.accum[dst_start..dst_start + (right - left) * 4];
+                    let emit_row = &mut emit[dst_start..dst_start + (right - left) * 4];
+                    for x in 0..(right - left) {
+                        let b = *src_row.add(x * 4);
+                        let g = *src_row.add(x * 4 + 1);
+                        let r = *src_row.add(x * 4 + 2);
+                        let a = *src_row.add(x * 4 + 3);
+                        dst_row[x * 4] = r;
+                        dst_row[x * 4 + 1] = g;
+                        dst_row[x * 4 + 2] = b;
+                        dst_row[x * 4 + 3] = a;
+                    }
+                    emit_row.copy_from_slice(dst_row);
                 }
                 if let Some(log) = &mut logged {
                     let cols = (right - left) * 4;
@@ -457,6 +434,8 @@ pub(super) fn start(
 }
 
 fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
+    #[cfg(windows)]
+    let _mmcss = crate::media::register_mmcss();
     let h_monitor = HMONITOR(h_monitor_raw as *mut _);
     loop {
         let Some(latest) = slot.upgrade() else {
@@ -492,38 +471,5 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::swizzle_bgra_row;
-
-    #[test]
-    fn bgra_rows_swizzle_to_rgba_in_both_outputs() {
-        let src = [
-            30, 20, 10, 255, // blue,green,red,alpha
-            0, 0, 255, 128, // red with partial alpha
-        ];
-        let mut accum = [0; 8];
-        let mut emit = [0; 8];
-        swizzle_bgra_row(&src, &mut accum, &mut emit);
-        let expected = [10, 20, 30, 255, 255, 0, 0, 128];
-        assert_eq!(accum, expected);
-        assert_eq!(emit, expected);
-    }
-
-    #[test]
-    fn bgra_rows_handle_an_unpaired_tail_pixel() {
-        let src = [
-            30, 20, 10, 255, 0, 0, 255, 128, // one u64 pair
-            4, 3, 2, 1, // odd tail pixel
-        ];
-        let mut accum = [0; 12];
-        let mut emit = [0; 12];
-        swizzle_bgra_row(&src, &mut accum, &mut emit);
-        let expected = [10, 20, 30, 255, 255, 0, 0, 128, 2, 3, 4, 1];
-        assert_eq!(accum, expected);
-        assert_eq!(emit, expected);
     }
 }

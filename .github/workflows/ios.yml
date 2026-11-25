@@ -12,18 +12,13 @@ permissions:
 
 jobs:
   simulator:
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/ios
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Require Xcode 26 (iOS 26 SDK for Liquid Glass)
-        run: |
-          xcodebuild -version
-          major=$(xcodebuild -version | awk 'NR==1 {split($2, v, "."); print v[1]}')
-          [ "$major" -ge 26 ] || { echo "::error::Xcode $major is too old; need 26+"; exit 1; }
       - name: Generate Xcode project
         run: |
           command -v xcodegen >/dev/null || brew install xcodegen

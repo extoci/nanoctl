@@ -775,3 +775,16 @@ Same rig/scene (`band --clock --height 80 --fps 120`), same agent binary, only `
 ## Cycle 40 — wire jitter under motion (2026-11-25)
 
 dcv-snap, `band --motion`, 20 s window: 926 deltas, **0 gaps, 0 KF resyncs, 0 decode-drops**; transit avg 1.43 ms, decode avg 1.09 ms (~46 fps consumed). No queueing behind IDR bursts or decode backlog — axis verified clean, nothing to climb.
+
+## Cycle 41 — MMCSS "Pro Audio" thread registration (2026-11-25)
+
+DXGI capture thread, xcap forwarder and encode producer now register with MMCSS `Pro Audio` (`AvSetMmThreadCharacteristicsW` via `Win32_System_Threading`), same trick Sunshine uses for gaming latency scheduling.
+
+G2G A-B, `band --clock`, same rig/session phase (n≈600-1300/run):
+
+|        | p50       | mean     | p99       |
+| ------ | --------- | -------- | --------- |
+| before | 41-42 ms  | 43.6     | 78-79     |
+| MMCSS  | **38 ms** | **39.4** | **63-65** |
+
+**−3.5 ms p50, −14 ms p99** — scheduling-jitter tail mostly gone. Noise fps unchanged (57.8); 60/60 media tests pass.

@@ -5,8 +5,10 @@ import { validateMediaEvidence } from "./verify-media-evidence";
 const targets = [
   ["linux", "x86_64"],
   ["linux", "aarch64"],
+  ["macos", "x86_64"],
   ["macos", "aarch64"],
   ["windows", "x86_64"],
+  ["windows", "aarch64"],
 ] as const;
 
 function record(target_os: string, target_arch: string) {
@@ -38,15 +40,6 @@ describe("physical media evidence", () => {
     expect(validateMediaEvidence(targets.map(([os, arch]) => record(os, arch)))).toEqual([]);
   });
 
-  test("rejects unsupported release targets", () => {
-    expect(validateMediaEvidence([record("macos", "x86_64")])).toEqual(
-      expect.arrayContaining(["record 1: unexpected target macos-x64"]),
-    );
-    expect(validateMediaEvidence([record("windows", "aarch64")])).toEqual(
-      expect.arrayContaining(["record 1: unexpected target windows-arm64"]),
-    );
-  });
-
   test("rejects software, short, duplicate, and missing evidence", () => {
     const records = targets.slice(0, -1).map(([os, arch]) => record(os, arch));
     records[0] = {
@@ -59,8 +52,8 @@ describe("physical media evidence", () => {
       expect.arrayContaining([
         "record 1: requested_seconds is below 1800",
         "record 1: hardware encoder evidence is absent",
-        "record 4: duplicate target linux-x64",
-        "missing target windows-x64",
+        "record 6: duplicate target linux-x64",
+        "missing target windows-arm64",
       ]),
     );
   });

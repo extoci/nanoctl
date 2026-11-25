@@ -21,6 +21,10 @@ case "$(uname -s):$(uname -m)" in
     platform=linux
     target=linux-arm64
     ;;
+  Darwin:x86_64)
+    platform=macos
+    target=macos-x64
+    ;;
   Darwin:arm64|Darwin:aarch64)
     platform=macos
     target=macos-arm64
