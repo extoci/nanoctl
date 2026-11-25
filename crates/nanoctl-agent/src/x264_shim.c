@@ -216,7 +216,7 @@ fail:
    incompressible content is encode-time-bound, and auto threads cut it ~40% at no
    measured quality cost there),
    1 = +CABAC/8x8 (high profile), 2 = +UMH, 3 = preset fast/subme6,
-   4 = one slice thread and three reference frames (only reachable after a long
+   4 = one slice thread and four reference frames (only reachable after a long
    easy window). Env-pinned knobs are left alone. Returns 0 on a re-open, 1 when
    the masked target already matches, -2 when adapt is disabled, -1 on failure
    (previous params restored). */
