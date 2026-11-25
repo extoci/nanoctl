@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { encodeBinaryInput } from "./binary-input";
+import { encodeBinaryInput, encodeGamepadHeartbeat } from "./binary-input";
 
 describe("encodeBinaryInput", () => {
   test("encodes pointer motion as normalized u16 coordinates", () => {
     const bytes = new Uint8Array(
       encodeBinaryInput({ type: "pointer", action: "move", x: 0.5, y: 1 })!,
     );
-    expect([...bytes]).toEqual([0x4e, 1, 1, 0x00, 0x80, 0xff, 0xff]);
+    expect([...bytes]).toEqual([1, 0x00, 0x80, 0xff, 0xff]);
   });
 
-  test("encodes version-2 discrete input without JSON framing", () => {
+  test("encodes keys as named ids or UTF-8 without code strings", () => {
     expect([
       ...new Uint8Array(
         encodeBinaryInput({
@@ -21,7 +21,22 @@ describe("encodeBinaryInput", () => {
           repeat: false,
         })!,
       ),
-    ]).toEqual([0x4e, 2, 5, 0, 4, 1, 75, 101, 121, 65, 97]);
+    ]).toEqual([5, 0, 97]);
+    expect([
+      ...new Uint8Array(
+        encodeBinaryInput({
+          type: "key",
+          action: "up",
+          code: "ShiftLeft",
+          key: "Shift",
+          modifiers: 0,
+          repeat: true,
+        })!,
+      ),
+    ]).toEqual([5, 7, 30]);
+  });
+
+  test("encodes discrete input without legacy framing", () => {
     expect([
       ...new Uint8Array(
         encodeBinaryInput({
@@ -32,12 +47,16 @@ describe("encodeBinaryInput", () => {
           button: 2,
         })!,
       ),
-    ]).toEqual([0x4e, 2, 3, 0x82, 0x00, 0x80, 0xff, 0xff]);
-    expect([...new Uint8Array(encodeBinaryInput({ type: "release" })!)]).toEqual([0x4e, 2, 7]);
+    ]).toEqual([3, 0x82, 0x00, 0x80, 0xff, 0xff]);
+    expect([...new Uint8Array(encodeBinaryInput({ type: "release" })!)]).toEqual([7]);
+    expect([...new Uint8Array(encodeGamepadHeartbeat())]).toEqual([11]);
+    expect([
+      ...new Uint8Array(encodeBinaryInput({ type: "ping", nonce: 9, sentAt: 123 })!),
+    ]).toEqual([8]);
   });
 
-  test("preserves wheel deltas as little-endian float64", () => {
-    const bytes = new DataView(
+  test("preserves exact wheel deltas as trailing-zero-truncated float64", () => {
+    const bytes = new Uint8Array(
       encodeBinaryInput({
         type: "pointer",
         action: "wheel",
@@ -47,8 +66,7 @@ describe("encodeBinaryInput", () => {
         deltaY: 120,
       })!,
     );
-    expect(bytes.getFloat64(7, true)).toBe(-12.5);
-    expect(bytes.getFloat64(15, true)).toBe(120);
+    expect([...bytes]).toEqual([4, 0, 0, 0, 0, 0x22, 0xc0, 0x29, 0x40, 0x5e]);
   });
 
   test("encodes compact gamepad reports including DualShock flags", () => {
@@ -67,7 +85,7 @@ describe("encodeBinaryInput", () => {
       })!,
     );
     expect([...bytes]).toEqual([
-      0x4e, 1, 2, 1, 2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+      2, 1, 2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
     ]);
   });
 });

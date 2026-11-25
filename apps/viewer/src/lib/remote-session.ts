@@ -125,7 +125,6 @@ const FIRST_FRAME_TIMEOUT_MS = 15_000;
 const DISCONNECTED_GRACE_MS = 1_500;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const STATS_INTERVAL_MS = 1_000;
-const KEEPALIVE_INTERVAL_MS = 1_000;
 const MAX_PENDING_CANDIDATES = 128;
 
 /**
@@ -202,7 +201,6 @@ export class RemoteSessionController {
   private restartTimer: number | null = null;
   private negotiationTimer: number | null = null;
   private firstFrameTimer: number | null = null;
-  private keepaliveTimer: number | null = null;
   private statsTimer: number | null = null;
   private recoveryPromise: Promise<void> | null = null;
   private recoveryRetryRequested = false;
@@ -331,9 +329,6 @@ export class RemoteSessionController {
     this.firstFrameReceived = false;
     this.attachPeer(peer, lifecycle);
     this.attachInput();
-    this.keepaliveTimer = window.setInterval(() => {
-      this.sendControl({ type: "ping", nonce: Date.now(), sentAt: Date.now() });
-    }, KEEPALIVE_INTERVAL_MS);
     this.statsTimer = window.setInterval(() => this.collectStats(lifecycle), STATS_INTERVAL_MS);
     this.publishSnapshot();
     return this.sendOffer(false, lifecycle).catch(() => {
@@ -1469,9 +1464,7 @@ export class RemoteSessionController {
     this.clearRecoveryTimer();
     this.clearNegotiationTimer();
     this.clearFirstFrameTimer();
-    if (this.keepaliveTimer !== null) window.clearInterval(this.keepaliveTimer);
     if (this.statsTimer !== null) window.clearInterval(this.statsTimer);
-    this.keepaliveTimer = null;
     this.statsTimer = null;
   }
 

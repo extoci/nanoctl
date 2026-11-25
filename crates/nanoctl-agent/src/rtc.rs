@@ -117,18 +117,10 @@ fn motion_channel() -> (
 
 #[cfg(any(feature = "media", test))]
 fn is_gamepad_report(bytes: &[u8]) -> bool {
-    // Binary v1 input: 'N', version, kind; kind 2 is a gamepad report. Keep
-    // this local because the input module exists only with the media feature.
-    if bytes.len() >= 3 && bytes[0] == 0x4e {
-        return bytes[2] == 2 || bytes[2] == 11;
-    }
-    #[derive(Deserialize)]
-    struct Kind<'a> {
-        #[serde(rename = "type", borrow)]
-        kind: Option<std::borrow::Cow<'a, str>>,
-    }
-    serde_json::from_slice::<Kind>(bytes)
-        .is_ok_and(|message| message.kind.as_deref() == Some("gamepad"))
+    // Input wire v3: byte zero is the kind; kind 2 is a gamepad report and
+    // kind 11 its heartbeat. Keep this local because the input module exists
+    // only with the media feature.
+    matches!(bytes.first().copied(), Some(2 | 11))
 }
 
 #[cfg(any(feature = "media", test))]
@@ -163,19 +155,7 @@ enum InputAdmission {
 
 #[cfg(any(feature = "media", test))]
 fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
-    #[derive(Deserialize)]
-    struct AudioControl<'a> {
-        #[serde(rename = "type", borrow)]
-        kind: std::borrow::Cow<'a, str>,
-        enabled: bool,
-    }
-    if bytes.len() == 4 && bytes[0] == 0x4e && bytes[1] == 2 && bytes[2] == 9 {
-        return Some(bytes[3] != 0);
-    }
-    serde_json::from_slice::<AudioControl>(bytes)
-        .ok()
-        .filter(|message| message.kind == "audio")
-        .map(|message| message.enabled)
+    (bytes.len() == 2 && bytes[0] == 9).then(|| bytes[1] != 0)
 }
 
 #[cfg(any(feature = "media", test))]
@@ -193,7 +173,7 @@ async fn admit_input_message(sender: &InputSender, bytes: Bytes) -> InputAdmissi
             };
             // A heartbeat carries no state, so it must never evict a pending
             // full snapshot from the lossy lane's single coalescing slot.
-            if bytes.len() >= 3 && bytes[0] == 0x4e && bytes[2] == 11 && slot.borrow().is_some() {
+            if bytes.len() == 1 && bytes[0] == 11 && slot.borrow().is_some() {
                 return InputAdmission::Accepted;
             }
             slot.send(Some(bytes)).is_ok()
@@ -1861,20 +1841,13 @@ mod tests {
 
     #[test]
     fn parses_audio_enabled_control() {
-        assert_eq!(
-            parse_audio_enabled(br#"{"type":"audio","enabled":false}"#),
-            Some(false)
-        );
+        assert_eq!(parse_audio_enabled(&[9, 0]), Some(false));
+        assert_eq!(parse_audio_enabled(&[9, 1]), Some(true));
         assert_eq!(
             parse_audio_enabled(br#"{"type":"audio","enabled":true}"#),
-            Some(true)
-        );
-        assert_eq!(
-            parse_audio_enabled(br#"{"type":"quality","enabled":false}"#),
             None
         );
-        assert_eq!(parse_audio_enabled(br#"{"type":"audio"}"#), None);
-        assert_eq!(parse_audio_enabled(b"not json"), None);
+        assert_eq!(parse_audio_enabled(&[9]), None);
     }
 
     #[test]
@@ -2185,23 +2158,46 @@ mod tests {
         let (sender, receiver) = motion_channel();
         let sender = InputSender::Motion(sender);
         let mut receiver = InputReceiver::Motion(receiver);
-        let pointer = |x: u32| format!(r#"{{"type":"pointer","action":"move","x":0.{x},"y":0.5}}"#);
-        let gamepad = |x: u32| format!(r#"{{"type":"gamepad","pads":[[0,0,0,0,{x},0,0,0]]}}"#);
+        let pointer = |x: u32| {
+            let x = x.min(65535) as u16;
+            vec![1, x as u8, (x >> 8) as u8, 0, 0]
+        };
+        let gamepad = |x: u32| {
+            let x = x.min(32767) as u16;
+            vec![
+                2,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                x as u8,
+                (x >> 8) as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        };
         // Each viewer frame sends its pointer move just before the frame's gamepad poll.
         for frame in 1_u32..=100 {
             for message in [pointer(frame), gamepad(frame)] {
                 assert_eq!(
-                    admit_input_message(&sender, Bytes::from(message.into_bytes())).await,
+                    admit_input_message(&sender, Bytes::from(message)).await,
                     InputAdmission::Accepted
                 );
             }
         }
         let mut delivered = vec![
-            String::from_utf8(receiver.recv().await.unwrap().to_vec()).unwrap(),
-            String::from_utf8(receiver.recv().await.unwrap().to_vec()).unwrap(),
+            receiver.recv().await.unwrap().to_vec(),
+            receiver.recv().await.unwrap().to_vec(),
         ];
         delivered.sort();
-        assert_eq!(delivered, [gamepad(100), pointer(100)]);
+        assert_eq!(delivered, [pointer(100), gamepad(100)]);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
                 .await

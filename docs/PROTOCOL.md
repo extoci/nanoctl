@@ -161,29 +161,25 @@ are silently ignored. A remote paste shortcut sends local clipboard text before 
 
 ### Compact input
 
-When `capabilities.binaryInput` is true, the viewer may send compact binary messages on the same input channels. Each message starts with byte `0x4e`, version byte `1`, and a kind byte. Kind `1` is pointer motion with normalized unsigned little-endian u16 `x` and `y` coordinates (7 bytes total). Kind `2` is a gamepad snapshot: a pad count byte followed by 14 bytes per pad — slot, little-endian u16 buttons, u8 triggers, four little-endian i16 axes, and a flags byte. Flag bit 0 marks a DualShock 4; bits 1/2/3 are its left-trigger, right-trigger and touchpad pressed states. Malformed binary messages are invalid input. Hosts without `binaryInput` must receive the JSON representation instead.
+Input uses compact binary wire v3 when `capabilities.binaryInput` is true. SCTP datagrams already preserve message boundaries, so byte zero is the kind; there is no magic or version framing. Integers are little-endian except wheel deltas, which use the exact significant big-endian bytes of each IEEE-754 f64 with trailing zero bytes omitted; a packed nibble byte stores the two 0–8 byte lengths. Malformed binary messages are invalid input.
 
-Binary version 2 keeps version-1 pointer motion and gamepad layouts unchanged and adds compact discrete input: kind `3` pointer button down/up (8 bytes), kind `4` wheel input with little-endian f64 deltas (23 bytes), kind `5` keyboard input with length-prefixed UTF-8 code/key strings, kind `6` text input, kind `7` release-all, kind `8` latency probes, kind `9` audio enablement, and kind `10` display selection. Versions are negotiated per message; agents accepting version 2 also accept version 1, so older iOS viewers using version-1 gamepad and pointer reports remain compatible. Kind `11` is a three-byte gamepad heartbeat: it proves the viewer is alive without replacing controller state. Unchanged pads mix heartbeats with periodic full snapshots so loss cannot wedge inputs; hosts neutralize active pads after 225 ms without reports.
+Kinds: `1` pointer motion with normalized unsigned u16 `x`/`y` (5 bytes); `2` gamepad snapshot — pad count, then 14 bytes per pad: slot, u16 buttons, u8 triggers, four i16 axes, and DualShock flags (bit 0 present, bits 1/2/3 left-trigger/right-trigger/touchpad); `3` pointer button down/up (6 bytes); `4` wheel input with exact compact f64 deltas (6–22 bytes); `5` keyboard input — flags byte (bit0 up, bit1 repeat, bit2 named-key form), followed by either a named-key id or the UTF-8 `key` bytes; `6` text input with a u16 byte length; `7` release-all (1 byte); `8` optional keepalive probe (1 byte — current clients do not send periodic application probes because SCTP and media traffic already keep the association alive); `9` audio enablement (2 bytes); `10` display selection with a u8 identifier length. Kind `11` is a one-byte gamepad heartbeat: it proves the viewer is alive without replacing controller state. Unchanged pads mix heartbeats with periodic full snapshots so loss cannot wedge inputs; hosts neutralize active pads after 225 ms without reports. JSON input forms are not part of wire v3.
 
 ### Gamepads
 
 When `capabilities.gamepad` is true, an opted-in viewer with control permission sends
-`{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the unordered pointer channel
-(`nanoctl.pointer.v1`) — snapshots carry full state, so the unordered lane drops stale
-reports instead of delaying fresh ones. Empty detach snapshots use the reliable control
-channel because they are one-shot control transitions rather than repeatable state. The
-host also accepts gamepad reports on the reliable control channel for compatibility with
-older viewers. The host keeps the latest pointer move and the latest gamepad snapshot in
-separate slots, so a per-frame snapshot never replaces the pointer move sent in the same frame.
-Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
+binary kind-2 snapshots on the unordered pointer channel (`nanoctl.pointer.v1`) — snapshots
+carry full state, so the unordered lane drops stale reports instead of delaying fresh ones.
+Empty detach snapshots use the reliable control channel because they are one-shot control
+transitions rather than repeatable state. The host keeps the latest pointer move and the
+latest gamepad snapshot in separate slots, so a per-frame snapshot never replaces the pointer
+move sent in the same frame. Each binary pad entry is
+`[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY, dualShockFlags]`:
 slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
-are signed 16-bit values with positive Y up. For PlayStation controllers, the viewer adds
-an optional `dualShock4` array to the snapshot with one
-`{"slot":0,"leftTriggerPressed":false,"rightTriggerPressed":false,"touchpadPressed":false}`
-entry per PlayStation pad. The host presents those slots as DualShock 4 controllers and
-all other slots as Xbox 360 controllers. The original `pads` entries are unchanged, so
-older hosts can ignore the extension. Each message is a full snapshot; the host unplugs
-slots not present. An empty snapshot detaches all pads. The viewer sends a
-change immediately, repeats it on every poll for 100 ms so a lost report is
-repaired on the next frame, then keeps an unchanged pad alive every 50 ms;
-after 150 ms without a snapshot the host neutralizes the current pads. Channel or session teardown unplugs them.
+are signed 16-bit values with positive Y up. The host presents slots with DualShock flags
+as DualShock 4 controllers and all other slots as Xbox 360 controllers. Each message is a
+full snapshot; the host unplugs slots not present. An empty snapshot detaches all pads. The
+viewer sends a change immediately, repeats it on every poll for 100 ms so a lost report is
+repaired on the next frame, then keeps an unchanged pad alive with heartbeats every 75 ms
+and full snapshots at least every 225 ms; after 225 ms without a report the host neutralizes
+the current pads. Channel or session teardown unplugs them.

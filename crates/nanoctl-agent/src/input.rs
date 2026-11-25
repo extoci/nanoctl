@@ -188,9 +188,6 @@ enum KeyAction {
     Up,
 }
 
-pub(crate) const BINARY_INPUT_MAGIC: u8 = 0x4e;
-const BINARY_INPUT_VERSION: u8 = 1;
-const BINARY_INPUT_VERSION_2: u8 = 2;
 const BINARY_POINTER_MOVE: u8 = 1;
 const BINARY_GAMEPAD: u8 = 2;
 const BINARY_POINTER_BUTTON: u8 = 3;
@@ -199,19 +196,64 @@ const BINARY_KEY: u8 = 5;
 const BINARY_TEXT: u8 = 6;
 const BINARY_RELEASE: u8 = 7;
 const BINARY_PING: u8 = 8;
+const BINARY_AUDIO: u8 = 9;
 const BINARY_DISPLAY: u8 = 10;
 const BINARY_GAMEPAD_HEARTBEAT: u8 = 11;
+const BINARY_KEY_NAMED: u8 = 4;
 
 pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&BINARY_INPUT_MAGIC)
+    bytes
+        .first()
+        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_GAMEPAD_HEARTBEAT).contains(kind))
 }
 
-/// Compact input wire format: `'N'`, version, kind. Version 1 keeps the
-/// original pointer-motion/gamepad layouts; version 2 adds discrete input
-/// kinds. All integer and floating-point fields are little-endian.
+fn binary_named_key(id: u8) -> Option<&'static str> {
+    match id {
+        1 => Some("Backspace"),
+        2 => Some("Delete"),
+        3 => Some("Enter"),
+        4 => Some("Escape"),
+        5 => Some("Tab"),
+        6 => Some("Space"),
+        7 => Some("ArrowUp"),
+        8 => Some("ArrowDown"),
+        9 => Some("ArrowLeft"),
+        10 => Some("ArrowRight"),
+        11 => Some("Home"),
+        12 => Some("End"),
+        13 => Some("PageUp"),
+        14 => Some("PageDown"),
+        15..=26 => Some(match id {
+            15 => "F1",
+            16 => "F2",
+            17 => "F3",
+            18 => "F4",
+            19 => "F5",
+            20 => "F6",
+            21 => "F7",
+            22 => "F8",
+            23 => "F9",
+            24 => "F10",
+            25 => "F11",
+            _ => "F12",
+        }),
+        27 => Some("CapsLock"),
+        28 => Some("PrintScreen"),
+        29 => Some("Insert"),
+        30 => Some("ShiftLeft"),
+        31 => Some("ControlLeft"),
+        32 => Some("AltLeft"),
+        33 => Some("MetaLeft"),
+        _ => None,
+    }
+}
+
+/// Version-3 compact input wire format. Datagram channels already preserve
+/// message boundaries, so byte zero is the kind and there is no magic/version
+/// framing. All integer and floating-point fields are little-endian.
 fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
-    if bytes.len() < 3 || ![BINARY_INPUT_VERSION, BINARY_INPUT_VERSION_2].contains(&bytes[1]) {
-        anyhow::bail!("unsupported binary input message");
+    if bytes.is_empty() {
+        anyhow::bail!("empty binary input message");
     }
     let u16_at = |offset: usize| -> Result<u16> {
         let bytes = bytes
@@ -219,19 +261,21 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
             .context("truncated binary input u16")?;
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     };
-    let f64_at = |offset: usize| -> Result<f64> {
+    let compact_f64_at = |offset: usize, len: usize| -> Result<f64> {
         let bytes = bytes
-            .get(offset..offset + 8)
-            .context("truncated binary input f64")?;
-        Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
+            .get(offset..offset + len)
+            .context("truncated compact binary input f64")?;
+        let mut wide = [0_u8; 8];
+        wide[..len].copy_from_slice(bytes);
+        Ok(f64::from_be_bytes(wide))
     };
     let position = |x: u16, y: u16| (f64::from(x) / 65535.0, f64::from(y) / 65535.0);
-    match (bytes[1], bytes[2]) {
-        (BINARY_INPUT_VERSION, BINARY_POINTER_MOVE) => {
-            if bytes.len() != 7 {
+    match bytes[0] {
+        BINARY_POINTER_MOVE => {
+            if bytes.len() != 5 {
                 anyhow::bail!("invalid binary pointer move length");
             }
-            let (x, y) = position(u16_at(3)?, u16_at(5)?);
+            let (x, y) = position(u16_at(1)?, u16_at(3)?);
             Ok(ControlMessage::Pointer {
                 action: PointerAction::Move,
                 x,
@@ -241,21 +285,19 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                 delta_y: None,
             })
         }
-        (BINARY_INPUT_VERSION, BINARY_GAMEPAD) => {
-            crate::gamepad::Snapshot::parse_binary(&bytes[3..])
-                .map(ControlMessage::Gamepad)
-                .map_err(anyhow::Error::msg)
-        }
-        (BINARY_INPUT_VERSION_2, BINARY_POINTER_BUTTON) => {
-            if bytes.len() != 8 {
+        BINARY_GAMEPAD => crate::gamepad::Snapshot::parse_binary(&bytes[1..])
+            .map(ControlMessage::Gamepad)
+            .map_err(anyhow::Error::msg),
+        BINARY_POINTER_BUTTON => {
+            if bytes.len() != 6 {
                 anyhow::bail!("invalid binary pointer button length");
             }
-            let control = bytes[3];
+            let control = bytes[1];
             let button = control & 0x03;
             if button > 2 || control & 0x7c != 0 {
                 anyhow::bail!("invalid binary pointer button flags");
             }
-            let (x, y) = position(u16_at(4)?, u16_at(6)?);
+            let (x, y) = position(u16_at(2)?, u16_at(4)?);
             Ok(ControlMessage::Pointer {
                 action: if control & 0x80 != 0 {
                     PointerAction::Up
@@ -269,39 +311,48 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                 delta_y: None,
             })
         }
-        (BINARY_INPUT_VERSION_2, BINARY_POINTER_WHEEL) => {
-            if bytes.len() != 23 {
+        BINARY_POINTER_WHEEL => {
+            if bytes.len() < 6 {
+                anyhow::bail!("truncated binary wheel input");
+            }
+            let x_len = usize::from(bytes[5] & 0x0f);
+            let y_len = usize::from(bytes[5] >> 4);
+            if x_len > 8 || y_len > 8 || bytes.len() != 6 + x_len + y_len {
                 anyhow::bail!("invalid binary wheel length");
             }
-            let (x, y) = position(u16_at(3)?, u16_at(5)?);
+            let (x, y) = position(u16_at(1)?, u16_at(3)?);
             Ok(ControlMessage::Pointer {
                 action: PointerAction::Wheel,
                 x,
                 y,
                 button: None,
-                delta_x: Some(f64_at(7)?),
-                delta_y: Some(f64_at(15)?),
+                delta_x: Some(compact_f64_at(6, x_len)?),
+                delta_y: Some(compact_f64_at(6 + x_len, y_len)?),
             })
         }
-        (BINARY_INPUT_VERSION_2, BINARY_KEY) => {
-            if bytes.len() < 6 {
+        BINARY_KEY => {
+            if bytes.len() < 2 {
                 anyhow::bail!("truncated binary key input");
             }
-            let flags = bytes[3];
-            if flags & !3 != 0 {
+            let flags = bytes[1];
+            if flags & !7 != 0 {
                 anyhow::bail!("invalid binary key flags");
             }
-            let code_len = usize::from(bytes[4]);
-            let key_len = usize::from(bytes[5]);
-            if bytes.len() != 6 + code_len + key_len || code_len > 64 || key_len > 128 {
-                anyhow::bail!("invalid binary key length");
-            }
-            let code = std::str::from_utf8(&bytes[6..6 + code_len])
-                .context("binary key code is not UTF-8")?
-                .to_owned();
-            let key = std::str::from_utf8(&bytes[6 + code_len..])
-                .context("binary key value is not UTF-8")?
-                .to_owned();
+            let (code, key) = if flags & BINARY_KEY_NAMED != 0 {
+                if bytes.len() != 3 {
+                    anyhow::bail!("invalid binary named key length");
+                }
+                let code = binary_named_key(bytes[2]).context("unknown binary named key")?;
+                (code.to_owned(), code.to_owned())
+            } else {
+                if bytes.len() <= 2 || bytes.len() > 34 {
+                    anyhow::bail!("invalid binary key length");
+                }
+                let key = std::str::from_utf8(&bytes[2..])
+                    .context("binary key value is not UTF-8")?
+                    .to_owned();
+                (String::new(), key)
+            };
             Ok(ControlMessage::Key {
                 action: if flags & 1 != 0 {
                     KeyAction::Up
@@ -313,48 +364,54 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                 repeat: flags & 2 != 0,
             })
         }
-        (BINARY_INPUT_VERSION_2, BINARY_TEXT) => {
-            if bytes.len() < 5 {
+        BINARY_TEXT => {
+            if bytes.len() < 3 {
                 anyhow::bail!("truncated binary text input");
             }
-            let len = usize::from(u16_at(3)?);
-            if bytes.len() != 5 + len {
+            let len = usize::from(u16_at(1)?);
+            if bytes.len() != 3 + len {
                 anyhow::bail!("invalid binary text length");
             }
             Ok(ControlMessage::Text {
-                text: std::str::from_utf8(&bytes[5..])
+                text: std::str::from_utf8(&bytes[3..])
                     .context("binary text is not UTF-8")?
                     .to_owned(),
             })
         }
-        (BINARY_INPUT_VERSION_2, BINARY_RELEASE) => {
-            if bytes.len() != 3 {
+        BINARY_RELEASE => {
+            if bytes.len() != 1 {
                 anyhow::bail!("invalid binary release length");
             }
             Ok(ControlMessage::Release)
         }
-        (BINARY_INPUT_VERSION_2, BINARY_GAMEPAD_HEARTBEAT) => {
-            if bytes.len() != 3 {
+        BINARY_GAMEPAD_HEARTBEAT => {
+            if bytes.len() != 1 {
                 anyhow::bail!("invalid binary gamepad heartbeat length");
             }
             Ok(ControlMessage::GamepadHeartbeat)
         }
-        (BINARY_INPUT_VERSION_2, BINARY_PING) => {
-            if bytes.len() != 19 {
+        BINARY_PING => {
+            if bytes.len() != 1 {
                 anyhow::bail!("invalid binary ping length");
             }
             Ok(ControlMessage::Ping)
         }
-        (BINARY_INPUT_VERSION_2, BINARY_DISPLAY) => {
-            if bytes.len() < 4 {
+        BINARY_AUDIO => {
+            if bytes.len() != 2 {
+                anyhow::bail!("invalid binary audio length");
+            }
+            Ok(ControlMessage::Unsupported)
+        }
+        BINARY_DISPLAY => {
+            if bytes.len() < 2 {
                 anyhow::bail!("truncated binary display input");
             }
-            let len = usize::from(bytes[3]);
-            if bytes.len() != 4 + len {
+            let len = usize::from(bytes[1]);
+            if bytes.len() != 2 + len {
                 anyhow::bail!("invalid binary display length");
             }
             Ok(ControlMessage::Display {
-                display_id: std::str::from_utf8(&bytes[4..])
+                display_id: std::str::from_utf8(&bytes[2..])
                     .context("binary display identifier is not UTF-8")?
                     .to_owned(),
             })
@@ -396,7 +453,7 @@ impl InputController {
         let message: ControlMessage = if is_binary_input_message(bytes) {
             parse_binary_control(bytes)?
         } else {
-            serde_json::from_slice(bytes).context("control message is invalid")?
+            anyhow::bail!("control message is not input wire v3");
         };
         match (&message, lane) {
             (
@@ -750,8 +807,7 @@ mod tests {
 
     #[test]
     fn decodes_binary_pointer_motion() {
-        let message =
-            parse_binary_control(&[BINARY_INPUT_MAGIC, 1, 1, 0x00, 0x80, 0xff, 0xff]).unwrap();
+        let message = parse_binary_control(&[1, 0x00, 0x80, 0xff, 0xff]).unwrap();
         assert!(matches!(
             message,
             ControlMessage::Pointer {
@@ -761,19 +817,61 @@ mod tests {
                 ..
             } if (x - 32768.0 / 65535.0).abs() < f64::EPSILON && y == 1.0
         ));
-        assert!(parse_binary_control(&[BINARY_INPUT_MAGIC, 1, 1, 0]).is_err());
-        assert!(parse_binary_control(&[BINARY_INPUT_MAGIC, 2, 1, 0x00, 0x80, 0xff, 0xff]).is_err());
+        assert!(parse_binary_control(&[1, 0x00, 0x80, 0xff]).is_err());
     }
 
     #[test]
     fn decodes_binary_gamepad_heartbeat_without_state() {
         assert!(matches!(
-            parse_binary_control(&[BINARY_INPUT_MAGIC, 2, BINARY_GAMEPAD_HEARTBEAT]).unwrap(),
+            parse_binary_control(&[BINARY_GAMEPAD_HEARTBEAT]).unwrap(),
             ControlMessage::GamepadHeartbeat
         ));
-        assert!(
-            parse_binary_control(&[BINARY_INPUT_MAGIC, 2, BINARY_GAMEPAD_HEARTBEAT, 0]).is_err()
-        );
+        assert!(parse_binary_control(&[BINARY_GAMEPAD_HEARTBEAT, 0]).is_err());
+    }
+
+    #[test]
+    fn decodes_utf8_and_named_binary_keys() {
+        let utf8 = parse_binary_control(&[BINARY_KEY, 0, b'a']).unwrap();
+        assert!(matches!(
+            utf8,
+            ControlMessage::Key { code, key, .. } if code.is_empty() && key == "a"
+        ));
+        let named = parse_binary_control(&[BINARY_KEY, 1 | BINARY_KEY_NAMED, 30]).unwrap();
+        assert!(matches!(
+            named,
+            ControlMessage::Key {
+                action: KeyAction::Up,
+                code,
+                ..
+            } if code == "ShiftLeft"
+        ));
+        assert!(parse_binary_control(&[BINARY_KEY, BINARY_KEY_NAMED, 99]).is_err());
+    }
+
+    #[test]
+    fn decodes_compact_binary_wheel_deltas_exactly() {
+        let bytes = [
+            BINARY_POINTER_WHEEL,
+            0,
+            0,
+            0,
+            0,
+            0x22,
+            0xc0,
+            0x29,
+            0x40,
+            0x5e,
+        ];
+        let message = parse_binary_control(&bytes).unwrap();
+        assert!(matches!(
+            message,
+            ControlMessage::Pointer {
+                action: PointerAction::Wheel,
+                delta_x: Some(x),
+                delta_y: Some(y),
+                ..
+            } if x == -12.5 && y == 120.0
+        ));
     }
 
     #[test]

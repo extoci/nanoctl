@@ -127,7 +127,7 @@ final class Session {
     var audioEnabled = true {
         didSet {
             audioTrack?.isEnabled = audioEnabled
-            _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
+            _ = sendControlBytesFree([9, audioEnabled ? 1 : 0])
         }
     }
     private var viewportWidth: Int?
@@ -268,63 +268,79 @@ final class Session {
 
     @discardableResult
     func sendGamepad(_ report: GamepadMessage) -> Bool {
-        // Gamepad reports are full-state snapshots: ride the unordered
-        // zero-retransmit pointer channel so a lost report never delays the
-        // next one. The agent accepts gamepad on this lane.
-        guard gamepadAllowed else { return false }
-        if connection?.host?.capabilities.binaryInput == true, let data = report.binary {
-            return send(data, pointer: true, limitBacklog: true, binary: true)
+        // Gamepad reports ride the unordered zero-retransmit pointer channel so
+        // a lost report never delays the next one. The agent accepts gamepad on this lane.
+        guard gamepadAllowed, let data = report.binary else { return false }
+        return send(data, pointer: true, limitBacklog: true, binary: true)
+    }
+
+    private func appendPosition(_ data: inout Data, x: Double, y: Double) {
+        let xu = UInt16((min(1, max(0, x)) * 65535).rounded())
+        let yu = UInt16((min(1, max(0, y)) * 65535).rounded())
+        data.append(contentsOf: [UInt8(xu & 0xff), UInt8(xu >> 8), UInt8(yu & 0xff), UInt8(yu >> 8)])
+    }
+
+    /// Significant big-endian IEEE-754 bytes; trailing zero bytes are omitted
+    /// and restored by the host, preserving the exact double bit pattern.
+    private func compactF64Bytes(_ value: Double) -> [UInt8] {
+        var bytes = stride(from: 56, through: 0, by: -8).map {
+            UInt8((value.bitPattern >> UInt64($0)) & 0xff)
         }
-        guard let data = try? JSONEncoder().encode(report) else { return false }
-        return send(data, pointer: true, limitBacklog: true)
+        while bytes.last == 0 { bytes.removeLast() }
+        return bytes
     }
 
     @discardableResult
     func sendKey(_ down: Bool) -> Bool {
-        sendControl(["type": "key", "action": down ? "down" : "up", "code": "Space",
-                     "key": " ", "modifiers": 0, "repeat": false])
+        // Space as one UTF-8 key byte: kind 5, flags bit 0 = up.
+        send(Data([5, down ? 0 : 1, 0x20]), binary: true)
     }
 
     @discardableResult
     func sendText(_ text: String) -> Bool {
-        sendControl(["type": "text", "text": text])
+        let bytes = Array(text.utf8)
+        guard bytes.count <= 65535 else { return false }
+        var data = Data([6, UInt8(bytes.count & 0xff), UInt8(bytes.count >> 8)])
+        data.append(contentsOf: bytes)
+        return send(data, binary: true)
     }
 
     @discardableResult
     func sendRelease() -> Bool {
-        sendControl(["type": "release"])
+        send(Data([7]), binary: true)
     }
 
     func sendPointer(x: Double, y: Double, action: String, button: Int = 0,
                      deltaX: Double = 0, deltaY: Double = 0) {
-        if action == "move", connection?.host?.capabilities.binaryInput == true {
-            var data = Data(count: 7)
-            data[0] = 0x4e
-            data[1] = 1
-            data[2] = 1
-            let xu = UInt16((min(1, max(0, x)) * 65535).rounded())
-            let yu = UInt16((min(1, max(0, y)) * 65535).rounded())
-            data[3] = UInt8(xu & 0xff)
-            data[4] = UInt8(xu >> 8)
-            data[5] = UInt8(yu & 0xff)
-            data[6] = UInt8(yu >> 8)
-            _ = send(data, pointer: true, limitBacklog: true, binary: true)
-            return
+        var data = Data()
+        if action == "move" {
+            data.append(contentsOf: [1])
+            appendPosition(&data, x: x, y: y)
+        } else if action == "wheel" {
+            let xBytes = compactF64Bytes(deltaX)
+            let yBytes = compactF64Bytes(deltaY)
+            data.append(contentsOf: [4])
+            appendPosition(&data, x: x, y: y)
+            data.append(contentsOf: [UInt8(xBytes.count | (yBytes.count << 4))])
+            data.append(contentsOf: xBytes)
+            data.append(contentsOf: yBytes)
+        } else {
+            guard action == "down" || action == "up", (0...2).contains(button) else { return }
+            data.append(contentsOf: [3])
+            let flags = UInt8(action == "up" ? 0x80 : 0) | UInt8(button)
+            data.append(contentsOf: [flags])
+            appendPosition(&data, x: x, y: y)
         }
-        var value: [String: Any] = ["type": "pointer", "action": action, "x": x, "y": y]
-        if action == "wheel" {
-            value["deltaX"] = deltaX
-            value["deltaY"] = deltaY
-        } else if action != "move" {
-            value["button"] = button
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: value) else { return }
-        _ = send(data, pointer: action == "move", limitBacklog: action == "move")
+        _ = send(data, pointer: action == "move", limitBacklog: action == "move", binary: true)
     }
 
     @discardableResult
     func selectDisplay(_ displayId: String) -> Bool {
-        sendControl(["type": "display", "displayId": displayId])
+        let bytes = Array(displayId.utf8)
+        guard bytes.count <= 255 else { return false }
+        var data = Data([10, UInt8(bytes.count)])
+        data.append(contentsOf: bytes)
+        return send(data, binary: true)
     }
 
     /// Reports the physical pixels visible to the rendered video. Nil restores
@@ -389,6 +405,12 @@ final class Session {
         guard let data = try? JSONSerialization.data(withJSONObject: value),
               let channel = connection?.control, channel.readyState == .open else { return false }
         return channel.sendData(RTCDataBuffer(data: data, isBinary: false))
+    }
+
+    /// Binary control-channel send that does not require input admission.
+    private func sendControlBytesFree(_ bytes: [UInt8]) -> Bool {
+        guard let channel = connection?.control, channel.readyState == .open else { return false }
+        return channel.sendData(RTCDataBuffer(data: Data(bytes), isBinary: true))
     }
 
     private func requireCurrent(_ current: Connection) throws {
@@ -685,7 +707,7 @@ final class Session {
 
     private func onControlOpen(_ current: Connection) {
         guard current.control?.readyState == .open else { return }
-        _ = sendControlFree(["type": "audio", "enabled": audioEnabled])
+        _ = sendControlBytesFree([9, audioEnabled ? 1 : 0])
         if !current.sentDisplayQualityCap {
             current.sentDisplayQualityCap = true
             _ = setQuality(maxFps: UIScreen.main.maximumFramesPerSecond, maxBitrateKbps: nil)
@@ -694,16 +716,9 @@ final class Session {
         if maxFps != nil || maxBitrateKbps != nil { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) }
         statsTask = nil
         statsTask = Task { [weak self, weak current] in
-            var ticks = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self, let current, self.connection === current else { return }
-                ticks += 1
-                if ticks % 3 == 0 {
-                    _ = self.sendControlFree(["type": "ping",
-                                            "nonce": Int(Date().timeIntervalSince1970 * 1000),
-                                            "sentAt": Int(Date().timeIntervalSince1970 * 1000)])
-                }
                 await self.collectStats(current)
             }
         }
