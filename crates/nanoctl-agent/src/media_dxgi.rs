@@ -92,11 +92,11 @@ impl Duplication {
                     .EnumOutputs(index)
                     .context("DXGI output not found for monitor")?;
                 index += 1;
-                let output1 = output.cast::<IDXGIOutput1>()?;
-                let duplication = output1
-                    .DuplicateOutput(&device)
-                    .context("DuplicateOutput failed")?;
                 if output.GetDesc()?.Monitor == h_monitor {
+                    let output1 = output.cast::<IDXGIOutput1>()?;
+                    let duplication = output1
+                        .DuplicateOutput(&device)
+                        .context("DuplicateOutput failed")?;
                     let desc = output.GetDesc()?;
                     let width =
                         (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
@@ -442,9 +442,13 @@ pub(super) fn start(
     Ok((latest, thread))
 }
 
-fn recreate(h_monitor: HMONITOR, dup: &mut Duplication) {
+fn recreate(h_monitor: HMONITOR, dup: &mut Option<Duplication>) {
+    // Windows allows only one duplication of an output. Release the stale COM
+    // objects before opening their replacement; creating the replacement first
+    // makes every recovery fail with DuplicateOutput/access-denied.
+    drop(dup.take());
     match Duplication::new(h_monitor) {
-        Ok(next) => *dup = next,
+        Ok(next) => *dup = Some(next),
         Err(recreate_error) => {
             tracing::warn!(%recreate_error, "DXGI duplication recreate failed");
             std::thread::sleep(Duration::from_secs(1));
@@ -452,10 +456,11 @@ fn recreate(h_monitor: HMONITOR, dup: &mut Duplication) {
     }
 }
 
-fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
+fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
     #[cfg(windows)]
     let _mmcss = crate::media::register_mmcss();
     let h_monitor = HMONITOR(h_monitor_raw as *mut _);
+    let mut dup = Some(dup);
     let mut last_frame = Instant::now();
     loop {
         let Some(latest) = slot.upgrade() else {
@@ -464,11 +469,18 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
         if latest.stopped.load(Ordering::Acquire) {
             return;
         }
-        match dup.acquire(100, &latest) {
+        if dup.is_none() {
+            recreate(h_monitor, &mut dup);
+            if dup.is_none() {
+                continue;
+            }
+        }
+        let active = dup.as_mut().expect("duplication checked above");
+        match active.acquire(100, &latest) {
             Ok(Some(frame)) => {
                 last_frame = Instant::now();
                 // Backend-verified change: producer skips the memcmp.
-                let eg = dup.emit_gen;
+                let eg = active.emit_gen;
                 if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), eg) {
                     return;
                 }
