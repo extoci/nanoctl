@@ -31,6 +31,33 @@ pub fn pixels_to_nv12(
     }
     // Every byte is overwritten, so a reused buffer of the right size needs no clearing.
     output.resize(pixels + pixels / 2, 0);
+    pixels_to_nv12_slice(rgba, width as u32, height as u32, format, output)
+}
+
+pub fn pixels_to_nv12_slice(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    output: &mut [u8],
+) -> Result<()> {
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        bail!("NV12 dimensions must be non-zero and even");
+    }
+    let pixels = width
+        .checked_mul(height)
+        .context("frame dimensions overflow")?;
+    if rgba.len() != pixels.checked_mul(4).context("RGBA frame size overflow")? {
+        bail!("RGBA frame length does not match its dimensions");
+    }
+    let nv12_len = pixels
+        .checked_add(pixels / 2)
+        .context("NV12 size overflows")?;
+    if output.len() != nv12_len {
+        bail!("NV12 output length does not match its dimensions");
+    }
     let (luma, chroma) = output.split_at_mut(pixels);
     let mut planar = yuv::YuvBiPlanarImageMut {
         y_plane: yuv::BufferStoreMut::Borrowed(luma),
