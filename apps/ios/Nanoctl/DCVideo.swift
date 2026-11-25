@@ -8,7 +8,7 @@ import Foundation
 /// Wire format: `[u32 seq][u8 flags (bit0 keyframe, bit1 fragmented,
 /// bit2 timestamped)]`, then optional u16 part/parts and u64 sent_ms before the
 /// payload chunk, all little-endian. Deltas ride the unordered
-/// unreliable channel; keyframes ride the reliable IDR channel. A sequence gap
+/// bounded-retransmit channel; keyframes ride the reliable IDR channel. A sequence gap
 /// breaks the reference chain: deltas after the gap are dropped and the viewer
 /// sends the text `KF` on the video channel until a keyframe arrives.
 final class DCVideoReceiver {

@@ -596,7 +596,10 @@ final class Session {
         if codecPreference.dataChannelCapable {
             let videoConfig = RTCDataChannelConfiguration()
             videoConfig.isOrdered = false
-            videoConfig.maxRetransmits = 0
+            // Time-bounded retransmission repairs isolated SCTP loss for a
+            // fraction of an IDR's cost; unordered delivery prevents head-of-line
+            // blocking, and expired copies would be too late for the reorder window.
+            videoConfig.maxPacketLifeTime = 80
             current.video = peer.dataChannel(forLabel: "nanoctl.video.v1", configuration: videoConfig)
             current.videoIdr = peer.dataChannel(forLabel: "nanoctl.video-idr.v1",
                                                 configuration: RTCDataChannelConfiguration())

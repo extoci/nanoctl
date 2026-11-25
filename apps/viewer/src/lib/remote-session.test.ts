@@ -945,6 +945,7 @@ class FakePeer {
   stats = new Map<string, Record<string, unknown>>();
   transceivers: [string, RTCRtpTransceiverDirection | undefined][] = [];
   channels = new Map<string, FakeDataChannel>();
+  channelConfigs = new Map<string, RTCDataChannelInit | undefined>();
   sent: [string, string][] = [];
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -954,9 +955,10 @@ class FakePeer {
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onRemoteDescription: ((sdp: string) => void) | null = null;
 
-  createDataChannel(label: string): FakeDataChannel {
+  createDataChannel(label: string, init?: RTCDataChannelInit): FakeDataChannel {
     const channel = new FakeDataChannel((message) => this.sent.push([label, message]));
     this.channels.set(label, channel);
+    this.channelConfigs.set(label, init);
     return channel;
   }
 
@@ -1031,6 +1033,10 @@ describe("webcodecs video gating and teardown", () => {
       expect(createEncodedStreamsCalls).toBe(
         codecChoice === "av1" || codecChoice === "hevc" ? 0 : 1,
       );
+      expect(peer.channelConfigs.get("nanoctl.video.v1")).toMatchObject({
+        ordered: false,
+        maxPacketLifeTime: 80,
+      });
       await controller.stop("done", false);
     }
   });

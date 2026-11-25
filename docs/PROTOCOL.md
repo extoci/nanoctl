@@ -105,13 +105,13 @@ host input or clipboard access. System audio is available to view-only sessions 
 A `quality` control message may include optional positive `maxWidth`/`maxHeight`
 physical-pixel caps in addition to rate caps. They describe the viewer's rendered video
 viewport. Hosts clamp them to configured encode dimensions, fit the source aspect ratio
-inside them, scale the bitrate ceiling by the square root of the viewport/source pixel
+inside them, scale the bitrate ceiling by the measured 0.8 power of the viewport/source pixel
 ratio, and force a keyframe when they change. Omitted dimensions preserve the configured
 encode size, so older iOS and web viewers remain compatible.
 
 ### Video over data channel
 
-A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and
+A viewer may also create `nanoctl.video.v1` (unordered, `maxPacketLifeTime: 80`) and
 `nanoctl.video-idr.v1` (reliable, ordered) to receive compressed access units directly,
 bypassing the RTP jitter buffer. H.264 and HEVC payloads use Annex-B; AV1 payloads use
 low-overhead OBU temporal units (the formats WebCodecs consumes). Each message is
@@ -120,7 +120,7 @@ with all integers little-endian. Flags bit0 marks a keyframe, bit1 marks fragmen
 part fields are present), and bit2 marks a sender timestamp. Unfragmented delta frames
 normally cost only five header bytes; keyframes and every sixteenth delta carry `sent_ms`
 for transit telemetry. `parts` splits large access units into ~48 KiB chunks.
-Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks
+Deltas ride the unordered bounded-retransmit channel and keyframes the reliable one. A sequence gap breaks
 the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
 video channel until a keyframe arrives. While `nanoctl.video.v1` is open the agent
 suppresses delta-frame writes on the RTP track automatically — a viewer decoding the

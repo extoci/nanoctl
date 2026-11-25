@@ -637,7 +637,7 @@ export function attachWebCodecsVideo(
 }
 
 /**
- * Direct video delivery over the nanoctl.video.v1 unreliable data channel:
+ * Direct video delivery over the nanoctl.video.v1 unordered bounded-retransmit data channel:
  * each message is one compressed access unit — no jitter buffer at all.
  */
 export function attachDataChannelVideo(
@@ -651,7 +651,7 @@ export function attachDataChannelVideo(
   const joinAt = performance.now();
   const sink = createVideoSink(video, onTeardown, joinAt, videoCodec);
   // Wire format: [u32 seq][u8 flags][access-unit bytes]. Deltas ride the unordered,
-  // unreliable channel; keyframes (large, loss-fatal) ride the reliable
+  // bounded-retransmit channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
   // chain — drop deltas until the next keyframe and ask the host for one.
   let expectedSeq: number | null = null;
@@ -670,7 +670,7 @@ export function attachDataChannelVideo(
     kfRequestedAt = Date.now();
     dbg.kf = (dbg.kf as number) + 1;
     try {
-      // The unreliable delta channel can drop this one-byte recovery request
+      // The bounded-retransmit delta channel can still drop this one-byte recovery request
       // exactly when loss recovery is needed. The IDR channel is reliable and
       // the host accepts the request on either channel.
       (idrChannel ?? channel).send("KF");

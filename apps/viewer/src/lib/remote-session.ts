@@ -691,7 +691,11 @@ export class RemoteSessionController {
     if (typeof VideoDecoder === "function" && directVideoEligible) {
       const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
         ordered: false,
-        maxRetransmits: 0,
+        // Time-bounded retransmission repairs isolated SCTP loss for a fraction
+        // of an IDR's cost. Unordered delivery means it cannot head-of-line
+        // block newer frames; after this lifetime copies would be too late for
+        // the small reorder window anyway, so SCTP stops paying for them.
+        maxPacketLifeTime: 80,
       });
       const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
       // Compressed access units must arrive as ArrayBuffer. The spec default is
