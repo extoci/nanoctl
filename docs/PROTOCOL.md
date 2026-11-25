@@ -56,9 +56,12 @@ Types and validators live in `packages/protocol`.
 
 Upgrade `GET /v1/connect` using `wss:` for HTTPS, otherwise `ws:`, with matching Host
 and Origin. Each message/frame is capped at 64 KiB. One socket is one session.
-The viewer includes a stable browser-instance `client` query parameter. It is only a
-replacement hint that lets a reconnect retire its own earlier socket; it is not an
-authentication or authorization credential.
+Up to four distinct client endpoints may share the host concurrently. The viewer
+includes a stable browser-instance `client` query parameter. Together with the
+authenticated Tailscale identity, machine name and peer address, it identifies an
+endpoint whose reconnect retires only its own earlier socket. It is not an
+authentication or authorization credential. Additional endpoints beyond the cap
+receive `{"type":"end","reason":"session-limit"}`.
 
 Server hello has shape `{type:"hello", sessionId:string, host:HostInfo}`, where
 `host` is the complete info **object**, not a serialized string.

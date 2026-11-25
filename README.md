@@ -58,7 +58,8 @@ See [security and sample grants](docs/SECURITY.md).
 
 The viewer auto-connects, displays the host and your tailnet identity, and includes a
 display picker, input toggle, fullscreen, secure-context keyboard lock and stream stats.
-Only one viewer is active at a time; a newer viewer replaces the older one.
+Up to four distinct browser endpoints can view and control the host concurrently.
+Reconnecting the same browser endpoint replaces only that endpoint's earlier session.
 Press **Ctrl+Alt+Shift+Esc** to release remote input.
 
 ### Game controllers

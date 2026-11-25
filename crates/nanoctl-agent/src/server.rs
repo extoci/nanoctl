@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use axum::{
     Extension, Router,
     extract::{
-        ConnectInfo, State, WebSocketUpgrade,
+        ConnectInfo, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, header},
@@ -20,7 +20,7 @@ use axum::{
 };
 use futures_util::SinkExt;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
 use crate::{
     config::AgentConfig,
@@ -29,13 +29,51 @@ use crate::{
 
 include!(concat!(env!("OUT_DIR"), "/viewer.rs"));
 
-type ActiveSession = (watch::Sender<String>, tokio::task::JoinHandle<()>);
+const MAX_CONCURRENT_SESSIONS: usize = 4;
 
-async fn stop_session((stop, task): ActiveSession, reason: &'static str) {
-    stop.send_replace(reason.into());
-    if let Err(error) = task.await {
+struct ActiveSession {
+    id: String,
+    stop: watch::Sender<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn stop_session(active: ActiveSession, reason: &'static str) {
+    active.stop.send_replace(reason.into());
+    if let Err(error) = active.task.await {
         tracing::warn!(%error, reason, "viewer session task failed");
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionKey {
+    login: String,
+    machine_name: String,
+    address: IpAddr,
+    client_id: String,
+}
+
+fn client_id_hint(params: &HashMap<String, String>) -> String {
+    params
+        .get("client")
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn session_client_json(
+    session_id: &str,
+    client_id: &str,
+    identity: &Identity,
+    control: bool,
+) -> Value {
+    json!({
+        "sessionId": session_id,
+        "clientId": client_id,
+        "login": &identity.login,
+        "displayName": &identity.display_name,
+        "machineName": &identity.machine_name,
+        "mayControl": control,
+    })
 }
 
 pub struct ServerState {
@@ -43,7 +81,8 @@ pub struct ServerState {
     pub config: AgentConfig,
     tailnet: Arc<dyn Tailnet>,
     node: RwLock<Node>,
-    active: Mutex<Option<ActiveSession>>,
+    sessions: Mutex<HashMap<SessionKey, ActiveSession>>,
+    presence: broadcast::Sender<Value>,
     stopping: std::sync::atomic::AtomicBool,
 }
 
@@ -61,12 +100,14 @@ impl ServerState {
             let preference = config.quality.encoder;
             std::thread::spawn(move || crate::media::ensure_codecs_probed(preference));
         }
+        let (presence, _) = broadcast::channel(32);
         Arc::new(Self {
             hosts: Mutex::new(None),
             config,
             tailnet,
             node: RwLock::new(Node::default()),
-            active: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            presence,
             stopping: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -74,8 +115,15 @@ impl ServerState {
     pub async fn stop(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(active) = self.active.lock().await.take() {
-            stop_session(active, "shutdown").await;
+        let sessions = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .drain()
+                .map(|(_, session)| session)
+                .collect::<Vec<_>>()
+        };
+        for session in sessions {
+            stop_session(session, "shutdown").await;
         }
     }
 
@@ -402,30 +450,83 @@ async fn connect(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(tls): Extension<bool>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let (identity, control) = match state.authenticate(peer, &headers, true, tls).await {
         Ok(result) => result,
         Err(error) => return forbidden(error),
     };
+    let client_id = client_id_hint(&params);
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| async move {
-            let mut active = state.active.lock().await;
+            let key = SessionKey {
+                login: identity.login.clone(),
+                machine_name: identity.machine_name.clone(),
+                address: peer.ip(),
+                client_id: client_id.clone(),
+            };
+            let mut sessions = state.sessions.lock().await;
             if state.stopping.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            if let Some(previous) = active.take() {
-                stop_session(previous, "replaced").await;
+            if sessions.len() >= MAX_CONCURRENT_SESSIONS && !sessions.contains_key(&key) {
+                drop(sessions);
+                let mut socket = socket;
+                let _ = send(&mut socket, json!({"type":"end","reason":"session-limit"})).await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
+                return;
             }
+            if let Some(previous) = sessions.remove(&key) {
+                tokio::spawn(stop_session(previous, "replaced"));
+            }
+            let id = uuid::Uuid::new_v4().to_string();
             let (stop, receiver) = watch::channel(String::new());
             let session_state = state.clone();
-            *active = Some((
-                stop,
-                tokio::spawn(async move {
-                    session(socket, session_state, identity, control, receiver).await;
-                }),
-            ));
+            let cleanup_state = state.clone();
+            let cleanup_key = key.clone();
+            let cleanup_id = id.clone();
+            let session_identity = identity.clone();
+            let cleanup_identity = identity.clone();
+            let cleanup_client_id = client_id.clone();
+            let session_client_id = client_id.clone();
+            let task = tokio::spawn(async move {
+                let reason = session(
+                    socket,
+                    session_state,
+                    session_identity,
+                    control,
+                    receiver,
+                    cleanup_id.clone(),
+                    session_client_id,
+                )
+                .await;
+                let removed = {
+                    let mut sessions = cleanup_state.sessions.lock().await;
+                    if sessions
+                        .get(&cleanup_key)
+                        .is_some_and(|active| active.id == cleanup_id)
+                    {
+                        sessions.remove(&cleanup_key);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if removed && reason != "replaced" {
+                    let _ = cleanup_state.presence.send(json!({
+                        "type":"client-disconnected",
+                        "client":session_client_json(
+                            &cleanup_id,
+                            &cleanup_client_id,
+                            &cleanup_identity,
+                            control,
+                        ),
+                    }));
+                }
+            });
+            sessions.insert(key, ActiveSession { id, stop, task });
         })
         .into_response()
 }
@@ -445,8 +546,9 @@ async fn session(
     identity: Identity,
     control: bool,
     mut stop: watch::Receiver<String>,
-) {
-    let id = uuid::Uuid::new_v4().to_string();
+    id: String,
+    client_id: String,
+) -> String {
     let info = state.info(&identity, control).await;
     if send(
         &mut socket,
@@ -455,8 +557,13 @@ async fn session(
     .await
     .is_err()
     {
-        return;
+        return "disconnected".into();
     }
+    let _ = state.presence.send(json!({
+        "type":"client-connected",
+        "client":session_client_json(&id, &client_id, &identity, control),
+    }));
+    let mut presence = state.presence.subscribe();
     tracing::info!(target: "nanoctl::status", "Viewer connected");
     #[cfg(feature = "media")]
     {
@@ -507,6 +614,14 @@ async fn session(
             _ = stop.changed() => { break stop.borrow().clone(); }
             message = messages.recv() => {
                 if let Some(message) = message && send(&mut socket, message).await.is_err() { break "disconnected".into(); }
+            }
+            event = presence.recv() => {
+                match event {
+                    Ok(message) => {
+                        if send(&mut socket, message).await.is_err() { break "disconnected".into(); }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
+                }
             }
             _ = tick.tick() => {
                 #[cfg(all(feature = "media", target_os = "windows"))]
@@ -614,9 +729,10 @@ async fn session(
         #[cfg(feature = "media")]
         crate::media::release_session_memory().await;
     }
-    let _ = send(&mut socket, json!({"type":"end","reason":reason})).await;
+    let _ = send(&mut socket, json!({"type":"end","reason":reason.clone()})).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
     tracing::info!(target: "nanoctl::status", %reason, "Viewer disconnected");
+    reason
 }
 
 #[cfg(all(feature = "media", target_os = "windows"))]
@@ -1060,15 +1176,20 @@ mod tests {
             "hello"
         );
         {
-            let mut active = state.active.lock().await;
-            let (stop, task) = active.take().unwrap();
-            *active = Some((
-                stop,
-                tokio::spawn(async move {
-                    task.await.unwrap();
-                    panic!("injected viewer teardown panic");
-                }),
-            ));
+            let mut sessions = state.sessions.lock().await;
+            let (key, active) = sessions.drain().next().unwrap();
+            let ActiveSession { id, stop, task } = active;
+            sessions.insert(
+                key,
+                ActiveSession {
+                    id,
+                    stop,
+                    task: tokio::spawn(async move {
+                        task.await.unwrap();
+                        panic!("injected viewer teardown panic");
+                    }),
+                },
+            );
         }
         second.close(None).await.unwrap();
         let (mut third, _) = tokio_tungstenite::connect_async(request()).await.unwrap();
@@ -1083,6 +1204,96 @@ mod tests {
         );
         state.stop().await;
         controller.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn distinct_client_hints_share_host_and_receive_presence() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let node = Node {
+            ips: vec!["100.64.1.2".parse().unwrap()],
+            owner: "owner@example.com".into(),
+            ..Default::default()
+        };
+        let fake = Arc::new(crate::tailnet::FakeTailnet {
+            node: node.clone(),
+            identity: Identity {
+                login: node.owner.clone(),
+                machine_name: "friend-laptop".into(),
+                ..Default::default()
+            },
+        });
+        let mut config = AgentConfig::default();
+        config.tailnet.serve_loopback = true;
+        let state = ServerState::new(config, fake);
+        *state.node.write().await = state.tailnet.status().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone(), false);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let request = |client_id: &str| {
+            let mut request = format!("ws://{addr}/v1/connect?client={client_id}")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("Origin", format!("http://{addr}").parse().unwrap());
+            request
+                .headers_mut()
+                .insert("Tailscale-User-Login", "owner@example.com".parse().unwrap());
+            request
+        };
+        let (mut first, _) = tokio_tungstenite::connect_async(request("one"))
+            .await
+            .unwrap();
+        let hello: Value =
+            serde_json::from_str(first.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        let (mut second, _) = tokio_tungstenite::connect_async(request("two"))
+            .await
+            .unwrap();
+        let hello: Value =
+            serde_json::from_str(second.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message: Value =
+                    serde_json::from_str(first.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                if message["type"] == "client-connected" {
+                    assert_eq!(message["client"]["clientId"], "two");
+                    break;
+                }
+                assert_ne!(message["type"], "end", "{message}");
+            }
+        })
+        .await
+        .unwrap();
+        second.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message: Value =
+                    serde_json::from_str(first.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                if message["type"] == "client-disconnected" {
+                    assert_eq!(message["client"]["clientId"], "two");
+                    break;
+                }
+                assert_ne!(message["type"], "end", "{message}");
+            }
+        })
+        .await
+        .unwrap();
+        state.stop().await;
         server.abort();
     }
 

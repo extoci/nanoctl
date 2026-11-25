@@ -160,6 +160,8 @@ export class SocketSession {
           if (message.type === "end") {
             if (message.reason === "replaced") {
               this.terminal("replaced", "Another viewer took over");
+            } else if (message.reason === "session-limit") {
+              this.terminal("error", "This host already has four connected clients");
             } else if (message.reason === "ended by controller") {
               this.terminal("error", message.reason);
             } else {
