@@ -870,3 +870,25 @@ PSNR identical (17.15 p50) at 4 vs 8, bitrate parity. Auto scales with core
 count, so tier 0 now uses x264 auto-threads (8 on this box) — cumulative
 worst-case encode 11.2→~6ms vs the pre-cycle-50 default. Tiers 1-3 stay at 2
 (bit-efficiency measured better on easy content).
+
+## Cycle 53 — convert cost measured, tier-0 preset frontier swept (all trades rejected)
+
+`media-smoke` now reports `color_convert_mean_milliseconds` (per-frame RGBA→I420
+conversion, inside encode time). Worst-case noise: **0.755ms of 7.26ms encode** —
+parallelizing conversion is at best a ~10% encode win, deprioritized.
+
+Preset frontier at tier 0 (noise worst case, 3-run means, PSNR identical everywhere):
+
+| preset             | fps  | encode p50 | bitrate  | PSNR p50 |
+| ------------------ | ---- | ---------- | -------- | -------- |
+| veryfast (default) | 45.6 | 7.78ms     | 16.7Mbps | 17.33dB  |
+| superfast          | 49.6 | 6.44ms     | 18.1Mbps | 17.31dB  |
+| ultrafast          | 55.2 | 5.55ms     | 21.2Mbps | 17.34dB  |
+
+Faster presets buy encode time and fps with bits at equal quality — a trade,
+not a hill-climb win, so the default is unchanged. The frontier belongs in
+network-adaptive negotiation: when RTT/loss prove bandwidth headroom, faster
+presets are nearly free latency; when congested, compression efficiency wins.
+That coupling (adapt tiers are content-driven today, RateController is
+network-driven) is the next structural axis. Also learned: single-run noise
+fps/bitrate swing ±20% on this VM — worst-case comparisons need 3-run means.

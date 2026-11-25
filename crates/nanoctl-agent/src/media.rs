@@ -1095,6 +1095,12 @@ impl CaptureEncoder {
     }
 }
 
+impl CaptureEncoder {
+    fn color_convert_ns(&self) -> u64 {
+        self.encoder.color_convert_ns()
+    }
+}
+
 impl EncoderBackend {
     fn adapt_state(&self) -> Option<(u8, u32)> {
         self.active
@@ -2149,6 +2155,8 @@ pub struct MediaSmokeReport {
     /// Per-second buckets: frames, bytes, and encode mean/max for that second.
     /// Ordered by `second`; trailing partial second included.
     pub per_second: Vec<SmokeSecond>,
+    /// Mean RGBA→I420 conversion time per encoded frame (inside encode time).
+    pub color_convert_mean_milliseconds: f64,
     /// Final adaptive-negotiation tier and cumulative tier switches (x264 only).
     pub x264_adapt_tier: Option<u8>,
     pub x264_adapt_switches: u32,
@@ -2375,6 +2383,11 @@ pub fn run_smoke(
         sps_units,
         pps_units,
         per_second,
+        color_convert_mean_milliseconds: if frames > 0 {
+            encoder.color_convert_ns() as f64 / frames as f64 / 1_000_000.0
+        } else {
+            0.0
+        },
         x264_adapt_tier: adapt_state.map(|(tier, _)| tier),
         x264_adapt_switches: adapt_state.map_or(0, |(_, switches)| switches),
     })
