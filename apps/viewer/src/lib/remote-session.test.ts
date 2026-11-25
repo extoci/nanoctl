@@ -917,7 +917,7 @@ class FakePeer {
 }
 
 describe("webcodecs video gating and teardown", () => {
-  test("creates WebCodecs encoded streams whenever the choice allows H.264", async () => {
+  test("creates WebCodecs encoded streams whenever the choice may need the H.264 tap", async () => {
     installBrowserGlobals(() => 0);
     defineGlobal("VideoDecoder", class FakeVideoDecoder {});
     for (const codecChoice of ["auto", "av1", "hevc", "h264"] as const) {
