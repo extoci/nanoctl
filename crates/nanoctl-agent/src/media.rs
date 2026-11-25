@@ -4007,7 +4007,7 @@ mod tests {
     }
 
     #[test]
-        fn display_refresh_rates_map_to_frame_rate_caps() {
+    fn display_refresh_rates_map_to_frame_rate_caps() {
         assert_eq!(super::refresh_to_fps(59.94), Some(60));
         assert_eq!(super::refresh_to_fps(143.9), Some(144));
         assert_eq!(super::refresh_to_fps(360.0), Some(240));
