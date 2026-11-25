@@ -38,7 +38,11 @@ final class Session {
         #else
         let decoder = RTCDefaultVideoDecoderFactory()
         #endif
-        return RTCPeerConnectionFactory(encoderFactory: RTCDefaultVideoEncoderFactory(), decoderFactory: decoder)
+        return RTCPeerConnectionFactory(
+            encoderFactory: RTCDefaultVideoEncoderFactory(),
+            decoderFactory: decoder,
+            audioDevice: PlayoutOnlyAudioDevice()
+        )
     }()
     private let network: URLSession
     private var connection: Connection?
@@ -304,7 +308,6 @@ final class Session {
             current.host = host
             audioOutputs = host.capabilities.audioOutputs ?? []
             if audioOutputs.isEmpty == false { _ = selectAudioOutput(nil) }
-            configureAudioSession(for: host)
             try await negotiate(current, injectHevc: codecPreference.injectHevc)
         case "signal":
             guard let id = current.id, let peer = current.peer, let signal = message.envelope,
@@ -365,19 +368,6 @@ final class Session {
         default:
             throw ViewerError("Unexpected host message.")
         }
-    }
-
-    private func configureAudioSession(for host: HostInfo) {
-        guard host.audioAvailable else { return }
-        let session = RTCAudioSession.sharedInstance()
-        session.lockForConfiguration()
-        do {
-            // .allowBluetoothHFP needs the iOS 26 SDK; .allowBluetooth is still valid (and not yet deprecated) on the iOS 18 SDK CI builds with.
-            try session.setCategory(.playback, with: [.allowBluetooth])
-            try session.setMode(.default)
-            try session.setActive(true)
-        } catch {}
-        session.unlockForConfiguration()
     }
 
     private func negotiate(_ current: Connection, injectHevc: Bool) async throws {
