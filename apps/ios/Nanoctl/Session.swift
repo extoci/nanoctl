@@ -269,7 +269,11 @@ final class Session {
         // Gamepad reports are full-state snapshots: ride the unordered
         // zero-retransmit pointer channel so a lost report never delays the
         // next one. The agent accepts gamepad on this lane.
-        guard gamepadAllowed, let data = try? JSONEncoder().encode(report) else { return false }
+        guard gamepadAllowed else { return false }
+        if connection?.host?.capabilities.binaryInput == true, let data = report.binary {
+            return send(data, pointer: true, limitBacklog: true, binary: true)
+        }
+        guard let data = try? JSONEncoder().encode(report) else { return false }
         return send(data, pointer: true, limitBacklog: true)
     }
 

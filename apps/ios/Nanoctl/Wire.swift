@@ -128,6 +128,35 @@ struct GamepadMessage: Encodable, Equatable {
     let pads: [[Int]]
     var dualShock4: [DualShock4]? = nil
 
+    /// Binary input v1 (`N`, 1, 2, count, 14 bytes per pad), matching the
+    /// viewer and the agent's `Snapshot::parse_binary`; nil when it cannot
+    /// represent the report so the caller can fall back to JSON.
+    var binary: Data? {
+        guard pads.count <= 4, pads.allSatisfy({ $0.count == 8 }) else { return nil }
+        let sony = Dictionary((dualShock4 ?? []).map { ($0.slot, $0) }, uniquingKeysWith: { $1 })
+        var data = Data([0x4e, 1, 2, UInt8(pads.count)])
+        for pad in pads {
+            guard let slot = UInt8(exactly: pad[0]), let buttons = UInt16(exactly: pad[1]),
+                  let left = UInt8(exactly: pad[2]), let right = UInt8(exactly: pad[3]) else { return nil }
+            var axes = [UInt16]()
+            for value in pad[4...] {
+                guard let axis = Int16(exactly: value) else { return nil }
+                axes.append(UInt16(bitPattern: axis))
+            }
+            var flags: UInt8 = 0
+            if let ds4 = sony[pad[0]] {
+                flags = 1
+                if ds4.leftTriggerPressed { flags |= 2 }
+                if ds4.rightTriggerPressed { flags |= 4 }
+                if ds4.touchpadPressed { flags |= 8 }
+            }
+            data.append(contentsOf: [slot, UInt8(buttons & 0xff), UInt8(buttons >> 8), left, right])
+            for axis in axes { data.append(contentsOf: [UInt8(axis & 0xff), UInt8(axis >> 8)]) }
+            data.append(flags)
+        }
+        return data
+    }
+
     static func axis(_ value: Float) -> Int {
         guard value.isFinite else { return 0 }
         let unit = min(1, max(-1, value))

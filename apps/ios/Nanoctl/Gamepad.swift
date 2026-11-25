@@ -34,7 +34,9 @@ final class Gamepad {
         keepalive?.invalidate()
         keepalive = nil
         if active {
-            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            // The host neutralizes pads after 150 ms without a snapshot; a
+            // 50 ms keepalive survives two consecutive lost reports.
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.send(force: true) }
             }
             RunLoop.main.add(timer, forMode: .common)
