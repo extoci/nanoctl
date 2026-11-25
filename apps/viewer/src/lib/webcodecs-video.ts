@@ -283,7 +283,7 @@ export function av1CodecOf(data: Uint8Array): string {
 
 interface VideoSink {
   canvas: HTMLCanvasElement;
-  feed(data: Uint8Array, isKey: boolean, timestampUs: number): void;
+  feed(data: Uint8Array, isKey: boolean, timestampUs: number): boolean;
   teardown(notify?: boolean): void;
   stats(): { decoded: number; dropped: number };
 }
@@ -485,6 +485,7 @@ function createVideoSink(
   // Chrome delivers H.264 in Annex-B. Keep an AVCC/packetized fallback just in
   // case the framing differs.
   let decoderConfigured = false;
+  let resyncing = false;
 
   const toAnnexB = (data: Uint8Array): Uint8Array => {
     if (
@@ -523,50 +524,64 @@ function createVideoSink(
     return new Uint8Array(out);
   };
 
-  const feed = (data: Uint8Array, isKey: boolean, timestampUs: number) => {
+  const feed = (data: Uint8Array, isKey: boolean, timestampUs: number): boolean => {
     const bitstream = videoCodec === "av1" ? data : toAnnexB(data);
     if (!decoderConfigured) {
       if (!isKey && !containsIdr(bitstream, videoCodec)) {
         dropped += 1;
-        return;
+        return false;
       }
       ensureDecoder(bitstream);
-      if (!decoder) return;
+      if (!decoder) return false;
       decoderConfigured = true;
     }
-    if (!decoder) return;
-    // Adaptive encoders may switch H.264 profiles between IDRs (e.g. baseline
-    // under stress, high when the content is easy). Bitstreams carry the new
-    // sequence parameters in-band; re-configure the decoder so the codec
-    // string tracks them.
-    if (isKey || containsIdr(bitstream, videoCodec)) {
+    if (!decoder) return false;
+    const key = isKey || containsIdr(bitstream, videoCodec);
+    if (resyncing && !key) {
+      dropped += 1;
+      return false;
+    }
+    // Adaptive encoders may switch profiles between random-access pictures.
+    // Bitstreams carry the new sequence parameters in-band; re-configure the
+    // decoder so the codec string tracks them. A recovery keyframe also resets
+    // the decoder: its queue may still contain deltas whose reference chain
+    // was deliberately abandoned.
+    if (key) {
       const codec = codecOf(bitstream);
-      if (codec !== configuredCodec) {
+      if (resyncing || codec !== configuredCodec) {
         try {
           decoder.reset();
           decoder.configure(decoderConfig(codec));
           configuredCodec = codec;
+          resyncing = false;
         } catch {
           decoderConfigured = false;
-          return;
+          return false;
         }
       }
     }
-    if (decoder.decodeQueueSize > 1 && !isKey) {
+    if (decoder.decodeQueueSize > 1 && !key) {
+      // Never decode deltas after a local drop: their reference chain is broken
+      // and decoding them produces persistent smearing. Drop forward to the
+      // next keyframe instead; the data-channel caller requests one.
       dropped += 1;
-      return;
+      resyncing = true;
+      return false;
     }
     try {
       decodeSubmit.set(timestampUs, performance.now());
       decoder.decode(
         new EncodedVideoChunk({
-          type: isKey ? "key" : "delta",
+          type: key ? "key" : "delta",
           timestamp: timestampUs,
           data: bitstream,
         }),
       );
+      return true;
     } catch {
       decoderConfigured = false;
+      resyncing = true;
+      return false;
     }
   };
 
@@ -650,12 +665,18 @@ export function attachDataChannelVideo(
   delete dbg.joinMs;
   delete dbg.firstMsgMs;
   delete dbg.firstDecodeMs;
-  // Ask for a keyframe immediately: without it the request only goes out
-  // after the first delta arrives, and an idle producer can delay that.
-  if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {
+  const requestKeyframe = () => {
+    if (Date.now() - kfRequestedAt <= 250) return;
+    kfRequestedAt = Date.now();
+    dbg.kf = (dbg.kf as number) + 1;
     try {
       channel.send("KF");
     } catch {}
+  };
+  // Ask for a keyframe immediately: without it the request only goes out
+  // after the first delta arrives, and an idle producer can delay that.
+  if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {
+    requestKeyframe();
   }
   const pending = new Map<
     number,
@@ -721,10 +742,14 @@ export function attachDataChannelVideo(
         return; // Already delivered (or already declared lost).
       }
       let deliverNow = diff === 0;
-      if (diff > 0 && isKey && waitingForKey) {
-        // A keyframe always jumps the reorder window — the missing seq is
-        // declared lost and only this IDR can restart the chain.
+      if (diff > 0 && isKey) {
+        // An IDR does not reference any missing predecessor, so it always
+        // jumps the reorder window. Older reordered deltas are both undecodable
+        // and temporally stale once this newer keyframe exists.
         deliverNow = true;
+        for (const buffered of reordered.keys()) {
+          if (((buffered - seq) | 0) < 0) reordered.delete(buffered);
+        }
       } else if (diff > 0) {
         // Unordered delivery reorders constantly; hold ahead-of-order frames
         // in a small reorder window instead of declaring a gap. While waiting
@@ -733,30 +758,35 @@ export function attachDataChannelVideo(
           reordered.set(seq, { au, isKey });
           dbg.reordered = ((dbg.reordered as number) || 0) + 1;
         }
-        if (reordered.size > 16 && !waitingForKey) {
+        if (reordered.size > 4 && !waitingForKey) {
           waitingForKey = true;
           dbg.gaps = (dbg.gaps as number) + 1;
           reordered.clear();
+          // Nothing can drain while the missing sequence is absent, so asking
+          // here rather than in deliver() is what bounds recovery time.
+          requestKeyframe();
         }
       }
       // Drain the reorder window in sequence.
       const deliver = (s: number, a: Uint8Array, k: boolean) => {
         expectedSeq = (s + 1) >>> 0;
         if (waitingForKey) {
-          if (Date.now() - kfRequestedAt > 250) {
-            kfRequestedAt = Date.now();
-            dbg.kf = (dbg.kf as number) + 1;
-            try {
-              channel.send("KF");
-            } catch {}
-          }
+          requestKeyframe();
           if (!k) return;
           waitingForKey = false;
+          kfRequestedAt = 0;
           dbg.waitingForKey = false;
           dbg.joinMs = performance.now() - joinAt;
         }
         dbg.fed = (dbg.fed as number) + 1;
-        sink.feed(a, k, s * 16_000);
+        const accepted = sink.feed(a, k, s * 16_000);
+        if (!accepted && !k && !waitingForKey) {
+          waitingForKey = true;
+          dbg.waitingForKey = true;
+          dbg.gaps = (dbg.gaps as number) + 1;
+          reordered.clear();
+          requestKeyframe();
+        }
       };
       if (deliverNow) {
         deliver(seq, au, isKey);

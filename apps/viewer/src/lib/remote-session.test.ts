@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
-import { attachWebCodecsVideo } from "./webcodecs-video";
+import { attachDataChannelVideo, attachWebCodecsVideo } from "./webcodecs-video";
 
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
@@ -989,6 +989,122 @@ describe("webcodecs video gating and teardown", () => {
       );
       await controller.stop("done", false);
     }
+  });
+
+  test("data-channel decode drops resync at a keyframe instead of decoding corrupt deltas", () => {
+    installBrowserGlobals(() => 0);
+    const decoded: string[] = [];
+    let resets = 0;
+    const decoderInstances: FakeVideoDecoderForRecovery[] = [];
+    class FakeVideoDecoderForRecovery {
+      decodeQueueSize = 0;
+      constructor() {
+        decoderInstances.push(this);
+      }
+      configure() {}
+      reset() {
+        resets += 1;
+        this.decodeQueueSize = 0;
+      }
+      decode(chunk: { init: { type: string } }) {
+        decoded.push(chunk.init.type);
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoderForRecovery);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(17 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes[7] = 1;
+      bytes.set(au, 17);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+    channel.sent = [];
+    receive(0, true);
+    receive(1);
+    expect(decoded).toEqual(["key", "delta"]);
+
+    decoderInstances[0]!.decodeQueueSize = 2;
+    receive(2);
+    expect(channel.sent).toContain("KF");
+    expect(decoded).toEqual(["key", "delta"]);
+    receive(3);
+    expect(decoded).toEqual(["key", "delta"]);
+    receive(4, true);
+    expect(decoded).toEqual(["key", "delta", "key"]);
+    expect(resets).toBeGreaterThan(0);
+  });
+
+  test("data-channel loss requests recovery as soon as the reorder window overflows", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(17 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes[7] = 1;
+      bytes.set(au, 17);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+    receive(0, true);
+    channel.sent = [];
+    receive(2);
+    receive(3);
+    receive(4);
+    receive(5);
+    expect(channel.sent).not.toContain("KF");
+    receive(6);
+    expect(channel.sent).toContain("KF");
   });
 
   test("webcodecs teardown does not clear an unowned video srcObject", async () => {
