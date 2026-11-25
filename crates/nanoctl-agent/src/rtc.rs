@@ -170,9 +170,9 @@ fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
         enabled: bool,
     }
     if bytes.len() == 4
-        && bytes[0] == crate::input::BINARY_INPUT_MAGIC
+        && bytes[0] == 0x4e
         && bytes[1] == 2
-        && bytes[2] == crate::input::BINARY_AUDIO
+        && bytes[2] == 9
     {
         return Some(bytes[3] != 0);
     }
