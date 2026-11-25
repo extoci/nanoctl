@@ -527,6 +527,7 @@ final class Session {
         delegate.onTrack = { [weak self, weak current] receiver in
             guard let self, let current, self.connection === current else { return }
             if let video = receiver.track as? RTCVideoTrack {
+                sessionLog.info("video track arrived (RTP leg)")
                 self.track = video
             } else if let audio = receiver.track as? RTCAudioTrack {
                 self.audioTrack = audio
@@ -536,6 +537,7 @@ final class Session {
         }
         delegate.onState = { [weak self, weak current] status in
             guard let self, let current, self.connection === current else { return }
+            sessionLog.info("peer connection state: \(peerStateName(status))")
             switch status {
             case .connected:
                 self.timeout?.cancel()
@@ -547,6 +549,9 @@ final class Session {
             default:
                 break
             }
+        }
+        delegate.onIceState = { state in
+            sessionLog.info("ice connection state: \(iceStateName(state))")
         }
         delegate.onControl = { [weak self, weak current] in
             guard let self, let current, self.connection === current else { return }
@@ -798,6 +803,42 @@ final class Session {
     }
 }
 
+private func peerStateName(_ state: RTCPeerConnectionState) -> String {
+    switch state {
+    case .new: return "new"
+    case .connecting: return "connecting"
+    case .connected: return "connected"
+    case .disconnected: return "disconnected"
+    case .failed: return "failed"
+    case .closed: return "closed"
+    @unknown default: return "unknown"
+    }
+}
+
+private func iceStateName(_ state: RTCIceConnectionState) -> String {
+    switch state {
+    case .new: return "new"
+    case .checking: return "checking"
+    case .connected: return "connected"
+    case .completed: return "completed"
+    case .failed: return "failed"
+    case .disconnected: return "disconnected"
+    case .closed: return "closed"
+    case .count: return "count"
+    @unknown default: return "unknown"
+    }
+}
+
+private func channelStateName(_ state: RTCDataChannelState) -> String {
+    switch state {
+    case .connecting: return "connecting"
+    case .open: return "open"
+    case .closing: return "closing"
+    case .closed: return "closed"
+    @unknown default: return "unknown"
+    }
+}
+
 private final class NoRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -836,6 +877,7 @@ private final class PeerEvents: NSObject, RTCPeerConnectionDelegate, RTCDataChan
     var onCandidate: ((SignalPayload) -> Void)?
     var onTrack: ((RTCRtpReceiver) -> Void)?
     var onState: ((RTCPeerConnectionState) -> Void)?
+    var onIceState: ((RTCIceConnectionState) -> Void)?
     var onControl: (() -> Void)?
     var onVideo: ((Data) -> Void)?
     var onVideoOpen: (() -> Void)?
@@ -864,6 +906,7 @@ private final class PeerEvents: NSObject, RTCPeerConnectionDelegate, RTCDataChan
 
     func dataChannelDidChangeState(_ channel: RTCDataChannel) {
         DispatchQueue.main.async { [weak self] in
+            sessionLog.info("data channel \(channel.label): \(channelStateName(channel.readyState))")
             switch channel.readyState {
             case .open:
                 if channel.label == "nanoctl.control.v1" {
@@ -892,7 +935,9 @@ private final class PeerEvents: NSObject, RTCPeerConnectionDelegate, RTCDataChan
     }
 
     func peerConnection(_ peer: RTCPeerConnection, didChange state: RTCSignalingState) {}
-    func peerConnection(_ peer: RTCPeerConnection, didChange state: RTCIceConnectionState) {}
+    func peerConnection(_ peer: RTCPeerConnection, didChange state: RTCIceConnectionState) {
+        DispatchQueue.main.async { [weak self] in self?.onIceState?(state) }
+    }
     func peerConnection(_ peer: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
     func peerConnection(_ peer: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     func peerConnectionShouldNegotiate(_ peer: RTCPeerConnection) {}
