@@ -1702,6 +1702,16 @@ fn encode_threads() -> u16 {
         })
 }
 
+/// Picks a slice cap that still engages OpenH264's slice-parallel encoder but
+/// avoids turning large keyframes into dozens/hundreds of tiny NAL units.
+/// Apple decoder stacks handle ordinary multi-slice frames, but very high
+/// slice counts are rejected; targeting roughly one slice per encode thread
+/// for an average frame keeps both sides inside their sweet spot.
+fn openh264_slice_len(bitrate_kbps: u32, max_fps: u16, threads: u16) -> u32 {
+    let frame_bytes = u64::from(bitrate_kbps) * 125 / u64::from(max_fps.max(1));
+    (frame_bytes / u64::from(threads.max(1))).clamp(2_048, 16_384) as u32
+}
+
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
     let (complexity, skip_frames, qp_min) = match latency_mode {
         // Responsiveness caps QP at 26: below ~47dB PSNR the bits are invisible on easy
@@ -1730,9 +1740,10 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .skip_frames(skip_frames)
         .scene_change_detect(false)
         // Slice-parallel encode: OpenH264 only uses encoder threads when the
-        // frame is cut into slices. A ~1.5KB cap splits even small deltas
-        // (~6-9KB) across the encode threads; tiny frames stay single-slice.
-        .max_slice_len(1_500)
+        // frame is cut into slices. Scale the cap with the frame-bitrate budget
+        // rather than using MTU-sized slices; a fixed tiny cap turns large
+        // keyframes into hundreds of slices, which VideoToolbox rejects.
+        .max_slice_len(openh264_slice_len(bitrate_kbps, max_fps, encode_threads()))
         .num_threads(encode_threads());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
@@ -3988,7 +3999,15 @@ mod tests {
     }
 
     #[test]
-    fn display_refresh_rates_map_to_frame_rate_caps() {
+    fn openh264_slice_len_targets_encode_threads_without_tiny_slices() {
+        assert_eq!(super::openh264_slice_len(8_000, 60, 4), 4_166);
+        assert_eq!(super::openh264_slice_len(24_000, 60, 4), 12_500);
+        assert_eq!(super::openh264_slice_len(100, 60, 4), 2_048);
+        assert_eq!(super::openh264_slice_len(900_000, 60, 1), 16_384);
+    }
+
+    #[test]
+        fn display_refresh_rates_map_to_frame_rate_caps() {
         assert_eq!(super::refresh_to_fps(59.94), Some(60));
         assert_eq!(super::refresh_to_fps(143.9), Some(144));
         assert_eq!(super::refresh_to_fps(360.0), Some(240));
