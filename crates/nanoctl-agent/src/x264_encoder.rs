@@ -221,10 +221,10 @@ impl AdaptPolicy {
             && self.encode_ewma_ns < 0.30 * budget_ns
             && (self.bytes_ewma < 0.50 * cap_bytes || self.network_constrained)
         {
-            // Trivially easy content skips intermediate tiers entirely —
-            // one re-open/IDR instead of one per rung.
+            // Trivially easy content jumps straight to the most efficient tier —
+            // one re-open/IDR, and no seconds spent with short references.
             if self.encode_ewma_ns < 0.12 * budget_ns && self.bytes_ewma < 0.20 * cap_bytes {
-                return Some((self.tier + 2).min(Self::MAX_TIER));
+                return Some(Self::MAX_TIER);
             }
             return Some(self.tier + 1);
         }
@@ -778,12 +778,12 @@ mod tests {
         }
         assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), Some(1));
         policy.committed(1);
-        // Trivially easy frames skip intermediate tiers (one re-open).
+        // Trivially easy frames jump straight to the most efficient tier.
         for _ in 0..AdaptPolicy::EASE_FRAMES[1] + AdaptPolicy::SWITCH_COOLDOWN {
             policy.observe(1_000_000, 500, budget, cap);
         }
-        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(3));
-        policy.committed(3);
+        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(4));
+        policy.committed(4);
         // Hard overload drops straight to tier 0.
         for _ in 0..40 {
             policy.observe(15_000_000, 500, budget, cap);
