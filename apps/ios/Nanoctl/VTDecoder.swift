@@ -92,6 +92,10 @@ final class VTDecoder {
         }
         if inflight > maxInflight && !isKey {
             dropped += 1
+            // The dropped delta is a reference-frame loss. Decode errors are
+            // not the only resync trigger: silently continuing here would
+            // smear every following delta until the next periodic keyframe.
+            fault()
             return
         }
         var block: CMBlockBuffer?
