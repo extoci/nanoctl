@@ -3121,12 +3121,14 @@ pub fn spawn_video(
                         }
                     }
                     // While the data-channel path is live it carries every AU
-                    // and the viewer drops the RTP copy, so delta frames over
-                    // RTP are pure duplicate bandwidth. IDRs still go to RTP:
-                    // they keep RTCP RTT/loss reports meaningful and let a
-                    // data-channel teardown resume the media track without
-                    // waiting for the next GOP boundary.
-                    if !dc_live || is_idr {
+                    // and the viewer drops the RTP copy, so RTP video is pure
+                    // duplicate bandwidth. That cost is worst exactly during
+                    // recovery, when IDRs are largest and the link is already
+                    // degraded; duplicating them also makes the rate controller
+                    // overcount egress. Channel teardown forces a fresh IDR
+                    // before RTP resumes, so no periodic copy is needed for
+                    // fallback continuity.
+                    if !dc_live {
                         let result = await_video_delivery(
                             async {
                                 track
