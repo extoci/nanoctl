@@ -260,7 +260,6 @@ pub(crate) struct DataChannelVideo {
 #[cfg(any(feature = "media", test))]
 #[derive(Default)]
 pub(crate) struct VideoReplay {
-    codec: Option<VideoCodec>,
     idr: Vec<Bytes>,
     pending_idr: Vec<Bytes>,
 }
@@ -288,12 +287,7 @@ pub(crate) fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
 impl VideoReplay {
     /// Records a wire-format video message. `is_idr`, `part` and `parts` come
     /// from the message header the producer already computed.
-    pub fn push(&mut self, codec: VideoCodec, is_idr: bool, part: u16, parts: u16, message: Bytes) {
-        if self.codec != Some(codec) {
-            self.codec = Some(codec);
-            self.idr.clear();
-            self.pending_idr.clear();
-        }
+    pub fn push(&mut self, is_idr: bool, part: u16, parts: u16, message: Bytes) {
         if is_idr {
             if part == 0 {
                 self.pending_idr.clear();
@@ -307,14 +301,8 @@ impl VideoReplay {
 
     /// Installs a ready-made keyframe only while the window is still empty.
     /// Checking and installing under one lock keeps a warm frame from ever
-    /// overwriting a live stream's keyframe. An incompatible cached stream is
-    /// useless to a viewer negotiated for another codec, so it may be replaced.
-    pub fn seed(&mut self, codec: VideoCodec, idr: Vec<Bytes>) -> bool {
-        if self.codec != Some(codec) {
-            self.codec = Some(codec);
-            self.idr.clear();
-            self.pending_idr.clear();
-        }
+    /// overwriting a live stream's keyframe.
+    pub fn seed(&mut self, idr: Vec<Bytes>) -> bool {
         if !self.idr.is_empty() || !self.pending_idr.is_empty() {
             return false;
         }
@@ -322,17 +310,9 @@ impl VideoReplay {
         true
     }
 
-    /// Whether any warm keyframe exists, regardless of codec. Startup warmup
-    /// uses this only to avoid duplicate work; viewers use `snapshot_for`.
-    pub fn is_warm(&self) -> bool {
-        !self.idr.is_empty()
-    }
-
-    /// Clones the warm keyframe for a newly attached channel when it belongs
-    /// to that channel's negotiated codec. Feeding H.264 warmup bytes into a
-    /// HEVC/AV1 decoder would poison the first attach instead of accelerating it.
-    pub fn snapshot_for(&self, codec: VideoCodec) -> Option<VideoReplaySnapshot> {
-        if self.codec != Some(codec) || self.idr.is_empty() {
+    /// Clones the warm keyframe for a newly attached channel.
+    pub fn snapshot(&self) -> Option<VideoReplaySnapshot> {
+        if self.idr.is_empty() {
             return None;
         }
         Some(self.idr.clone())
@@ -1884,72 +1864,31 @@ mod tests {
         let mut replay = VideoReplay::default();
         let idr = Bytes::from(vec![1, 2, 3, 4]);
         let delta = Bytes::from(vec![5, 6, 7]);
-        replay.push(VideoCodec::H264, true, 0, 1, idr.clone());
-        replay.push(VideoCodec::H264, false, 0, 1, delta);
+        replay.push(true, 0, 1, idr.clone());
+        replay.push(false, 0, 1, delta);
 
-        let idr_replay = replay
-            .snapshot_for(VideoCodec::H264)
-            .expect("complete replay window");
+        let idr_replay = replay.snapshot().expect("complete replay window");
         assert_eq!(idr_replay.len(), 1);
         assert_eq!(idr_replay[0].as_ptr(), idr.as_ptr());
         assert_eq!(idr_replay[0].len(), idr.len());
-        assert!(replay.snapshot_for(VideoCodec::Hevc).is_none());
-        assert!(replay.snapshot_for(VideoCodec::Av1).is_none());
     }
 
     #[test]
     fn video_replay_requires_complete_keyframe_and_resets_at_next_idr() {
         let mut replay = VideoReplay::default();
-        assert!(replay.seed(VideoCodec::H264, vec![Bytes::from_static(b"seed-idr")]));
-        assert!(!replay.seed(VideoCodec::H264, vec![Bytes::from_static(b"replacement")]));
-        assert_eq!(replay.snapshot_for(VideoCodec::H264).unwrap().len(), 1);
+        assert!(replay.seed(vec![Bytes::from_static(b"seed-idr")]));
+        assert!(!replay.seed(vec![Bytes::from_static(b"replacement")]));
+        assert_eq!(replay.snapshot().unwrap().len(), 1);
 
         let mut replay = VideoReplay::default();
-        replay.push(
-            VideoCodec::H264,
-            true,
-            0,
-            2,
-            Bytes::from_static(b"first-half"),
-        );
-        assert!(replay.snapshot_for(VideoCodec::H264).is_none());
-        replay.push(
-            VideoCodec::H264,
-            true,
-            1,
-            2,
-            Bytes::from_static(b"second-half"),
-        );
-        assert_eq!(replay.snapshot_for(VideoCodec::H264).unwrap().len(), 2);
-        replay.push(VideoCodec::H264, false, 0, 1, Bytes::from_static(b"delta"));
-        assert_eq!(replay.snapshot_for(VideoCodec::H264).unwrap().len(), 2);
-        replay.push(VideoCodec::H264, true, 0, 1, Bytes::from_static(b"new-idr"));
-        assert_eq!(replay.snapshot_for(VideoCodec::H264).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn video_replay_codec_change_discards_incompatible_keyframe() {
-        let mut replay = VideoReplay::default();
-        replay.push(
-            VideoCodec::Hevc,
-            true,
-            0,
-            1,
-            Bytes::from_static(b"hevc-idr"),
-        );
-        assert!(replay.snapshot_for(VideoCodec::Hevc).is_some());
-        replay.push(
-            VideoCodec::H264,
-            false,
-            0,
-            1,
-            Bytes::from_static(b"h264-delta"),
-        );
-        assert!(replay.snapshot_for(VideoCodec::Hevc).is_none());
-        assert!(replay.snapshot_for(VideoCodec::H264).is_none());
-
-        assert!(replay.seed(VideoCodec::H264, vec![Bytes::from_static(b"h264-idr")]));
-        assert!(replay.snapshot_for(VideoCodec::H264).is_some());
+        replay.push(true, 0, 2, Bytes::from_static(b"first-half"));
+        assert!(replay.snapshot().is_none());
+        replay.push(true, 1, 2, Bytes::from_static(b"second-half"));
+        assert_eq!(replay.snapshot().unwrap().len(), 2);
+        replay.push(false, 0, 1, Bytes::from_static(b"delta"));
+        assert_eq!(replay.snapshot().unwrap().len(), 2);
+        replay.push(true, 0, 1, Bytes::from_static(b"new-idr"));
+        assert_eq!(replay.snapshot().unwrap().len(), 1);
     }
 
     #[test]

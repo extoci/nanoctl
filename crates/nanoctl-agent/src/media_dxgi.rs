@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Weak, atomic::Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use windows::Win32::Foundation::{HMODULE, RECT};
@@ -442,10 +442,21 @@ pub(super) fn start(
     Ok((latest, thread))
 }
 
+fn recreate(h_monitor: HMONITOR, dup: &mut Duplication) {
+    match Duplication::new(h_monitor) {
+        Ok(next) => *dup = next,
+        Err(recreate_error) => {
+            tracing::warn!(%recreate_error, "DXGI duplication recreate failed");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
 fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
     #[cfg(windows)]
     let _mmcss = crate::media::register_mmcss();
     let h_monitor = HMONITOR(h_monitor_raw as *mut _);
+    let mut last_frame = Instant::now();
     loop {
         let Some(latest) = slot.upgrade() else {
             return;
@@ -455,13 +466,27 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
         }
         match dup.acquire(100, &latest) {
             Ok(Some(frame)) => {
+                last_frame = Instant::now();
                 // Backend-verified change: producer skips the memcmp.
                 let eg = dup.emit_gen;
                 if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), eg) {
                     return;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // A frozen/then-resumed pipeline (process suspend, network
+                // partition) leaves the duplication session stale:
+                // AcquireNextFrame keeps timing out without ever returning
+                // ACCESS_LOST, so the error path never rebuilds it and the
+                // stream sits on keepalives until the session happens to
+                // unstick (~15s observed). Rebuild after sustained
+                // starvation — idempotent; a truly static desktop just
+                // re-emits one frame on roughly the keepalive cadence.
+                if last_frame.elapsed() >= Duration::from_secs(4) {
+                    recreate(h_monitor, &mut dup);
+                    last_frame = Instant::now();
+                }
+            }
             Err(error) => {
                 let is_access_lost = error
                     .downcast_ref::<windows::core::Error>()
@@ -471,13 +496,7 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
                     return;
                 }
                 // Desktop switch / mode change: rebuild the duplication.
-                match Duplication::new(h_monitor) {
-                    Ok(next) => dup = next,
-                    Err(recreate_error) => {
-                        tracing::warn!(%recreate_error, "DXGI duplication recreate failed");
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                }
+                recreate(h_monitor, &mut dup);
             }
         }
     }

@@ -817,3 +817,13 @@ Measured on the media-smoke pipeline (in-process, 30s window under `band --motio
 - input→photon **p50 84ms** vs ~48ms idle — but G2G context also rose to p50 68ms (encode 11.5ms + transit 4.1 + decode 2.8 + present ~6 under load).
 - Input lane delta vs G2G ≈ +16ms ≈ idle (+~10ms) — **no SCTP head-of-line blocking**: input keeps pace with the video path under worst-case bitrate.
 - First G2G-under-noise datapoint: ~68ms p50 vs ~38ms clock-scene — worst-case inflation is encode-time dominated (11.5ms/frame), consistent with the swept x264 trade table.
+
+## Cycle 48 — ICE-dip + DXGI starvation watchdog: recovery ~15s → ~1s (2026-11-25)
+
+- `netsh advfirewall` UDP blocks on 127.0.0.1 do **not** touch loopback WebRTC traffic (msgs flowed at full rate through the "block") — Windows doesn't filter localhost.
+- Working dip method (from the gamepad-testing skill): `NtSuspendProcess`/`NtResumeProcess` on the agent process. 7s suspension = real partition: media + signaling stall, Chrome marks `disconnected` at ~5s; keep it under the 15s `Failed` watchdog.
+- Recovery profile after a 7s suspend (pre-fix): msgs frozen 7s → ~1 msg/s trickle for ~15s → full ~57/s. Root cause in agent.log: ICE reconnected in 200ms but `frames_captured` stayed flat — the DXGI duplication session went stale during the freeze and `AcquireNextFrame` kept returning `WAIT_TIMEOUT` instead of `ACCESS_LOST`, so the rebuild path never fired; the trickle was keepalive IDRs.
+- Fix: capture-thread watchdog — no fresh frame for ≥4s → rebuild `Duplication` (same path as `ACCESS_LOST`). Post-fix dip: **frozen 7s → full ~58 msg/s within ~1s of resume**, 0 seq gaps, 0 KF requests.
+- Caveat: a process freeze also stops the producer (a pure network partition would let the encoder keep filling the DC backlog → `dc_skips` → seq gaps → KF resync — untested; needs two machines).
+- Also on this branch: `EncoderBackend::encode` gated `#[cfg(test)]` (windows-2025 clippy `dead_code` on a newer toolchain; its one runtime caller now uses `encode_format` directly).
+- Noted during the same run: decoded ~47/s vs ~58 emitted/s = negotiated-fps pacer, not a drop defect.

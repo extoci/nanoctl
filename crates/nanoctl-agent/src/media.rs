@@ -1702,16 +1702,6 @@ fn encode_threads() -> u16 {
         })
 }
 
-/// Picks a slice cap that still engages OpenH264's slice-parallel encoder but
-/// avoids turning large keyframes into dozens/hundreds of tiny NAL units.
-/// Apple decoder stacks handle ordinary multi-slice frames, but very high
-/// slice counts are rejected; targeting roughly one slice per encode thread
-/// for an average frame keeps both sides inside their sweet spot.
-fn openh264_slice_len(bitrate_kbps: u32, max_fps: u16, threads: u16) -> u32 {
-    let frame_bytes = u64::from(bitrate_kbps) * 125 / u64::from(max_fps.max(1));
-    (frame_bytes / u64::from(threads.max(1))).clamp(2_048, 16_384) as u32
-}
-
 fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) -> Result<Encoder> {
     let (complexity, skip_frames, qp_min) = match latency_mode {
         // Responsiveness caps QP at 26: below ~47dB PSNR the bits are invisible on easy
@@ -1740,10 +1730,9 @@ fn create_encoder(bitrate_kbps: u32, max_fps: u16, latency_mode: LatencyMode) ->
         .skip_frames(skip_frames)
         .scene_change_detect(false)
         // Slice-parallel encode: OpenH264 only uses encoder threads when the
-        // frame is cut into slices. Scale the cap with the frame-bitrate budget
-        // rather than using MTU-sized slices; a fixed tiny cap turns large
-        // keyframes into hundreds of slices, which VideoToolbox rejects.
-        .max_slice_len(openh264_slice_len(bitrate_kbps, max_fps, encode_threads()))
+        // frame is cut into slices. A ~1.5KB cap splits even small deltas
+        // (~6-9KB) across the encode threads; tiny frames stay single-slice.
+        .max_slice_len(1_500)
         .num_threads(encode_threads());
     Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("H.264 encoder is unavailable")
@@ -2491,7 +2480,7 @@ pub fn prime_replay(
     encoder_preference: EncoderPreference,
 ) -> Result<()> {
     let replay = crate::rtc::video_replay();
-    if replay.lock().unwrap().is_warm() {
+    if replay.lock().unwrap().snapshot().is_some() {
         return Ok(());
     }
     let monitor = Monitor::all()
@@ -2536,9 +2525,8 @@ pub fn prime_replay(
     if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
         bail!("captured display dimensions must be non-zero and even");
     }
-    // Warmup cannot know which codec a future viewer will negotiate, so it
-    // uses universally supported baseline H.264; the replay window tags it and
-    // will not serve these bytes to a HEVC/AV1 viewer.
+    // The data-channel path only carries H.264 (rtc.rs gates the channels on
+    // the negotiated codec), so the warm keyframe is always baseline H.264.
     let mut backend = EncoderBackend::new_for_codec(
         VideoCodec::H264,
         false,
@@ -2574,10 +2562,7 @@ pub fn prime_replay(
         msg.extend_from_slice(&frame.bytes[start..end]);
         messages.push(Bytes::from(msg));
     }
-    replay
-        .lock()
-        .unwrap()
-        .seed(crate::codec::VideoCodec::H264, messages);
+    replay.lock().unwrap().seed(messages);
     Ok(())
 }
 
@@ -2938,7 +2923,7 @@ pub fn spawn_video(
                             .replay
                             .lock()
                             .unwrap()
-                            .snapshot_for(quality.codec)
+                            .snapshot()
                             .map(|idr| {
                                 let mut queue = std::collections::VecDeque::new();
                                 queue.extend(idr);
@@ -3164,7 +3149,7 @@ pub fn spawn_video(
                     {
                         let mut replay = video_data_channel.replay.lock().unwrap();
                         for (part, msg) in messages.into_iter().enumerate() {
-                            replay.push(quality.codec, is_idr, part as u16, parts, msg);
+                            replay.push(is_idr, part as u16, parts, msg);
                         }
                     }
                     // While the data-channel path is live it carries every AU
@@ -4000,14 +3985,6 @@ mod tests {
         assert_eq!(bitrate_target(3_000, 5_000, 250, 8_000), Some(5_000));
         assert_eq!(bitrate_target(4_000, 100, 250, 8_000), Some(250));
         assert_eq!(bitrate_target(4_000, 20_000, 250, 8_000), Some(8_000));
-    }
-
-    #[test]
-    fn openh264_slice_len_targets_encode_threads_without_tiny_slices() {
-        assert_eq!(super::openh264_slice_len(8_000, 60, 4), 4_166);
-        assert_eq!(super::openh264_slice_len(24_000, 60, 4), 12_500);
-        assert_eq!(super::openh264_slice_len(100, 60, 4), 2_048);
-        assert_eq!(super::openh264_slice_len(900_000, 60, 1), 16_384);
     }
 
     #[test]

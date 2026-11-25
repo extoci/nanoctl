@@ -70,10 +70,6 @@ final class VTDecoder {
         }
         if inflight > maxInflight && !isKey {
             dropped += 1
-            // The dropped delta is a reference-frame loss. Decode errors are
-            // not the only resync trigger: silently continuing here would
-            // smear every following delta until the next periodic keyframe.
-            fault()
             return
         }
         var block: CMBlockBuffer?
@@ -82,10 +78,9 @@ final class VTDecoder {
             blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
             offsetToData: 0, dataLength: avcc.count, flags: 0, blockBufferOut: &block
         ) == kCMBlockBufferNoErr, let block else { return }
-        let copy = avcc.withUnsafeBytes { raw -> OSStatus in
-            guard let baseAddress = raw.baseAddress else { return -1 }
-            return CMBlockBufferReplaceDataBytes(with: baseAddress, blockBuffer: block,
-                                                 offsetIntoDestination: 0, dataLength: avcc.count)
+        let copy = avcc.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
+                                        offsetIntoDestination: 0, dataLength: avcc.count)
         }
         guard copy == kCMBlockBufferNoErr, let format else { return }
 
@@ -113,9 +108,8 @@ final class VTDecoder {
         }
 
         inflight += 1
-        guard let session else { return }
         let status = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample,
+            session!, sampleBuffer: sample,
             flags: [._EnableAsynchronousDecompression, ._1xRealTimePlayback],
             infoFlagsOut: nil
         ) { [weak self] status, _, buffer, _, _ in
@@ -181,41 +175,22 @@ final class VTDecoder {
         return true
     }
 
-    private static func parameterSetRank(_ set: Data, codec: Codec) -> Int {
-        guard let first = set.first else { return Int.max }
-        if codec == .h264 {
-            switch first & 0x1f {
-            case 7: return 0
-            case 8: return 1
-            default: return Int.max
-            }
-        }
-        switch (first >> 1) & 0x3f {
-        case 32: return 0
-        case 33: return 1
-        case 34: return 2
-        default: return Int.max
-        }
-    }
-
     /// Builds a format description from the codec's parameter sets.
     private static func format(codec: Codec, sets: [Data]) -> CMFormatDescription? {
         var format: CMFormatDescription?
-        let ordered = sets.sorted { parameterSetRank($0, codec: codec) < parameterSetRank($1, codec: codec) }
-        log.info("format: \(ordered.count, privacy: .public) sets")
-        let status = ordered.withParameterSets { pointers, sizes in
-            guard let pointers, let sizes else { return OSStatus(-1) }
+        log.info("format: \(sets.count, privacy: .public) sets")
+        let status = sets.withParameterSets { pointers, sizes in
             switch codec {
             case .h264:
-                guard ordered.count >= 2 else { return OSStatus(-1) }
+                guard sets.count >= 2 else { return OSStatus(-1) }
                 return CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault, parameterSetCount: ordered.count,
+                    allocator: kCFAllocatorDefault, parameterSetCount: sets.count,
                     parameterSetPointers: pointers, parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4, formatDescriptionOut: &format)
             case .hevc:
-                guard ordered.count >= 3 else { return OSStatus(-1) }
+                guard sets.count >= 3 else { return OSStatus(-1) }
                 return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                    allocator: kCFAllocatorDefault, parameterSetCount: ordered.count,
+                    allocator: kCFAllocatorDefault, parameterSetCount: sets.count,
                     parameterSetPointers: pointers, parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &format)
             }
@@ -294,32 +269,38 @@ final class VTDecoder {
         var out = Data()
         out.reserveCapacity(au.count + nals.count)
         var length: UInt32 = 0
-        for nal in nals where !nal.isEmpty {
-            let type = codec == .h264 ? nal[nal.startIndex] & 0x1f : (nal[nal.startIndex] >> 1) & 0x3f
-            let parameterSet = codec == .h264 ? type == 7 || type == 8 : type == 32 || type == 33 || type == 34
-            // Parameter sets belong in the format description, not in an AVCC sample.
-            if parameterSet { continue }
+        for nal in nals {
             length = UInt32(nal.count).bigEndian
             withUnsafeBytes(of: &length) { out.append(contentsOf: $0) }
             out.append(nal)
         }
-        return out.isEmpty ? nil : out
+        return out
     }
 }
 
 private extension Array where Element == Data {
-    /// Calls `body` with the parameter-set pointers and sizes. `NSData` keeps
-    /// the backing storage alive and stable for the duration of the call.
+    /// Calls `body` with the parameter-set pointers and sizes, ordered as
+    /// CoreMedia expects (vps, sps, pps for HEVC; sps, pps for H.264).
     func withParameterSets<T>(
-        _ body: (UnsafePointer<UnsafePointer<UInt8>>?, UnsafePointer<Int>?) -> T
+        _ body: (UnsafePointer<UnsafePointer<UInt8>>, UnsafePointer<Int>) -> T
     ) -> T {
-        let storage = map { $0 as NSData }
-        var pointers = storage.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
-        var sizes = storage.map(\.count)
-        return pointers.withUnsafeBufferPointer { p in
-            sizes.withUnsafeBufferPointer { s in
-                body(p.baseAddress, s.baseAddress)
+        var pointers: [UnsafePointer<UInt8>] = []
+        var sizes: [Int] = []
+        func run(_ remaining: ArraySlice<Data>) -> T {
+            if remaining.isEmpty {
+                return pointers.withUnsafeBufferPointer { p in
+                    sizes.withUnsafeBufferPointer { s in
+                        body(p.baseAddress!, s.baseAddress!)
+                    }
+                }
+            }
+            return remaining.first!.withUnsafeBytes { raw in
+                pointers.append(raw.bindMemory(to: UInt8.self).baseAddress!)
+                sizes.append(remaining.first!.count)
+                defer { pointers.removeLast(); sizes.removeLast() }
+                return run(remaining.dropFirst())
             }
         }
+        return run(self[...])
     }
 }
