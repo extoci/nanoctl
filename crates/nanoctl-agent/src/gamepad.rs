@@ -70,6 +70,54 @@ struct WirePad(usize, u16, u8, u8, i16, i16, i16, i16);
 #[serde(try_from = "WireSnapshot")]
 pub struct Snapshot([Option<PadReport>; MAX_PADS]);
 
+impl Snapshot {
+    /// Parses the compact binary gamepad report used by protocol v1 input:
+    /// u8 count, then per pad u8 slot, u16 buttons, u8 LT, u8 RT,
+    /// i16 LX/LY/RX/RY, and u8 DualShock flags (bit 0 = DS4 present,
+    /// bits 1/2/3 = left trigger/right trigger/touchpad pressed).
+    pub(crate) fn parse_binary(data: &[u8]) -> Result<Self, &'static str> {
+        let Some((&count, entries)) = data.split_first() else {
+            return Err("truncated gamepad report");
+        };
+        let count = count as usize;
+        if count > MAX_PADS || entries.len() != count * 14 {
+            return Err("invalid gamepad report length");
+        }
+        let mut pads = Vec::with_capacity(count);
+        let mut dual_shock4 = Vec::new();
+        for entry in entries.chunks_exact(14) {
+            let slot = entry[0] as usize;
+            let buttons = u16::from_le_bytes([entry[1], entry[2]]);
+            let axes = |offset: usize| i16::from_le_bytes([entry[offset], entry[offset + 1]]);
+            pads.push(WirePad(
+                slot,
+                buttons,
+                entry[3],
+                entry[4],
+                axes(5),
+                axes(7),
+                axes(9),
+                axes(11),
+            ));
+            let flags = entry[13];
+            if flags & !0x0f != 0 {
+                return Err("invalid DualShock 4 flags");
+            }
+            if flags & 1 != 0 {
+                dual_shock4.push(WireDs4Pad {
+                    slot,
+                    buttons: Ds4Buttons {
+                        left_trigger_pressed: flags & 0x02 != 0,
+                        right_trigger_pressed: flags & 0x04 != 0,
+                        touchpad_pressed: flags & 0x08 != 0,
+                    },
+                });
+            }
+        }
+        Snapshot::try_from(WireSnapshot { pads, dual_shock4 })
+    }
+}
+
 impl TryFrom<WireSnapshot> for Snapshot {
     type Error = &'static str;
 
@@ -431,6 +479,40 @@ mod tests {
         );
         let empty = snapshot("[]").unwrap();
         assert_eq!(empty.0, [None; MAX_PADS]);
+    }
+
+    #[test]
+    fn decodes_binary_reports_by_slot() {
+        let report = Snapshot::parse_binary(&[
+            1, 2, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+        ])
+        .unwrap();
+        assert_eq!(
+            report.0[2],
+            Some(PadReport {
+                state: Report(0x1001, 7, 8, -32768, 32767, -1, 1),
+                ds4: Some(Ds4Buttons {
+                    left_trigger_pressed: true,
+                    right_trigger_pressed: false,
+                    touchpad_pressed: true,
+                }),
+            })
+        );
+        assert!(
+            Snapshot::parse_binary(&[0])
+                .unwrap()
+                .0
+                .iter()
+                .all(Option::is_none)
+        );
+        for invalid in [
+            &[][..],
+            &[1],
+            &[5, 0],
+            &[1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10],
+        ] {
+            assert!(Snapshot::parse_binary(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]
