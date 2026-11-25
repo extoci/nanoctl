@@ -465,8 +465,8 @@ impl InputController {
         }
     }
 
-    pub fn release_if_idle(&mut self, timeout: Duration) {
-        self.gamepads.neutralize_if_idle(timeout);
+    pub fn release_if_idle(&mut self, timeout: Duration, gamepad_timeout: Duration) {
+        self.gamepads.neutralize_if_idle(gamepad_timeout);
         if self.last_physical_input.elapsed() >= timeout
             && (!self.held_keys.is_empty() || !self.held_buttons.is_empty())
         {
