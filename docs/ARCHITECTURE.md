@@ -27,8 +27,11 @@ WireGuard transport, NAT traversal and, when needed, DERP relay.
   endpoint or socket closure tears down and joins that session's media/input work.
 - `rtc.rs` retains v2 epochs, ICE generations, input lanes and bounded recovery.
   ICE has no servers and only gathers tailnet host candidates.
-- The media pipeline captures the interactive desktop, bounds its newest-frame queue,
-  encodes the negotiated codec (AV1, HEVC or H.264) and sends RTP. Input requires config, platform capability and viewer permission.
+- The media pipeline captures the interactive desktop once for clients using the same
+  negotiated codec/profile, bounds its newest-frame queue and fans encoded frames out
+  to per-client WebRTC writers. Each session owns its input controller and virtual
+  gamepad devices, so clients can use independent controllers. Input requires config,
+  platform capability and viewer permission.
 
 ## Viewer
 

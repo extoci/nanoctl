@@ -22,8 +22,8 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
+    Arc, Condvar, Mutex, Weak,
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use webrtc::media::Sample;
@@ -1738,6 +1738,7 @@ impl Drop for CaptureEncoder {
     }
 }
 
+#[derive(Clone)]
 pub struct EncodedFrame {
     pub bytes: Vec<u8>,
     pub width: u32,
@@ -1753,6 +1754,7 @@ struct EncodedFrameSlot {
     ready: tokio::sync::Notify,
     closed: AtomicBool,
     dropped: AtomicU16,
+    subscribers: Mutex<Vec<Weak<EncodedFrameSlot>>>,
 }
 
 impl EncodedFrameSlot {
@@ -1768,13 +1770,28 @@ impl EncodedFrameSlot {
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
             dropped: AtomicU16::new(0),
+            subscribers: Mutex::new(Vec::new()),
         }
+    }
+
+    fn subscribe(self: &Arc<Self>) -> Arc<Self> {
+        let subscriber = Arc::new(Self::with_codec(self.codec));
+        self.subscribers
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&subscriber));
+        subscriber
     }
 
     fn replace(&self, frame: EncodedFrame) -> bool {
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
+        self.subscribers.lock().unwrap().retain(|subscriber| {
+            subscriber
+                .upgrade()
+                .is_some_and(|subscriber| subscriber.replace(frame.clone()))
+        });
         let Ok(mut slot) = self.frame.lock() else {
             return false;
         };
@@ -1802,6 +1819,11 @@ impl EncodedFrameSlot {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        for subscriber in self.subscribers.lock().unwrap().iter() {
+            if let Some(subscriber) = subscriber.upgrade() {
+                subscriber.close();
+            }
+        }
         self.ready.notify_waiters();
     }
 
@@ -2272,6 +2294,7 @@ pub(crate) struct VideoPipeline {
     stop: tokio::sync::watch::Sender<bool>,
     stopped: Arc<AtomicBool>,
     pub stats: Arc<PipelineStats>,
+    hub: Option<(VideoHub, u64, Arc<VideoFanoutState>)>,
 }
 
 impl VideoPipeline {
@@ -2287,13 +2310,17 @@ impl VideoPipeline {
         }
     }
 
-    pub(crate) async fn finish(self) -> Result<()> {
+    pub(crate) async fn finish(mut self) -> Result<()> {
         let result = self
             .task
             .await
             .context("video pipeline task stopped unexpectedly")
             .and_then(|result| result);
         self.stats.log();
+        if let Some((hub, generation, fanout)) = self.hub.take() {
+            fanout.clients.fetch_sub(1, Ordering::AcqRel);
+            hub.release(generation).await;
+        }
         result
     }
 
@@ -2324,6 +2351,171 @@ impl VideoPipeline {
             stop,
             stopped,
             stats: Arc::default(),
+            hub: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct VideoFanoutState {
+    clients: AtomicUsize,
+    dc_live: AtomicUsize,
+}
+
+impl VideoFanoutState {
+    fn all_live(&self) -> bool {
+        let clients = self.clients.load(Ordering::Acquire);
+        clients != 0 && self.dc_live.load(Ordering::Acquire) == clients
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoClient {
+    pub track: Arc<TrackLocalStaticSample>,
+    pub video_data_channel: Arc<crate::rtc::DataChannelVideo>,
+    pub keyframe_requests: tokio::sync::watch::Receiver<u64>,
+    pub link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    pub viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
+    pub display_selection: tokio::sync::watch::Receiver<String>,
+    pub display_selection_feedback: tokio::sync::watch::Sender<String>,
+}
+
+struct CaptureState {
+    generation: u64,
+    codec: VideoCodec,
+    h264_high: bool,
+    root: Arc<EncodedFrameSlot>,
+    recovery: tokio::sync::watch::Sender<u64>,
+    fanout: Arc<VideoFanoutState>,
+    pipeline: VideoPipeline,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct VideoHub {
+    inner: Arc<Mutex<VideoHubInner>>,
+}
+
+#[derive(Default)]
+struct VideoHubInner {
+    capture: Option<CaptureState>,
+    clients: std::collections::HashMap<u64, usize>,
+    next_generation: u64,
+}
+
+impl VideoHub {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attach(&self, client: VideoClient, quality: VideoQuality) -> VideoPipeline {
+        let mut inner = self.inner.lock().unwrap();
+        let matches = inner.capture.as_ref().is_some_and(|capture| {
+            capture.codec == quality.codec && capture.h264_high == quality.h264_high
+        });
+        if inner.capture.is_some() && !matches {
+            // A differently negotiated codec falls back to its own capture pipeline rather
+            // than decoding the wrong bitstream. Equal-codec clients still share capture.
+            return spawn_video(
+                client.track,
+                client.video_data_channel,
+                client.keyframe_requests,
+                client.link_feedback,
+                client.viewer_limits,
+                client.display_selection,
+                client.display_selection_feedback,
+                quality,
+            );
+        }
+        if inner
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.pipeline.is_finished())
+        {
+            inner.capture = None;
+        }
+        if inner.capture.is_none() {
+            let generation = inner.next_generation;
+            inner.next_generation += 1;
+            let root = Arc::new(EncodedFrameSlot::with_codec(quality.codec));
+            let (recovery, _) = tokio::sync::watch::channel(0_u64);
+            let empty_channel = Arc::new(crate::rtc::DataChannelVideo {
+                channel: Mutex::new(None),
+                idr_channel: Mutex::new(None),
+                keyframe_requests: AtomicU64::new(0),
+                replay: crate::rtc::video_replay(),
+            });
+            let fanout = Arc::new(VideoFanoutState::default());
+            let (_unused_keyframe_sender, capture_keyframe_requests) =
+                tokio::sync::watch::channel(0_u64);
+            let pipeline = spawn_video_inner(
+                client.track.clone(),
+                empty_channel,
+                capture_keyframe_requests,
+                client.link_feedback.clone(),
+                client.viewer_limits.clone(),
+                client.display_selection.clone(),
+                client.display_selection_feedback.clone(),
+                quality,
+                Some(root.clone()),
+                false,
+                Some(recovery.clone()),
+                Some(fanout.clone()),
+            );
+            inner.capture = Some(CaptureState {
+                generation,
+                codec: quality.codec,
+                h264_high: quality.h264_high,
+                root,
+                recovery,
+                fanout,
+                pipeline,
+            });
+        }
+        let generation = inner.capture.as_ref().unwrap().generation;
+        *inner.clients.entry(generation).or_insert(0) += 1;
+        let capture = inner.capture.as_ref().unwrap();
+        let subscriber = capture.root.subscribe();
+        let recovery = capture.recovery.clone();
+        let fanout = capture.fanout.clone();
+        fanout.clients.fetch_add(1, Ordering::AcqRel);
+        drop(inner);
+        let mut writer = spawn_video_inner(
+            client.track,
+            client.video_data_channel,
+            client.keyframe_requests,
+            client.link_feedback,
+            client.viewer_limits,
+            client.display_selection,
+            client.display_selection_feedback,
+            quality,
+            Some(subscriber),
+            true,
+            Some(recovery),
+            Some(fanout.clone()),
+        );
+        writer.hub = Some((self.clone(), generation, fanout));
+        writer
+    }
+
+    async fn release(&self, generation: u64) {
+        let capture = {
+            let mut inner = self.inner.lock().unwrap();
+            let clients = inner.clients.entry(generation).or_insert(0);
+            *clients = clients.saturating_sub(1);
+            let empty = *clients == 0;
+            if empty {
+                inner.clients.remove(&generation);
+            }
+            if empty
+                && inner
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.generation == generation)
+            {
+                inner.capture.take()
+            } else {
+                None
+            }
+        };
+        if let Some(capture) = capture {
+            Box::pin(capture.pipeline.stop()).await;
         }
     }
 }
@@ -2434,6 +2626,37 @@ pub fn spawn_video(
     display_selection_feedback: tokio::sync::watch::Sender<String>,
     quality: VideoQuality,
 ) -> VideoPipeline {
+    spawn_video_inner(
+        track,
+        video_data_channel,
+        keyframe_requests,
+        link_feedback,
+        viewer_limits,
+        display_selection,
+        display_selection_feedback,
+        quality,
+        None,
+        false,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_video_inner(
+    track: Arc<TrackLocalStaticSample>,
+    video_data_channel: Arc<crate::rtc::DataChannelVideo>,
+    keyframe_requests: tokio::sync::watch::Receiver<u64>,
+    link_feedback: tokio::sync::watch::Receiver<Option<crate::adaptive::LinkSample>>,
+    viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
+    display_selection: tokio::sync::watch::Receiver<String>,
+    display_selection_feedback: tokio::sync::watch::Sender<String>,
+    quality: VideoQuality,
+    encoded_source: Option<Arc<EncodedFrameSlot>>,
+    write_only: bool,
+    shared_delivery_recovery: Option<tokio::sync::watch::Sender<u64>>,
+    fanout: Option<Arc<VideoFanoutState>>,
+) -> VideoPipeline {
     let stopped = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(PipelineStats::default());
     let controller = RateController::new(quality.max_bitrate_kbps, quality.max_fps);
@@ -2446,102 +2669,136 @@ pub fn spawn_video(
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let worker_stopped = stopped.clone();
     let task = tokio::spawn(async move {
-        let encoded_slot = Arc::new(EncodedFrameSlot::with_codec(quality.codec));
+        let shared_rtp = !write_only && shared_delivery_recovery.is_some();
+        let writer_keyframe_requests = keyframe_requests.clone();
+        let encoded_slot =
+            encoded_source.unwrap_or_else(|| Arc::new(EncodedFrameSlot::with_codec(quality.codec)));
         let (delivery_recovery, mut delivery_recovery_requests) =
-            tokio::sync::watch::channel(0_u64);
+            if let Some(sender) = shared_delivery_recovery {
+                let receiver = sender.subscribe();
+                (sender, receiver)
+            } else {
+                tokio::sync::watch::channel(0_u64)
+            };
         let producer_slot = EncodedFrameProducer(encoded_slot.clone());
         let producer_stopped = worker_stopped.clone();
         let producer_stats = writer_stats.clone();
         let producer_video_channel = video_data_channel.clone();
-        let producer = tokio::task::spawn_blocking(move || -> Result<()> {
-            let producer_slot = producer_slot;
-            #[cfg(target_os = "linux")]
-            producer_stats.producer_tid.store(
-                std::fs::read_link("/proc/thread-self")
-                    .ok()
-                    .and_then(|path| path.file_name()?.to_str()?.parse().ok())
-                    .unwrap_or_default(),
-                Ordering::Relaxed,
-            );
-            (|| -> Result<()> {
-                let mut encoder = CaptureEncoder::primary(
-                    initial.bitrate_kbps,
-                    quality.max_fps,
-                    quality.max_width,
-                    quality.max_height,
-                    quality.latency_mode,
-                    quality.encoder_preference,
-                    quality.codec,
-                    quality.h264_high,
-                    producer_stats.clone(),
-                )?;
-                let mut keyframe_requests = keyframe_requests;
-                let mut link_feedback = link_feedback;
-                let mut viewer_limits = viewer_limits;
-                let mut bitrate_ceiling = quality.max_bitrate_kbps;
-                let mut display_selection = display_selection;
-                let display_selection_feedback = display_selection_feedback;
-                let mut controller = controller;
-                let mut fps = initial.fps;
-                let mut pacer = DamagePacer::new(fps);
-                let mut scale = EncodeScale::new(initial.bitrate_kbps);
-                let mut last: Option<Arc<CapturedFrame>> = None;
-                let mut last_encoded: Option<Arc<CapturedFrame>> = None;
-                let mut forced_keyframe = false;
-                let mut waiting_since = Instant::now();
-                loop {
-                    if producer_stopped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if encoder
-                        .forwarder
-                        .as_ref()
-                        .is_some_and(|thread| thread.is_finished())
-                    {
-                        bail!("display capture forwarding thread stopped");
-                    }
-                    let now = Instant::now();
-                    let wait = if last.is_some() {
-                        pacer.next_deadline(now, fps).saturating_duration_since(now)
-                    } else {
-                        Duration::from_millis(50)
-                    }
-                    .min(Duration::from_millis(50));
-                    let wait_started = Instant::now();
-                    let fresh = encoder
-                        .latest_frame
-                        .take_until_stopped(wait, &producer_stopped)?;
-                    producer_stats
-                        .capture_wait_ns
-                        .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    if producer_stopped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if keyframe_requests.has_changed().unwrap_or(false) {
-                        keyframe_requests.borrow_and_update();
-                        forced_keyframe = true;
-                    }
-                    if delivery_recovery_requests.has_changed().unwrap_or(false) {
-                        delivery_recovery_requests.borrow_and_update();
-                        forced_keyframe = true;
-                    }
-                    let now = Instant::now();
-                    let send_kbps = producer_stats.send_window.lock().unwrap().kbps(now);
-                    producer_stats
-                        .send_kbps
-                        .store(send_kbps as u32, Ordering::Relaxed);
-                    controller.update_sender(send_kbps, pacer.idle(), now);
-                    if link_feedback.has_changed().unwrap_or(false)
-                        && let Some(mut sample) = *link_feedback.borrow_and_update()
-                    {
-                        // While the data channel carries video, RTP only
-                        // sends sparse IDRs — the browser's REMB describes
-                        // that thin stream, not real egress, so it must not
-                        // bind the encoder rate.
-                        if producer_video_channel.channel.lock().unwrap().is_some() {
-                            sample.remb_kbps = None;
+        let producer = if write_only {
+            None
+        } else {
+            Some(tokio::task::spawn_blocking(move || -> Result<()> {
+                let producer_slot = producer_slot;
+                #[cfg(target_os = "linux")]
+                producer_stats.producer_tid.store(
+                    std::fs::read_link("/proc/thread-self")
+                        .ok()
+                        .and_then(|path| path.file_name()?.to_str()?.parse().ok())
+                        .unwrap_or_default(),
+                    Ordering::Relaxed,
+                );
+                (|| -> Result<()> {
+                    let mut encoder = CaptureEncoder::primary(
+                        initial.bitrate_kbps,
+                        quality.max_fps,
+                        quality.max_width,
+                        quality.max_height,
+                        quality.latency_mode,
+                        quality.encoder_preference,
+                        quality.codec,
+                        quality.h264_high,
+                        producer_stats.clone(),
+                    )?;
+                    let mut keyframe_requests = keyframe_requests;
+                    let mut link_feedback = link_feedback;
+                    let mut viewer_limits = viewer_limits;
+                    let mut bitrate_ceiling = quality.max_bitrate_kbps;
+                    let mut display_selection = display_selection;
+                    let display_selection_feedback = display_selection_feedback;
+                    let mut controller = controller;
+                    let mut fps = initial.fps;
+                    let mut pacer = DamagePacer::new(fps);
+                    let mut scale = EncodeScale::new(initial.bitrate_kbps);
+                    let mut last: Option<Arc<CapturedFrame>> = None;
+                    let mut last_encoded: Option<Arc<CapturedFrame>> = None;
+                    let mut forced_keyframe = false;
+                    let mut waiting_since = Instant::now();
+                    loop {
+                        if producer_stopped.load(Ordering::Acquire) {
+                            break;
                         }
-                        if let Some(decision) = controller.observe(sample) {
+                        if encoder
+                            .forwarder
+                            .as_ref()
+                            .is_some_and(|thread| thread.is_finished())
+                        {
+                            bail!("display capture forwarding thread stopped");
+                        }
+                        let now = Instant::now();
+                        let wait = if last.is_some() {
+                            pacer.next_deadline(now, fps).saturating_duration_since(now)
+                        } else {
+                            Duration::from_millis(50)
+                        }
+                        .min(Duration::from_millis(50));
+                        let wait_started = Instant::now();
+                        let fresh = encoder
+                            .latest_frame
+                            .take_until_stopped(wait, &producer_stopped)?;
+                        producer_stats
+                            .capture_wait_ns
+                            .fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        if producer_stopped.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if keyframe_requests.has_changed().unwrap_or(false) {
+                            keyframe_requests.borrow_and_update();
+                            forced_keyframe = true;
+                        }
+                        if delivery_recovery_requests.has_changed().unwrap_or(false) {
+                            delivery_recovery_requests.borrow_and_update();
+                            forced_keyframe = true;
+                        }
+                        let now = Instant::now();
+                        let send_kbps = producer_stats.send_window.lock().unwrap().kbps(now);
+                        producer_stats
+                            .send_kbps
+                            .store(send_kbps as u32, Ordering::Relaxed);
+                        controller.update_sender(send_kbps, pacer.idle(), now);
+                        if link_feedback.has_changed().unwrap_or(false)
+                            && let Some(mut sample) = *link_feedback.borrow_and_update()
+                        {
+                            // While the data channel carries video, RTP only
+                            // sends sparse IDRs — the browser's REMB describes
+                            // that thin stream, not real egress, so it must not
+                            // bind the encoder rate.
+                            if producer_video_channel.channel.lock().unwrap().is_some() {
+                                sample.remb_kbps = None;
+                            }
+                            if let Some(decision) = controller.observe(sample) {
+                                encoder.apply_bitrate_estimate(
+                                    decision.bitrate_kbps,
+                                    bitrate_ceiling,
+                                )?;
+                                fps = decision.fps;
+                                pacer.set_fps(fps);
+                                forced_keyframe |= scale.changed_limits(
+                                    decision.bitrate_kbps,
+                                    quality.max_width,
+                                    quality.max_height,
+                                );
+                                producer_stats
+                                    .target_kbps
+                                    .store(decision.bitrate_kbps, Ordering::Relaxed);
+                                producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                            }
+                        }
+                        if viewer_limits.has_changed().unwrap_or(false) {
+                            let (ceiling, max_fps) = viewer_limits
+                                .borrow_and_update()
+                                .resolve(quality.max_bitrate_kbps, quality.max_fps);
+                            let decision = controller.set_limits(ceiling, max_fps);
+                            bitrate_ceiling = ceiling;
                             encoder
                                 .apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
                             fps = decision.fps;
@@ -2556,160 +2813,146 @@ pub fn spawn_video(
                                 .store(decision.bitrate_kbps, Ordering::Relaxed);
                             producer_stats.target_fps.store(fps, Ordering::Relaxed);
                         }
-                    }
-                    if viewer_limits.has_changed().unwrap_or(false) {
-                        let (ceiling, max_fps) = viewer_limits
-                            .borrow_and_update()
-                            .resolve(quality.max_bitrate_kbps, quality.max_fps);
-                        let decision = controller.set_limits(ceiling, max_fps);
-                        bitrate_ceiling = ceiling;
-                        encoder.apply_bitrate_estimate(decision.bitrate_kbps, bitrate_ceiling)?;
-                        fps = decision.fps;
-                        pacer.set_fps(fps);
-                        forced_keyframe |= scale.changed_limits(
-                            decision.bitrate_kbps,
-                            quality.max_width,
-                            quality.max_height,
-                        );
-                        producer_stats
-                            .target_kbps
-                            .store(decision.bitrate_kbps, Ordering::Relaxed);
-                        producer_stats.target_fps.store(fps, Ordering::Relaxed);
-                    }
-                    let mut switched = false;
-                    if display_selection.has_changed().unwrap_or(false) {
-                        let display_id = display_selection.borrow_and_update().clone();
-                        if !display_id.is_empty() {
-                            match encoder.select_display(&display_id) {
-                                Ok(()) => {
-                                    last = None;
-                                    last_encoded = None;
-                                    pacer = DamagePacer::new(fps);
-                                    forced_keyframe = true;
-                                    waiting_since = Instant::now();
-                                    switched = true;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        display_id,
-                                        error = %error,
-                                        "display switch rejected; retaining current capture"
-                                    );
-                                    // Input geometry is updated optimistically by the reliable control
-                                    // worker. If capture rejects the same request, publish the actual
-                                    // capture target so that worker rolls its geometry back. Do not
-                                    // overwrite a newer request that arrived while the switch ran.
-                                    if display_selection.borrow().as_str() == display_id.as_str() {
-                                        display_selection_feedback
-                                            .send_replace(encoder.current_display_id().to_owned());
+                        let mut switched = false;
+                        if display_selection.has_changed().unwrap_or(false) {
+                            let display_id = display_selection.borrow_and_update().clone();
+                            if !display_id.is_empty() {
+                                match encoder.select_display(&display_id) {
+                                    Ok(()) => {
+                                        last = None;
+                                        last_encoded = None;
+                                        pacer = DamagePacer::new(fps);
+                                        forced_keyframe = true;
+                                        waiting_since = Instant::now();
+                                        switched = true;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            display_id,
+                                            error = %error,
+                                            "display switch rejected; retaining current capture"
+                                        );
+                                        // Input geometry is updated optimistically by the reliable control
+                                        // worker. If capture rejects the same request, publish the actual
+                                        // capture target so that worker rolls its geometry back. Do not
+                                        // overwrite a newer request that arrived while the switch ran.
+                                        if display_selection.borrow().as_str()
+                                            == display_id.as_str()
+                                        {
+                                            display_selection_feedback.send_replace(
+                                                encoder.current_display_id().to_owned(),
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    let mut changed = false;
-                    if !switched && let Some(fresh) = fresh {
-                        producer_stats.fresh_frames.fetch_add(1, Ordering::Relaxed);
-                        let compare_started = Instant::now();
-                        changed = last_encoded
-                            .as_ref()
-                            .is_none_or(|previous| fresh.differs_from(previous));
-                        producer_stats.compare_ns.fetch_add(
-                            compare_started.elapsed().as_nanos() as u64,
-                            Ordering::Relaxed,
-                        );
-                        if !changed {
-                            producer_stats
-                                .skipped_unchanged
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        last = Some(fresh);
-                    }
-                    let Some(captured) = last.as_ref() else {
-                        if waiting_since.elapsed() >= Duration::from_secs(5) {
-                            bail!("display capture stopped without a frame");
-                        }
-                        continue;
-                    };
-                    let keepalive = pacer.idle() && !changed && !forced_keyframe;
-                    #[cfg(target_os = "windows")]
-                    let action = pacer.on_capture_frame(Instant::now(), changed, forced_keyframe);
-                    #[cfg(not(target_os = "windows"))]
-                    let action = pacer.on_frame(Instant::now(), changed, forced_keyframe);
-                    if action == PaceAction::Skip {
-                        producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    if forced_keyframe {
-                        encoder.encoder.force_keyframe();
-                        forced_keyframe = false;
-                    }
-                    let (max_width, max_height) =
-                        scale.limits(quality.max_width, quality.max_height);
-                    let (frame, _timing) =
-                        encoder.encode_captured_frame(captured, max_width, max_height)?;
-                    if frame.bytes.is_empty() {
-                        continue;
-                    }
-                    // `changed` already ran this exact comparison for fresh
-                    // frames; only re-compare for keepalive/pace re-encodes.
-                    let changed_output = changed
-                        || last_encoded
-                            .as_ref()
-                            .is_none_or(|previous| captured.differs_from(previous));
-                    if changed_output {
-                        #[cfg(target_os = "linux")]
-                        if let Some(started) = producer_stats.damage_started.lock().unwrap().take()
-                        {
-                            let elapsed = started.elapsed().as_nanos() as u64;
-                            producer_stats.first_change_capture_ready_ns.store(
-                                captured
-                                    .captured_at
-                                    .saturating_duration_since(started)
-                                    .as_nanos() as u64,
+                        let mut changed = false;
+                        if !switched && let Some(fresh) = fresh {
+                            producer_stats.fresh_frames.fetch_add(1, Ordering::Relaxed);
+                            let compare_started = Instant::now();
+                            changed = last_encoded
+                                .as_ref()
+                                .is_none_or(|previous| fresh.differs_from(previous));
+                            producer_stats.compare_ns.fetch_add(
+                                compare_started.elapsed().as_nanos() as u64,
                                 Ordering::Relaxed,
                             );
-                            producer_stats
-                                .first_change_encode_ns
-                                .store(_timing.encode.as_nanos() as u64, Ordering::Relaxed);
-                            producer_stats
-                                .first_change_samples
-                                .fetch_add(1, Ordering::Relaxed);
-                            producer_stats
-                                .first_change_last_ns
-                                .store(elapsed, Ordering::Relaxed);
-                            producer_stats
-                                .first_change_max_ns
-                                .fetch_max(elapsed, Ordering::Relaxed);
+                            if !changed {
+                                producer_stats
+                                    .skipped_unchanged
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            last = Some(fresh);
                         }
+                        let Some(captured) = last.as_ref() else {
+                            if waiting_since.elapsed() >= Duration::from_secs(5) {
+                                bail!("display capture stopped without a frame");
+                            }
+                            continue;
+                        };
+                        let keepalive = pacer.idle() && !changed && !forced_keyframe;
+                        #[cfg(target_os = "windows")]
+                        let action =
+                            pacer.on_capture_frame(Instant::now(), changed, forced_keyframe);
+                        #[cfg(not(target_os = "windows"))]
+                        let action = pacer.on_frame(Instant::now(), changed, forced_keyframe);
+                        if action == PaceAction::Skip {
+                            producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if forced_keyframe {
+                            encoder.encoder.force_keyframe();
+                            forced_keyframe = false;
+                        }
+                        let (max_width, max_height) =
+                            scale.limits(quality.max_width, quality.max_height);
+                        let (frame, _timing) =
+                            encoder.encode_captured_frame(captured, max_width, max_height)?;
+                        if frame.bytes.is_empty() {
+                            continue;
+                        }
+                        // `changed` already ran this exact comparison for fresh
+                        // frames; only re-compare for keepalive/pace re-encodes.
+                        let changed_output = changed
+                            || last_encoded
+                                .as_ref()
+                                .is_none_or(|previous| captured.differs_from(previous));
+                        if changed_output {
+                            #[cfg(target_os = "linux")]
+                            if let Some(started) =
+                                producer_stats.damage_started.lock().unwrap().take()
+                            {
+                                let elapsed = started.elapsed().as_nanos() as u64;
+                                producer_stats.first_change_capture_ready_ns.store(
+                                    captured
+                                        .captured_at
+                                        .saturating_duration_since(started)
+                                        .as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                producer_stats
+                                    .first_change_encode_ns
+                                    .store(_timing.encode.as_nanos() as u64, Ordering::Relaxed);
+                                producer_stats
+                                    .first_change_samples
+                                    .fetch_add(1, Ordering::Relaxed);
+                                producer_stats
+                                    .first_change_last_ns
+                                    .store(elapsed, Ordering::Relaxed);
+                                producer_stats
+                                    .first_change_max_ns
+                                    .fetch_max(elapsed, Ordering::Relaxed);
+                            }
+                            producer_stats
+                                .changed_encodes
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            producer_stats
+                                .unchanged_encodes
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        last_encoded = Some(captured.clone());
                         producer_stats
-                            .changed_encodes
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
+                            .encoded_width
+                            .store(frame.width, Ordering::Relaxed);
                         producer_stats
-                            .unchanged_encodes
+                            .encoded_height
+                            .store(frame.height, Ordering::Relaxed);
+                        producer_stats
+                            .frames_encoded
                             .fetch_add(1, Ordering::Relaxed);
+                        if keepalive {
+                            producer_stats.keepalives.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if !producer_slot.0.replace(frame) {
+                            break;
+                        }
                     }
-                    last_encoded = Some(captured.clone());
-                    producer_stats
-                        .encoded_width
-                        .store(frame.width, Ordering::Relaxed);
-                    producer_stats
-                        .encoded_height
-                        .store(frame.height, Ordering::Relaxed);
-                    producer_stats
-                        .frames_encoded
-                        .fetch_add(1, Ordering::Relaxed);
-                    if keepalive {
-                        producer_stats.keepalives.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if !producer_slot.0.replace(frame) {
-                        break;
-                    }
-                }
-                Ok(())
-            })()
-        });
+                    Ok(())
+                })()
+            }))
+        };
         let mut stop_rx = stop_rx;
         let mut previous_written = None;
         let extensions = [video_playout_delay(quality.latency_mode)];
@@ -2741,6 +2984,17 @@ pub fn spawn_video(
             ..ReferenceRecovery::default()
         };
         let mut write_result = Ok(());
+        if write_only {
+            let mut keyframe_requests = writer_keyframe_requests;
+            let delivery_recovery = delivery_recovery.clone();
+            tokio::spawn(async move {
+                while keyframe_requests.changed().await.is_ok() {
+                    delivery_recovery.send_modify(|generation| {
+                        *generation = generation.wrapping_add(1);
+                    });
+                }
+            });
+        }
         let mut attach_poll = tokio::time::interval(Duration::from_millis(5));
         attach_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -2874,6 +3128,13 @@ pub fn spawn_video(
                     let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_live = video_channel.is_some();
                     if dc_live != dc_was_live {
+                        if write_only && let Some(fanout) = &fanout {
+                            if dc_live {
+                                fanout.dc_live.fetch_add(1, Ordering::AcqRel);
+                            } else if dc_was_live {
+                                fanout.dc_live.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }
                         dc_was_live = dc_live;
                         if !dc_live {
                             // The unreliable video channel just went away and
@@ -2989,7 +3250,8 @@ pub fn spawn_video(
                     // they keep RTCP RTT/loss reports meaningful and let a
                     // data-channel teardown resume the media track without
                     // waiting for the next GOP boundary.
-                    if !dc_live || is_idr {
+                    let all_data_channels = fanout.as_ref().is_some_and(|fanout| fanout.all_live());
+                    if !write_only && (!all_data_channels || is_idr) {
                         let result = await_video_delivery(
                             async {
                                 track
@@ -3030,6 +3292,18 @@ pub fn spawn_video(
                             recovery_keyframe_requested = false;
                         }
                         Ok(()) => {}
+                        Err(error) if shared_rtp => {
+                            delivery_error_count = delivery_error_count.saturating_add(1);
+                            if delivery_error_count == 1
+                                || delivery_error_count.is_multiple_of(300)
+                            {
+                                tracing::warn!(
+                                    error = %error,
+                                    delivery_errors = delivery_error_count,
+                                    "shared video RTP delivery degraded; retaining fanout pipeline"
+                                );
+                            }
+                        }
                         Err(error) => {
                             delivery_error_count = delivery_error_count.saturating_add(1);
                             if !recovery_keyframe_requested {
@@ -3062,11 +3336,19 @@ pub fn spawn_video(
                 }
             }
         }
+        if write_only
+            && dc_was_live
+            && let Some(fanout) = &fanout
+        {
+            fanout.dc_live.fetch_sub(1, Ordering::AcqRel);
+        }
         worker_stopped.store(true, Ordering::Release);
-        let producer_result = producer
-            .await
-            .context("video capture worker stopped unexpectedly")?;
-        producer_result?;
+        if let Some(producer) = producer {
+            let producer_result = producer
+                .await
+                .context("video capture worker stopped unexpectedly")?;
+            producer_result?;
+        }
         write_result?;
         Ok(())
     });
@@ -3075,6 +3357,7 @@ pub fn spawn_video(
         stop,
         stopped,
         stats,
+        hub: None,
     }
 }
 
@@ -3678,6 +3961,25 @@ mod tests {
             slot.take().await.expect("recovery frame").0.bytes,
             vec![0, 0, 0, 1, 0x65]
         );
+    }
+
+    #[tokio::test]
+    async fn encoded_frame_slot_fans_out_newest_frames_to_subscribers() {
+        let root = std::sync::Arc::new(EncodedFrameSlot::new());
+        let first = root.subscribe();
+        let second = root.subscribe();
+        assert!(root.replace(EncodedFrame {
+            bytes: vec![0, 0, 0, 1, 0x65],
+            width: 2,
+            height: 2,
+        }));
+
+        for subscriber in [first, second] {
+            assert_eq!(
+                subscriber.take().await.expect("fanned-out frame").0.bytes,
+                vec![0, 0, 0, 1, 0x65]
+            );
+        }
     }
 
     #[tokio::test]

@@ -122,17 +122,20 @@ impl Drop for ReadyFile {
 
 #[cfg(feature = "media")]
 pub(crate) fn spawn_media(
+    hub: &crate::media::VideoHub,
     peer: &crate::rtc::HostPeer,
     config: &AgentConfig,
 ) -> crate::media::VideoPipeline {
-    crate::media::spawn_video(
-        peer.video_track(),
-        peer.video_data_channel(),
-        peer.keyframe_requests(),
-        peer.link_feedback(),
-        peer.viewer_limits(),
-        peer.display_selection(),
-        peer.display_selection_feedback_sender(),
+    hub.attach(
+        crate::media::VideoClient {
+            track: peer.video_track(),
+            video_data_channel: peer.video_data_channel(),
+            keyframe_requests: peer.keyframe_requests(),
+            link_feedback: peer.link_feedback(),
+            viewer_limits: peer.viewer_limits(),
+            display_selection: peer.display_selection(),
+            display_selection_feedback: peer.display_selection_feedback_sender(),
+        },
         crate::media::VideoQuality {
             max_bitrate_kbps: config.quality.max_bitrate_kbps,
             max_fps: crate::media::effective_max_fps(config.quality.max_fps),
