@@ -47,6 +47,46 @@ function report(pad: InputPad, slot: number): GamepadReport {
   ];
 }
 
+
+function sameReports(left: readonly GamepadReport[] | undefined, right: readonly GamepadReport[] | undefined): boolean {
+  return (
+    left?.length === right?.length &&
+    (left ?? []).every((report, index) =>
+      report.every((value, field) => value === right?.[index]?.[field]),
+    )
+  );
+}
+
+function sameDualShock4(
+  left: readonly DualShock4Pad[] | undefined,
+  right: readonly DualShock4Pad[] | undefined,
+): boolean {
+  return (
+    left?.length === right?.length &&
+    (left ?? []).every((pad, index) => {
+      const other = right?.[index];
+      return (
+        pad.slot === other?.slot &&
+        pad.leftTriggerPressed === other.leftTriggerPressed &&
+        pad.rightTriggerPressed === other.rightTriggerPressed &&
+        pad.touchpadPressed === other.touchpadPressed
+      );
+    })
+  );
+}
+
+function sameMessage(left: GamepadMessage, right: GamepadMessage): boolean {
+  return sameReports(left.pads, right.pads) && sameDualShock4(left.dualShock4, right.dualShock4);
+}
+
+function copyMessage(message: GamepadMessage): GamepadMessage {
+  return {
+    type: "gamepad",
+    pads: message.pads.map((pad) => [...pad]),
+    ...(message.dualShock4 && { dualShock4: message.dualShock4.map((pad) => ({ ...pad })) }),
+  };
+}
+
 /**
  * A slot is one virtual controller on the host, tracked by browser pad identity rather than by
  * position: `navigator.getGamepads()` renumbers pads as devices come and go, so identity keeps a
@@ -65,7 +105,7 @@ type TrackedPad = { index: number; id: string };
 export class GamepadForwarder {
   private readonly slots: (TrackedPad | undefined)[] = Array.from({ length: MAX_SLOTS });
   private sentSlots = new Set<number>();
-  private lastSent = JSON.stringify({ type: "gamepad", pads: [] });
+  private lastSent: GamepadMessage = { type: "gamepad", pads: [] };
   private sentAt = -Infinity;
 
   constructor(private readonly send: (message: GamepadMessage) => boolean) {}
@@ -149,10 +189,10 @@ export class GamepadForwarder {
 
   private flush(message: GamepadMessage, now: number): void {
     const { pads } = message;
-    const state = JSON.stringify(message);
-    if (state === this.lastSent && (!pads.length || now - this.sentAt < KEEPALIVE_MS)) return;
+    if (sameMessage(message, this.lastSent) && (!pads.length || now - this.sentAt < KEEPALIVE_MS))
+      return;
     if (this.send(message)) {
-      this.lastSent = state;
+      this.lastSent = copyMessage(message);
       this.sentSlots = new Set(pads.map(([slot]) => slot));
       this.sentAt = now;
     }
