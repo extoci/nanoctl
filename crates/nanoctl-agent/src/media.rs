@@ -832,6 +832,13 @@ impl I420Frame {
         {
             bail!("invalid partial I420 conversion rectangle");
         }
+        // `yuv` walks stride-sized rows and therefore needs the padding after
+        // the final row to exist in the slice, even though it converts only
+        // `right - left` pixels. For a rectangle ending at the bottom edge
+        // that padding is outside the frame unless the slice starts at the
+        // left edge. Widening the rectangle leftward is exact: converting
+        // unchanged extra pixels produces the same I420 bytes.
+        let left = if bottom == self.height { 0 } else { left };
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
         let width = right - left;
@@ -4314,6 +4321,15 @@ mod tests {
                 after[offset..offset + 4].copy_from_slice(&[250, 5, 120, 255]);
             }
         }
+        // Include damage in a bottom-edge macroblock which does not start at
+        // the left edge. That shape needs leftward widening because the `yuv`
+        // row iterator requires stride padding after the frame's final row.
+        for y in 48..64 {
+            for x in 48..64 {
+                let offset = (y * 64 + x) * 4;
+                after[offset..offset + 4].copy_from_slice(&[20, 240, 90, 255]);
+            }
+        }
         let mut full_before = super::I420Frame::new(64, 64).unwrap();
         full_before.read_pixels(&before, PixelFormat::Rgba).unwrap();
         let mut full_after = super::I420Frame::new(64, 64).unwrap();
@@ -4322,6 +4338,7 @@ mod tests {
         partial.bytes = full_before.bytes.clone();
         let mut map = vec![1_u8; 16];
         map[1 + 4] = 0;
+        map[3 + 3 * 4] = 0;
         partial
             .read_pixels_constant_mb(&after, PixelFormat::Rgba, &map)
             .unwrap();
