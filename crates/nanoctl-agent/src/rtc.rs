@@ -717,7 +717,7 @@ impl HostPeer {
                 let input = Arc::downgrade(input);
                 let mut shutdown = input_shutdown.subscribe();
                 input_tasks.push(tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_millis(500));
+                    let mut interval = tokio::time::interval(Duration::from_millis(50));
                     loop {
                         tokio::select! {
                             _ = shutdown.changed() => break,
@@ -726,7 +726,13 @@ impl HostPeer {
                                     break;
                                 };
                                 if let Ok(mut input) = input.lock() {
-                                    input.release_if_idle(Duration::from_secs(2));
+                                    // Gamepad viewers send full-state snapshots every frame,
+                                    // so 150ms of silence means the transport is badly impaired;
+                                    // don't let a held stick/button keep driving for seconds.
+                                    input.release_if_idle(
+                                        Duration::from_secs(2),
+                                        Duration::from_millis(150),
+                                    );
                                 }
                             }
                         }
