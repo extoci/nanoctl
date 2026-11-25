@@ -37,7 +37,7 @@ final class Gamepad {
         keepalive?.invalidate()
         keepalive = nil
         if active {
-            // The host neutralizes pads after 225 ms without a report. The
+            // The host neutralizes pads after 750 ms without a report. The
             // 50 ms timer supplies repeat, heartbeat, and refresh deadlines.
             let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.send(force: true) }
@@ -98,8 +98,8 @@ final class Gamepad {
         let changed = message != lastSent
         if changed { changedAt = now }
         let repeating = changedAt.map { now - $0 < 0.1 } ?? false
-        let needsFull = fullAt.map { now - $0 >= 0.225 } ?? true
-        let heartbeatDue = heartbeatAt.map { now - $0 >= 0.075 } ?? true
+        let needsFull = fullAt.map { now - $0 >= 2.0 } ?? true
+        let heartbeatDue = heartbeatAt.map { now - $0 >= 0.25 } ?? true
         var sent = false
         if changed || repeating || needsFull {
             let sparse = !needsFull

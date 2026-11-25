@@ -467,7 +467,10 @@ export class RemoteSessionController {
 
   sendControl(payload: ControlMessage | GamepadStateInput): boolean {
     const gamepadState = payload.type === "gamepad" || payload.type === "gamepad-sparse";
-    const lossyGamepadSnapshot = gamepadState && payload.pads.length > 0;
+    // Sparse snapshots self-repair individual slots and belong on the lossy
+    // lane. Full snapshots are the sparse baseline, so they must not be dropped;
+    // they ride the reliable control lane even when they carry pads.
+    const lossyGamepadSnapshot = payload.type === "gamepad-sparse" && payload.pads.length > 0;
     const channel =
       lossyGamepadSnapshot || (payload.type === "pointer" && payload.action === "move")
         ? this.pointerChannel

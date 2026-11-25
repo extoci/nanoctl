@@ -270,11 +270,11 @@ describe("remote session lifecycle", () => {
     controlChannel.sent = [];
     channel.sent = [];
     flushAnimationFrame(1_000);
-    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
-    expect(controlChannel.sent).toEqual([]);
+    expect(channel.sent).toEqual([]);
     channel.sent = [];
     expect(controller.sendControl({ type: "gamepad", pads: [] })).toBe(true);
     expect(JSON.parse(controlChannel.sent.at(-1)!)).toEqual({ type: "gamepad", pads: [] });
@@ -292,10 +292,11 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     channel.sent = [];
     flushAnimationFrame(2_000);
-    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+    expect(channel.sent).toEqual([]);
 
     controller.setInputEnabled(false);
     expect(controller.snapshot.gamepadEnabled).toBe(false);
@@ -303,10 +304,11 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     channel.sent = [];
     flushAnimationFrame(3_000);
-    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+    expect(channel.sent).toEqual([]);
     await controller.stop();
   });
 

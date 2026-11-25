@@ -115,14 +115,14 @@ test("bounds to four controllers, preserves slots, and retries a blocked release
   ]);
 });
 
-test("repeats a change for 100ms, then heartbeats an unchanged pad every 75ms", () => {
+test("repeats a change for 100ms, then heartbeats an unchanged pad about every 250ms", () => {
   const sentAt: number[] = [];
   const gamepad = new GamepadForwarder(() => Boolean(sentAt.push(now)));
   const controller = pad(0);
   let now = 0;
   for (; now <= 400; now += 20) gamepad.sample([controller], now);
-  expect(sentAt).toEqual([0, 20, 40, 60, 80, 160, 240, 320, 400]);
+  expect(sentAt).toEqual([0, 20, 40, 60, 80, 340]);
   const pressed = { ...controller, axes: [0, 0, 0, 0] };
-  for (; now <= 600; now += 20) gamepad.sample([pressed], now);
-  expect(sentAt.slice(9)).toEqual([420, 440, 460, 480, 500, 580]);
+  for (; now <= 800; now += 20) gamepad.sample([pressed], now);
+  expect(sentAt.slice(6)).toEqual([420, 440, 460, 480, 500, 760]);
 });

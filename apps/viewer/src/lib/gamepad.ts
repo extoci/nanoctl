@@ -9,13 +9,17 @@ const MAX_SLOTS = 4;
 /** Every poll within this window after a change repeats the snapshot to repair loss. */
 const REPEAT_MS = 100;
 /**
- * Unchanged pads send a three-byte heartbeat at this interval once the repeat
- * window ends. The host neutralizes pads after 225 ms of silence, so two
+ * Unchanged pads send a one-byte heartbeat at this interval once the repeat
+ * window ends. The host neutralizes pads after 750 ms of silence, so two
  * consecutive lost heartbeats are still tolerated.
  */
-const KEEPALIVE_MS = 75;
-/** Full snapshots still refresh periodically so loss cannot wedge stick/button state. */
-const FULL_REFRESH_MS = 225;
+const KEEPALIVE_MS = 250;
+/**
+ * Full snapshots rebaseline sparse reporting. They ride the reliable control
+ * lane, so they only need an occasional consistency refresh rather than
+ * constant loss repair.
+ */
+const FULL_REFRESH_MS = 2_000;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
 type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
 type GamepadHeartbeat = { type: "gamepad-heartbeat" };
@@ -163,6 +167,7 @@ export class GamepadForwarder {
       keepaliveMs: number;
       heartbeat: boolean;
       sparse?: boolean;
+      fullRefreshMs?: number;
     } = {
       repeatMs: REPEAT_MS,
       keepaliveMs: KEEPALIVE_MS,
@@ -291,7 +296,7 @@ export class GamepadForwarder {
       else if (
         this.timing.heartbeat &&
         now - this.changedAt >= this.timing.repeatMs &&
-        now - this.fullAt < FULL_REFRESH_MS
+        now - this.fullAt < (this.timing.fullRefreshMs ?? FULL_REFRESH_MS)
       ) {
         if (this.send({ type: "gamepad-heartbeat" })) this.sentAt = now;
         return;
@@ -305,7 +310,7 @@ export class GamepadForwarder {
       !this.baseline ||
       diff.topology ||
       this.timing.sparse === false ||
-      now - this.fullAt >= FULL_REFRESH_MS;
+      now - this.fullAt >= (this.timing.fullRefreshMs ?? FULL_REFRESH_MS);
     let outgoing = message;
     if (!full) {
       const slots = new Set(diff.slots);

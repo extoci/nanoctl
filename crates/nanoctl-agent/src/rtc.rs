@@ -714,12 +714,12 @@ impl HostPeer {
                                     break;
                                 };
                                 if let Ok(mut input) = input.lock() {
-                                    // Gamepad viewers send full-state snapshots every frame,
-                                    // so 225ms of silence means the transport is badly impaired;
-                                    // don't let a held stick/button keep driving for seconds.
+                                    // Gamepad viewers heartbeat every 250ms while idle. Three
+                                    // missed heartbeats mean the transport or viewer is badly
+                                    // impaired; don't let a held stick/button keep driving.
                                     input.release_if_idle(
                                         Duration::from_secs(2),
-                                        Duration::from_millis(225),
+                                        Duration::from_millis(750),
                                     );
                                 }
                             }

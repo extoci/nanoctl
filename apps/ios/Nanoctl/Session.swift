@@ -269,11 +269,12 @@ final class Session {
 
     @discardableResult
     func sendGamepad(_ report: GamepadMessage, sparse: Bool = false) -> Bool {
-        // Gamepad reports ride the unordered zero-retransmit pointer channel so
-        // a lost report never delays the next one. Empty detaches stay reliable.
+        // Sparse reports self-repair individual slots and ride the unordered
+        // zero-retransmit pointer channel. Full reports are the sparse baseline,
+        // so they stay reliable even when they carry pads.
         let wire = sparse ? report.sparseBinary(sequence: gamepadSequence) : report.binary(sequence: gamepadSequence)
         guard gamepadAllowed, let data = wire else { return false }
-        guard send(data, pointer: !report.pads.isEmpty, limitBacklog: true, binary: true) else { return false }
+        guard send(data, pointer: sparse && !report.pads.isEmpty, limitBacklog: true, binary: true) else { return false }
         gamepadSequence &+= 1
         return true
     }

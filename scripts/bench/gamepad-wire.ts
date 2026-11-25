@@ -50,6 +50,7 @@ const measure = (
   sparse: boolean,
   padCount: number,
   trace: (frame: number) => State,
+  fullRefreshMs: number,
 ) => {
   let messages = 0;
   let bytes = 0;
@@ -62,7 +63,7 @@ const measure = (
           : (encodeBinaryInput(message)?.byteLength ?? 0)) + OVERHEAD;
       return true;
     },
-    { repeatMs: 100, keepaliveMs, heartbeat, sparse },
+    { repeatMs: 100, keepaliveMs, heartbeat, sparse, fullRefreshMs },
   );
   for (let frame = 0; frame < SECONDS * 60; frame++) {
     forwarder.sample(
@@ -76,8 +77,8 @@ const measure = (
 };
 
 for (const [name, trace] of Object.entries(traces)) {
-  const before = measure(true, 75, false, 4, trace);
-  const after = measure(true, 75, true, 4, trace);
+  const before = measure(true, 75, true, 4, trace, 225);
+  const after = measure(true, 250, true, 4, trace, 2_000);
   const kbps = (value: number) => ((value * 8) / SECONDS / 1000).toFixed(2);
   const improvement = (1 - after.bytes / before.bytes) * 100;
   console.log(

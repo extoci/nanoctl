@@ -274,11 +274,10 @@ impl Gamepads {
         }
         let missing_base = self.sequence.is_none() || self.waiting_for_full;
         if sparse && missing_base {
-            // Sparse records are absolute per-slot state, and the sender
-            // accumulates every slot differing from the receiver's last full
-            // baseline. Before that baseline arrives, though, an omitted slot
-            // could hide state the host never received.
-            self.sequence = Some(sequence);
+            // Sparse records arrive on a different lane from their reliable
+            // full baseline. Do not consume their sequence while dropping them:
+            // when the delayed baseline arrives it is still the newest usable
+            // reset point even if its sequence number is lower.
             self.waiting_for_full = true;
             return Ok(());
         }
@@ -854,6 +853,25 @@ mod tests {
                 updates.lock().unwrap().as_slice(),
                 &[PadReport::neutral(PadKind::DualShock4)]
             );
+        }
+
+        #[test]
+        fn dropped_sparse_before_baseline_does_not_consume_its_sequence() {
+            let mut gamepads = Gamepads::default();
+            let report = PadReport {
+                state: Report(0x1000, 0, 0, 0, 0, 0, 0),
+                ds4: None,
+            };
+            let mut slots = [None, None, None, None];
+            slots[0] = Some(report);
+
+            gamepads.update(Snapshot(slots, true, 5)).unwrap();
+            assert_eq!(gamepads.sequence, None);
+            assert!(gamepads.waiting_for_full);
+
+            gamepads.update(Snapshot(slots, false, 4)).unwrap();
+            assert_eq!(gamepads.sequence, Some(4));
+            assert!(!gamepads.waiting_for_full);
         }
 
         #[test]
