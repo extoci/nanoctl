@@ -24,6 +24,8 @@ mod media_bench;
 mod nv12;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod nvenc_encoder;
+#[cfg(any(feature = "media", test))]
+mod pixel_format;
 mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;
