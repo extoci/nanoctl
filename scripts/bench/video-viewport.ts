@@ -96,13 +96,16 @@ try {
     [960, 540],
   ] as const) {
     const pixelRatio = (width * height) / (SOURCE_WIDTH * SOURCE_HEIGHT);
-    const cap = Math.round(FULL_BITRATE_KBPS * Math.pow(pixelRatio, 0.5));
+    const beforeCap = Math.round(FULL_BITRATE_KBPS * Math.pow(pixelRatio, 0.5));
+    const cap = Math.round(FULL_BITRATE_KBPS * Math.pow(pixelRatio, 0.8));
+    const beforeBytes = encode(directory, `${width}x${height}-sqrt`, width, height, beforeCap);
     const bytes = encode(directory, `${width}x${height}`, width, height, cap);
-    const saved = 1 - bytes / full;
+    const saved = 1 - bytes / beforeBytes;
     const fullSsim = ssimAtViewport(directory, "full", width, height);
+    const beforeSsim = ssimAtViewport(directory, `${width}x${height}-sqrt`, width, height);
     const viewportSsim = ssimAtViewport(directory, `${width}x${height}`, width, height);
     console.log(
-      `${width}x${height} viewport @ ${cap} kbps cap: ${bytes} bytes (${(saved * 100).toFixed(1)}% less), SSIM at viewport ${viewportSsim.toFixed(4)} vs ${fullSsim.toFixed(4)} downscaled`,
+      `${width}x${height} viewport @ ${beforeCap} -> ${cap} kbps cap: ${beforeBytes} -> ${bytes} bytes (${(saved * 100).toFixed(1)}% less, ${(100 * (1 - bytes / full)).toFixed(1)}% below full), SSIM at viewport ${viewportSsim.toFixed(4)} vs ${beforeSsim.toFixed(4)} before and ${fullSsim.toFixed(4)} downscaled`,
     );
   }
 } finally {
