@@ -26,6 +26,7 @@ final class ViewerModel {
     var displays: [DisplayInfo] = []
     var toast: String?
     var touchMode = TouchMode.trackpad
+    var keyboardVisible = false
     var codec = CodecPreference.auto
     var maxFps: Int?
     var maxBitrateKbps: Int?
@@ -53,6 +54,9 @@ final class Desktop {
 
     init() {
         session.onChange = { [weak self] in self?.update() }
+        stage.onKeyboardVisible = { [weak self] visible in
+            self?.model.keyboardVisible = visible
+        }
         NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
                                                queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkAirPlay() }
@@ -116,6 +120,14 @@ final class Desktop {
     func setTouchMode(_ mode: TouchMode) {
         stage.touchMode = mode
         update()
+    }
+
+    func setKeyboardVisible(_ visible: Bool) {
+        stage.setKeyboardVisible(visible)
+    }
+
+    func restoreInputFocus() {
+        stage.restoreInputFocus()
     }
 
     func setCodec(_ codec: CodecPreference) {

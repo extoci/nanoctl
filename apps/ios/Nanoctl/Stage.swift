@@ -9,6 +9,16 @@ final class Stage: UIView {
     private let cursor = UIView()
     private weak var desktop: Desktop?
     private var external = false
+    private var inputWasReady = false
+    private(set) lazy var keyboardForwarder = KeyboardForwarder(
+        sendKey: { [weak self] down, key, repeating in
+            self?.desktop?.session.sendKey(down, key: key, repeating: repeating) ?? false
+        },
+        sendText: { [weak self] text in
+            self?.desktop?.session.sendText(text) ?? false
+        })
+    private lazy var keyboardInput = KeyboardInputView(forwarder: keyboardForwarder)
+    var onKeyboardVisible: ((Bool) -> Void)?
     private(set) lazy var gestures = TouchGestures(
         mode: TouchMode(rawValue: UserDefaults.standard.string(forKey: "touchMode") ?? "") ?? .trackpad,
         geometry: { [weak self] in self?.inputGeometry() },
@@ -36,6 +46,15 @@ final class Stage: UIView {
             child.frame = bounds
             child.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             addSubview(child)
+        }
+        keyboardInput.center = CGPoint(x: 0.5, y: 0.5)
+        addSubview(keyboardInput)
+        NotificationCenter.default.addObserver(forName: UIResponder.keyboardDidHideNotification, object: nil,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.keyboardInput.isFirstResponder else { return }
+                self.onKeyboardVisible?(false)
+            }
         }
         surface.gestures = gestures
         gestures.onCursor = { [weak self] _ in self?.placeCursor() }
@@ -65,7 +84,15 @@ final class Stage: UIView {
         let session = desktop.session
         let hasVideo = desktop.hasVideo
         surface.isUserInteractionEnabled = session.inputReady
-        if !session.inputReady { gestures.reset() }
+        if !session.inputReady {
+            gestures.reset()
+            keyboardForwarder.releaseAll()
+            setKeyboardVisible(false)
+        }
+        if session.inputReady, !inputWasReady, !keyboardInput.isFirstResponder {
+            keyboardInput.becomeFirstResponder()
+        }
+        inputWasReady = session.inputReady
         if external, gestures.zoom != Zoom() {
             gestures.zoom = Zoom()
             gestures.onZoom?(Zoom())
@@ -75,6 +102,55 @@ final class Stage: UIView {
         video.show(pixels: hasVideo && !external && session.transport == .dataChannel ? session.pixelMailbox : nil)
         placeCursor()
         publishViewportSize()
+    }
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    func restoreInputFocus() {
+        guard desktop?.session.inputReady == true, !keyboardInput.isFirstResponder else { return }
+        keyboardInput.becomeFirstResponder()
+    }
+
+    func setKeyboardVisible(_ visible: Bool) {
+        keyboardInput.wantsSoftwareKeyboard = visible
+        if visible {
+            guard desktop?.session.inputReady == true else { return }
+            if !keyboardInput.isFirstResponder { keyboardInput.becomeFirstResponder() }
+            keyboardInput.reloadInputViews()
+            if keyboardInput.isFirstResponder { onKeyboardVisible?(true) }
+        } else {
+            keyboardInput.reloadInputViews()
+            keyboardForwarder.releaseAll()
+            onKeyboardVisible?(false)
+        }
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        forwardKeyPresses(presses, with: event, began: true)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        forwardKeyPresses(presses, with: event, began: false)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        forwardKeyPresses(presses, with: event, began: false)
+    }
+
+    private func forwardKeyPresses(_ presses: Set<UIPress>, with event: UIPressesEvent?, began: Bool) {
+        guard desktop?.session.inputReady == true else {
+            began ? super.pressesBegan(presses, with: event) : super.pressesEnded(presses, with: event)
+            return
+        }
+        var remaining = Set<UIPress>()
+        for press in presses {
+            guard let key = press.key, keyboardForwarder.press(key, down: began) else {
+                remaining.insert(press)
+                continue
+            }
+        }
+        guard !remaining.isEmpty else { return }
+        began ? super.pressesBegan(remaining, with: event) : super.pressesEnded(remaining, with: event)
     }
 
     /// The letterboxed video rect in surface coordinates, including zoom.

@@ -261,10 +261,21 @@ struct SessionView: View {
                     }
                     .glassID("touch", in: glass)
 
+                    ChromeButton(model.keyboardVisible ? "Hide keyboard" : "Keyboard",
+                                 systemImage: model.keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard") {
+                        desktop.setKeyboardVisible(!model.keyboardVisible)
+                        poke()
+                    }
+                    .opacity(model.keyboardVisible ? 1 : 0.92)
+                    .glassID("keyboard", in: glass)
+
                     Menu {
                         menu(model)
                             .onAppear { collapseTask?.cancel() }
-                            .onDisappear { poke() }
+                            .onDisappear {
+                                desktop.restoreInputFocus()
+                                poke()
+                            }
                     } label: {
                         Image(systemName: "ellipsis")
                             .font(.system(size: 17, weight: .semibold))

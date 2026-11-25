@@ -38,6 +38,12 @@ DualShock 4** on a Windows host with ViGEm; other supported profiles request an
 Xbox 360. This is not a native DualSense device on the host, and does not forward
 rumble, adaptive triggers, touchpad, or motion.
 
+Hardware keyboards forward real key down/up events, including key repeat, arrows,
+function keys and modifiers. The Keyboard button opens the iOS keyboard for text;
+its accessory strip sends Escape, Tab, navigation keys and Delete, with latchable
+Shift/Ctrl/Alt/Win modifiers for shortcuts. Text and key input use the same compact
+binary wire format as the web viewer.
+
 ## External display, no tvOS app
 
 When iOS provides a separate external-display scene, nanoctl sends only video there

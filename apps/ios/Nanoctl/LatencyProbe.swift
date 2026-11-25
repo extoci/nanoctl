@@ -176,10 +176,10 @@ final class LatencyProbe {
             for i in 1...12 {
                 try? await Task.sleep(for: .milliseconds(181 + (i * 43) % 193))
                 let time = (CACurrentMediaTime() + epochOffset) * 1000
-                guard session.sendKey(true) else { break }
+                guard session.sendSpaceKey(true) else { break }
                 inputTimes.append(time)
                 try? await Task.sleep(for: .milliseconds(30))
-                session.sendKey(false)
+                session.sendSpaceKey(false)
                 let deadline = CACurrentMediaTime() + 3
                 while frames.last?.input != i && CACurrentMediaTime() < deadline {
                     try? await Task.sleep(for: .milliseconds(10))

@@ -301,9 +301,15 @@ final class Session {
     }
 
     @discardableResult
-    func sendKey(_ down: Bool) -> Bool {
-        // Space as one UTF-8 key byte: kind 5, flags bit 0 = up.
-        send(Data([5, down ? 0 : 1, 0x20]), binary: true)
+    func sendKey(_ down: Bool, key: RemoteKey, repeating: Bool = false) -> Bool {
+        guard let data = key.binary(down: down, repeating: repeating) else { return false }
+        return send(data, binary: true)
+    }
+
+    @discardableResult
+    func sendSpaceKey(_ down: Bool) -> Bool {
+        guard let space = RemoteKey.special("Space") else { return false }
+        return sendKey(down, key: space)
     }
 
     @discardableResult
