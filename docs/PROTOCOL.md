@@ -170,6 +170,7 @@ an optional `dualShock4` array to the snapshot with one
 entry per PlayStation pad. The host presents those slots as DualShock 4 controllers and
 all other slots as Xbox 360 controllers. The original `pads` entries are unchanged, so
 older hosts can ignore the extension. Each message is a full snapshot; the host unplugs
-slots not present. An empty snapshot detaches all pads. The viewer sends
-changes and a 500 ms keepalive while forwarding; after 2 seconds without a snapshot
-the host neutralizes the current pads. Channel or session teardown unplugs them.
+slots not present. An empty snapshot detaches all pads. The viewer sends a
+change immediately, repeats it on every poll for 100 ms so a lost report is
+repaired on the next frame, then keeps an unchanged pad alive every 50 ms;
+after 150 ms without a snapshot the host neutralizes the current pads. Channel or session teardown unplugs them.
