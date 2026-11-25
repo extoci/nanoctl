@@ -47,8 +47,10 @@ function report(pad: InputPad, slot: number): GamepadReport {
   ];
 }
 
-
-function sameReports(left: readonly GamepadReport[] | undefined, right: readonly GamepadReport[] | undefined): boolean {
+function sameReports(
+  left: readonly GamepadReport[] | undefined,
+  right: readonly GamepadReport[] | undefined,
+): boolean {
   return (
     left?.length === right?.length &&
     (left ?? []).every((report, index) =>
