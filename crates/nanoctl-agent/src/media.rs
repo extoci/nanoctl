@@ -1310,6 +1310,7 @@ impl EncoderBackend {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn encode(
         &mut self,
         image: &xcap::image::ImageBuffer<
