@@ -655,6 +655,11 @@ export class RemoteSessionController {
         maxRetransmits: 0,
       });
       const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
+      // Compressed access units must arrive as ArrayBuffer. The spec default is
+      // Blob in some implementations, which would make the zero-copy feed path
+      // ignore every frame.
+      videoChannel.binaryType = "arraybuffer";
+      idrChannel.binaryType = "arraybuffer";
       videoChannel.onopen = () => {
         if (!this.isCurrent(lifecycle, peer)) return;
         const directVideoCodec = negotiatedDirectVideoCodec(peer);
