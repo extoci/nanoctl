@@ -94,6 +94,83 @@ function stripEmulationPrevention(bytes: Uint8Array): Uint8Array {
   return out.subarray(0, n);
 }
 
+export interface H264Nal {
+  type: number;
+  data: Uint8Array;
+}
+
+/** Splits an H.264 Annex-B access unit into its NAL units (3- or 4-byte start codes). */
+export function parseH264AnnexB(bitstream: Uint8Array): H264Nal[] {
+  const starts: number[] = [];
+  const lens: number[] = [];
+  let i = 0;
+  while (i + 3 <= bitstream.length) {
+    if (bitstream[i] === 0 && bitstream[i + 1] === 0 && bitstream[i + 2] === 1) {
+      starts.push(i);
+      lens.push(3);
+      i += 3;
+    } else if (
+      i + 4 <= bitstream.length &&
+      bitstream[i] === 0 &&
+      bitstream[i + 1] === 0 &&
+      bitstream[i + 2] === 0 &&
+      bitstream[i + 3] === 1
+    ) {
+      starts.push(i);
+      lens.push(4);
+      i += 4;
+    } else {
+      i += 1;
+    }
+  }
+  const nals: H264Nal[] = [];
+  for (let k = 0; k < starts.length; k++) {
+    const start = starts[k]! + lens[k]!;
+    const end = k + 1 < starts.length ? starts[k + 1]! : bitstream.length;
+    if (end > start) nals.push({ type: bitstream[start]! & 0x1f, data: bitstream.subarray(start, end) });
+  }
+  return nals;
+}
+
+/** Builds the avcC decoder configuration record WebKit requires for H.264. */
+export function buildAvcCDescription(sps: Uint8Array, pps: Uint8Array): Uint8Array {
+  const out = new Uint8Array(11 + sps.length + pps.length);
+  out[0] = 1;
+  out[1] = sps[1] ?? 0;
+  out[2] = sps[2] ?? 0;
+  out[3] = sps[3] ?? 0;
+  out[4] = 0xff; // 6 reserved bits + lengthSizeMinusOne = 3 (4-byte lengths)
+  out[5] = 0xe1; // 3 reserved bits + one SPS
+  out[6] = sps.length >> 8;
+  out[7] = sps.length & 0xff;
+  out.set(sps, 8);
+  let offset = 8 + sps.length;
+  out[offset] = 1; // one PPS
+  out[offset + 1] = pps.length >> 8;
+  out[offset + 2] = pps.length & 0xff;
+  out.set(pps, offset + 3);
+  return out;
+}
+
+/** Repacks NAL units as a length-prefixed AVCC sample, dropping parameter sets. */
+export function buildAvccPayload(nals: H264Nal[]): Uint8Array {
+  const kept = nals.filter((nal) => nal.type !== 7 && nal.type !== 8);
+  let total = 0;
+  for (const nal of kept) total += 4 + nal.data.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const nal of kept) {
+    const length = nal.data.length;
+    out[offset] = length >>> 24;
+    out[offset + 1] = (length >>> 16) & 0xff;
+    out[offset + 2] = (length >>> 8) & 0xff;
+    out[offset + 3] = length & 0xff;
+    out.set(nal.data, offset + 4);
+    offset += 4 + length;
+  }
+  return out;
+}
+
 class BitReader {
   private bit = 0;
 
@@ -444,12 +521,18 @@ function createVideoSink(
     return codec;
   };
 
-  const decoderConfig = (codec: string) =>
-    ({
+  const decoderConfig = (codec: string, description?: Uint8Array | null) => {
+    const config = {
       codec,
       optimizeForLatency: true,
       latencyMode: "realtime",
-    }) as VideoDecoderConfig & { latencyMode: "realtime" };
+    } as VideoDecoderConfig & { latencyMode: "realtime" };
+    // WebKit's H.264 decoder only accepts length-prefixed samples with the
+    // parameter sets carried in the configuration record; Chrome accepts
+    // both. Feeding AVCC with a description is correct in every engine.
+    if (description) config.description = description;
+    return config;
+  };
 
   let configuredCodec: string | undefined;
 
@@ -503,9 +586,10 @@ function createVideoSink(
       error: decoderFault,
     });
     try {
-      next.configure(decoderConfig(codec));
+      next.configure(decoderConfig(codec, avcDescription));
       decoder = next;
       configuredCodec = codec;
+      descriptionDirty = false;
     } catch (error) {
       console.warn("webcodecs video configure failed", error);
       decoderFault(error);
@@ -517,6 +601,10 @@ function createVideoSink(
   // case the framing differs.
   let decoderConfigured = false;
   let resyncing = false;
+  // Active avcC record built from in-band SPS/PPS. Once present, chunks are
+  // fed length-prefixed and the record rides in the decoder configuration.
+  let avcDescription: Uint8Array | null = null;
+  let descriptionDirty = false;
 
   const toAnnexB = (data: Uint8Array): Uint8Array => {
     if (
@@ -557,18 +645,46 @@ function createVideoSink(
 
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number): boolean => {
     if (closed) return false;
-    const bitstream = videoCodec === "av1" ? data : toAnnexB(data);
-    if (!decoderConfigured) {
-      if (!isKey && !containsIdr(bitstream, videoCodec)) {
+    // Scan the Annex-B form for random-access pictures and parameter sets;
+    // the payload actually fed may be repacked as AVCC below.
+    const scanned = videoCodec === "av1" ? data : toAnnexB(data);
+    let avcc: Uint8Array | null = null;
+    if (videoCodec === "h264") {
+      const nals = parseH264AnnexB(scanned);
+      if (nals.length > 0) {
+        const sps = nals.find((nal) => nal.type === 7)?.data;
+        const pps = nals.find((nal) => nal.type === 8)?.data;
+        if (sps && pps && sps.length >= 4) {
+          const discovered = buildAvcCDescription(sps, pps);
+          const unchanged =
+            avcDescription !== null &&
+            discovered.length === avcDescription.length &&
+            discovered.every((byte, index) => byte === avcDescription[index]);
+          if (!unchanged) {
+            avcDescription = discovered;
+            descriptionDirty = true;
+          }
+        }
+        if (avcDescription) avcc = buildAvccPayload(nals);
+      } else if (avcDescription) {
+        // Unparseable frame while AVCC decoding is configured: feeding it
+        // would corrupt the decoder's input format.
         dropped += 1;
         return false;
       }
-      ensureDecoder(bitstream);
+    }
+    const bitstream = avcc ?? scanned;
+    if (!decoderConfigured) {
+      if (!isKey && !containsIdr(scanned, videoCodec)) {
+        dropped += 1;
+        return false;
+      }
+      ensureDecoder(scanned);
       if (!decoder) return false;
       decoderConfigured = true;
     }
     if (!decoder) return false;
-    const key = isKey || containsIdr(bitstream, videoCodec);
+    const key = isKey || containsIdr(scanned, videoCodec);
     if (resyncing && !key) {
       dropped += 1;
       return false;
@@ -579,12 +695,13 @@ function createVideoSink(
     // the decoder: its queue may still contain deltas whose reference chain
     // was deliberately abandoned.
     if (key) {
-      const codec = codecOf(bitstream);
-      if (resyncing || codec !== configuredCodec) {
+      const codec = codecOf(scanned);
+      if (resyncing || codec !== configuredCodec || descriptionDirty) {
         try {
           decoder.reset();
-          decoder.configure(decoderConfig(codec));
+          decoder.configure(decoderConfig(codec, avcDescription));
           configuredCodec = codec;
+          descriptionDirty = false;
           resyncing = false;
         } catch {
           decoderConfigured = false;
@@ -900,7 +1017,34 @@ export function attachDataChannelVideo(
   };
   channel.onmessage = onFrame;
   if (idrChannel) idrChannel.onmessage = onFrame;
-  channel.onclose = () => sink.teardown(true);
-  if (idrChannel) idrChannel.onclose = () => sink.teardown(true);
-  return { canvas: sink.canvas, drop: () => sink.teardown(false), stats: sink.stats };
+  // Watchdog: a join always begins with a keyframe, so a healthy decoder
+  // produces its first frame quickly. Some engines accept the configuration
+  // but never decode (codec/profile unsupported in practice) — black-holing
+  // video while the agent keeps the RTP leg suppressed. Abandon the path so
+  // the agent resumes ordinary RTP video instead.
+  const watchdog = window.setTimeout(() => {
+    if (sink.stats().decoded > 0) return;
+    dbg.watchdog = 1;
+    try {
+      channel.close();
+    } catch {}
+    try {
+      idrChannel?.close();
+    } catch {}
+    sink.teardown(true);
+  }, 4000);
+  const onClosed = () => {
+    window.clearTimeout(watchdog);
+    sink.teardown(true);
+  };
+  channel.onclose = onClosed;
+  if (idrChannel) idrChannel.onclose = onClosed;
+  return {
+    canvas: sink.canvas,
+    drop: () => {
+      window.clearTimeout(watchdog);
+      sink.teardown(false);
+    },
+    stats: sink.stats,
+  };
 }
