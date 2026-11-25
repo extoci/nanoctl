@@ -179,7 +179,6 @@ pub struct WindowsEncoder {
     reconfigure: bool,
     force_keyframe: bool,
     timestamp: i64,
-    nv12: Vec<u8>,
 }
 
 impl Drop for WindowsEncoder {
@@ -214,7 +213,6 @@ impl WindowsEncoder {
             reconfigure: false,
             force_keyframe: false,
             timestamp: 0,
-            nv12: Vec::new(),
         };
         // `doctor` calls this constructor. Configure a real encoder rather than treating an
         // enumeration result as proof that its media types and buffers work.
@@ -286,9 +284,16 @@ impl FrameEncoder for WindowsEncoder {
             }
             self.force_keyframe = false;
         }
-        crate::nv12::pixels_to_nv12(image.as_raw(), width, height, format, &mut self.nv12)?;
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .context("NV12 frame dimensions overflow")?;
+        let nv12_len = pixels
+            .checked_add(pixels / 2)
+            .context("NV12 frame size overflows")?;
         let duration = 10_000_000_i64 / i64::from(self.max_fps);
-        let sample = create_input_sample(&self.nv12, self.timestamp, duration)?;
+        let sample = create_input_sample(nv12_len, self.timestamp, duration, |output| {
+            crate::nv12::pixels_to_nv12_slice(image.as_raw(), width, height, format, output)
+        })?;
         self.timestamp = self.timestamp.saturating_add(duration);
         let active = self
             .active
@@ -622,8 +627,13 @@ fn create_video_type(
     Ok(media_type)
 }
 
-fn create_input_sample(bytes: &[u8], timestamp: i64, duration: i64) -> Result<IMFSample> {
-    let length = u32::try_from(bytes.len()).context("NV12 frame is too large")?;
+fn create_input_sample(
+    byte_len: usize,
+    timestamp: i64,
+    duration: i64,
+    fill: impl FnOnce(&mut [u8]) -> Result<()>,
+) -> Result<IMFSample> {
+    let length = u32::try_from(byte_len).context("NV12 frame is too large")?;
     // SAFETY: the locked buffer is valid for `length` bytes and is always unlocked before return.
     unsafe {
         let buffer =
@@ -632,10 +642,11 @@ fn create_input_sample(bytes: &[u8], timestamp: i64, duration: i64) -> Result<IM
         buffer
             .Lock(&mut destination, None, None)
             .context("cannot lock an NV12 media buffer")?;
-        ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
-        if let Err(error) = buffer.Unlock() {
-            return Err(error).context("cannot unlock an NV12 media buffer");
-        }
+        let output = slice::from_raw_parts_mut(destination, byte_len);
+        let fill_result = fill(output);
+        let unlock_result = buffer.Unlock();
+        fill_result?;
+        unlock_result.context("cannot unlock an NV12 media buffer")?;
         buffer
             .SetCurrentLength(length)
             .context("cannot set NV12 media buffer length")?;
