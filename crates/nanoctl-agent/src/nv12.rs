@@ -11,7 +11,7 @@ pub fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) 
     pixels_to_nv12(rgba, width, height, PixelFormat::Rgba, output)
 }
 
-#[cfg(test)]
+#[cfg(any(target_os = "linux", test))]
 pub fn pixels_to_nv12(
     rgba: &[u8],
     width: u32,
