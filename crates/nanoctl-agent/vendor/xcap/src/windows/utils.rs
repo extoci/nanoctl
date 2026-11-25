@@ -337,18 +337,27 @@ pub(super) fn texture_to_frame(
             Some(&mut mapped),
         )?;
 
-        let mut bgra = vec![0u8; (width * height * 4) as usize];
+        let len = (width * height * 4) as usize;
+        let row_bytes = (width * 4) as usize;
+        let mut bgra = Vec::with_capacity(len);
         let src_ptr = mapped.pData as *const u8;
+        let dst_ptr = bgra.as_mut_ptr();
 
-        for row in 0..height {
-            let src_offset = (row * mapped.RowPitch) as usize;
-            let dst_offset = (row * width * 4) as usize;
-
-            let src_slice =
-                std::slice::from_raw_parts(src_ptr.add(src_offset), (width * 4) as usize);
-
-            bgra[dst_offset..dst_offset + (width * 4) as usize].copy_from_slice(src_slice);
+        if mapped.RowPitch as usize == row_bytes {
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len);
+        } else {
+            for row in 0..height {
+                let src_offset = (row * mapped.RowPitch) as usize;
+                let dst_offset = (row * width * 4) as usize;
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src_offset),
+                    dst_ptr.add(dst_offset),
+                    row_bytes,
+                );
+            }
         }
+        // Every byte in `len` was initialized by the contiguous or row-wise copies above.
+        bgra.set_len(len);
 
         d3d_context.Unmap(Some(&resource), 0);
 
