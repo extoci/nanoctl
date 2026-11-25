@@ -670,7 +670,10 @@ export function attachDataChannelVideo(
     kfRequestedAt = Date.now();
     dbg.kf = (dbg.kf as number) + 1;
     try {
-      channel.send("KF");
+      // The unreliable delta channel can drop this one-byte recovery request
+      // exactly when loss recovery is needed. The IDR channel is reliable and
+      // the host accepts the request on either channel.
+      (idrChannel ?? channel).send("KF");
     } catch {}
   };
   // Ask for a keyframe immediately: without it the request only goes out
