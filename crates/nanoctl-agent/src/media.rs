@@ -62,6 +62,57 @@ mod resize;
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+// SCTP caps a message at ~64KiB, so large access units are chunked. The compact
+// wire header is [u32 seq][u8 flags]; fragmented messages add u16 part/parts
+// and timestamped messages add u64 sent_ms. Most delta frames therefore cost
+// five header bytes instead of the original seventeen.
+const VIDEO_DC_CHUNK: usize = 48 * 1024;
+const VIDEO_FLAG_KEYFRAME: u8 = 1;
+const VIDEO_FLAG_FRAGMENTED: u8 = 2;
+const VIDEO_FLAG_TIMESTAMP: u8 = 4;
+
+fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
+    let parts = data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
+    let timestamped = is_keyframe || seq % 16 == 0;
+    let sent_ms = timestamped
+        .then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let mut flags = if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
+    if parts > 1 {
+        flags |= VIDEO_FLAG_FRAGMENTED;
+    }
+    if timestamped {
+        flags |= VIDEO_FLAG_TIMESTAMP;
+    }
+    let mut messages = Vec::with_capacity(parts as usize);
+    for part in 0..parts {
+        let start = part as usize * VIDEO_DC_CHUNK;
+        let end = (start + VIDEO_DC_CHUNK).min(data.len());
+        let mut header = 5 + usize::from(timestamped) * 8;
+        if parts > 1 {
+            header += 4;
+        }
+        let mut msg = Vec::with_capacity(end - start + header);
+        msg.extend_from_slice(&seq.to_le_bytes());
+        msg.push(flags);
+        if parts > 1 {
+            msg.extend_from_slice(&part.to_le_bytes());
+            msg.extend_from_slice(&parts.to_le_bytes());
+        }
+        if timestamped {
+            msg.extend_from_slice(&sent_ms.to_le_bytes());
+        }
+        msg.extend_from_slice(&data[start..end]);
+        messages.push(Bytes::from(msg));
+    }
+    messages
+}
+
 fn video_playout_delay(mode: LatencyMode) -> HeaderExtension {
     HeaderExtension::PlayoutDelay(PlayoutDelayExtension {
         min_delay: 0,
@@ -2807,26 +2858,10 @@ pub fn prime_replay(
     } else {
         backend.encode_format(&rgba_view(&captured)?, pixel_format)?
     };
-    const CHUNK: usize = 48 * 1024;
-    let parts = frame.bytes.len().div_ceil(CHUNK).max(1) as u16;
-    let sent_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default();
-    let mut messages = Vec::with_capacity(parts as usize);
-    for part in 0..parts {
-        let start = part as usize * CHUNK;
-        let end = (start + CHUNK).min(frame.bytes.len());
-        let mut msg = Vec::with_capacity(end - start + 17);
-        msg.extend_from_slice(&0_u32.to_le_bytes());
-        msg.push(1_u8);
-        msg.extend_from_slice(&part.to_le_bytes());
-        msg.extend_from_slice(&parts.to_le_bytes());
-        msg.extend_from_slice(&sent_ms.to_le_bytes());
-        msg.extend_from_slice(&frame.bytes[start..end]);
-        messages.push(Bytes::from(msg));
-    }
-    replay.lock().unwrap().seed(messages);
+    replay
+        .lock()
+        .unwrap()
+        .seed(video_data_messages(0, true, &frame.bytes));
     Ok(())
 }
 
@@ -3374,10 +3409,7 @@ pub fn spawn_video(
                     // post-gap deltas and asks for a keyframe on "KF".
                     // Keyframes go over the reliable channel: they are
                     // large and cannot survive partial reliability.
-                    // SCTP caps a message at ~64KiB, so large AUs are
-                    // chunked: [u32 seq][u8 flags][u16 part][u16 parts].
-                    const CHUNK: usize = 48 * 1024;
-                    let parts = sample.data.len().div_ceil(CHUNK).max(1) as u16;
+                    let parts = sample.data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
                     if is_idr {
                         tracing::info!(
                             dc_skips,
@@ -3386,25 +3418,9 @@ pub fn spawn_video(
                     }
                     let seq = dc_seq;
                     dc_seq = dc_seq.wrapping_add(1);
-                    let sent_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or_default();
                     // Messages are built even without an attached viewer so the
                     // replay window stays warm for the next attach.
-                    let mut messages = Vec::with_capacity(parts as usize);
-                    for part in 0..parts {
-                        let start = part as usize * CHUNK;
-                        let end = (start + CHUNK).min(sample.data.len());
-                        let mut msg = Vec::with_capacity(end - start + 17);
-                        msg.extend_from_slice(&seq.to_le_bytes());
-                        msg.push(u8::from(is_idr));
-                        msg.extend_from_slice(&part.to_le_bytes());
-                        msg.extend_from_slice(&parts.to_le_bytes());
-                        msg.extend_from_slice(&sent_ms.to_le_bytes());
-                        msg.extend_from_slice(&sample.data[start..end]);
-                        messages.push(Bytes::from(msg));
-                    }
+                    let messages = video_data_messages(seq, is_idr, &sample.data);
                     let target = if is_idr {
                         idr_channel.as_ref().or(video_channel.as_ref())
                     } else {
@@ -3637,10 +3653,29 @@ mod tests {
         HARDWARE_BACKENDS, HardwareBackend, LatestFrame, PixelFormat, SoftwareEncoder,
         TimingSample, TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types,
         avcc_to_annex_b, await_video_delivery, bitrate_target, delivery_failure_grace_elapsed,
-        fit_dimensions, viewport_scaled_rate,
+        fit_dimensions, video_data_messages, viewport_scaled_rate,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+
+    #[test]
+    fn video_wire_messages_use_compact_optional_headers() {
+        let delta = video_data_messages(1, false, &[7; 10]);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].len(), 15);
+        assert_eq!(&delta[0][..5], &[1, 0, 0, 0, 0]);
+
+        let timestamped = video_data_messages(16, false, &[7; 10]);
+        assert_eq!(timestamped[0][4], 4);
+        assert_eq!(timestamped[0].len(), 23);
+
+        let keyframe = video_data_messages(32, true, &vec![9; 100_000]);
+        assert_eq!(keyframe.len(), 3);
+        assert_eq!(keyframe[0][4], 7);
+        assert_eq!(&keyframe[0][5..9], &[0, 0, 3, 0]);
+        assert_eq!(keyframe[0].len(), 17 + 48 * 1024);
+        assert_eq!(keyframe[2].len(), 17 + (100_000 - 2 * 48 * 1024));
+    }
 
     #[test]
     fn viewport_bitrate_scaling_preserves_more_bits_per_pixel() {

@@ -689,7 +689,7 @@ export function attachDataChannelVideo(
   const onFrame = (event: MessageEvent) => {
     try {
       const data = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
-      if (!data || data.length < 18) {
+      if (!data || data.length < 6) {
         dbg.nonArrayBuffer = (dbg.nonArrayBuffer as number) + 1;
         return;
       }
@@ -699,15 +699,28 @@ export function attachDataChannelVideo(
         dbg.firstMsgMs = performance.now() - joinAt;
       }
       const seq = data[0]! | (data[1]! << 8) | (data[2]! << 16) | (data[3]! << 24);
-      const isKey = (data[4]! & 1) !== 0;
-      const part = data[5]! | (data[6]! << 8);
-      const parts = data[7]! | (data[8]! << 8);
-      const dv = new DataView(data.buffer, data.byteOffset + 9);
-      const sentMs = Number(dv.getBigUint64(0, true));
-      const transitMs = Date.now() - sentMs;
-      dbg.transitMs = transitMs;
-      dbg.transitSum = ((dbg.transitSum as number) || 0) + transitMs;
-      const chunk = data.subarray(17);
+      const flags = data[4]!;
+      const isKey = (flags & 1) !== 0;
+      let offset = 5;
+      let part = 0;
+      let parts = 1;
+      if ((flags & 2) !== 0) {
+        if (data.length < offset + 5) return;
+        part = data[offset]! | (data[offset + 1]! << 8);
+        parts = data[offset + 2]! | (data[offset + 3]! << 8);
+        offset += 4;
+        if (part >= parts) return;
+      }
+      if ((flags & 4) !== 0) {
+        if (data.length < offset + 8) return;
+        const dv = new DataView(data.buffer, data.byteOffset + offset);
+        const transitMs = Date.now() - Number(dv.getBigUint64(0, true));
+        dbg.transitMs = transitMs;
+        dbg.transitSum = ((dbg.transitSum as number) || 0) + transitMs;
+        offset += 8;
+      }
+      if (data.length <= offset) return;
+      const chunk = data.subarray(offset);
       let au: Uint8Array | null = chunk;
       if (parts > 1) {
         let entry = pending.get(seq);

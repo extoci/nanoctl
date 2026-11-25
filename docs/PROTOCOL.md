@@ -115,8 +115,11 @@ A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and
 `nanoctl.video-idr.v1` (reliable, ordered) to receive compressed access units directly,
 bypassing the RTP jitter buffer. H.264 and HEVC payloads use Annex-B; AV1 payloads use
 low-overhead OBU temporal units (the formats WebCodecs consumes). Each message is
-`[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts][u64 sent_ms][payload chunk]`
-with all integers little-endian; `parts` splits large access units into ~48 KiB chunks.
+`[u32 seq][u8 flags][optional u16 part][optional u16 parts][optional u64 sent_ms][payload chunk]`
+with all integers little-endian. Flags bit0 marks a keyframe, bit1 marks fragmentation (the
+part fields are present), and bit2 marks a sender timestamp. Unfragmented delta frames
+normally cost only five header bytes; keyframes and every sixteenth delta carry `sent_ms`
+for transit telemetry. `parts` splits large access units into ~48 KiB chunks.
 Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks
 the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
 video channel until a keyframe arrives. While `nanoctl.video.v1` is open the agent

@@ -5,8 +5,9 @@ import Foundation
 /// Annex-B access units with no jitter buffer. Mirrors
 /// `attachDataChannelVideo` in the browser viewer.
 ///
-/// Wire format: `[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts]
-/// [u64 sent_ms][payload chunk]`, all little-endian. Deltas ride the unordered
+/// Wire format: `[u32 seq][u8 flags (bit0 keyframe, bit1 fragmented,
+/// bit2 timestamped)]`, then optional u16 part/parts and u64 sent_ms before the
+/// payload chunk, all little-endian. Deltas ride the unordered
 /// unreliable channel; keyframes ride the reliable IDR channel. A sequence gap
 /// breaks the reference chain: deltas after the gap are dropped and the viewer
 /// sends the text `KF` on the video channel until a keyframe arrives.
@@ -102,15 +103,29 @@ final class DCVideoReceiver {
     }
 
     private func process(_ data: Data) {
-        guard data.count >= 17 else { return }
+        guard data.count >= 6 else { return }
         stats.msgs += 1
         let seq = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
-        let isKey = data[4] & 1 != 0
-        let part = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt16.self) })
-        let parts = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 7, as: UInt16.self) })
-        let sentMs = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 9, as: UInt64.self) }
-        stats.transitMs = Date().timeIntervalSince1970 * 1000 - Double(sentMs)
-        var chunk = data.subdata(in: 17..<data.count)
+        let flags = data[4]
+        let isKey = flags & 1 != 0
+        var offset = 5
+        var part = 0
+        var parts = 1
+        if flags & 2 != 0 {
+            guard data.count >= offset + 5 else { return }
+            part = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt16.self) })
+            parts = Int(data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset + 2, as: UInt16.self) })
+            offset += 4
+            guard part < parts else { return }
+        }
+        if flags & 4 != 0 {
+            guard data.count >= offset + 8 else { return }
+            let sentMs = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
+            stats.transitMs = Date().timeIntervalSince1970 * 1000 - Double(sentMs)
+            offset += 8
+        }
+        guard data.count > offset else { return }
+        var chunk = data.subdata(in: offset..<data.count)
 
         if parts > 1 {
             var entry = pending[seq] ?? (isKey, parts, [Data?](repeating: nil, count: parts), 0)
