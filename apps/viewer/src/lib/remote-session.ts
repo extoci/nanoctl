@@ -276,6 +276,15 @@ export class RemoteSessionController {
     this.publishSnapshot();
   };
 
+  // The WebCodecs path renders through a track generator or a plain canvas;
+  // where neither touches the <video> element (WebKit has no
+  // MediaStreamTrackGenerator), loadeddata never fires and the session would
+  // otherwise hit the first-frame timeout despite video being on screen.
+  private readonly onDirectVideoFrame = () => {
+    if (this.firstFrameReceived) return;
+    this.onVideoLoadedData();
+  };
+
   constructor(options: RemoteSessionOptions) {
     this.qualityLimits = { ...options.qualityLimits };
     this.options = options;
@@ -732,6 +741,7 @@ export class RemoteSessionController {
           this.options.video,
           restoreRemoteVideo,
           directVideoCodec,
+          this.onDirectVideoFrame,
         );
       };
     }
@@ -765,7 +775,12 @@ export class RemoteSessionController {
         negotiatedDirectVideoCodec(peer) === "h264"
       ) {
         const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
-        this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video, restoreRemoteVideo);
+        this.webCodecsVideo = attachWebCodecsVideo(
+          encoded,
+          this.options.video,
+          restoreRemoteVideo,
+          this.onDirectVideoFrame,
+        );
       }
       // The data-channel path owns the element through its track generator:
       // writing the RTP stream over srcObject starves the generator, so the

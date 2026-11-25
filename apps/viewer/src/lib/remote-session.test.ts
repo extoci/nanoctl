@@ -1355,8 +1355,15 @@ describe("webcodecs video gating and teardown", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(decoderError).not.toBeNull();
+    // A single decoder error is not fatal: the decoder is rebuilt on the next
+    // keyframe and the RTP leg stays untouched.
     decoderError!(new Error("Decoding error"));
-
+    expect(video.srcObject).toBe(liveStream);
+    expect(teardownNotified).toBe(0);
+    // Repeated failure gives up on the WebCodecs path so the session falls
+    // back to RTP video.
+    decoderError!(new Error("Decoding error"));
+    decoderError!(new Error("Decoding error"));
     expect(video.srcObject).toBe(liveStream);
     expect(teardownNotified).toBe(1);
     handle.drop();

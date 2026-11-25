@@ -293,11 +293,19 @@ interface VideoTrackGeneratorLike {
   writable: WritableStream<VideoFrame>;
 }
 
+interface VideoSinkHooks {
+  /** First decoded frame reached the screen: the session is visibly live. */
+  onFirstFrame?: () => void;
+  /** Decoder failed beyond recovery; the caller should abandon this path. */
+  onFatal?: () => void;
+}
+
 function createVideoSink(
   video: HTMLVideoElement,
   onTeardown?: () => void,
   joinAt?: number,
   videoCodec: DirectVideoCodec = "h264",
+  hooks?: VideoSinkHooks,
 ): VideoSink {
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
@@ -341,6 +349,31 @@ function createVideoSink(
   let decoder: VideoDecoder | null = null;
   let decoded = 0;
   let dropped = 0;
+  let decoderErrors = 0;
+  let firstFrameFired = false;
+  const fireFirstFrame = () => {
+    if (firstFrameFired) return;
+    firstFrameFired = true;
+    hooks?.onFirstFrame?.();
+  };
+  // A decoder error is not necessarily fatal: throw the instance away and
+  // rebuild it on the next keyframe. Only repeated failure abandons the
+  // WebCodecs path so the session can fall back to the RTP leg.
+  const decoderFault = (error: unknown) => {
+    console.warn("webcodecs video decoder error", error);
+    if (closed) return;
+    decoderErrors += 1;
+    try {
+      decoder?.close();
+    } catch {}
+    decoder = null;
+    decoderConfigured = false;
+    resyncing = true;
+    if (decoderErrors >= 3) {
+      teardown(true);
+      hooks?.onFatal?.();
+    }
+  };
   // Decode latency probe: chunk timestampUs -> performance.now() at decode().
   const decodeSubmit = new Map<number, number>();
   // Present latency probe: decoder-output times keyed by frame timestamp.
@@ -444,6 +477,7 @@ function createVideoSink(
         if (decodeOutput.size > 256) {
           decodeOutput.delete(decodeOutput.keys().next().value!);
         }
+        fireFirstFrame();
         if (writer) {
           decoded += 1;
           // Close once the generator has consumed the frame.
@@ -466,10 +500,7 @@ function createVideoSink(
           frame.close();
         }
       },
-      error: (error) => {
-        console.warn("webcodecs video decoder error", error);
-        teardown(true);
-      },
+      error: decoderFault,
     });
     try {
       next.configure(decoderConfig(codec));
@@ -477,7 +508,7 @@ function createVideoSink(
       configuredCodec = codec;
     } catch (error) {
       console.warn("webcodecs video configure failed", error);
-      teardown(true);
+      decoderFault(error);
     }
   };
 
@@ -525,6 +556,7 @@ function createVideoSink(
   };
 
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number): boolean => {
+    if (closed) return false;
     const bitstream = videoCodec === "av1" ? data : toAnnexB(data);
     if (!decoderConfigured) {
       if (!isKey && !containsIdr(bitstream, videoCodec)) {
@@ -614,8 +646,11 @@ export function attachWebCodecsVideo(
   streams: EncodedStreams,
   video: HTMLVideoElement,
   onTeardown?: () => void,
+  onFirstFrame?: () => void,
 ): WebCodecsVideoHandle {
-  const sink = createVideoSink(video, onTeardown, performance.now());
+  const sink = createVideoSink(video, onTeardown, performance.now(), "h264", {
+    ...(onFirstFrame ? { onFirstFrame } : {}),
+  });
   const wrappedTransform = new TransformStream<EncodedVideoFrameLike, EncodedVideoFrameLike>({
     transform: (frame, controller) => {
       try {
@@ -646,10 +681,23 @@ export function attachDataChannelVideo(
   video: HTMLVideoElement,
   onTeardown?: () => void,
   videoCodec: DirectVideoCodec = "h264",
+  onFirstFrame?: () => void,
 ): WebCodecsVideoHandle {
   // Join latency: attach -> first keyframe fed to the decoder.
   const joinAt = performance.now();
-  const sink = createVideoSink(video, onTeardown, joinAt, videoCodec);
+  // A decoder that fails beyond recovery must not keep the RTP leg suppressed:
+  // closing the channels tells the agent to resume normal RTP video.
+  const sink = createVideoSink(video, onTeardown, joinAt, videoCodec, {
+    ...(onFirstFrame ? { onFirstFrame } : {}),
+    onFatal: () => {
+      try {
+        channel.close();
+      } catch {}
+      try {
+        idrChannel?.close();
+      } catch {}
+    },
+  });
   // Wire format: [u32 seq][u8 flags][access-unit bytes]. Deltas ride the unordered,
   // bounded-retransmit channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
