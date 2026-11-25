@@ -71,6 +71,18 @@ final class AV1BitstreamTests: XCTestCase {
 }
 
 final class NanoctlDecoderFactoryTests: XCTestCase {
+    func testDetectCodecSniffsAV1TemporalUnit() {
+        // Temporal delimiter + sequence header + frame OBU, exactly tiled,
+        // no Annex-B start codes.
+        let bytes: [UInt8] = [
+            0x12, 0x00,
+            0x0a, 0x0b,
+            0x02, 0x00, 0x00, 0x05, 0x5d, 0xa7, 0xfb, 0x8d, 0x5f, 0x30, 0x08,
+            0x32, 0x01, 0x00,
+        ]
+        XCTAssertEqual(VTDecoder.detectCodec(Data(bytes)), .av1)
+    }
+
     func testAV1UsesVideoToolboxOnlyWhenHardwareDecodeExists() {
         let decoder = NanoctlDecoderFactory().createDecoder(RTCVideoCodecInfo(name: "AV1"))
         if #available(iOS 26.2, *) {

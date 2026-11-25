@@ -18,6 +18,7 @@ final class VTDecoder {
     enum Codec: String {
         case h264
         case hevc
+        case av1
     }
 
     let codec: Codec
@@ -32,6 +33,7 @@ final class VTDecoder {
     private(set) var faults = 0
 
     private var session: VTDecompressionSession?
+    private var av1Core: VTAV1CoreDecoder?
     private var format: CMFormatDescription?
     private var parameters: [Data] = []
     private var inflight = 0
@@ -47,6 +49,26 @@ final class VTDecoder {
     /// timestamps, mirroring the browser's `seq * 16_000` microseconds.
     func decode(_ au: Data, isKey: Bool, seq: UInt32) {
         if faultPending { fault() }
+        if codec == .av1 {
+            if av1Core == nil {
+                let core = VTAV1CoreDecoder(maxInflight: maxInflight)
+                core.onFrame = { [weak self] buffer, _ in
+                    self?.decoded += 1
+                    self?.onFrame?(buffer)
+                }
+                core.onFault = { [weak self] in
+                    guard let self else { return }
+                    self.faults += 1
+                    self.onFault?()
+                }
+                av1Core = core
+            }
+            if av1Core?.decode(au, timestamp: Int64(seq) * 16_000,
+                               timescale: 1_000_000, isKey: isKey) != true {
+                dropped += 1
+            }
+            return
+        }
         var parameters: [Data] = []
         guard let avcc = Self.avcc(au, codec: codec, parameters: &parameters) else {
             dropped += 1
@@ -208,6 +230,10 @@ final class VTDecoder {
                     allocator: kCFAllocatorDefault, parameterSetCount: ordered.count,
                     parameterSetPointers: pointers, parameterSetSizes: sizes,
                     nalUnitHeaderLength: 4, formatDescriptionOut: &format)
+            case .av1:
+                // AV1 never takes the Annex-B parameter-set path; VTAV1CoreDecoder
+                // builds its format description from the sequence header OBU.
+                return OSStatus(-1)
             case .hevc:
                 guard ordered.count >= 3 else { return OSStatus(-1) }
                 return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
@@ -266,6 +292,15 @@ final class VTDecoder {
             default: break
             }
         }
+        // AV1 low-overhead OBUs tile the temporal unit exactly with explicit
+        // sizes; Annex-B streams essentially never do. Check it first because
+        // AV1 payloads may legitimately contain 00 00 01 byte patterns.
+        let obus = AV1Bitstream.obus(au)
+        if let last = obus.last, last.range.upperBound == au.count,
+           obus.contains(where: { $0.type == 1 }),
+           obus.contains(where: { $0.type == 3 || $0.type == 6 }) {
+            return .av1
+        }
         if hevc && !h264 { return .hevc }
         if h264 { return .h264 }
         return nil
@@ -274,6 +309,7 @@ final class VTDecoder {
     /// Converts an Annex-B access unit to the 4-byte length-prefixed framing
     /// VTDecompressionSession consumes, collecting parameter-set NAL units.
     static func avcc(_ au: Data, codec: Codec, parameters: inout [Data]) -> Data? {
+        guard codec != .av1 else { return nil }
         let nals = annexBNals(au)
         guard !nals.isEmpty else { return nil }
         for nal in nals where !nal.isEmpty {

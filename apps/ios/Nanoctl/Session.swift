@@ -22,7 +22,7 @@ enum CodecPreference: String, CaseIterable {
     }
 
     /// Whether this preference can use the Annex-B data-channel video path.
-    var dataChannelCapable: Bool { self != .av1 }
+    var dataChannelCapable: Bool { true }
     var injectHevc: Bool { self == .auto || self == .hevc }
 
     var wireName: String? {
@@ -531,9 +531,9 @@ final class Session {
             _ = peer.addTransceiver(of: .audio, init: audio)
         }
 
-        // Low-latency raw-video data channels for codecs VideoToolbox can
-        // decode. Not created for AV1: the wire format is Annex-B and AV1 over
-        // RTP uses the libwebrtc path instead.
+        // Low-latency raw-video data channels. H.264/HEVC ride as Annex-B
+        // access units and AV1 as low-overhead OBU temporal units; all three
+        // decode through VideoToolbox on hardware that supports them.
         if codecPreference.dataChannelCapable {
             let videoConfig = RTCDataChannelConfiguration()
             videoConfig.isOrdered = false
@@ -615,11 +615,6 @@ final class Session {
         guard let video = current.video, video.readyState == .open,
               let idr = current.videoIdr, idr.readyState == .open,
               current.dcVideo == nil else { return }
-        if codec == "av1" {
-            video.close()
-            idr.close()
-            return
-        }
         let receiver = DCVideoReceiver(codec: codec.flatMap(VTDecoder.Codec.init(rawValue:)))
         receiver.requestKeyframe = { [weak video] in
             video?.sendData(RTCDataBuffer(data: Data("KF".utf8), isBinary: false))
@@ -636,9 +631,9 @@ final class Session {
             }
         }
         receiver.onUnsupported = { [weak self, weak current] in
-            // The wire stream is not H.264/HEVC (e.g. AV1 won negotiation):
-            // close the data channels so the host keeps the RTP leg, which
-            // libwebrtc decodes for every negotiated codec.
+            // The wire stream is none of H.264/HEVC/AV1: close the data
+            // channels so the host keeps the RTP leg, which libwebrtc
+            // decodes for every negotiated codec.
             Task { @MainActor in
                 guard let session = self, let current = current ?? session.connection else { return }
                 session.deactivateDataChannelVideo(current)
