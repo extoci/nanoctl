@@ -2893,7 +2893,6 @@ pub fn spawn_video(
         let mut dc_kf_seen = 0_u64;
         let mut dc_had_channel = false;
         let mut dc_replay: Option<std::collections::VecDeque<Bytes>> = None;
-        let mut dc_replay_served: Option<Instant> = None;
         let mut replay_last_orig: Option<u32> = None;
         let mut replay_last_new = 0_u32;
         let mut dc_was_live = false;
@@ -2913,33 +2912,32 @@ pub fn spawn_video(
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
                     let has_channel = video_channel.is_some() || idr_channel.is_some();
                     if has_channel && !dc_had_channel {
-                        // A viewer just attached: replay the last keyframe and
-                        // the deltas that followed it so it sees a picture
-                        // immediately instead of waiting for a forced IDR.
+                        // Show the most recent keyframe immediately, but do not
+                        // replay the delta tail: catching up can burst megabytes
+                        // into SCTP and make the viewer decode dozens of stale
+                        // frames before it reaches the present. The viewer's
+                        // attach-time KF produces a fresh IDR instead, while
+                        // live deltas are suppressed until it arrives.
                         let replayed = video_data_channel
                             .replay
                             .lock()
                             .unwrap()
                             .snapshot()
-                            .map(|(idr, deltas)| {
+                            .map(|idr| {
                                 let mut queue = std::collections::VecDeque::new();
                                 queue.extend(idr);
-                                queue.extend(deltas);
                                 queue
                             });
                         if replayed.is_some() {
-                            tracing::info!("video data channel replaying stream to new viewer");
-                            dc_replay_served = Some(Instant::now());
+                            tracing::info!("video data channel replaying keyframe to new viewer");
                         }
                         dc_replay = replayed;
                     }
                     dc_had_channel = has_channel;
                     if let Some(queue) = dc_replay.as_mut() {
                         while let Some(msg) = queue.pop_front() {
-                            // Everything replays on the reliable channel: the
-                            // tail must arrive in order — an unordered delta
-                            // outrunning its keyframe makes the viewer drop
-                            // the keyframe as late and wait for the next one.
+                            // Replay uses the reliable channel so the keyframe
+                            // cannot be overtaken by unordered live traffic.
                             let replay_channel =
                                 idr_channel.as_ref().or(video_channel.as_ref());
                             let Some(channel) = replay_channel else {
@@ -2953,9 +2951,10 @@ pub fn spawn_video(
                                 tokio::time::sleep(Duration::from_millis(1)).await;
                             }
                             // Renumber into the live sequence and restamp the
-                            // send time so the replayed tail flows straight
-                            // into the frames that follow it. All parts of a
-                            // chunked access unit share one sequence number.
+                            // send time so the warm keyframe flows straight
+                            // into the fresh keyframe that follows it. All
+                            // parts of a chunked access unit share one sequence
+                            // number.
                             let orig_seq = u32::from_le_bytes(msg[0..4].try_into().unwrap());
                             let new_seq = if Some(orig_seq) == replay_last_orig {
                                 replay_last_new
@@ -3016,16 +3015,17 @@ pub fn spawn_video(
                     // skipping it while its SCTP buffer backs up. Skipped
                     // deltas would wedge the decoder, so a stall requests a
                     // fresh keyframe once throughput recovers.
+                    let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_kf = video_data_channel.keyframe_requests.load(Ordering::Relaxed);
                     if dc_kf != dc_kf_seen {
                         dc_kf_seen = dc_kf;
-                        // A freshly served replay already gave the viewer a
-                        // complete stream, so its attach-time KF request is
-                        // satisfied: forcing another IDR now only congests the
-                        // association right behind the replayed keyframe.
-                        let replay_recent = dc_replay_served
-                            .is_some_and(|served| served.elapsed() < Duration::from_secs(1));
-                        if !replay_recent {
+                        // The encoded queue is capacity one, so an IDR already
+                        // in hand is at most one frame old and satisfies the
+                        // request when delivered. Forcing another one here is
+                        // what produced back-to-back startup IDRs: the encoder's
+                        // natural first keyframe followed immediately by a
+                        // forced copy of nearly the same picture.
+                        if !is_idr {
                             delivery_recovery.send_modify(|generation| {
                                 *generation = generation.wrapping_add(1);
                             });
@@ -3033,7 +3033,6 @@ pub fn spawn_video(
                     }
                     let video_channel = video_data_channel.channel.lock().unwrap().clone();
                     let idr_channel = video_data_channel.idr_channel.lock().unwrap().clone();
-                    let is_idr = is_keyframe(quality.codec, &sample.data);
                     let dc_live = video_channel.is_some();
                     if dc_live != dc_was_live {
                         dc_was_live = dc_live;
@@ -3087,50 +3086,57 @@ pub fn spawn_video(
                     } else {
                         video_channel.as_ref()
                     };
+                    let skip_live_delta =
+                        video_data_channel.needs_keyframe.load(Ordering::Acquire) && !is_idr;
                     if let Some(channel) = target {
-                        let au_len = sample.data.len();
-                        for msg in &messages {
-                            if is_idr {
-                                // Pace IDR parts: bursting ~150KB into the
-                                // association starves the congestion window
-                                // and drops deltas on the sibling channel,
-                                // which re-triggers keyframe requests.
-                                for _ in 0..30 {
-                                    if channel.buffered_amount().await <= 128 * 1024 {
+                        if !skip_live_delta {
+                            let au_len = sample.data.len();
+                            for msg in &messages {
+                                if is_idr {
+                                    // Pace IDR parts: bursting ~150KB into the
+                                    // association starves the congestion window
+                                    // and drops deltas on the sibling channel,
+                                    // which re-triggers keyframe requests.
+                                    for _ in 0..30 {
+                                        if channel.buffered_amount().await <= 128 * 1024 {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(1)).await;
+                                    }
+                                    if let Err(error) = channel.send(msg).await {
+                                        tracing::warn!(%error, "video data channel send failed");
+                                        dc_backed_up = true;
                                         break;
                                     }
-                                    tokio::time::sleep(Duration::from_millis(1)).await;
-                                }
-                                if let Err(error) = channel.send(msg).await {
-                                    tracing::warn!(%error, "video data channel send failed");
-                                    dc_backed_up = true;
+                                    dc_backed_up = false;
+                                } else if channel.buffered_amount().await <= 64 * 1024 {
+                                    if let Err(error) = channel.send(msg).await {
+                                        tracing::warn!(%error, "video data channel send failed");
+                                        dc_backed_up = true;
+                                        break;
+                                    }
+                                    dc_backed_up = false;
+                                } else {
+                                    dc_skips += 1;
+                                    if !dc_backed_up {
+                                        dc_backed_up = true;
+                                        delivery_recovery.send_modify(|generation| {
+                                            *generation = generation.wrapping_add(1);
+                                        });
+                                    }
                                     break;
                                 }
-                                dc_backed_up = false;
-                            } else if channel.buffered_amount().await <= 64 * 1024 {
-                                if let Err(error) = channel.send(msg).await {
-                                    tracing::warn!(%error, "video data channel send failed");
-                                    dc_backed_up = true;
-                                    break;
-                                }
-                                dc_backed_up = false;
-                            } else {
-                                dc_skips += 1;
-                                if !dc_backed_up {
-                                    dc_backed_up = true;
-                                    delivery_recovery.send_modify(|generation| {
-                                        *generation = generation.wrapping_add(1);
-                                    });
-                                }
-                                break;
                             }
-                        }
-                        if !dc_backed_up {
-                            // Count the data-channel egress too: the rate
-                            // controller measures real wire bytes, not
-                            // just the RTP share.
-                            writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
-                            writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
+                            if is_idr && !dc_backed_up {
+                                video_data_channel.needs_keyframe.store(false, Ordering::Release);
+                            }
+                            if !dc_backed_up {
+                                // Count the data-channel egress too: the rate
+                                // controller measures real wire bytes, not
+                                // just the RTP share.
+                                writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
+                                writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
+                            }
                         }
                     } else if dc_backed_up {
                         dc_backed_up = false;
@@ -3146,12 +3152,14 @@ pub fn spawn_video(
                         }
                     }
                     // While the data-channel path is live it carries every AU
-                    // and the viewer drops the RTP copy, so delta frames over
-                    // RTP are pure duplicate bandwidth. IDRs still go to RTP:
-                    // they keep RTCP RTT/loss reports meaningful and let a
-                    // data-channel teardown resume the media track without
-                    // waiting for the next GOP boundary.
-                    if !dc_live || is_idr {
+                    // and the viewer drops the RTP copy, so RTP video is pure
+                    // duplicate bandwidth. That cost is worst exactly during
+                    // recovery, when IDRs are largest and the link is already
+                    // degraded; duplicating them also makes the rate controller
+                    // overcount egress. Channel teardown forces a fresh IDR
+                    // before RTP resumes, so no periodic copy is needed for
+                    // fallback continuity.
+                    if !dc_live {
                         let result = await_video_delivery(
                             async {
                                 track

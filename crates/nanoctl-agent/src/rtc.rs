@@ -248,33 +248,30 @@ pub(crate) struct DataChannelVideo {
     pub channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub idr_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub keyframe_requests: AtomicU64,
+    pub needs_keyframe: AtomicBool,
     pub replay: Arc<std::sync::Mutex<VideoReplay>>,
 }
 
-/// The most recent complete keyframe plus every delta produced after it, kept
-/// so a freshly attached viewer can be caught up without waiting for the
-/// encoder to produce a new keyframe.
+/// The most recent complete keyframe, kept so a freshly attached viewer can
+/// show a warm frame while the encoder produces a fresh keyframe. Delta tails
+/// are deliberately not retained: replaying them can burst megabytes into SCTP
+/// and make the decoder catch up through stale video instead of presenting the
+/// current desktop.
 #[cfg(any(feature = "media", test))]
 #[derive(Default)]
 pub(crate) struct VideoReplay {
     idr: Vec<Bytes>,
     pending_idr: Vec<Bytes>,
-    deltas: Vec<Bytes>,
-    bytes: usize,
 }
 
-/// A reference-counted replay window: the keyframe's wire messages and the
-/// deltas after it. Cloning the snapshot is cheap; messages themselves are
+/// A reference-counted keyframe. Cloning the snapshot is cheap; messages are
 /// shared with the live send path instead of copied a second time.
 #[cfg(any(feature = "media", test))]
-pub(crate) type VideoReplaySnapshot = (Vec<Bytes>, Vec<Bytes>);
-
-#[cfg(any(feature = "media", test))]
-const VIDEO_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) type VideoReplaySnapshot = Vec<Bytes>;
 
 /// The replay window outlives a single peer connection: a freshly attached
-/// viewer replays the previous stream's tail and reaches live video without
-/// waiting for the new pipeline to produce its first keyframe.
+/// viewer replays the previous stream's latest keyframe while a fresh one is
+/// encoded.
 #[cfg(feature = "media")]
 static VIDEO_REPLAY: std::sync::OnceLock<Arc<std::sync::Mutex<VideoReplay>>> =
     std::sync::OnceLock::new();
@@ -298,45 +295,27 @@ impl VideoReplay {
             self.pending_idr.push(message);
             if part + 1 == parts {
                 self.idr = std::mem::take(&mut self.pending_idr);
-                self.deltas.clear();
-                self.bytes = self.idr.iter().map(Bytes::len).sum();
             }
-            return;
         }
-        if self.idr.is_empty() {
-            // No complete keyframe base to anchor the delta to.
-            return;
-        }
-        if self.bytes + message.len() > VIDEO_REPLAY_MAX_BYTES {
-            self.idr.clear();
-            self.deltas.clear();
-            self.bytes = 0;
-            return;
-        }
-        self.bytes += message.len();
-        self.deltas.push(message);
     }
 
     /// Installs a ready-made keyframe only while the window is still empty.
     /// Checking and installing under one lock keeps a warm frame from ever
-    /// overwriting a live stream's keyframe, which would corrupt the deltas
-    /// anchored to it.
+    /// overwriting a live stream's keyframe.
     pub fn seed(&mut self, idr: Vec<Bytes>) -> bool {
         if !self.idr.is_empty() || !self.pending_idr.is_empty() {
             return false;
         }
-        self.bytes = idr.iter().map(Bytes::len).sum();
         self.idr = idr;
         true
     }
 
-    /// Clones the replay for a newly attached channel. The cache keeps
-    /// accumulating so later attaches get a fresh window too.
+    /// Clones the warm keyframe for a newly attached channel.
     pub fn snapshot(&self) -> Option<VideoReplaySnapshot> {
         if self.idr.is_empty() {
             return None;
         }
-        Some((self.idr.clone(), self.deltas.clone()))
+        Some(self.idr.clone())
     }
 }
 
@@ -718,6 +697,7 @@ impl HostPeer {
             channel: std::sync::Mutex::new(None),
             idr_channel: std::sync::Mutex::new(None),
             keyframe_requests: AtomicU64::new(0),
+            needs_keyframe: AtomicBool::new(false),
             replay: video_replay(),
         });
         #[cfg(feature = "media")]
@@ -819,6 +799,10 @@ impl HostPeer {
                     if is_idr {
                         *slot.idr_channel.lock().unwrap() = Some(channel.clone());
                     } else {
+                        // Publish the resync requirement with the channel so a
+                        // just-encoded delta can never race ahead of the fresh
+                        // keyframe this attachment is about to request.
+                        slot.needs_keyframe.store(true, Ordering::Release);
                         *slot.channel.lock().unwrap() = Some(channel.clone());
                     }
                     let kf = video_dc_for_channel.clone();
@@ -1876,20 +1860,17 @@ mod tests {
     }
 
     #[test]
-    fn video_replay_snapshot_shares_message_allocations() {
+    fn video_replay_snapshot_shares_keyframe_allocations_and_drops_deltas() {
         let mut replay = VideoReplay::default();
         let idr = Bytes::from(vec![1, 2, 3, 4]);
         let delta = Bytes::from(vec![5, 6, 7]);
         replay.push(true, 0, 1, idr.clone());
-        replay.push(false, 0, 1, delta.clone());
+        replay.push(false, 0, 1, delta);
 
-        let (idr_replay, deltas) = replay.snapshot().expect("complete replay window");
+        let idr_replay = replay.snapshot().expect("complete replay window");
         assert_eq!(idr_replay.len(), 1);
-        assert_eq!(deltas.len(), 1);
         assert_eq!(idr_replay[0].as_ptr(), idr.as_ptr());
-        assert_eq!(deltas[0].as_ptr(), delta.as_ptr());
         assert_eq!(idr_replay[0].len(), idr.len());
-        assert_eq!(deltas[0].len(), delta.len());
     }
 
     #[test]
@@ -1897,18 +1878,17 @@ mod tests {
         let mut replay = VideoReplay::default();
         assert!(replay.seed(vec![Bytes::from_static(b"seed-idr")]));
         assert!(!replay.seed(vec![Bytes::from_static(b"replacement")]));
-        assert_eq!(replay.snapshot().unwrap().0.len(), 1);
+        assert_eq!(replay.snapshot().unwrap().len(), 1);
 
         let mut replay = VideoReplay::default();
         replay.push(true, 0, 2, Bytes::from_static(b"first-half"));
         assert!(replay.snapshot().is_none());
         replay.push(true, 1, 2, Bytes::from_static(b"second-half"));
-        assert_eq!(replay.snapshot().unwrap().0.len(), 2);
+        assert_eq!(replay.snapshot().unwrap().len(), 2);
         replay.push(false, 0, 1, Bytes::from_static(b"delta"));
-        assert_eq!(replay.snapshot().unwrap().1.len(), 1);
+        assert_eq!(replay.snapshot().unwrap().len(), 2);
         replay.push(true, 0, 1, Bytes::from_static(b"new-idr"));
-        let (_, deltas) = replay.snapshot().unwrap();
-        assert!(deltas.is_empty());
+        assert_eq!(replay.snapshot().unwrap().len(), 1);
     }
 
     #[test]
