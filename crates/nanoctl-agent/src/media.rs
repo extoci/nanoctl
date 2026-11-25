@@ -502,7 +502,7 @@ impl CaptureRecorder {
     }
 }
 
-pub(crate) use crate::nv12::PixelFormat;
+pub(crate) use crate::pixel_format::PixelFormat;
 
 pub(crate) type RgbaFrame<'a> = xcap::image::ImageBuffer<xcap::image::Rgba<u8>, &'a [u8]>;
 

@@ -2,13 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum PixelFormat {
-    #[default]
-    Rgba,
-    Bgra,
-}
-
+use crate::pixel_format::PixelFormat;
 /// Below this size a frame converts faster on one thread than it takes to start more.
 const PARALLEL_MIN_PIXELS: usize = 640 * 360;
 const MAX_THREADS: usize = 8;
