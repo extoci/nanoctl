@@ -1,11 +1,10 @@
-//! BT.601 limited-range RGBA to NV12 conversion for encoders that take system-memory NV12.
+//! BT.601 limited-range RGBA/BGRA to NV12 conversion for encoders that take system-memory NV12.
+//! Uses the `yuv` crate's runtime-dispatched SIMD: one SIMD thread is both faster and
+//! many core-seconds cheaper than the previous multi-threaded scalar conversion.
 
 use anyhow::{Context, Result, bail};
 
 use crate::pixel_format::PixelFormat;
-/// Below this size a frame converts faster on one thread than it takes to start more.
-const PARALLEL_MIN_PIXELS: usize = 640 * 360;
-const MAX_THREADS: usize = 8;
 
 #[cfg(test)]
 pub fn rgba_to_nv12(rgba: &[u8], width: u32, height: u32, output: &mut Vec<u8>) -> Result<()> {
@@ -33,28 +32,38 @@ pub fn pixels_to_nv12(
     // Every byte is overwritten, so a reused buffer of the right size needs no clearing.
     output.resize(pixels + pixels / 2, 0);
     let (luma, chroma) = output.split_at_mut(pixels);
-    let threads = if pixels >= PARALLEL_MIN_PIXELS {
-        std::thread::available_parallelism().map_or(1, |count| count.get().min(MAX_THREADS))
-    } else {
-        1
+    let mut planar = yuv::YuvBiPlanarImageMut {
+        y_plane: yuv::BufferStoreMut::Borrowed(luma),
+        y_stride: width as u32,
+        uv_plane: yuv::BufferStoreMut::Borrowed(chroma),
+        uv_stride: width as u32,
+        width: width as u32,
+        height: height as u32,
     };
-    let row_pairs_per_band = (height / 2).div_ceil(threads);
-    let mut bands = rgba
-        .chunks(row_pairs_per_band * 2 * width * 4)
-        .zip(luma.chunks_mut(row_pairs_per_band * 2 * width))
-        .zip(chroma.chunks_mut(row_pairs_per_band * width));
-    let Some(((first_rgba, first_luma), first_chroma)) = bands.next() else {
-        return Ok(());
+    let stride = (width * 4) as u32;
+    let result = match format {
+        PixelFormat::Rgba => yuv::rgba_to_yuv_nv12(
+            &mut planar,
+            rgba,
+            stride,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        ),
+        PixelFormat::Bgra => yuv::bgra_to_yuv_nv12(
+            &mut planar,
+            rgba,
+            stride,
+            yuv::YuvRange::Limited,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        ),
     };
-    std::thread::scope(|scope| {
-        for ((rgba, luma), chroma) in bands {
-            scope.spawn(move || convert_band(rgba, luma, chroma, width, format));
-        }
-        convert_band(first_rgba, first_luma, first_chroma, width, format);
-    });
+    result.map_err(|error| anyhow::anyhow!("pixel input to NV12 conversion failed: {error}"))?;
     Ok(())
 }
 
+#[cfg(test)]
 fn convert_band(
     rgba: &[u8],
     luma: &mut [u8],
@@ -68,6 +77,7 @@ fn convert_band(
     }
 }
 
+#[cfg(test)]
 fn convert_band_impl<const BGRA: bool>(
     rgba: &[u8],
     luma: &mut [u8],
@@ -110,6 +120,7 @@ fn convert_band_impl<const BGRA: bool>(
 }
 
 #[inline(always)]
+#[cfg(test)]
 fn luma_of(pixel: &[u8], ri: usize, gi: usize, bi: usize) -> u8 {
     let r = i32::from(pixel[ri]);
     let g = i32::from(pixel[gi]);
@@ -119,7 +130,7 @@ fn luma_of(pixel: &[u8], ri: usize, gi: usize, bi: usize) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PixelFormat, pixels_to_nv12, rgba_to_nv12};
+    use super::{PixelFormat, convert_band, pixels_to_nv12, rgba_to_nv12};
 
     /// The previous two-pass scalar conversion, kept as the bit-exact reference.
     fn reference(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
@@ -157,6 +168,29 @@ mod tests {
         output
     }
 
+    /// The previous multi-threaded scalar conversion, retained only as a benchmark baseline.
+    fn parallel_scalar(rgba: &[u8], width: usize, height: usize, format: PixelFormat) -> Vec<u8> {
+        let pixels = width * height;
+        let mut output = vec![0; pixels + pixels / 2];
+        let (luma, chroma) = output.split_at_mut(pixels);
+        let threads = std::thread::available_parallelism().map_or(1, |count| count.get().min(8));
+        let row_pairs_per_band = (height / 2).div_ceil(threads);
+        let mut bands = rgba
+            .chunks(row_pairs_per_band * 2 * width * 4)
+            .zip(luma.chunks_mut(row_pairs_per_band * 2 * width))
+            .zip(chroma.chunks_mut(row_pairs_per_band * width));
+        let Some(((first_rgba, first_luma), first_chroma)) = bands.next() else {
+            return output;
+        };
+        std::thread::scope(|scope| {
+            for ((rgba, luma), chroma) in bands {
+                scope.spawn(move || convert_band(rgba, luma, chroma, width, format));
+            }
+            convert_band(first_rgba, first_luma, first_chroma, width, format);
+        });
+        output
+    }
+
     fn noise(len: usize) -> Vec<u8> {
         let mut state = 0x2545_f491_u32;
         (0..len)
@@ -185,7 +219,14 @@ mod tests {
         for (width, height) in [(2, 2), (6, 4), (1_280, 720), (1_922, 1_082)] {
             let rgba = noise(width * height * 4);
             rgba_to_nv12(&rgba, width as u32, height as u32, &mut output).unwrap();
-            assert_eq!(output, reference(&rgba, width, height), "{width}x{height}");
+            let expected = reference(&rgba, width, height);
+            let max_diff = output
+                .iter()
+                .zip(&expected)
+                .map(|(actual, expected)| actual.abs_diff(*expected))
+                .max()
+                .unwrap();
+            assert!(max_diff <= 1, "{width}x{height} max_diff={max_diff}");
         }
     }
 
@@ -209,6 +250,14 @@ mod tests {
             .unwrap();
             rgba_to_nv12(&rgba, width as u32, height as u32, &mut expected).unwrap();
             assert_eq!(from_bgra, expected, "{width}x{height}");
+            let scalar = reference(&rgba, width, height);
+            let max_diff = from_bgra
+                .iter()
+                .zip(&scalar)
+                .map(|(actual, expected)| actual.abs_diff(*expected))
+                .max()
+                .unwrap();
+            assert!(max_diff <= 1, "{width}x{height} max_diff={max_diff}");
         }
     }
 
@@ -232,9 +281,16 @@ mod tests {
         let reference_ms = started.elapsed().as_secs_f64() * 1_000.0 / 20.0;
         let started = std::time::Instant::now();
         for _ in 0..20 {
+            std::hint::black_box(parallel_scalar(&rgba, width, height, PixelFormat::Rgba));
+        }
+        let scalar_ms = started.elapsed().as_secs_f64() * 1_000.0 / 20.0;
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
             rgba_to_nv12(&rgba, width as u32, height as u32, &mut output).unwrap();
         }
         let fast_ms = started.elapsed().as_secs_f64() * 1_000.0 / 20.0;
-        println!("4K RGBA->NV12: reference {reference_ms:.2} ms, fast {fast_ms:.2} ms");
+        println!(
+            "4K RGBA->NV12: reference {reference_ms:.2} ms, scalar-parallel {scalar_ms:.2} ms, SIMD {fast_ms:.2} ms"
+        );
     }
 }
