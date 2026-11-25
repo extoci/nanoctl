@@ -314,6 +314,32 @@ impl Drop for MmcssGuard {
 /// tagged with the emit generation it last carried.
 type RecycledFrames = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
+/// A backend-reported rectangle whose pixels may differ from the previously
+/// encoded desktop. Coordinates are clipped, exclusive-end source pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DirtyRect {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+fn compact_dirty_rects(rects: &mut Vec<DirtyRect>) {
+    if rects.len() <= 16 {
+        return;
+    }
+    let left = rects.iter().map(|rect| rect.left).min().unwrap_or(0);
+    let top = rects.iter().map(|rect| rect.top).min().unwrap_or(0);
+    let right = rects.iter().map(|rect| rect.right).max().unwrap_or(0);
+    let bottom = rects.iter().map(|rect| rect.bottom).max().unwrap_or(0);
+    *rects = vec![DirtyRect {
+        left,
+        top,
+        right,
+        bottom,
+    }];
+}
+
 #[derive(Default)]
 struct LatestFrame {
     slot: Mutex<Option<Arc<CapturedFrame>>>,
@@ -339,6 +365,10 @@ struct CapturedFrame {
     backend_changed: Option<bool>,
     /// Monotonic emit counter from the capture backend (0 = unknown).
     emit_gen: u64,
+    /// Dirty regions reported since the preceding capture emission, including
+    /// any unseen frame this one replaced in the capture slot. `None` means
+    /// the backend cannot prove which macroblocks are unchanged.
+    dirty_rects: Option<Arc<Vec<DirtyRect>>>,
     /// Sink this frame returns its pixel buffer to on drop, when it came from
     /// a recycling backend.
     recycle: Option<RecycledFrames>,
@@ -374,7 +404,7 @@ impl CapturedFrame {
 
 impl LatestFrame {
     fn replace(&self, frame: xcap::Frame) -> bool {
-        self.replace_hint(frame, PixelFormat::Rgba, None, 0)
+        self.replace_hint(frame, PixelFormat::Rgba, None, 0, None)
     }
 
     /// Drains the recycled pixel-buffer stash — (emit generation, buffer)
@@ -393,16 +423,31 @@ impl LatestFrame {
         format: PixelFormat,
         backend_changed: Option<bool>,
         emit_gen: u64,
+        dirty_rects: Option<Vec<DirtyRect>>,
     ) -> bool {
         let Ok(mut slot) = self.slot.lock() else {
             return false;
         };
+        let dirty_rects = dirty_rects.map(|mut rects| {
+            // Frames dropped while the encoder was busy still contributed pixels
+            // to this full-frame emission, so their damage must stay in the hint.
+            if let Some(previous) = slot.as_ref().and_then(|previous| {
+                (previous.frame.width == frame.width && previous.frame.height == frame.height)
+                    .then(|| previous.dirty_rects.clone())
+                    .flatten()
+            }) {
+                rects.extend(previous.iter().copied());
+            }
+            compact_dirty_rects(&mut rects);
+            Arc::new(rects)
+        });
         let captured = Arc::new(CapturedFrame {
             frame,
             format,
             captured_at: Instant::now(),
             backend_changed,
             emit_gen,
+            dirty_rects,
             recycle: (emit_gen > 0).then(|| self.recycled.clone()),
         });
         if let Ok(mut last) = self.last.lock() {
@@ -546,6 +591,17 @@ pub(crate) trait FrameEncoder {
             .context("invalid BGRA frame dimensions")?;
         self.encode(&converted)
     }
+    /// Encodes with a per-macroblock `1 = provably constant, 0 = inspect`
+    /// hint map in row-major 16x16 macroblock order. Encoders without a fast
+    /// constant-block path ignore it.
+    fn encode_format_with_constant_mb(
+        &mut self,
+        image: &RgbaFrame<'_>,
+        format: PixelFormat,
+        _constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
+        self.encode_format(image, format)
+    }
     /// (tier, switches) for encoders with content-driven parameter negotiation.
     fn adapt_state(&self) -> Option<(u8, u32)> {
         None
@@ -688,27 +744,76 @@ impl I420Frame {
     }
 
     fn read_pixels(&mut self, pixels_in: &[u8], format: PixelFormat) -> Result<()> {
+        self.read_pixels_rect(pixels_in, format, 0, 0, self.width, self.height)
+    }
+
+    /// Converts one even-aligned rectangle while preserving the rest of the
+    /// persistent I420 image. H.264 4:2:0 chroma is computed independently
+    /// per 2x2 pixel block, so this is bit-identical to a full-frame conversion
+    /// when every changed pixel is inside the rectangle set.
+    fn read_pixels_rect(
+        &mut self,
+        pixels_in: &[u8],
+        format: PixelFormat,
+        left: usize,
+        top: usize,
+        right: usize,
+        bottom: usize,
+    ) -> Result<()> {
         let pixels = self.width * self.height;
         if Some(pixels_in.len()) != pixels.checked_mul(4) {
             bail!("pixel buffer does not match I420 dimensions");
         }
+        if !left.is_multiple_of(2)
+            || !top.is_multiple_of(2)
+            || !right.is_multiple_of(2)
+            || !bottom.is_multiple_of(2)
+            || right > self.width
+            || bottom > self.height
+            || left >= right
+            || top >= bottom
+        {
+            bail!("invalid partial I420 conversion rectangle");
+        }
         let (y, uv) = self.bytes.split_at_mut(pixels);
         let (u, v) = uv.split_at_mut(pixels / 4);
+        let width = right - left;
+        let height = bottom - top;
+        let chroma_left = left / 2;
+        let chroma_top = top / 2;
+        let chroma_stride = self.width / 2;
+        let y_offset = top * self.width + left;
+        let chroma_offset = chroma_top * chroma_stride + chroma_left;
+        let input_offset = (top * self.width + left) * 4;
+        // `yuv` iterates whole stride-sized rows. Cap each slice at the end of
+        // the rectangle's last row; passing the rest of the frame silently
+        // converts those trailing rows too and erases the partial-conversion
+        // win. Row padding itself is present but not converted because the
+        // explicit rectangle width is narrower than the stride.
+        let y_len = height * self.width;
+        let chroma_height = height / 2;
+        let chroma_len = chroma_height * chroma_stride;
         let mut planar = yuv::YuvPlanarImageMut {
-            y_plane: yuv::BufferStoreMut::Borrowed(y),
+            y_plane: yuv::BufferStoreMut::Borrowed(&mut y[y_offset..y_offset + y_len]),
             y_stride: self.width as u32,
-            u_plane: yuv::BufferStoreMut::Borrowed(u),
-            u_stride: (self.width / 2) as u32,
-            v_plane: yuv::BufferStoreMut::Borrowed(v),
-            v_stride: (self.width / 2) as u32,
-            width: self.width as u32,
-            height: self.height as u32,
+            u_plane: yuv::BufferStoreMut::Borrowed(
+                &mut u[chroma_offset..chroma_offset + chroma_len],
+            ),
+            u_stride: chroma_stride as u32,
+            v_plane: yuv::BufferStoreMut::Borrowed(
+                &mut v[chroma_offset..chroma_offset + chroma_len],
+            ),
+            v_stride: chroma_stride as u32,
+            width: width as u32,
+            height: height as u32,
         };
         let stride = (self.width * 4) as u32;
+        let input_len = height * self.width * 4;
+        let input = &pixels_in[input_offset..input_offset + input_len];
         let result = match format {
             PixelFormat::Rgba => yuv::rgba_to_yuv420(
                 &mut planar,
-                pixels_in,
+                input,
                 stride,
                 yuv::YuvRange::Limited,
                 yuv::YuvStandardMatrix::Bt601,
@@ -716,7 +821,7 @@ impl I420Frame {
             ),
             PixelFormat::Bgra => yuv::bgra_to_yuv420(
                 &mut planar,
-                pixels_in,
+                input,
                 stride,
                 yuv::YuvRange::Limited,
                 yuv::YuvStandardMatrix::Bt601,
@@ -724,6 +829,62 @@ impl I420Frame {
             ),
         };
         result.map_err(|error| anyhow!("pixel input to I420 conversion failed: {error}"))?;
+        Ok(())
+    }
+
+    /// Converts only macroblocks marked dirty (`0`) in a row-major 16x16
+    /// constant map. Fragmented or large damage falls back to the exact
+    /// full-frame path; an empty damage set is a conversion no-op.
+    fn read_pixels_constant_mb(
+        &mut self,
+        pixels_in: &[u8],
+        format: PixelFormat,
+        constant_mb: &[u8],
+    ) -> Result<()> {
+        let mb_width = self.width.div_ceil(16);
+        let mb_height = self.height.div_ceil(16);
+        if constant_mb.len() != mb_width * mb_height {
+            bail!("constant macroblock map does not match I420 dimensions");
+        }
+        let dirty = constant_mb.iter().filter(|value| **value == 0).count();
+        if dirty == 0 {
+            return Ok(());
+        }
+        if dirty * 10 >= constant_mb.len() * 3 {
+            return self.read_pixels(pixels_in, format);
+        }
+        let mut rects: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for mb_y in 0..mb_height {
+            let mut x = 0;
+            while x < mb_width {
+                if constant_mb[mb_y * mb_width + x] != 0 {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < mb_width && constant_mb[mb_y * mb_width + x] == 0 {
+                    x += 1;
+                }
+                if let Some(rect) = rects
+                    .iter_mut()
+                    .find(|rect| rect.0 == start && rect.1 == x && rect.3 == mb_y)
+                {
+                    rect.3 = mb_y + 1;
+                } else {
+                    rects.push((start, x, mb_y, mb_y + 1));
+                }
+            }
+        }
+        for (x0, x1, y0, y1) in rects {
+            self.read_pixels_rect(
+                pixels_in,
+                format,
+                (x0 * 16).min(self.width),
+                (y0 * 16).min(self.height),
+                (x1 * 16).min(self.width),
+                (y1 * 16).min(self.height),
+            )?;
+        }
         Ok(())
     }
 }
@@ -979,15 +1140,39 @@ impl CaptureEncoder {
         max_height: u32,
     ) -> Result<(EncodedFrame, TimingSample, bool)> {
         let (captured, fresh) = self.latest_frame.take(Duration::from_secs(5))?;
-        let (encoded, timing) = self.encode_captured_frame(&captured, max_width, max_height)?;
+        let damage = if fresh {
+            captured.dirty_rects.as_deref().map(Vec::as_slice)
+        } else {
+            // Timed-out smoke re-encodes repeat the exact pixels of the prior
+            // encode, so every macroblock is provably constant.
+            Some(&[][..])
+        };
+        let (encoded, timing) =
+            self.encode_captured_frame_with_damage(&captured, max_width, max_height, damage)?;
         Ok((encoded, timing, fresh))
     }
 
+    #[cfg(test)]
     fn encode_captured_frame(
         &mut self,
         captured: &CapturedFrame,
         max_width: u32,
         max_height: u32,
+    ) -> Result<(EncodedFrame, TimingSample)> {
+        self.encode_captured_frame_with_damage(
+            captured,
+            max_width,
+            max_height,
+            captured.dirty_rects.as_deref().map(Vec::as_slice),
+        )
+    }
+
+    fn encode_captured_frame_with_damage(
+        &mut self,
+        captured: &CapturedFrame,
+        max_width: u32,
+        max_height: u32,
+        dirty_rects: Option<&[DirtyRect]>,
     ) -> Result<(EncodedFrame, TimingSample)> {
         let CapturedFrame {
             frame,
@@ -1077,7 +1262,20 @@ impl CaptureEncoder {
             .encode_attempts
             .fetch_add(1, Ordering::Relaxed);
         let color_before = self.encoder.color_convert_ns();
-        let encoded = self.encoder.encode_format(&image, *format)?;
+        let constant_mb = (target_width == source_width && target_height == source_height)
+            .then(|| {
+                constant_mb_map(
+                    dirty_rects,
+                    source_width,
+                    source_height,
+                    target_width,
+                    target_height,
+                )
+            })
+            .flatten();
+        let encoded =
+            self.encoder
+                .encode_format_with_constant_mb(&image, *format, constant_mb.as_deref())?;
         let encoded_at = Instant::now();
         if let Some(probe) = self.psnr.as_mut() {
             probe.observe(&image, *format, &encoded.bytes);
@@ -1352,6 +1550,18 @@ impl EncoderBackend {
         >,
         format: PixelFormat,
     ) -> Result<EncodedFrame> {
+        self.encode_format_with_constant_mb(image, format, None)
+    }
+
+    fn encode_format_with_constant_mb(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+        format: PixelFormat,
+        constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
         let view = xcap::image::ImageBuffer::from_raw(
             image.width(),
             image.height(),
@@ -1369,7 +1579,7 @@ impl EncoderBackend {
             let active = self.active.as_mut().context("no active video encoder")?;
             let encoded = active
                 .encoder
-                .encode_format(image, format)
+                .encode_format_with_constant_mb(image, format, constant_mb)
                 .and_then(|frame| {
                     if active.needs_initial_idr {
                         crate::codec::validate_initial_access_unit(
@@ -2673,6 +2883,10 @@ pub fn spawn_video(
                 let mut scale = EncodeScale::new(initial.bitrate_kbps);
                 let mut last: Option<Arc<CapturedFrame>> = None;
                 let mut last_encoded: Option<Arc<CapturedFrame>> = None;
+                // Damage for captures the pacer dropped still has to reach the
+                // next encoded frame; x264's constant-macroblock hints must be
+                // relative to the last frame the decoder actually saw.
+                let mut damage_since_encode: Option<Vec<DirtyRect>> = None;
                 let mut forced_keyframe = false;
                 let mut viewer_dimensions = (quality.max_width, quality.max_height);
                 let mut viewport_bitrate_scale = 1.0;
@@ -2803,6 +3017,7 @@ pub fn spawn_video(
                                 Ok(()) => {
                                     last = None;
                                     last_encoded = None;
+                                    damage_since_encode = None;
                                     pacer = DamagePacer::new(fps);
                                     forced_keyframe = true;
                                     waiting_since = Instant::now();
@@ -2829,6 +3044,13 @@ pub fn spawn_video(
                     let mut changed = false;
                     if !switched && let Some(fresh) = fresh {
                         producer_stats.fresh_frames.fetch_add(1, Ordering::Relaxed);
+                        if let Some(dirty) = fresh.dirty_rects.as_deref() {
+                            let damage = damage_since_encode.get_or_insert_with(Vec::new);
+                            damage.extend(dirty.iter().copied());
+                            compact_dirty_rects(damage);
+                        } else {
+                            damage_since_encode = None;
+                        }
                         let compare_started = Instant::now();
                         changed = last_encoded
                             .as_ref()
@@ -2890,10 +3112,17 @@ pub fn spawn_video(
                             .target_kbps
                             .store(target_kbps, Ordering::Relaxed);
                     }
-                    let (frame, _timing) =
-                        encoder.encode_captured_frame(captured, max_width, max_height)?;
+                    let (frame, _timing) = encoder.encode_captured_frame_with_damage(
+                        captured,
+                        max_width,
+                        max_height,
+                        damage_since_encode.as_deref(),
+                    )?;
                     if frame.bytes.is_empty() {
                         continue;
+                    }
+                    if let Some(damage) = damage_since_encode.as_mut() {
+                        damage.clear();
                     }
                     // `changed` already ran this exact comparison for fresh
                     // frames; only re-compare for keepalive/pace re-encodes.
@@ -3330,6 +3559,55 @@ pub fn spawn_video(
     }
 }
 
+/// Converts clipped source-space dirty rectangles into x264's row-major
+/// 16x16 macroblock hints for the resized encode dimensions. The four-pixel
+/// source margin covers scaler/chroma phase bleed; overlap outside a reported
+/// dirty region stays marked constant. 1 means provably constant, 0 means
+/// x264 must run normal analysis.
+fn constant_mb_map(
+    dirty_rects: Option<&[DirtyRect]>,
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Option<Vec<u8>> {
+    let dirty_rects = dirty_rects?;
+    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+        return None;
+    }
+    let mb_width = target_width.div_ceil(16);
+    let mb_height = target_height.div_ceil(16);
+    let mut map = vec![1_u8; (mb_width * mb_height) as usize];
+    for rect in dirty_rects {
+        let left = rect.left.saturating_sub(4).min(source_width) as u64;
+        let right = (rect.right as u64 + 4).min(u64::from(source_width));
+        let top = rect.top.saturating_sub(4).min(source_height) as u64;
+        let bottom = (rect.bottom as u64 + 4).min(u64::from(source_height));
+        if right <= left || bottom <= top {
+            continue;
+        }
+        let source_width = u64::from(source_width);
+        let source_height = u64::from(source_height);
+        let target_width = u64::from(target_width);
+        let target_height = u64::from(target_height);
+        let x0 = ((left * target_width / source_width) as u32 / 16).min(mb_width);
+        let x1 = ((right * target_width).div_ceil(source_width) as u32)
+            .div_ceil(16)
+            .min(mb_width);
+        let y0 = ((top * target_height / source_height) as u32 / 16).min(mb_height);
+        let y1 = ((bottom * target_height).div_ceil(source_height) as u32)
+            .div_ceil(16)
+            .min(mb_height);
+        for y in y0..y1 {
+            let row = y as usize * mb_width as usize;
+            for x in x0..x1 {
+                map[row + x as usize] = 0;
+            }
+        }
+    }
+    Some(map)
+}
+
 fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
     let scale = (f64::from(max_width) / f64::from(width))
         .min(f64::from(max_height) / f64::from(height))
@@ -3634,6 +3912,7 @@ mod tests {
             captured_at: now,
             backend_changed: None,
             emit_gen: 0,
+            dirty_rects: None,
             recycle: None,
         };
         let mut next = previous.clone();
@@ -3857,6 +4136,7 @@ mod tests {
             captured_at: Instant::now() - Duration::from_secs(10),
             backend_changed: None,
             emit_gen: 0,
+            dirty_rects: None,
             recycle: None,
         };
         let (frame, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
@@ -3877,6 +4157,115 @@ mod tests {
         );
         captured.frame.raw.clear();
         assert!(encoder.encode_captured_frame(&captured, 64, 64).is_err());
+    }
+
+    #[test]
+    fn constant_macroblock_maps_mark_only_expanded_dirty_regions() {
+        let rect = super::DirtyRect {
+            left: 20,
+            top: 20,
+            right: 28,
+            bottom: 28,
+        };
+        let map = super::constant_mb_map(Some(&[rect]), 64, 64, 64, 64).unwrap();
+        assert_eq!(map.len(), 16);
+        assert_eq!(map[1 + 4], 0);
+        assert_eq!(map.iter().filter(|value| **value == 0).count(), 1);
+
+        let scaled = super::constant_mb_map(
+            Some(&[super::DirtyRect {
+                left: 32,
+                top: 32,
+                right: 48,
+                bottom: 48,
+            }]),
+            64,
+            64,
+            32,
+            32,
+        )
+        .unwrap();
+        assert_eq!(scaled.len(), 4);
+        assert_eq!(scaled, [0, 0, 0, 0]);
+
+        let empty = super::constant_mb_map(Some(&[]), 64, 64, 64, 64).unwrap();
+        assert!(empty.iter().all(|value| *value == 1));
+        assert!(super::constant_mb_map(None, 64, 64, 64, 64).is_none());
+    }
+
+    #[test]
+    fn replaced_captures_accumulate_dirty_hints() {
+        let latest = super::LatestFrame::default();
+        let first = super::DirtyRect {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        let second = super::DirtyRect {
+            left: 1,
+            top: 1,
+            right: 2,
+            bottom: 2,
+        };
+        assert!(latest.replace_hint(
+            xcap::Frame::new(2, 2, vec![0; 16]),
+            PixelFormat::Rgba,
+            Some(true),
+            0,
+            Some(vec![first]),
+        ));
+        assert!(latest.replace_hint(
+            xcap::Frame::new(2, 2, vec![1; 16]),
+            PixelFormat::Rgba,
+            Some(true),
+            0,
+            Some(vec![second]),
+        ));
+        let (frame, fresh) = latest.take(Duration::from_millis(1)).unwrap();
+        assert!(fresh);
+        let dirty = frame.dirty_rects.as_deref().unwrap().as_slice();
+        assert_eq!(dirty.len(), 2);
+        assert!(dirty.contains(&first));
+        assert!(dirty.contains(&second));
+    }
+
+    #[test]
+    fn partial_i420_conversion_is_bit_identical_when_damage_is_covered() {
+        let mut before = Vec::with_capacity(64 * 64 * 4);
+        for index in 0..64 * 64 {
+            before.extend_from_slice(&[
+                (index % 251) as u8,
+                (index % 241) as u8,
+                (index % 229) as u8,
+                255,
+            ]);
+        }
+        let mut after = before.clone();
+        for y in 20..32 {
+            for x in 20..28 {
+                let offset = (y * 64 + x) * 4;
+                after[offset..offset + 4].copy_from_slice(&[250, 5, 120, 255]);
+            }
+        }
+        let mut full_before = super::I420Frame::new(64, 64).unwrap();
+        full_before.read_pixels(&before, PixelFormat::Rgba).unwrap();
+        let mut full_after = super::I420Frame::new(64, 64).unwrap();
+        full_after.read_pixels(&after, PixelFormat::Rgba).unwrap();
+        let mut partial = super::I420Frame::new(64, 64).unwrap();
+        partial.bytes = full_before.bytes.clone();
+        let mut map = vec![1_u8; 16];
+        map[1 + 4] = 0;
+        partial
+            .read_pixels_constant_mb(&after, PixelFormat::Rgba, &map)
+            .unwrap();
+        assert_eq!(partial.bytes, full_after.bytes);
+
+        let mut idle = super::I420Frame::new(64, 64).unwrap();
+        idle.bytes = full_before.bytes.clone();
+        idle.read_pixels_constant_mb(&after, PixelFormat::Rgba, &[1_u8; 16])
+            .unwrap();
+        assert_eq!(idle.bytes, full_before.bytes);
     }
 
     #[test]

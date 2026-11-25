@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::core::Interface;
 use xcap::{Frame, Monitor};
 
-use super::{LatestFrame, PipelineStats};
+use super::{DirtyRect, LatestFrame, PipelineStats};
 
 /// Native BGRA bytes of one dirty rect.
 type Patch = (RECT, Vec<u8>);
@@ -213,7 +213,11 @@ impl Duplication {
     /// last (emit_gen == self.emit_gen) comes back once every Arc is dropped,
     /// still holding the previous image — patching the current dirty rects
     /// makes it identical to `accum` without a full-frame clone.
-    fn acquire(&mut self, timeout_ms: u32, latest: &LatestFrame) -> Result<Option<Frame>> {
+    fn acquire(
+        &mut self,
+        timeout_ms: u32,
+        latest: &LatestFrame,
+    ) -> Result<Option<(Frame, Vec<DirtyRect>)>> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         unsafe {
@@ -228,7 +232,7 @@ impl Duplication {
                 return Err(error.into());
             }
         }
-        let result = (|| -> Result<Option<Frame>> {
+        let result = (|| -> Result<Option<(Frame, Vec<DirtyRect>)>> {
             if info.LastPresentTime == 0 {
                 return Ok(None);
             }
@@ -300,7 +304,22 @@ impl Duplication {
                     self.log_base = self.emit_gen + 1;
                 }
             }
-            Ok(Some(Frame::new(self.width, self.height, emit)))
+            let dirty = rects
+                .iter()
+                .filter_map(|rect| {
+                    let left = rect.left.max(0) as u32;
+                    let top = rect.top.max(0) as u32;
+                    let right = (rect.right.max(0) as u32).min(self.width);
+                    let bottom = (rect.bottom.max(0) as u32).min(self.height);
+                    (right > left && bottom > top).then_some(DirtyRect {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    })
+                })
+                .collect();
+            Ok(Some((Frame::new(self.width, self.height, emit), dirty)))
         })();
         unsafe {
             let _ = self.duplication.ReleaseFrame();
@@ -473,7 +492,7 @@ pub(super) fn capture_once(monitor: &Monitor) -> Result<Frame> {
     let mut dup = Duplication::try_new(h_monitor)?;
     let latest = Arc::new(LatestFrame::default());
     for _ in 0..8 {
-        if let Some(frame) = dup.acquire(125, &latest)? {
+        if let Some((frame, _)) = dup.acquire(125, &latest)? {
             return Ok(frame);
         }
     }
@@ -584,9 +603,15 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
         };
         let resumed = resumed || capture_loop_resumed(acquire_started, Instant::now());
         match acquired {
-            Ok(Some(frame)) => {
+            Ok(Some((frame, dirty))) => {
                 // Backend-verified change: producer skips the memcmp.
-                if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), emit_gen) {
+                if !latest.replace_hint(
+                    frame,
+                    super::PixelFormat::Bgra,
+                    Some(true),
+                    emit_gen,
+                    Some(dirty),
+                ) {
                     return;
                 }
             }

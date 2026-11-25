@@ -334,6 +334,18 @@ impl X264Encoder {
         >,
         format: PixelFormat,
     ) -> Result<EncodedFrame> {
+        self.encode_format_with_constant_mb(image, format, None)
+    }
+
+    pub(super) fn encode_format_with_constant_mb(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+        format: PixelFormat,
+        constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.active.dimensions != dimensions {
             self.active = Active::new(
@@ -347,14 +359,20 @@ impl X264Encoder {
             self.force_keyframe = true;
         }
         let color_started = Instant::now();
+        let mut fresh_i420 = false;
         if self.yuv.is_none() {
             self.yuv = Some(I420Frame::new(
                 dimensions.0 as usize,
                 dimensions.1 as usize,
             )?);
+            fresh_i420 = true;
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
-        yuv.read_pixels(image.as_raw(), format)?;
+        if !fresh_i420 && let Some(constant_mb) = constant_mb {
+            yuv.read_pixels_constant_mb(image.as_raw(), format, constant_mb)?;
+        } else {
+            yuv.read_pixels(image.as_raw(), format)?;
+        }
         self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
         let pts = (self
             .started
@@ -471,6 +489,33 @@ impl FrameEncoder for ResilientX264 {
                     self.encode_format(image, format)
                 }
             },
+            Self::Fallback(encoder) => encoder.encode_format(image, format),
+        }
+    }
+
+    fn encode_format_with_constant_mb(
+        &mut self,
+        image: &RgbaFrame<'_>,
+        format: PixelFormat,
+        constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
+        match self {
+            Self::Native(encoder) => {
+                match encoder.encode_format_with_constant_mb(image, format, constant_mb) {
+                    Ok(frame) => Ok(frame),
+                    Err(error) => {
+                        tracing::warn!(%error, "x264 failed; switching session to OpenH264");
+                        let fallback = SoftwareEncoder::new(
+                            encoder.bitrate_kbps,
+                            encoder.max_fps,
+                            encoder.latency_mode,
+                        )
+                        .context("x264 failed and OpenH264 fallback is unavailable")?;
+                        *self = Self::Fallback(Box::new(fallback));
+                        self.encode_format(image, format)
+                    }
+                }
+            }
             Self::Fallback(encoder) => encoder.encode_format(image, format),
         }
     }

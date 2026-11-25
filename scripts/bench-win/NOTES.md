@@ -909,3 +909,30 @@ Responsiveness is **+2.3% fps, −6.3% bitrate, −8.7% encode time and −0.44m
 capture→encode** for a negligible −0.09dB on uncompressible noise; realistic
 motion was already measured better in cycle 30. It is now the default.
 `latency_mode = "balanced"` and `"quality"` remain available explicitly.
+
+## Cycle 55 — DXGI-damage partial RGBA→I420 conversion (2026-11-25)
+
+The conversion itself is bit-exact per 2x2 pixel block, so unchanged pixels do
+not need to be reconverted. DXGI dirty/move rects are accumulated relative to
+the last encoded frame (including pacer-skipped and encoder-busy replacements),
+expanded to conservative 16x16 macroblock coverage, and used to convert only
+damaged rows in the persistent I420 buffer. Fragmented or >=30% damage falls
+back to full conversion. A unit test asserts partial output is byte-identical
+to full conversion, including damage on the final row of a converted block.
+
+Clock motion (`band --clock --height 80`, 10s, two runs each, x264 adapt pinned
+to tier 0):
+
+| path     | fps   | bitrate | encode p50 | convert mean | capture→encode p50 | PSNR p50 |
+| -------- | ----- | ------- | ---------- | ------------ | ------------------ | -------- |
+| baseline | 58.18 | 324kbps | 2.826ms    | 0.436ms      | 11.142ms           | 52.36dB  |
+| partial  | 58.12 | 335kbps | 2.419ms    | 0.034ms      | 10.466ms           | 52.27dB  |
+
+Partial conversion is **−92.1% conversion time, −14.4% encode p50 and −0.68ms
+capture→encode** at fps/PSNR parity. Bitrate stays within this scene's run-to-
+run variance (the two baseline runs alone span 311-338kbps); byte-identical
+conversion means there is no encoder-input quality or compression change.
+
+Noise fallback regression check (`band --noise --height 1200`, 10s, two runs
+each): fps 57.32→57.02, bitrate 20.96→20.74Mbps, encode p50 5.551→5.528ms,
+PSNR 17.186→17.193dB — within noise-run variance, no regression.
