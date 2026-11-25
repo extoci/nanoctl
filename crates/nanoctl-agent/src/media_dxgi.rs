@@ -29,6 +29,11 @@ use xcap::{Frame, Monitor};
 
 use super::{LatestFrame, PipelineStats};
 
+/// Swizzled RGBA bytes of one dirty rect.
+type Patch = (RECT, Vec<u8>);
+/// Dirty-region pixels of a contiguous run of small-dirty emits.
+type PatchLog = std::collections::VecDeque<(u64, Vec<Patch>)>;
+
 struct Duplication {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
@@ -37,6 +42,18 @@ struct Duplication {
     height: u32,
     /// Latest full RGBA image; dirty rects are patched into it between emits.
     accum: Vec<u8>,
+    /// Number of frames emitted so far — recycled buffers older than this
+    /// generation need the logged patches below to catch up.
+    emit_gen: u64,
+    /// Pixel data of recent emits' dirty regions: (emit generation, per-rect
+    /// (rect, swizzled RGBA bytes)) for a contiguous run of small-dirty
+    /// emits. A high-dirty emit clears it (storing patches would cost more
+    /// than the clone it saves), so entries are a gap-free run.
+    patch_log: PatchLog,
+    /// First emit generation covered by `patch_log` (== next emit when empty).
+    /// A recycled buffer emitted at gen >= log_base - 1 can be brought
+    /// current by replaying the log.
+    log_base: u64,
 }
 
 fn create_device() -> Result<ID3D11Device> {
@@ -110,6 +127,9 @@ impl Duplication {
                         width,
                         height,
                         accum: vec![0; (width * height * 4) as usize],
+                        emit_gen: 0,
+                        patch_log: PatchLog::new(),
+                        log_base: 0,
                     });
                 }
             }
@@ -120,7 +140,11 @@ impl Duplication {
     /// carries changed pixels, patches the dirty regions into `accum` and
     /// returns a full RGBA frame. Returns `None` on timeout or metadata-only
     /// frames (cursor moves without pixel changes).
-    fn acquire(&mut self, timeout_ms: u32) -> Result<Option<Frame>> {
+    /// `latest` supplies recycled emit buffers: the frame this thread emitted
+    /// last (emit_gen == self.emit_gen) comes back once every Arc is dropped,
+    /// still holding the previous image — patching the current dirty rects
+    /// makes it identical to `accum` without a full-frame clone.
+    fn acquire(&mut self, timeout_ms: u32, latest: &LatestFrame) -> Result<Option<Frame>> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         unsafe {
@@ -162,12 +186,52 @@ impl Duplication {
                     bottom: desc.Height as i32,
                 }];
             }
-            self.copy_dirty(&texture, &rects)?;
-            Ok(Some(Frame::new(
-                self.width,
-                self.height,
-                self.accum.clone(),
-            )))
+            // A recycled buffer emitted at gen g already contains the image
+            // through emit g; it can be brought current iff every emit in
+            // (g, emit_gen] was logged — i.e. g + 1 >= log_base.
+            let recycled = latest
+                .take_recycled()
+                .into_iter()
+                .filter(|(_, buf)| buf.len() == self.accum.len())
+                .filter(|(eg, _)| *eg + 1 >= self.log_base && *eg <= self.emit_gen)
+                .max_by_key(|(eg, _)| *eg)
+                .map(|(_, buf)| buf);
+            let mut emit = if let Some(mut buf) = recycled {
+                self.replay_patches(&mut buf);
+                buf
+            } else {
+                self.accum.clone()
+            };
+            let dirty_pixels: u64 = rects
+                .iter()
+                .map(|r| {
+                    (r.right.max(0) - r.left.max(0)).max(0) as u64
+                        * (r.bottom.max(0) - r.top.max(0)).max(0) as u64
+                })
+                .sum();
+            let log_patches = dirty_pixels * 4 < self.accum.len() as u64;
+            let logged = self.copy_dirty(&texture, &rects, &mut emit, log_patches)?;
+            self.emit_gen += 1;
+            match logged {
+                Some(patches) => {
+                    self.patch_log.push_back((self.emit_gen, patches));
+                    while self.patch_log.len() > 4 {
+                        self.patch_log.pop_front();
+                    }
+                    self.log_base = self
+                        .patch_log
+                        .front()
+                        .map(|(eg, _)| *eg)
+                        .unwrap_or(self.emit_gen + 1);
+                }
+                None => {
+                    // A large-dirty emit breaks the logged run: buffers older
+                    // than this emit can no longer catch up.
+                    self.patch_log.clear();
+                    self.log_base = self.emit_gen + 1;
+                }
+            }
+            Ok(Some(Frame::new(self.width, self.height, emit)))
         })();
         unsafe {
             let _ = self.duplication.ReleaseFrame();
@@ -235,9 +299,41 @@ impl Duplication {
         }
     }
 
+    /// Replays the logged dirty-region pixels newer than `buf`'s generation
+    /// so a recycled emit buffer matches the current accumulated image.
+    fn replay_patches(&self, buf: &mut [u8]) {
+        // `buf` was emitted gap generations ago; every logged patch applies.
+        let w = self.width as usize;
+        for (_, patches) in &self.patch_log {
+            for (rect, bytes) in patches {
+                let mut offset = 0usize;
+                let left = rect.left.max(0) as usize;
+                let top = rect.top.max(0) as usize;
+                let cols = (rect.right - rect.left).max(0) as usize;
+                let rows = (rect.bottom - rect.top).max(0) as usize;
+                for y in top..top + rows {
+                    let start = (y * w + left) * 4;
+                    let len = cols * 4;
+                    if start + len <= buf.len() && offset + len <= bytes.len() {
+                        buf[start..start + len].copy_from_slice(&bytes[offset..offset + len]);
+                    }
+                    offset += len;
+                }
+            }
+        }
+    }
+
     /// Copies each dirty rect GPU→staging (sub-resource copies, so only dirty
-    /// data crosses the bus), then swizzles BGRA→RGBA into `accum`.
-    fn copy_dirty(&mut self, texture: &ID3D11Texture2D, rects: &[RECT]) -> Result<()> {
+    /// data crosses the bus), then swizzles BGRA→RGBA into `accum` and the
+    /// emit buffer. When `log_patches` is set the swizzled rect bytes are
+    /// retained so future recycled buffers can catch up cheaply.
+    fn copy_dirty(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        rects: &[RECT],
+        emit: &mut [u8],
+        log_patches: bool,
+    ) -> Result<Option<Vec<Patch>>> {
         unsafe {
             for rect in rects {
                 if rect.right <= rect.left || rect.bottom <= rect.top {
@@ -267,6 +363,7 @@ impl Duplication {
                 .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let src = mapped.pData as *const u8;
             let row_pitch = mapped.RowPitch as usize;
+            let mut logged = log_patches.then(Vec::new);
             for rect in rects {
                 let left = (rect.left.max(0) as usize).min(self.width as usize);
                 let right = (rect.right as usize).min(self.width as usize);
@@ -276,6 +373,7 @@ impl Duplication {
                     let src_row = src.add(y * row_pitch + left * 4);
                     let dst_start = (y * self.width as usize + left) * 4;
                     let dst_row = &mut self.accum[dst_start..dst_start + (right - left) * 4];
+                    let emit_row = &mut emit[dst_start..dst_start + (right - left) * 4];
                     for x in 0..(right - left) {
                         let b = *src_row.add(x * 4);
                         let g = *src_row.add(x * 4 + 1);
@@ -286,11 +384,21 @@ impl Duplication {
                         dst_row[x * 4 + 2] = b;
                         dst_row[x * 4 + 3] = a;
                     }
+                    emit_row.copy_from_slice(dst_row);
+                }
+                if let Some(log) = &mut logged {
+                    let cols = (right - left) * 4;
+                    let mut bytes = Vec::with_capacity(cols * (bottom - top));
+                    for y in top..bottom {
+                        let start = (y * self.width as usize + left) * 4;
+                        bytes.extend_from_slice(&self.accum[start..start + cols]);
+                    }
+                    log.push((*rect, bytes));
                 }
             }
             self.context.Unmap(&self.staging, 0);
+            Ok(logged)
         }
-        Ok(())
     }
 }
 
@@ -334,10 +442,11 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
         if latest.stopped.load(Ordering::Acquire) {
             return;
         }
-        match dup.acquire(100) {
+        match dup.acquire(100, &latest) {
             Ok(Some(frame)) => {
                 // Backend-verified change: producer skips the memcmp.
-                if !latest.replace_hint(frame, Some(true)) {
+                let eg = dup.emit_gen;
+                if !latest.replace_hint(frame, Some(true), eg) {
                     return;
                 }
             }

@@ -271,6 +271,10 @@ where
         .context("video sample delivery timed out")?
 }
 
+/// Stash of pixel buffers released by fully-dropped `CapturedFrame`s, each
+/// tagged with the emit generation it last carried.
+type RecycledFrames = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
 #[derive(Default)]
 struct LatestFrame {
     slot: Mutex<Option<Arc<CapturedFrame>>>,
@@ -279,6 +283,10 @@ struct LatestFrame {
     stopped: AtomicBool,
     finished: AtomicBool,
     stats: Arc<PipelineStats>,
+    /// Pixel buffers released by fully-dropped `CapturedFrame`s, tagged with
+    /// the emit generation they last carried. The capture thread reuses them
+    /// so per-frame `Frame` emission does not clone the full frame.
+    recycled: RecycledFrames,
 }
 
 #[derive(Clone)]
@@ -289,6 +297,24 @@ struct CapturedFrame {
     /// the pixels changed (e.g. DXGI dirty rects) — the expensive full-frame
     /// memcmp is then skipped. `None` falls back to byte comparison.
     backend_changed: Option<bool>,
+    /// Monotonic emit counter from the capture backend (0 = unknown).
+    emit_gen: u64,
+    /// Sink this frame returns its pixel buffer to on drop, when it came from
+    /// a recycling backend.
+    recycle: Option<RecycledFrames>,
+}
+
+impl Drop for CapturedFrame {
+    fn drop(&mut self) {
+        let Some(recycle) = &self.recycle else {
+            return;
+        };
+        if let Ok(mut stash) = recycle.lock()
+            && stash.len() < 3
+        {
+            stash.push((self.emit_gen, std::mem::take(&mut self.frame.raw)));
+        }
+    }
 }
 
 impl CapturedFrame {
@@ -305,10 +331,25 @@ impl CapturedFrame {
 
 impl LatestFrame {
     fn replace(&self, frame: xcap::Frame) -> bool {
-        self.replace_hint(frame, None)
+        self.replace_hint(frame, None, 0)
     }
 
-    fn replace_hint(&self, frame: xcap::Frame, backend_changed: Option<bool>) -> bool {
+    /// Drains the recycled pixel-buffer stash — (emit generation, buffer)
+    /// pairs released by fully-dropped `CapturedFrame`s.
+    #[cfg(target_os = "windows")]
+    fn take_recycled(&self) -> Vec<(u64, Vec<u8>)> {
+        self.recycled
+            .lock()
+            .map(|mut stash| std::mem::take(&mut *stash))
+            .unwrap_or_default()
+    }
+
+    fn replace_hint(
+        &self,
+        frame: xcap::Frame,
+        backend_changed: Option<bool>,
+        emit_gen: u64,
+    ) -> bool {
         let Ok(mut slot) = self.slot.lock() else {
             return false;
         };
@@ -316,6 +357,8 @@ impl LatestFrame {
             frame,
             captured_at: Instant::now(),
             backend_changed,
+            emit_gen,
+            recycle: (emit_gen > 0).then(|| self.recycled.clone()),
         });
         if let Ok(mut last) = self.last.lock() {
             *last = Some(captured.clone());
@@ -897,12 +940,12 @@ impl CaptureEncoder {
                     )
                 }
             };
-            #[cfg(target_os = "windows")]
-            let resized_pixels = resized;
-            #[cfg(not(target_os = "windows"))]
-            let resized_pixels = resized.as_raw().as_slice();
-            xcap::image::ImageBuffer::from_raw(target_width, target_height, resized_pixels)
-                .context("resized capture returned an invalid RGBA frame")?
+            xcap::image::ImageBuffer::from_raw(
+                target_width,
+                target_height,
+                resized.as_raw().as_slice(),
+            )
+            .context("resized capture returned an invalid RGBA frame")?
         };
         let (width, height) = image.dimensions();
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
@@ -3324,6 +3367,8 @@ mod tests {
             frame: xcap::Frame::new(2, 2, vec![0; 16]),
             captured_at: now,
             backend_changed: None,
+            emit_gen: 0,
+            recycle: None,
         };
         let mut next = previous.clone();
         next.captured_at += Duration::from_secs(1);
@@ -3514,6 +3559,8 @@ mod tests {
             frame: xcap::Frame::new(64, 64, vec![128; 64 * 64 * 4]),
             captured_at: Instant::now() - Duration::from_secs(10),
             backend_changed: None,
+            emit_gen: 0,
+            recycle: None,
         };
         let (frame, _) = encoder.encode_captured_frame(&captured, 64, 64).unwrap();
         assert!(!frame.bytes.is_empty());

@@ -3,10 +3,11 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{Image, ImageRef},
 };
+use xcap::image::RgbaImage;
+
 #[derive(Default)]
 pub(super) struct RgbaResizer {
     resizer: Resizer,
-    output: Vec<u8>,
 }
 
 impl RgbaResizer {
@@ -17,7 +18,7 @@ impl RgbaResizer {
         height: u32,
         target_width: u32,
         target_height: u32,
-    ) -> Result<&[u8]> {
+    ) -> Result<RgbaImage> {
         ensure!(
             width > 0 && height > 0 && target_width > 0 && target_height > 0,
             "resize dimensions must be non-zero"
@@ -29,38 +30,24 @@ impl RgbaResizer {
                 == Some(pixels.len()),
             "resize pixels do not match RGBA dimensions"
         );
-        let output_len = (target_width as usize)
-            .checked_mul(target_height as usize)
-            .and_then(|n| n.checked_mul(4))
-            .context("resize output dimensions overflow")?;
-        if self.output.len() != output_len {
-            self.output.clear();
-            self.output.resize(output_len, 0);
-        }
         let source = ImageRef::new(width, height, pixels, PixelType::U8x4)?;
-        {
-            let mut output = Image::from_slice_u8(
-                target_width,
-                target_height,
-                &mut self.output,
-                PixelType::U8x4,
-            )?;
-            self.resizer.resize(
-                &source,
-                &mut output,
-                &ResizeOptions::new()
-                    .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
-                    .use_alpha(false),
-            )?;
-        }
-        Ok(&self.output[..output_len])
+        let mut output = Image::new(target_width, target_height, PixelType::U8x4);
+        self.resizer.resize(
+            &source,
+            &mut output,
+            &ResizeOptions::new()
+                .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
+                .use_alpha(false),
+        )?;
+        RgbaImage::from_raw(target_width, target_height, output.into_vec())
+            .context("resizer returned invalid RGBA pixels")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xcap::image::{Rgba, RgbaImage, imageops};
+    use xcap::image::{Rgba, imageops};
 
     #[test]
     fn triangle_matches_reference_across_dimensions_and_reuses_scratch() {
@@ -73,54 +60,20 @@ mod tests {
             let actual = resizer
                 .resize(source.as_raw(), 80, 60, width, height)
                 .unwrap();
-            assert_eq!(actual.len(), expected.as_raw().len());
-            for (actual, expected) in actual.iter().zip(expected.as_raw()) {
+            assert_eq!(actual.dimensions(), expected.dimensions());
+            for (actual, expected) in actual.as_raw().iter().zip(expected.as_raw()) {
                 assert!(actual.abs_diff(*expected) <= 2, "{actual} != {expected}");
             }
         }
     }
 
     #[test]
-    fn repeated_same_size_resize_reuses_the_output_allocation() {
+    fn triangle_preserves_constant_rgba_without_premultiplication() {
         let source = RgbaImage::from_pixel(80, 60, Rgba([23, 42, 199, 17]));
-        let mut resizer = RgbaResizer::default();
-        let first = resizer
+        let output = RgbaResizer::default()
             .resize(source.as_raw(), 80, 60, 48, 36)
-            .unwrap()
-            .as_ptr();
-        for _ in 0..16 {
-            let actual = resizer.resize(source.as_raw(), 80, 60, 48, 36).unwrap();
-            assert_eq!(actual.as_ptr(), first);
-            assert!(
-                actual
-                    .chunks_exact(4)
-                    .all(|pixel| pixel == [23, 42, 199, 17])
-            );
-        }
-    }
-
-    #[test]
-    fn shrinking_and_returning_within_capacity_reuses_the_output_allocation() {
-        let source = RgbaImage::from_pixel(80, 60, Rgba([23, 42, 199, 17]));
-        let mut resizer = RgbaResizer::default();
-        let first = resizer
-            .resize(source.as_raw(), 80, 60, 80, 60)
-            .unwrap()
-            .as_ptr();
-        assert_eq!(
-            resizer
-                .resize(source.as_raw(), 80, 60, 32, 24)
-                .unwrap()
-                .as_ptr(),
-            first
-        );
-        assert_eq!(
-            resizer
-                .resize(source.as_raw(), 80, 60, 64, 48)
-                .unwrap()
-                .as_ptr(),
-            first
-        );
+            .unwrap();
+        assert!(output.pixels().all(|pixel| pixel.0 == [23, 42, 199, 17]));
     }
 
     #[test]

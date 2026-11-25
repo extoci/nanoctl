@@ -177,6 +177,3 @@ lto = "thin"
 opt-level = 3
 panic = "unwind"
 strip = "symbols"
-
-[patch.crates-io]
-xcap = { path = "vendor/xcap" }

@@ -747,3 +747,16 @@ Worst case (`band --noise`, full-screen dirty every frame): 58.2fps /
 `accum` still clones ~7.7MB per emit (~1% CPU); a generation-tracked buffer
 recycle could reclaim it later. On a real GPU box the compositor path is the
 same API — dirty rects should help even more where present rates are 144Hz+.
+
+## Emit-buffer recycling (cycle 38)
+
+`LatestFrame` now stashes pixel buffers of fully-dropped `CapturedFrame`s,
+tagged by emit generation; the DXGI capture thread reuses them instead of
+`accum.clone()`-ing 7.7MB per emit. A recycled buffer emitted `g` gens ago
+is brought current by replaying `patch_log` — the swizzled dirty-region
+pixels of recent small-dirty emits (dirt >25% of the frame clears the log,
+so worst case degenerates to the clone, never worse).
+
+Same `band --clock` A-B: agent CPU **6.1% → 5.6%**; cumulative vs xcap path
+**10.9% → 5.6% (−49%)**. fps/bitrate unchanged (58.1 / 108kbps); noise
+worst case unchanged (57.3fps / 19.2Mbps / tier 0).
