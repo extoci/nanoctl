@@ -20,7 +20,9 @@ final class DCVideoReceiver {
         var transitMs = 0.0
     }
 
-    private let window = 16
+    // Match the browser viewer: four frames bounds reordering without making
+    // a single loss cost a quarter-second of buffered video at 60fps.
+    private let window = 4
     /// The codec SDP negotiation reported, used only when the stream itself
     /// carries no parameter sets to sniff. SDP can lie (the answer may merely
     /// mirror the offer's codec ordering); the bitstream does not.
@@ -36,6 +38,9 @@ final class DCVideoReceiver {
     /// negotiated while the data channels are still up) — the caller should
     /// close the channels and fall back to the RTP path.
     var onUnsupported: () -> Void = {}
+    /// Repeated decoder failure even across replacement keyframes; the caller
+    /// should close the channels and use the RTP video track instead.
+    var onPersistentFault: () -> Void = {}
 
     private(set) var stats = Stats()
     // Link-quality counters drained by `takeLinkStats`.
@@ -48,6 +53,8 @@ final class DCVideoReceiver {
     private var kfRequestedAt: CFAbsoluteTime = 0
     private var pending: [UInt32: (isKey: Bool, parts: Int, got: [Data?], n: Int)] = [:]
     private var reordered: [UInt32: (au: Data, isKey: Bool)] = [:]
+    private var consecutiveFaults = 0
+    private let maxConsecutiveFaults = 3
     private let queue = DispatchQueue(label: "nanoctl.dcvideo", qos: .userInteractive)
 
     init(codec hint: VTDecoder.Codec? = nil) {
@@ -60,7 +67,7 @@ final class DCVideoReceiver {
     }
 
     /// Rolling loss fraction plus the counters since the last call.
-    func takeLinkStats() -> (fractionLost: Double, transitMs: Double) {
+    func takeLinkStats() -> (fractionLost: Double, transitMs: Double, frames: Int) {
         var lost = 0
         var received = 0
         var transit = 0.0
@@ -72,7 +79,7 @@ final class DCVideoReceiver {
             self.received = 0
         }
         let total = lost + received
-        return (total > 0 ? Double(lost) / Double(total) : 0, transit)
+        return (total > 0 ? Double(lost) / Double(total) : 0, transit, received)
     }
 
     var decodedCount: Int { decoder?.decoded ?? 0 }
@@ -82,6 +89,16 @@ final class DCVideoReceiver {
     private func onDecoderFault() {
         waitingForKey = true
         reordered.removeAll()
+        consecutiveFaults += 1
+        if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
+            kfRequestedAt = CFAbsoluteTimeGetCurrent()
+            stats.kfRequests += 1
+            requestKeyframe()
+        }
+        if consecutiveFaults >= maxConsecutiveFaults {
+            consecutiveFaults = 0
+            onPersistentFault()
+        }
     }
 
     private func process(_ data: Data) {
@@ -123,10 +140,15 @@ final class DCVideoReceiver {
             return
         }
         var deliverNow = diff == 0
-        if diff > 0, isKey, waitingForKey {
-            // A keyframe jumps the reorder window — missing seqs are lost.
+        if diff > 0, isKey {
+            // A keyframe never depends on the missing deltas before it, so it
+            // jumps the reorder window in every state. Older buffered deltas
+            // are both undecodable and temporally stale once it exists.
             deliverNow = true
             lost += Int(diff)
+            for buffered in reordered.keys.filter({ Int32(bitPattern: $0 &- seq) < 0 }) {
+                reordered.removeValue(forKey: buffered)
+            }
         } else if diff > 0 {
             if isKey || !waitingForKey {
                 reordered[seq] = (chunk, isKey)
@@ -177,7 +199,10 @@ final class DCVideoReceiver {
         }
         let decoder = VTDecoder(codec: detected)
         decoder.onFault = { [weak self] in self?.queue.async { self?.onDecoderFault() } }
-        decoder.onFrame = { [weak self] buffer in self?.onBuffer(buffer) }
+        decoder.onFrame = { [weak self] buffer in
+            self?.onBuffer(buffer)
+            self?.queue.async { self?.consecutiveFaults = 0 }
+        }
         codec = detected
         self.decoder = decoder
         return decoder

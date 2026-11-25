@@ -5,7 +5,8 @@
 //! dirty/move rects instead of the whole texture, and tags the frame as
 //! backend-verified changed so the producer can skip its full-frame memcmp.
 
-use std::sync::{Arc, Weak, atomic::Ordering};
+use std::collections::HashSet;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, atomic::Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -34,10 +35,69 @@ type Patch = (RECT, Vec<u8>);
 /// Dirty-region pixels of a contiguous run of small-dirty emits.
 type PatchLog = std::collections::VecDeque<(u64, Vec<Patch>)>;
 
+static ACTIVE_OUTPUTS: OnceLock<(Mutex<HashSet<usize>>, Condvar)> = OnceLock::new();
+
+fn active_outputs() -> &'static (Mutex<HashSet<usize>>, Condvar) {
+    ACTIVE_OUTPUTS.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+}
+
+fn lock_active_outputs() -> MutexGuard<'static, HashSet<usize>> {
+    active_outputs()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Exclusive process-local ownership of one output's duplication session.
+/// Windows rejects a second `DuplicateOutput` while another session for the
+/// same output exists; this includes nanoctl's replay warmup racing its real
+/// capture pipeline. The permit is stored after `duplication` below so struct
+/// drop order releases the COM session before another waiter may open one.
+struct OutputPermit(usize);
+
+impl OutputPermit {
+    fn acquire(h_monitor: HMONITOR) -> Result<Self> {
+        let key = h_monitor.0 as usize;
+        let started = Instant::now();
+        let mut active = lock_active_outputs();
+        loop {
+            if active.insert(key) {
+                return Ok(Self(key));
+            }
+            let remaining = Duration::from_secs(3).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                bail!("timed out waiting for the active DXGI output duplication");
+            }
+            let (guard, _) = active_outputs()
+                .1
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = guard;
+        }
+    }
+
+    fn try_acquire(h_monitor: HMONITOR) -> Result<Self> {
+        let key = h_monitor.0 as usize;
+        if lock_active_outputs().insert(key) {
+            Ok(Self(key))
+        } else {
+            bail!("DXGI output duplication is already active")
+        }
+    }
+}
+
+impl Drop for OutputPermit {
+    fn drop(&mut self) {
+        lock_active_outputs().remove(&self.0);
+        active_outputs().1.notify_one();
+    }
+}
+
 struct Duplication {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: ID3D11Texture2D,
+    _permit: OutputPermit,
     width: u32,
     height: u32,
     /// Latest full BGRA image; dirty rects are patched into it between emits.
@@ -81,6 +141,14 @@ fn create_device() -> Result<ID3D11Device> {
 
 impl Duplication {
     fn new(h_monitor: HMONITOR) -> Result<Self> {
+        Self::with_permit(h_monitor, OutputPermit::acquire(h_monitor)?)
+    }
+
+    fn try_new(h_monitor: HMONITOR) -> Result<Self> {
+        Self::with_permit(h_monitor, OutputPermit::try_acquire(h_monitor)?)
+    }
+
+    fn with_permit(h_monitor: HMONITOR, permit: OutputPermit) -> Result<Self> {
         unsafe {
             let device = create_device()?;
             let dxgi_device = device.cast::<IDXGIDevice>()?;
@@ -92,11 +160,11 @@ impl Duplication {
                     .EnumOutputs(index)
                     .context("DXGI output not found for monitor")?;
                 index += 1;
-                let output1 = output.cast::<IDXGIOutput1>()?;
-                let duplication = output1
-                    .DuplicateOutput(&device)
-                    .context("DuplicateOutput failed")?;
                 if output.GetDesc()?.Monitor == h_monitor {
+                    let output1 = output.cast::<IDXGIOutput1>()?;
+                    let duplication = output1
+                        .DuplicateOutput(&device)
+                        .context("DuplicateOutput failed")?;
                     let desc = output.GetDesc()?;
                     let width =
                         (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
@@ -124,6 +192,7 @@ impl Duplication {
                         context,
                         duplication,
                         staging,
+                        _permit: permit,
                         width,
                         height,
                         accum: vec![0; (width * height * 4) as usize],
@@ -401,7 +470,7 @@ impl Duplication {
 /// agent with 0xc0000005.
 pub(super) fn capture_once(monitor: &Monitor) -> Result<Frame> {
     let h_monitor = HMONITOR(monitor.id()? as usize as *mut _);
-    let mut dup = Duplication::new(h_monitor)?;
+    let mut dup = Duplication::try_new(h_monitor)?;
     let latest = Arc::new(LatestFrame::default());
     for _ in 0..8 {
         if let Some(frame) = dup.acquire(125, &latest)? {
@@ -442,21 +511,54 @@ pub(super) fn start(
     Ok((latest, thread))
 }
 
-fn recreate(h_monitor: HMONITOR, dup: &mut Duplication) {
+const RESUME_GAP: Duration = Duration::from_secs(2);
+
+fn capture_loop_resumed(previous_loop: Instant, loop_started: Instant) -> bool {
+    loop_started.duration_since(previous_loop) >= RESUME_GAP
+}
+
+fn recreate(h_monitor: HMONITOR, dup: &mut Option<Duplication>) -> bool {
+    // Windows allows only one duplication of an output. Release the stale COM
+    // objects before opening their replacement; creating the replacement first
+    // makes every recovery fail with DuplicateOutput/access-denied.
+    drop(dup.take());
     match Duplication::new(h_monitor) {
-        Ok(next) => *dup = next,
+        Ok(next) => {
+            *dup = Some(next);
+            true
+        }
         Err(recreate_error) => {
-            tracing::warn!(%recreate_error, "DXGI duplication recreate failed");
+            tracing::warn!("DXGI duplication recreate failed: {recreate_error:#}");
             std::thread::sleep(Duration::from_secs(1));
+            false
         }
     }
 }
 
-fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
+fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
     #[cfg(windows)]
     let _mmcss = crate::media::register_mmcss();
     let h_monitor = HMONITOR(h_monitor_raw as *mut _);
-    let mut last_frame = Instant::now();
+    let mut dup = Some(dup);
+    // A process/system suspend can invalidate the desktop-duplication session
+    // without returning ACCESS_LOST: after resume AcquireNextFrame only times
+    // out. Do not infer staleness from a static desktop — timeouts are normal
+    // there. Infer suspension from the capture loop itself missing its normal
+    // ~100ms cadence by a wide margin instead.
+    let mut previous_loop = Instant::now();
+    let mut recreate_failures = 0_u8;
+    let mut recreate_bounded = |dup: &mut Option<Duplication>| {
+        if recreate(h_monitor, dup) {
+            recreate_failures = 0;
+            true
+        } else {
+            recreate_failures += 1;
+            // A permanently unavailable duplication session must not leave the
+            // stream on indefinite keepalives. Exit so the caller can rebuild
+            // the pipeline and fall back to the continuous capture backend.
+            recreate_failures < 5
+        }
+    };
     loop {
         let Some(latest) = slot.upgrade() else {
             return;
@@ -464,27 +566,41 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
         if latest.stopped.load(Ordering::Acquire) {
             return;
         }
-        match dup.acquire(100, &latest) {
+        let loop_started = Instant::now();
+        let resumed = capture_loop_resumed(previous_loop, loop_started);
+        previous_loop = loop_started;
+        if dup.is_none() && !recreate_bounded(&mut dup) {
+            tracing::warn!("DXGI duplication recovery failed repeatedly; capture thread exiting");
+            return;
+        }
+        if dup.is_none() {
+            continue;
+        }
+        let acquire_started = Instant::now();
+        let (acquired, emit_gen) = {
+            let active = dup.as_mut().expect("duplication checked above");
+            let acquired = active.acquire(100, &latest);
+            (acquired, active.emit_gen)
+        };
+        let resumed = resumed || capture_loop_resumed(acquire_started, Instant::now());
+        match acquired {
             Ok(Some(frame)) => {
-                last_frame = Instant::now();
                 // Backend-verified change: producer skips the memcmp.
-                let eg = dup.emit_gen;
-                if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), eg) {
+                if !latest.replace_hint(frame, super::PixelFormat::Bgra, Some(true), emit_gen) {
                     return;
                 }
             }
             Ok(None) => {
-                // A frozen/then-resumed pipeline (process suspend, network
-                // partition) leaves the duplication session stale:
-                // AcquireNextFrame keeps timing out without ever returning
-                // ACCESS_LOST, so the error path never rebuilds it and the
-                // stream sits on keepalives until the session happens to
-                // unstick (~15s observed). Rebuild after sustained
-                // starvation — idempotent; a truly static desktop just
-                // re-emits one frame on roughly the keepalive cadence.
-                if last_frame.elapsed() >= Duration::from_secs(4) {
-                    recreate(h_monitor, &mut dup);
-                    last_frame = Instant::now();
+                // Give the existing session one acquire after a resume: if
+                // the compositor can still deliver accumulated changes, no
+                // rebuild is needed. The stale post-suspend session observed
+                // in cycle 48 only timed out, so a timeout here is the safe
+                // signal to replace it.
+                if resumed && !recreate_bounded(&mut dup) {
+                    tracing::warn!(
+                        "DXGI duplication recovery failed repeatedly; capture thread exiting"
+                    );
+                    return;
                 }
             }
             Err(error) => {
@@ -496,8 +612,71 @@ fn run(h_monitor_raw: usize, mut dup: Duplication, slot: Weak<LatestFrame>) {
                     return;
                 }
                 // Desktop switch / mode change: rebuild the duplication.
-                recreate(h_monitor, &mut dup);
+                if !recreate_bounded(&mut dup) {
+                    tracing::warn!(
+                        "DXGI duplication recovery failed repeatedly; capture thread exiting"
+                    );
+                    return;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Gdi::HMONITOR;
+
+    static NEXT_TEST_OUTPUT: AtomicUsize = AtomicUsize::new(0x7000_0000);
+
+    fn test_monitor() -> HMONITOR {
+        HMONITOR(NEXT_TEST_OUTPUT.fetch_add(0x10, Ordering::Relaxed) as *mut _)
+    }
+
+    #[test]
+    fn output_permit_rejects_overlapping_try_acquire() {
+        let monitor = test_monitor();
+        let first = OutputPermit::try_acquire(monitor).expect("first permit");
+        assert!(OutputPermit::try_acquire(monitor).is_err());
+        drop(first);
+        assert!(OutputPermit::try_acquire(monitor).is_ok());
+    }
+
+    #[test]
+    fn output_permit_waits_for_release() {
+        let monitor = test_monitor();
+        let first = OutputPermit::try_acquire(monitor).expect("first permit");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(first);
+        });
+        let started = Instant::now();
+        let second = OutputPermit::acquire(monitor).expect("second permit");
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        drop(second);
+    }
+
+    #[test]
+    fn resume_detection_ignores_normal_static_capture_cadence() {
+        let start = Instant::now();
+        assert!(!capture_loop_resumed(start, start));
+        assert!(!capture_loop_resumed(
+            start,
+            start + Duration::from_millis(100)
+        ));
+        assert!(!capture_loop_resumed(
+            start,
+            start + RESUME_GAP - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn resume_detection_catches_process_or_system_suspend() {
+        let start = Instant::now();
+        assert!(capture_loop_resumed(start, start + RESUME_GAP));
+        assert!(capture_loop_resumed(start, start + Duration::from_secs(7)));
     }
 }
