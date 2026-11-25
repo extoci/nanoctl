@@ -20,7 +20,9 @@ final class DCVideoReceiver {
         var transitMs = 0.0
     }
 
-    private let window = 16
+    // Match the browser viewer: four frames bounds reordering without making
+    // a single loss cost a quarter-second of buffered video at 60fps.
+    private let window = 4
     /// The codec SDP negotiation reported, used only when the stream itself
     /// carries no parameter sets to sniff. SDP can lie (the answer may merely
     /// mirror the offer's codec ordering); the bitstream does not.
@@ -88,6 +90,11 @@ final class DCVideoReceiver {
         waitingForKey = true
         reordered.removeAll()
         consecutiveFaults += 1
+        if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
+            kfRequestedAt = CFAbsoluteTimeGetCurrent()
+            stats.kfRequests += 1
+            requestKeyframe()
+        }
         if consecutiveFaults >= maxConsecutiveFaults {
             consecutiveFaults = 0
             onPersistentFault()
@@ -133,10 +140,15 @@ final class DCVideoReceiver {
             return
         }
         var deliverNow = diff == 0
-        if diff > 0, isKey, waitingForKey {
-            // A keyframe jumps the reorder window — missing seqs are lost.
+        if diff > 0, isKey {
+            // A keyframe never depends on the missing deltas before it, so it
+            // jumps the reorder window in every state. Older buffered deltas
+            // are both undecodable and temporally stale once it exists.
             deliverNow = true
             lost += Int(diff)
+            for buffered in reordered.keys.filter({ Int32(bitPattern: $0 &- seq) < 0 }) {
+                reordered.removeValue(forKey: buffered)
+            }
         } else if diff > 0 {
             if isKey || !waitingForKey {
                 reordered[seq] = (chunk, isKey)
