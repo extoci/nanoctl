@@ -17,6 +17,65 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "1"
 
 jobs:
+  branch-freshness:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Require the PR head to contain the current base branch
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/branches/${BASE_REF}" --jq '.commit.sha')"
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${current_base}...${HEAD_SHA}" --jq '.status')"
+          state=failure
+          description="stale: rebase onto latest ${BASE_REF} before merging"
+          if [ "$status" = ahead ] || [ "$status" = identical ]; then
+            state=success
+            description="contains latest ${BASE_REF}"
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" --method POST \
+            -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
+          if [ "$state" = failure ]; then
+            echo "PR head compare status is '$status' against ${BASE_REF}@${current_base}." >&2
+            echo "Rebase onto the latest ${BASE_REF}; merging a stale branch can silently overwrite freshly merged work." >&2
+            exit 1
+          fi
+          echo "PR head contains ${BASE_REF}@${current_base}."
+      - name: Re-mark open PR freshness after master moves
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/branches/master" --jq '.commit.sha')"
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json headRefOid,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository | not) | .headRefOid' |
+            while read -r head_sha; do
+              [ -n "$head_sha" ] || continue
+              if ! status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${current_base}...${head_sha}" --jq '.status' 2>/dev/null)"; then
+                continue
+              fi
+              state=failure
+              description="stale: rebase onto latest master before merging"
+              if [ "$status" = ahead ] || [ "$status" = identical ]; then
+                state=success
+                description="contains latest master"
+              fi
+              gh api "repos/${GITHUB_REPOSITORY}/statuses/${head_sha}" --method POST \
+                -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
+            done
   viewer:
     runs-on: ubuntu-latest
     timeout-minutes: 20
