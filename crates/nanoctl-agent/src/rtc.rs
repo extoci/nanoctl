@@ -948,17 +948,19 @@ impl HostPeer {
         if let Some(output) = audio_output
             && offer.lines().any(|line| line.starts_with("m=audio "))
         {
-            let audio = Arc::new(TrackLocalStaticSample::new(
-                RTCRtpCodecCapability {
-                    mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
-                    clock_rate: 48_000,
-                    channels: 2,
-                    sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".into(),
-                    ..Default::default()
-                },
-                "system-audio".into(),
-                "nanoctl-audio".into(),
-            ));
+            let audio = Arc::new(
+                webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP::new(
+                    RTCRtpCodecCapability {
+                        mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
+                        clock_rate: 48_000,
+                        channels: 2,
+                        sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".into(),
+                        ..Default::default()
+                    },
+                    "system-audio".into(),
+                    "nanoctl-audio".into(),
+                ),
+            );
             let sender = peer.add_track(audio.clone()).await?;
             input_tasks.push(tokio::spawn(crate::audio::run(
                 audio,
