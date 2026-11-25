@@ -166,6 +166,7 @@ export class RemoteSessionController {
       : this.sendGamepadHeartbeat(),
   );
   private keyQueue: Promise<void> = Promise.resolve();
+  private lastKeyRepeatAt = 0;
   private readonly onClipboardFocus = () => {
     void this.clipboard?.focus();
   };
@@ -951,6 +952,13 @@ export class RemoteSessionController {
       return;
     if (event.type === "keydown") this.pressedKeys.add(event.code);
     event.preventDefault();
+    // The host synthesizes typematic repeats from the held key state. Browser
+    // repeats are throttled to liveness ticks so a stuck key still times out
+    // when the viewer or network dies, without paying a datagram at typematic rate.
+    if (event.type === "keydown" && event.repeat) {
+      if (event.timeStamp - this.lastKeyRepeatAt < 250) return;
+      this.lastKeyRepeatAt = event.timeStamp;
+    }
     const message: ControlMessage = {
       type: "key",
       action: event.type === "keydown" ? "down" : "up",

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -128,6 +128,7 @@ pub struct InputController {
     width: u32,
     height: u32,
     held_keys: HashSet<Key>,
+    repeat_keys: HashMap<Key, Instant>,
     held_buttons: HashSet<Button>,
     last_physical_input: Instant,
     gamepads: crate::gamepad::Gamepads,
@@ -187,6 +188,13 @@ enum KeyAction {
     Down,
     Up,
 }
+
+/// The host synthesizes typematic repeats while a key is physically held.
+/// Sending every browser repeat over SCTP costs a full datagram for no extra
+/// information. These match the common desktop default closely enough for
+/// remote input; the exact client OS setting is intentionally not replicated.
+const KEY_REPEAT_DELAY: Duration = Duration::from_millis(500);
+const KEY_REPEAT_INTERVAL: Duration = Duration::from_millis(33);
 
 const BINARY_POINTER_MOVE: u8 = 1;
 const BINARY_GAMEPAD: u8 = 2;
@@ -438,6 +446,7 @@ impl InputController {
             width: monitor.width()?,
             height: monitor.height()?,
             held_keys: HashSet::new(),
+            repeat_keys: HashMap::new(),
             held_buttons: HashSet::new(),
             last_physical_input: Instant::now(),
             gamepads: Default::default(),
@@ -651,12 +660,20 @@ impl InputController {
             return Ok(());
         };
         match action {
-            KeyAction::Down if repeat || !self.held_keys.contains(&key) => {
+            // Typematic repeats are generated locally while the key remains
+            // held. A repeat datagram is only a clock tick and is ignored.
+            KeyAction::Down if repeat => {}
+            KeyAction::Down if !self.held_keys.contains(&key) => {
                 self.enigo.key(key, Direction::Press)?;
                 self.held_keys.insert(key);
+                if repeatable_key(key) {
+                    self.repeat_keys
+                        .insert(key, Instant::now() + KEY_REPEAT_DELAY);
+                }
             }
             KeyAction::Up => {
                 self.held_keys.remove(&key);
+                self.repeat_keys.remove(&key);
                 self.enigo.key(key, Direction::Release)?;
             }
             KeyAction::Down => {}
@@ -664,7 +681,19 @@ impl InputController {
         Ok(())
     }
 
+    /// Emits host-side typematic repeats whose deadline has passed. The RTC
+    /// watchdog calls this frequently; it is a no-op unless a repeatable key
+    /// is still held.
+    pub(crate) fn pump_key_repeats(&mut self, now: Instant) {
+        for (key, due) in &mut self.repeat_keys {
+            if key_repeat_due(due, now) {
+                let _ = self.enigo.key(*key, Direction::Press);
+            }
+        }
+    }
+
     pub fn release_all(&mut self) {
+        self.repeat_keys.clear();
         for key in self.held_keys.drain() {
             let _ = self.enigo.key(key, Direction::Release);
         }
@@ -756,6 +785,21 @@ fn map_button(value: Option<u8>) -> Result<Button> {
     }
 }
 
+fn key_repeat_due(due: &mut Instant, now: Instant) -> bool {
+    if now < *due {
+        return false;
+    }
+    *due = now + KEY_REPEAT_INTERVAL;
+    true
+}
+
+fn repeatable_key(key: Key) -> bool {
+    !matches!(
+        key,
+        Key::Shift | Key::Control | Key::Alt | Key::Meta | Key::CapsLock
+    )
+}
+
 fn map_key(code: &str, value: &str) -> Option<Key> {
     let named = match code {
         "Backspace" => Some(Key::Backspace),
@@ -805,6 +849,22 @@ fn map_key(code: &str, value: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_repeat_schedule_and_repeatable_key_classification() {
+        let start = Instant::now();
+        let mut due = start + KEY_REPEAT_DELAY;
+        assert!(!key_repeat_due(
+            &mut due,
+            start + KEY_REPEAT_DELAY - Duration::from_millis(1)
+        ));
+        assert!(key_repeat_due(&mut due, start + KEY_REPEAT_DELAY));
+        assert_eq!(due, start + KEY_REPEAT_DELAY + KEY_REPEAT_INTERVAL);
+        assert!(repeatable_key(Key::Unicode('a')));
+        assert!(repeatable_key(Key::Backspace));
+        assert!(!repeatable_key(Key::Shift));
+        assert!(!repeatable_key(Key::Control));
+    }
     use crate::rtc::MAX_CONTROL_MESSAGE_BYTES;
     use proptest::prelude::*;
 

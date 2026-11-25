@@ -423,6 +423,10 @@ describe("remote session lifecycle", () => {
     pressKey("keydown", body, { code: "ShiftLeft", key: "Shift", shiftKey: true });
     pressKey("keyup", { tagName: "BUTTON" }, { code: "ShiftLeft", key: "Shift" });
     expect(channel.sent.map((data) => JSON.parse(data).action)).toEqual(["down", "up"]);
+    channel.sent = [];
+    for (const timeStamp of [500, 600, 760])
+      pressKey("keydown", body, { code: "KeyD", key: "d", repeat: true, timeStamp });
+    expect(channel.sent.map((data) => JSON.parse(data).repeat)).toEqual([true, true]);
     await controller.stop();
   });
 
@@ -844,7 +848,9 @@ const windowListeners = new Map<string, Set<(event: Event) => void>>();
 
 /** Delivers a key event to window listeners as if it bubbled up from `target`. */
 function pressKey(type: string, target: unknown, properties: object): void {
-  const event = Object.assign(new Event(type, { cancelable: true }), properties);
+  const { timeStamp, ...assignable } = properties as { timeStamp?: number };
+  const event = Object.assign(new Event(type, { cancelable: true }), assignable);
+  if (timeStamp !== undefined) Object.defineProperty(event, "timeStamp", { value: timeStamp });
   Object.defineProperty(event, "target", { value: target });
   for (const listener of windowListeners.get(type) ?? []) listener(event);
 }

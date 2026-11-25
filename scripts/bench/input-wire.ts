@@ -121,3 +121,21 @@ console.log(
   `periodic keepalive probes: JSON ${probeWire.json} -> v2 ${probeWire.v2} -> v3 0 bytes/sample ` +
     `(v3 saves 100.0% vs v2, 100.0% vs JSON)`,
 );
+
+// Held-key typematic repeat: before, every browser repeat occupied an SCTP
+// datagram; after host-side synthesis, only sparse liveness ticks cross the wire.
+const heldKey = { ...key("a", true), repeat: true };
+const repeatBefore = total([
+  key("a", true),
+  ...Array.from({ length: 30 }, () => heldKey),
+  key("a", false),
+]);
+const repeatAfter = total([
+  key("a", true),
+  ...Array.from({ length: 4 }, () => heldKey),
+  key("a", false),
+]);
+console.log(
+  `held key for 1s at 30 repeats/s: ${repeatBefore.v3} -> ${repeatAfter.v3} bytes ` +
+    `(saves ${percent(repeatBefore.v3, repeatAfter.v3).toFixed(1)}%)`,
+);

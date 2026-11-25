@@ -705,7 +705,8 @@ impl HostPeer {
                 let input = Arc::downgrade(input);
                 let mut shutdown = input_shutdown.subscribe();
                 input_tasks.push(tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_millis(50));
+                    let mut interval = tokio::time::interval(Duration::from_millis(10));
+                    let mut tick = 0_u8;
                     loop {
                         tokio::select! {
                             _ = shutdown.changed() => break,
@@ -714,13 +715,17 @@ impl HostPeer {
                                     break;
                                 };
                                 if let Ok(mut input) = input.lock() {
-                                    // Gamepad viewers heartbeat every 250ms while idle. Three
-                                    // missed heartbeats mean the transport or viewer is badly
-                                    // impaired; don't let a held stick/button keep driving.
-                                    input.release_if_idle(
-                                        Duration::from_secs(2),
-                                        Duration::from_millis(750),
-                                    );
+                                    input.pump_key_repeats(Instant::now());
+                                    tick = tick.wrapping_add(1);
+                                    if tick.is_multiple_of(5) {
+                                        // Gamepad viewers heartbeat every 250ms while idle. Three
+                                        // missed heartbeats mean the transport or viewer is badly
+                                        // impaired; don't let a held stick/button keep driving.
+                                        input.release_if_idle(
+                                            Duration::from_secs(2),
+                                            Duration::from_millis(750),
+                                        );
+                                    }
                                 }
                             }
                         }
