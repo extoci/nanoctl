@@ -23,19 +23,20 @@ test("reports whether the browser sees a supported controller", () => {
   expect(gamepad.sample([pad(1, ""), pad(2)], 2)).toBe("connected");
 });
 
-test("maps standard controls and sends snapshots on change or keepalive", () => {
+test("maps standard controls and repeats active snapshots every poll", () => {
   const messages: unknown[] = [];
   const gamepad = new GamepadForwarder((message) => Boolean(messages.push(message)));
   const controller = pad(10);
   gamepad.sample([null, controller, pad(12, "")], 0);
-  gamepad.sample([controller], 499);
+  gamepad.sample([controller], 16);
   const state = { type: "gamepad", pads: [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]] };
-  expect(messages).toEqual([state]);
-  gamepad.sample([controller], 500);
-  gamepad.sample([{ ...controller, axes: [NaN] }], 501);
-  gamepad.sample([], 502);
+  expect(messages).toEqual([state, state]);
+  gamepad.sample([controller], 32);
+  gamepad.sample([{ ...controller, axes: [NaN] }], 48);
+  gamepad.sample([], 64);
   gamepad.release();
   expect(messages).toEqual([
+    state,
     state,
     state,
     { type: "gamepad", pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
@@ -91,6 +92,7 @@ test("bounds to four controllers, preserves slots, and retries a blocked release
   gamepad.release();
   expect(slots).toEqual([
     [0, 1, 2, 3],
+    [0, 1, 2],
     [0, 1, 2],
     [0, 1, 2],
   ]);

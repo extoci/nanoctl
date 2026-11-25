@@ -4,7 +4,6 @@ const XINPUT_BUTTONS = [
   0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, 0, 0, 0x0020, 0x0010, 0x0040, 0x0080, 0x0001,
   0x0002, 0x0004, 0x0008, 0x0400,
 ];
-const KEEPALIVE_MS = 500;
 const MAX_SLOTS = 4;
 type InputPad = Pick<Gamepad, "axes" | "buttons" | "connected" | "id" | "index" | "mapping">;
 type GamepadMessage = Extract<ControlMessage, { type: "gamepad" }>;
@@ -47,48 +46,6 @@ function report(pad: InputPad, slot: number): GamepadReport {
   ];
 }
 
-function sameReports(
-  left: readonly GamepadReport[] | undefined,
-  right: readonly GamepadReport[] | undefined,
-): boolean {
-  return (
-    left?.length === right?.length &&
-    (left ?? []).every((report, index) =>
-      report.every((value, field) => value === right?.[index]?.[field]),
-    )
-  );
-}
-
-function sameDualShock4(
-  left: readonly DualShock4Pad[] | undefined,
-  right: readonly DualShock4Pad[] | undefined,
-): boolean {
-  return (
-    left?.length === right?.length &&
-    (left ?? []).every((pad, index) => {
-      const other = right?.[index];
-      return (
-        pad.slot === other?.slot &&
-        pad.leftTriggerPressed === other.leftTriggerPressed &&
-        pad.rightTriggerPressed === other.rightTriggerPressed &&
-        pad.touchpadPressed === other.touchpadPressed
-      );
-    })
-  );
-}
-
-function sameMessage(left: GamepadMessage, right: GamepadMessage): boolean {
-  return sameReports(left.pads, right.pads) && sameDualShock4(left.dualShock4, right.dualShock4);
-}
-
-function copyMessage(message: GamepadMessage): GamepadMessage {
-  return {
-    type: "gamepad",
-    pads: message.pads.map((pad) => [...pad]),
-    ...(message.dualShock4 && { dualShock4: message.dualShock4.map((pad) => ({ ...pad })) }),
-  };
-}
-
 /**
  * A slot is one virtual controller on the host, tracked by browser pad identity rather than by
  * position: `navigator.getGamepads()` renumbers pads as devices come and go, so identity keeps a
@@ -107,8 +64,7 @@ type TrackedPad = { index: number; id: string };
 export class GamepadForwarder {
   private readonly slots: (TrackedPad | undefined)[] = Array.from({ length: MAX_SLOTS });
   private sentSlots = new Set<number>();
-  private lastSent: GamepadMessage = { type: "gamepad", pads: [] };
-  private sentAt = -Infinity;
+  private lastSentEmpty = true;
 
   constructor(private readonly send: (message: GamepadMessage) => boolean) {}
 
@@ -189,14 +145,17 @@ export class GamepadForwarder {
     this.sentSlots.clear();
   }
 
-  private flush(message: GamepadMessage, now: number): void {
+  private flush(message: GamepadMessage, _now: number): void {
     const { pads } = message;
-    if (sameMessage(message, this.lastSent) && (!pads.length || now - this.sentAt < KEEPALIVE_MS))
-      return;
+    // Active snapshots are full state on an unordered lossy lane, so repeating
+    // them every animation frame is redundant transmission rather than extra
+    // latency: one lost button press or release is repaired on the next frame
+    // instead of waiting for a keepalive. Empty detach snapshots are reliable
+    // one-shot transitions and stay deduplicated.
+    if (!pads.length && this.lastSentEmpty) return;
     if (this.send(message)) {
-      this.lastSent = copyMessage(message);
+      this.lastSentEmpty = !pads.length;
       this.sentSlots = new Set(pads.map(([slot]) => slot));
-      this.sentAt = now;
     }
   }
 }
