@@ -1,3 +1,6 @@
+import CoreMedia
+import VideoToolbox
+import WebRTC
 import XCTest
 @testable import Nanoctl
 
@@ -51,5 +54,32 @@ final class CodecNegotiationTests: XCTestCase {
         let video = try XCTUnwrap(rewritten.components(separatedBy: "\r\n").first { $0.hasPrefix("m=video ") })
         XCTAssertTrue(video.hasPrefix("m=video 9 UDP/TLS/RTP/SAVPF 98 35 96"), video)
         XCTAssertTrue(rewritten.contains("a=rtpmap:35 H265/90000"))
+    }
+}
+
+final class AV1BitstreamTests: XCTestCase {
+    func testBuildsFormatDescriptionFromLowOverheadSequenceHeader() throws {
+        let bytes: [UInt8] = [
+            0x12, 0x00, // temporal delimiter
+            0x0a, 0x0b, // sequence header, 11-byte payload
+            0x02, 0x00, 0x00, 0x05, 0x5d, 0xa7, 0xfb, 0x8d, 0x5f, 0x30, 0x08,
+        ]
+        let format = try XCTUnwrap(AV1Bitstream.formatDescription(Data(bytes)))
+        XCTAssertEqual(CMVideoFormatDescriptionGetDimensions(format).width, 160)
+        XCTAssertEqual(CMVideoFormatDescriptionGetDimensions(format).height, 120)
+    }
+}
+
+final class NanoctlDecoderFactoryTests: XCTestCase {
+    func testAV1UsesVideoToolboxOnlyWhenHardwareDecodeExists() {
+        let decoder = NanoctlDecoderFactory().createDecoder(RTCVideoCodecInfo(name: "AV1"))
+        if #available(iOS 26.2, *) {
+            VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
+        }
+        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
+            XCTAssertEqual(decoder?.implementationName(), "VideoToolbox-AV1")
+        } else {
+            XCTAssertNotEqual(decoder?.implementationName(), "VideoToolbox-AV1")
+        }
     }
 }

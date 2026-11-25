@@ -5,8 +5,8 @@ import VideoToolbox
 import WebRTC
 
 enum CodecPreference: String, CaseIterable {
-    /// HEVC first (data-channel + VideoToolbox), falling back to H.264, then
-    /// anything else the host can encode over the RTP path.
+    /// Best efficient hardware-decoded codec first, falling back through H.264
+    /// and then software-decoded choices, matching the browser viewer.
     case auto
     case hevc
     case h264
@@ -21,7 +21,7 @@ enum CodecPreference: String, CaseIterable {
         }
     }
 
-    /// VideoToolbox-decodable codecs for the data-channel path.
+    /// Whether this preference can use the Annex-B data-channel video path.
     var dataChannelCapable: Bool { self != .av1 }
     var injectHevc: Bool { self == .auto || self == .hevc }
 
@@ -64,7 +64,11 @@ enum CodecPreference: String, CaseIterable {
 
     static func hardwareDecodes(_ codec: String) -> Bool {
         switch codec {
-        case "av1": return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+        case "av1":
+            if #available(iOS 26.2, *) {
+                VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
+            }
+            return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
         case "hevc": return VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
         case "h264": return VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)
         default: return false
@@ -81,9 +85,9 @@ enum VideoTransport {
 final class Session {
     private let factory: RTCPeerConnectionFactory = {
         #if DEBUG && targetEnvironment(simulator)
-        let decoder: RTCVideoDecoderFactory = LatencyProbe.enabled ? TimedDecoderFactory() : RTCDefaultVideoDecoderFactory()
+        let decoder: RTCVideoDecoderFactory = LatencyProbe.enabled ? TimedDecoderFactory() : NanoctlDecoderFactory()
         #else
-        let decoder = RTCDefaultVideoDecoderFactory()
+        let decoder = NanoctlDecoderFactory()
         #endif
         return RTCPeerConnectionFactory(
             encoderFactory: RTCDefaultVideoEncoderFactory(),
@@ -315,7 +319,9 @@ final class Session {
         var value: [String: Any] = ["type": "quality"]
         if let maxFps { value["maxFps"] = maxFps }
         if let maxBitrateKbps { value["maxBitrateKbps"] = maxBitrateKbps }
-        return sendControl(value)
+        // Viewer quality limits are view-only safe on the host; they must not
+        // depend on input admission.
+        return sendControlFree(value)
     }
 
     @discardableResult
