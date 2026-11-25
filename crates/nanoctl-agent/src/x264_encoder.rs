@@ -7,7 +7,7 @@ use openh264::formats::YUVSource;
 
 #[cfg(test)]
 use super::bitrate_target;
-use super::{EncodedFrame, FrameEncoder, I420Frame, RgbaFrame, SoftwareEncoder};
+use super::{EncodedFrame, FrameEncoder, I420Frame, PixelFormat, RgbaFrame, SoftwareEncoder};
 use crate::config::LatencyMode;
 
 unsafe extern "C" {
@@ -322,6 +322,7 @@ impl X264Encoder {
             xcap::image::Rgba<u8>,
             impl std::ops::Deref<Target = [u8]>,
         >,
+        format: PixelFormat,
     ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.active.dimensions != dimensions {
@@ -343,7 +344,7 @@ impl X264Encoder {
             )?);
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
-        yuv.read_rgba(image.as_raw())?;
+        yuv.read_pixels(image.as_raw(), format)?;
         self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
         let pts = (self
             .started
@@ -422,7 +423,7 @@ impl FrameEncoder for ResilientX264 {
 
     fn encode(&mut self, image: &RgbaFrame<'_>) -> Result<EncodedFrame> {
         match self {
-            Self::Native(encoder) => match encoder.encode(image) {
+            Self::Native(encoder) => match encoder.encode(image, PixelFormat::Rgba) {
                 Ok(frame) => Ok(frame),
                 Err(error) => {
                     tracing::warn!(%error, "x264 failed; switching session to OpenH264");
@@ -437,6 +438,30 @@ impl FrameEncoder for ResilientX264 {
                 }
             },
             Self::Fallback(encoder) => encoder.encode(image),
+        }
+    }
+
+    fn encode_format(
+        &mut self,
+        image: &RgbaFrame<'_>,
+        format: PixelFormat,
+    ) -> Result<EncodedFrame> {
+        match self {
+            Self::Native(encoder) => match encoder.encode(image, format) {
+                Ok(frame) => Ok(frame),
+                Err(error) => {
+                    tracing::warn!(%error, "x264 failed; switching session to OpenH264");
+                    let fallback = SoftwareEncoder::new(
+                        encoder.bitrate_kbps,
+                        encoder.max_fps,
+                        encoder.latency_mode,
+                    )
+                    .context("x264 failed and OpenH264 fallback is unavailable")?;
+                    *self = Self::Fallback(Box::new(fallback));
+                    self.encode_format(image, format)
+                }
+            },
+            Self::Fallback(encoder) => encoder.encode_format(image, format),
         }
     }
 
