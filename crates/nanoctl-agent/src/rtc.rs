@@ -169,6 +169,13 @@ fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
         kind: std::borrow::Cow<'a, str>,
         enabled: bool,
     }
+    if bytes.len() == 4
+        && bytes[0] == crate::input::BINARY_INPUT_MAGIC
+        && bytes[1] == 2
+        && bytes[2] == crate::input::BINARY_AUDIO
+    {
+        return Some(bytes[3] != 0);
+    }
     serde_json::from_slice::<AudioControl>(bytes)
         .ok()
         .filter(|message| message.kind == "audio")
@@ -862,14 +869,15 @@ impl HostPeer {
                     if reliable {
                         let audio_enabled = audio_enabled_for_channel.clone();
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
-                            if !message.is_string {
-                                return Box::pin(async {});
+                            if message.is_string {
+                                if let Some(limits) =
+                                    crate::adaptive::ViewerLimits::parse(&message.data)
+                                {
+                                    viewer_limits.send_replace(limits);
+                                    return Box::pin(async {});
+                                }
                             }
-                            if let Some(limits) =
-                                crate::adaptive::ViewerLimits::parse(&message.data)
-                            {
-                                viewer_limits.send_replace(limits);
-                            } else if let Some(enabled) = parse_audio_enabled(&message.data) {
+                            if let Some(enabled) = parse_audio_enabled(&message.data) {
                                 audio_enabled.send_replace(enabled);
                             }
                             Box::pin(async {})
@@ -889,10 +897,12 @@ impl HostPeer {
                 let weak_channel = Arc::downgrade(&channel);
                 let audio_enabled = audio_enabled_for_channel.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    if reliable && message.is_string {
-                        if let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data) {
-                            viewer_limits.send_replace(limits);
-                            return Box::pin(async {});
+                    if reliable {
+                        if message.is_string {
+                            if let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data) {
+                                viewer_limits.send_replace(limits);
+                                return Box::pin(async {});
+                            }
                         }
                         if let Some(enabled) = parse_audio_enabled(&message.data) {
                             audio_enabled.send_replace(enabled);

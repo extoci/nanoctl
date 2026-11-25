@@ -464,7 +464,7 @@ export class RemoteSessionController {
     }
     if (payload.type === "display" && !this.remoteInputAllowed) return false;
     const isMotion = payload.type === "pointer" && payload.action === "move";
-    const binary = isMotion && this.options.binaryInput ? encodeBinaryInput(payload) : null;
+    const binary = this.options.binaryInput ? encodeBinaryInput(payload) : null;
     let serialized: string | null = null;
     if (!binary) {
       serialized = JSON.stringify(payload);

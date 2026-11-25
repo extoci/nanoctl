@@ -42,7 +42,11 @@ Types and validators live in `packages/protocol`.
       "displays": []
     },
     "viewer": {
-      "identity": { "login": "owner@example.com", "displayName": "Owner", "tags": [] },
+      "identity": {
+        "login": "owner@example.com",
+        "displayName": "Owner",
+        "tags": []
+      },
       "mayControl": true
     }
   }
@@ -151,6 +155,8 @@ are silently ignored. A remote paste shortcut sends local clipboard text before 
 ### Compact input
 
 When `capabilities.binaryInput` is true, the viewer may send compact binary messages on the same input channels. Each message starts with byte `0x4e`, version byte `1`, and a kind byte. Kind `1` is pointer motion with normalized unsigned little-endian u16 `x` and `y` coordinates (7 bytes total). Kind `2` is a gamepad snapshot: a pad count byte followed by 14 bytes per pad — slot, little-endian u16 buttons, u8 triggers, four little-endian i16 axes, and a flags byte. Flag bit 0 marks a DualShock 4; bits 1/2/3 are its left-trigger, right-trigger and touchpad pressed states. Malformed binary messages are invalid input. Hosts without `binaryInput` must receive the JSON representation instead.
+
+Binary version 2 keeps version-1 pointer motion and gamepad layouts unchanged and adds compact discrete input: kind `3` pointer button down/up (8 bytes), kind `4` wheel input with little-endian f64 deltas (23 bytes), kind `5` keyboard input with length-prefixed UTF-8 code/key strings, kind `6` text input, kind `7` release-all, kind `8` latency probes, kind `9` audio enablement, and kind `10` display selection. Versions are negotiated per message; agents accepting version 2 also accept version 1, so older iOS viewers using version-1 gamepad and pointer reports remain compatible.
 
 ### Gamepads
 
