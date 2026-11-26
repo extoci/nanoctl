@@ -18,3 +18,13 @@ yuv = "0.8.21"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+anyhow = "1.0"
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+] }

@@ -180,10 +180,11 @@ pub trait VideoSource: Send {
 
 #[async_trait]
 pub trait VideoEncoder: Send {
-    /// Encode one request into one access unit. The encoder must honor
-    /// `force_keyframe`; the pipeline treats a non-keyframe response as a contract
-    /// violation because dependent deltas would otherwise be emitted unsafely.
-    async fn encode(&mut self, request: &EncodeRequest) -> Result<EncodedBitstream, MediaError>;
+    /// Encode one owned request into one access unit. Ownership lets platform backends hand
+    /// the frame to a dedicated blocking-thread owner without copying or unsafe references.
+    /// The encoder must honor `force_keyframe`; the pipeline treats a non-keyframe response as
+    /// a contract violation because dependent deltas would otherwise be emitted unsafely.
+    async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError>;
 }
 
 #[async_trait]
