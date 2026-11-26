@@ -126,3 +126,21 @@ and stats after multiple samples, not just the first frame.
 
 `NEXT_VERSION.md` and `research/next-version-reliability.md` remain historical mixed
 native/reliability notes, not the 3.0 architecture or evidence of passing release gates.
+
+## v4 bad-network gate
+
+On Linux, install the browser test dependencies, Xvfb, and `iproute2`. Build the
+media agent before entering the isolated network namespace.
+
+```sh
+bun run build:agent
+scripts/v4-bad-network.sh crates/nanoctl-agent/target/release/nanoctl
+```
+
+The test applies 5% random UDP packet loss, 25% reordering, 25 ms delay with
+8 ms jitter, and a shared 3 Mbps cap to the real WebRTC traffic. Signaling uses
+TCP and stays outside the fault profile. The viewer must present new desktop
+content for 60 seconds with gaps no longer than 500 ms, then pass 20 reattach
+cycles under the same profile. The gate also checks peak and sustained
+keyframe rates, host RSS growth, and queue limits. The run writes the profile,
+observed counters, and timestamps to `test-results/*/bad-network.json`.
