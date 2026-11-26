@@ -38,11 +38,11 @@ typedef struct {
     /* Retained open arguments so adapt can rebuild params on a re-open. */
     int width, height, kbps, fps, frames;
     /* Effective adaptive knobs: preset, profile tier, motion-estimation,
-       subpel refine, slice threads and reference frames. */
+       subpel refine, slice threads, reference frames and trellis. */
     const char *want_preset;
-    int want_high, want_me, want_subme, want_threads, want_refs;
+    int want_high, want_me, want_subme, want_threads, want_refs, want_trellis;
     /* bit0 profile, bit1 me, bit2 subme, bit3 preset, bit4 threads,
-       bit5 refs: env-pinned knobs adapt may not touch. */
+       bit5 refs, bit6 trellis: env-pinned knobs adapt may not touch. */
     int pins;
 } NanoX264;
 
@@ -103,6 +103,7 @@ static int fill_params(NanoX264 *context, x264_param_t *p) {
     if (nr && nr[0]) p->analyse.i_noise_reduction = atoi(nr);
     const char *trellis = getenv("NANOCTL_X264_TRELLIS");
     if (trellis && trellis[0]) p->analyse.i_trellis = atoi(trellis);
+    else p->analyse.i_trellis = context->want_trellis;
     const char *refs = getenv("NANOCTL_X264_REFS");
     p->i_frame_reference = refs && refs[0] ? atoi(refs) : context->want_refs;
     int me = env_me();
@@ -168,6 +169,7 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     context->want_subme = 2;
     context->want_threads = 0; /* x264 auto: scales with cores */
     context->want_refs = 1;
+    context->want_trellis = 0;
     const char *profile_env = getenv("NANOCTL_X264_PROFILE");
     if (profile_env && profile_env[0]) context->pins |= 1;
     if (env_me() >= 0) context->pins |= 2;
@@ -179,6 +181,8 @@ NanoX264 *nano_x264_open(int width, int height, int kbps, int fps, int frames,
     if (threads_env && threads_env[0]) context->pins |= 16;
     const char *refs_env = getenv("NANOCTL_X264_REFS");
     if (refs_env && refs_env[0]) context->pins |= 32;
+    const char *trellis_env = getenv("NANOCTL_X264_TRELLIS");
+    if (trellis_env && trellis_env[0]) context->pins |= 64;
     if (library) {
         context->library = load(library);
     } else {
@@ -224,7 +228,7 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     const char *off = getenv("NANOCTL_X264_ADAPT");
     if (off && (!strcmp(off, "0") || !strcmp(off, "false"))) return -2;
     const char *preset;
-    int high, me, subme, threads, refs;
+    int high, me, subme, threads, refs, trellis = 0;
     switch (tier) {
     case 0: preset = "veryfast"; high = 0; me = X264_ME_HEX; subme = 2; threads = 0; refs = 1; break;
     case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; threads = 2; refs = 1; break;
@@ -239,20 +243,23 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     if (context->pins & 8) preset = context->want_preset;
     if (context->pins & 16) threads = context->want_threads;
     if (context->pins & 32) refs = context->want_refs;
+    if (context->pins & 64) trellis = context->want_trellis;
     if (high == context->want_high && me == context->want_me &&
         subme == context->want_subme && !strcmp(preset, context->want_preset) &&
-        threads == context->want_threads && refs == context->want_refs)
+        threads == context->want_threads && refs == context->want_refs &&
+        trellis == context->want_trellis)
         return 1;
     const char *prev_preset = context->want_preset;
     int prev_high = context->want_high, prev_me = context->want_me,
         prev_subme = context->want_subme, prev_threads = context->want_threads,
-        prev_refs = context->want_refs;
+        prev_refs = context->want_refs, prev_trellis = context->want_trellis;
     context->want_preset = preset;
     context->want_high = high;
     context->want_me = me;
     context->want_subme = subme;
     context->want_threads = threads;
     context->want_refs = refs;
+    context->want_trellis = trellis;
     if (reopen(context) == 0) return 0;
     context->want_preset = prev_preset;
     context->want_high = prev_high;
@@ -260,6 +267,7 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     context->want_subme = prev_subme;
     context->want_threads = prev_threads;
     context->want_refs = prev_refs;
+    context->want_trellis = prev_trellis;
     reopen(context);
     return -1;
 }
@@ -305,7 +313,7 @@ typedef struct {
     int bitrate, buffer_kbit, crf_milli, qp_max, csp, threads, bframes, lookahead;
     int sync_lookahead, cabac, transform8x8, repeat_headers, annexb, fullrange;
     int primaries, transfer, matrix, chroma_location, keyint, rc_method;
-    int me, subme, refs;
+    int me, subme, refs, trellis;
 } NanoX264Params;
 
 void nano_x264_parameters(NanoX264 *context, NanoX264Params *out) {
@@ -317,6 +325,7 @@ void nano_x264_parameters(NanoX264 *context, NanoX264Params *out) {
         p.i_sync_lookahead, p.b_cabac, p.analyse.b_transform_8x8, p.b_repeat_headers,
         p.b_annexb, p.vui.b_fullrange, p.vui.i_colorprim, p.vui.i_transfer,
         p.vui.i_colmatrix, p.vui.i_chroma_loc, p.i_keyint_max, p.rc.i_rc_method,
-        p.analyse.i_me_method, p.analyse.i_subpel_refine, p.i_frame_reference
+        p.analyse.i_me_method, p.analyse.i_subpel_refine, p.i_frame_reference,
+        p.analyse.i_trellis
     };
 }

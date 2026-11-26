@@ -582,6 +582,7 @@ struct Parameters {
     me: c_int,
     subme: c_int,
     refs: c_int,
+    trellis: c_int,
 }
 
 #[cfg(test)]
@@ -737,14 +738,14 @@ mod tests {
         assert_eq!(encoder.active.adapt(3), 0);
         let p = encoder.active.parameters();
         assert_eq!(
-            (p.cabac, p.me, p.subme, p.threads, p.refs),
-            (1, ME_UMH, 6, 2, 4)
+            (p.cabac, p.me, p.subme, p.threads, p.refs, p.trellis),
+            (1, ME_UMH, 6, 2, 4, 0)
         );
         assert_eq!(encoder.active.adapt(4), 0);
         let p = encoder.active.parameters();
         assert_eq!(
-            (p.cabac, p.me, p.subme, p.threads, p.refs),
-            (1, ME_UMH, 6, 1, 4)
+            (p.cabac, p.me, p.subme, p.threads, p.refs, p.trellis),
+            (1, ME_UMH, 6, 1, 4, 0)
         );
         assert_eq!(encoder.active.adapt(0), 0);
         let p = encoder.active.parameters();
