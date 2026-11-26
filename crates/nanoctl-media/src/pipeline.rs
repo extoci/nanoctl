@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::{self, MissedTickBehavior};
+use tokio::time::{self, Instant as TokioInstant};
 
 use crate::latest::{LatestSlot, PutOutcome};
 use crate::types::{
@@ -152,39 +152,52 @@ async fn capture_loop_inner(
     shutdown: &mut watch::Receiver<bool>,
     metrics: &Mutex<MediaPipelineSnapshot>,
 ) -> Result<(), MediaError> {
-    let mut interval = time::interval(config.frame_interval());
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let period = config.frame_interval();
+    let mut next_deadline = TokioInstant::now();
+    let mut first_tick = true;
     let mut capture_sequence = 0_u64;
 
     loop {
-        tokio::select! {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let now = TokioInstant::now();
+        if !first_tick {
+            while next_deadline <= now {
+                next_deadline += period;
+            }
+        }
+        if next_deadline > now {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown) => return Ok(()),
+                _ = time::sleep_until(next_deadline) => {}
+            }
+        }
+        first_tick = false;
+        record_metrics(metrics, |snapshot| snapshot.capture_ticks += 1);
+        let next_frame = tokio::select! {
             biased;
             _ = wait_for_shutdown(shutdown) => return Ok(()),
-            _ = interval.tick() => {
-                record_metrics(metrics, |snapshot| snapshot.capture_ticks += 1);
-                let next_frame = tokio::select! {
-                    biased;
-                    _ = wait_for_shutdown(shutdown) => return Ok(()),
-                    result = source.next_frame() => result,
-                };
-                match next_frame {
-                    Ok(Some(mut frame)) => {
-                        capture_sequence += 1;
-                        frame.capture_sequence = capture_sequence;
-                        let outcome = frame_slot.put(frame);
-                        record_metrics(metrics, |snapshot| {
-                            snapshot.frames_captured += 1;
-                            if outcome == PutOutcome::Replaced {
-                                snapshot.frames_replaced_before_encode += 1;
-                            }
-                        });
+            result = source.next_frame() => result,
+        };
+        next_deadline += period;
+        match next_frame {
+            Ok(Some(mut frame)) => {
+                capture_sequence += 1;
+                frame.capture_sequence = capture_sequence;
+                let outcome = frame_slot.put(frame);
+                record_metrics(metrics, |snapshot| {
+                    snapshot.frames_captured += 1;
+                    if outcome == PutOutcome::Replaced {
+                        snapshot.frames_replaced_before_encode += 1;
                     }
-                    Ok(None) => return Ok(()),
-                    Err(error) => {
-                        record_metrics(metrics, |snapshot| snapshot.capture_errors += 1);
-                        return Err(error);
-                    }
-                }
+                });
+            }
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                record_metrics(metrics, |snapshot| snapshot.capture_errors += 1);
+                return Err(error);
             }
         }
     }
