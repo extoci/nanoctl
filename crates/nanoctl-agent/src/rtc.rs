@@ -779,6 +779,7 @@ impl HostPeer {
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
             let audio_enabled_for_channel = audio_enabled.clone();
+            let link_feedback_for_channel = link_feedback.clone();
             // The data-channel video path carries the encoder's exact
             // temporal units: H.264/HEVC Annex-B or AV1 low-overhead OBUs.
             // A viewer in "auto" may open the channels before negotiation
@@ -793,6 +794,7 @@ impl HostPeer {
                 let input = input.clone();
                 let viewer_limits = viewer_limits_for_channel.clone();
                 let input_revoked = input_revoked_for_channel.clone();
+                let link_feedback = link_feedback_for_channel.clone();
                 if channel.label() == "nanoctl.video.v1"
                     || channel.label() == "nanoctl.video-idr.v1"
                 {
@@ -873,6 +875,18 @@ impl HostPeer {
                                 viewer_limits.send_replace(limits);
                                 return Box::pin(async {});
                             }
+                            if message.is_string
+                                && let Some(loss) = crate::adaptive::parse_link_stats(&message.data)
+                            {
+                                link_feedback.send_replace(Some(crate::adaptive::LinkSample {
+                                    fraction_lost: loss,
+                                    rtt: None,
+                                    remb_kbps: None,
+                                    at: std::time::Instant::now(),
+                                    receiver_report_at: Some(std::time::Instant::now()),
+                                }));
+                                return Box::pin(async {});
+                            }
                             if let Some(enabled) = parse_audio_enabled(&message.data) {
                                 audio_enabled.send_replace(enabled);
                             }
@@ -900,6 +914,18 @@ impl HostPeer {
                             && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
                         {
                             viewer_limits.send_replace(limits);
+                            return Box::pin(async {});
+                        }
+                        if message.is_string
+                            && let Some(loss) = crate::adaptive::parse_link_stats(&message.data)
+                        {
+                            link_feedback.send_replace(Some(crate::adaptive::LinkSample {
+                                fraction_lost: loss,
+                                rtt: None,
+                                remb_kbps: None,
+                                at: std::time::Instant::now(),
+                                receiver_report_at: Some(std::time::Instant::now()),
+                            }));
                             return Box::pin(async {});
                         }
                         if let Some(enabled) = parse_audio_enabled(&message.data) {

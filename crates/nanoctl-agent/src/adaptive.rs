@@ -88,6 +88,24 @@ impl ViewerLimits {
     }
 }
 
+/// Viewer-measured data-channel link quality, sent as JSON on the reliable
+/// control channel. RTP feedback is blind while video rides the data channel,
+/// so this is the signal that lets the rate controller adapt to congestion.
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
+pub fn parse_link_stats(data: &[u8]) -> Option<f64> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        #[serde(rename = "type")]
+        kind: String,
+        loss: Option<f64>,
+    }
+    if !data.windows(12).any(|window| window == b"\"link-stats\"") {
+        return None;
+    }
+    let envelope: Envelope = serde_json::from_slice(data).ok()?;
+    (envelope.kind == "link-stats").then_some(envelope.loss?)
+}
+
 pub struct RateController {
     ceiling: u32,
     max_fps: u16,

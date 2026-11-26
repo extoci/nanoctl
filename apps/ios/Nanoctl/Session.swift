@@ -839,6 +839,12 @@ final class Session {
             return
         }
         let (loss, transit, frames) = receiver.takeLinkStats()
+        // Receiver-measured loss is the host's only congestion signal while
+        // video rides the data channel: RTP feedback describes the thin
+        // keepalive leg, not real egress, so the rate controller adapts to
+        // these reports instead — the difference between a stream that
+        // degrades gracefully and one that collapses on a bad link.
+        _ = sendControlFree(["type": "link-stats", "loss": loss])
         statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount) · loss \(String(format: "%.1f", loss * 100))%"
         onChange?()
         // Loss/gap visibility is what distinguishes a congested or relayed
