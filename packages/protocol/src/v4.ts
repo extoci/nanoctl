@@ -522,6 +522,18 @@ export function parseVideoChunk(bytes: Uint8Array): VideoChunk {
   };
 }
 
+export type VideoControlMessage = { readonly kind: "keyframeRequest" };
+
+export function encodeVideoControlMessage(_message: VideoControlMessage): Uint8Array {
+  return new Uint8Array([V4_WIRE_VERSION, 0x41]);
+}
+
+export function parseVideoControlMessage(bytes: Uint8Array): VideoControlMessage {
+  versioned(bytes, 0x41, 0x41);
+  if (bytes.length !== 2) fail("invalidLength", "invalid video control length");
+  return { kind: "keyframeRequest" };
+}
+
 export type ReassemblyOutcome = {
   readonly droppedIncompleteSequence?: number;
   readonly complete?: AccessUnit;
