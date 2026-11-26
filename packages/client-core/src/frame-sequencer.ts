@@ -60,7 +60,19 @@ export class FrameSequencer {
     if (!validSequence(unit.streamSequence)) throw new Error("invalid access-unit sequence");
     const outcome = emptyOutcome();
     if (unit.keyframe) {
-      this.reorderBuffer.length = 0;
+      // Reference and delta frames travel on independent lanes, so a delta that
+      // references this keyframe may validly arrive before the keyframe itself.
+      // Discard only older generations; keep newer buffered units and drain them
+      // once the keyframe establishes the reference.
+      for (let index = this.reorderBuffer.length - 1; index >= 0; index -= 1) {
+        const buffered = this.reorderBuffer[index];
+        if (
+          buffered === undefined ||
+          sequenceDistance(buffered.streamSequence, unit.streamSequence) >= MODULO_HALF
+        ) {
+          this.reorderBuffer.splice(index, 1);
+        }
+      }
       this.awaitingKeyframe = false;
       this.expectedSequence = (unit.streamSequence + 1) >>> 0;
       outcome.emitted.push(unit);
