@@ -133,14 +133,10 @@ jobs:
             nanoctl-linux-x64.sha256
             nanoctl-linux-arm64
             nanoctl-linux-arm64.sha256
-            nanoctl-macos-x64
-            nanoctl-macos-x64.sha256
             nanoctl-macos-arm64
             nanoctl-macos-arm64.sha256
             nanoctl-windows-x64.exe
             nanoctl-windows-x64.exe.sha256
-            nanoctl-windows-arm64.exe
-            nanoctl-windows-arm64.exe.sha256
           )
           for file in "${expected[@]}"; do
             test -f "dist/$file" || {
