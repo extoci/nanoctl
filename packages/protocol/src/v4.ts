@@ -6,6 +6,10 @@ export const MAX_VIDEO_CHUNK_BYTES = 48 * 1024;
 export const MAX_VIDEO_PARTS = 512;
 export const MAX_ACCESS_UNIT_BYTES = 16 * 1024 * 1024;
 export const VIDEO_HEADER_BYTES = 20;
+export const CONTROL_CHANNEL_LABEL = "nanoctl.control.v4" as const;
+export const MOTION_CHANNEL_LABEL = "nanoctl.motion.v4" as const;
+export const VIDEO_DELTA_CHANNEL_LABEL = "nanoctl.video-delta.v4" as const;
+export const VIDEO_REFERENCE_CHANNEL_LABEL = "nanoctl.video-reference.v4" as const;
 
 export type WireErrorCode =
   | "empty"

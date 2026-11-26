@@ -11,6 +11,25 @@ pub mod video;
 
 pub const WIRE_VERSION: u8 = 4;
 
+pub const CONTROL_CHANNEL_LABEL: &str = "nanoctl.control.v4";
+pub const MOTION_CHANNEL_LABEL: &str = "nanoctl.motion.v4";
+pub const VIDEO_DELTA_CHANNEL_LABEL: &str = "nanoctl.video-delta.v4";
+pub const VIDEO_REFERENCE_CHANNEL_LABEL: &str = "nanoctl.video-reference.v4";
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn v4_lane_labels_are_stable() {
+        assert_eq!(super::CONTROL_CHANNEL_LABEL, "nanoctl.control.v4");
+        assert_eq!(super::MOTION_CHANNEL_LABEL, "nanoctl.motion.v4");
+        assert_eq!(super::VIDEO_DELTA_CHANNEL_LABEL, "nanoctl.video-delta.v4");
+        assert_eq!(
+            super::VIDEO_REFERENCE_CHANNEL_LABEL,
+            "nanoctl.video-reference.v4"
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     Empty,
