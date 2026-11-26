@@ -171,6 +171,7 @@ export class SocketSession {
               remoteInputEnabled: message.host.remoteInput,
               remoteInputPolicy: message.host.viewer.mayControl,
               gamepadAvailable: message.host.capabilities.gamepad === true,
+              binaryInput: message.host.capabilities.binaryInput === true,
               clipboardEnabled:
                 message.host.capabilities.clipboard &&
                 message.host.remoteInput &&

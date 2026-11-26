@@ -8,12 +8,10 @@
  * re-enqueued downstream), so stats and the <video> fallback keep working.
  */
 
-import { V4VideoReceiver } from "@nanoctl/client-core";
-
 export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
   drop(): void;
-  stats(): { decoded: number; dropped: number; bytes: number };
+  stats(): { decoded: number; dropped: number };
   /** Rolling data-channel loss fraction since the previous call, when the
    * handle tracks sequence numbers (data-channel video). */
   takeLinkLoss?(): number;
@@ -368,7 +366,7 @@ interface VideoSink {
   canvas: HTMLCanvasElement;
   feed(data: Uint8Array, isKey: boolean, timestampUs: number): boolean;
   teardown(notify?: boolean): void;
-  stats(): { decoded: number; dropped: number; bytes: number };
+  stats(): { decoded: number; dropped: number };
 }
 
 interface VideoTrackGeneratorLike {
@@ -432,7 +430,6 @@ function createVideoSink(
   let decoder: VideoDecoder | null = null;
   let decoded = 0;
   let dropped = 0;
-  let receivedBytes = 0;
   let decoderErrors = 0;
   let firstFrameFired = false;
   const fireFirstFrame = () => {
@@ -652,7 +649,6 @@ function createVideoSink(
 
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number): boolean => {
     if (closed) return false;
-    receivedBytes += data.byteLength;
     // Scan the Annex-B form for random-access pictures and parameter sets;
     // the payload actually fed may be repacked as AVCC below.
     const scanned = videoCodec === "av1" ? data : toAnnexB(data);
@@ -764,7 +760,7 @@ function createVideoSink(
     canvas: canvas ?? video.ownerDocument.createElement("canvas"),
     feed,
     teardown,
-    stats: () => ({ decoded, dropped, bytes: receivedBytes }),
+    stats: () => ({ decoded, dropped }),
   };
 }
 
@@ -1068,53 +1064,5 @@ export function attachDataChannelVideo(
       const total = lost + received;
       return total > 0 ? lost / total : 0;
     },
-  };
-}
-
-/** v4 video delivery: the protocol package owns bounded chunk reassembly and
- * reference-chain recovery; this adapter only decodes emitted access units. */
-export function attachV4DataChannelVideo(
-  videoDelta: RTCDataChannel,
-  videoReference: RTCDataChannel,
-  video: HTMLVideoElement,
-  onTeardown?: () => void,
-  onFirstFrame?: () => void,
-): WebCodecsVideoHandle {
-  const sink = createVideoSink(video, onTeardown, performance.now(), "h264", {
-    onFirstFrame,
-    onFatal: () => {
-      try {
-        videoDelta.close();
-      } catch {}
-      try {
-        videoReference.close();
-      } catch {}
-    },
-  });
-  const receiver = new V4VideoReceiver({
-    videoDelta,
-    videoReference,
-    onAccessUnit: (unit) => {
-      sink.feed(unit.payload, unit.keyframe, unit.captureTimeUs);
-    },
-    sendKeyframeRequest: (bytes) => {
-      if (videoReference.readyState === "open") {
-        const copy = new Uint8Array(new ArrayBuffer(bytes.length));
-        copy.set(bytes);
-        videoReference.send(copy);
-      }
-    },
-    onError: (error) => console.warn("v4 video lane error", error),
-  });
-  const onClosed = () => sink.teardown(true);
-  videoDelta.onclose = onClosed;
-  videoReference.onclose = onClosed;
-  return {
-    canvas: sink.canvas,
-    drop: () => {
-      receiver.dispose();
-      sink.teardown(false);
-    },
-    stats: sink.stats,
   };
 }

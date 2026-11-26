@@ -8,11 +8,6 @@ use anyhow::{Context, Result};
 #[cfg(any(feature = "media", test))]
 use bytes::Bytes;
 use interceptor::registry::Registry;
-#[cfg(feature = "media")]
-use nanoctl_core::{
-    CONTROL_CHANNEL_LABEL, MOTION_CHANNEL_LABEL, VIDEO_DELTA_CHANNEL_LABEL,
-    VIDEO_REFERENCE_CHANNEL_LABEL,
-};
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -225,8 +220,6 @@ pub struct HostPeer {
     /// units straight to WebCodecs, bypassing the track's jitter buffer.
     #[cfg(feature = "media")]
     video_data_channel: Arc<DataChannelVideo>,
-    #[cfg(feature = "media")]
-    v4_video_data_channel: Arc<V4DataChannelVideo>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video_codec: VideoCodec,
     #[cfg(feature = "media")]
@@ -245,30 +238,6 @@ pub(crate) struct DataChannelVideo {
     pub keyframe_requests: AtomicU64,
     pub needs_keyframe: AtomicBool,
     pub replay: Arc<std::sync::Mutex<VideoReplay>>,
-}
-
-/// Host-owned endpoints for the clean v4 video lanes. Channels are published only after
-/// WebRTC reports them open; before then the lane sink is deliberately full so encoded
-/// access units drop before their first byte instead of queueing startup latency.
-#[cfg(feature = "media")]
-#[derive(Default)]
-pub(crate) struct V4DataChannelVideo {
-    pub delta_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
-    pub reference_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
-    pub keyframe_requested: Arc<AtomicBool>,
-    pub ready: tokio::sync::Notify,
-}
-
-#[cfg(feature = "media")]
-impl V4DataChannelVideo {
-    pub fn lanes_ready(&self) -> bool {
-        self.delta_channel.lock().unwrap().is_some()
-            && self.reference_channel.lock().unwrap().is_some()
-    }
-
-    pub fn request_keyframe(&self) {
-        self.keyframe_requested.store(true, Ordering::Release);
-    }
 }
 
 /// The most recent complete keyframe, kept so a freshly attached viewer can
@@ -745,8 +714,6 @@ impl HostPeer {
             replay: video_replay(),
         });
         #[cfg(feature = "media")]
-        let v4_video_data_channel = Arc::new(V4DataChannelVideo::default());
-        #[cfg(feature = "media")]
         {
             let input = if allow_remote_input {
                 match crate::input::InputController::new() {
@@ -793,18 +760,8 @@ impl HostPeer {
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
             let (pointer_sender, pointer_receiver) = motion_channel();
-            let (v4_control_sender, v4_control_receiver) =
-                tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
-            let (v4_motion_sender, v4_motion_receiver) = motion_channel();
             let blocked_notices = InputBlockedNotices::default();
             if let Some(input) = &input {
-                input_tasks.push(spawn_v4_input_worker(
-                    InputReceiver::Reliable(v4_control_receiver),
-                    InputReceiver::Motion(v4_motion_receiver),
-                    input.clone(),
-                    input_shutdown_receiver.clone(),
-                    input_revoked.clone(),
-                ));
                 input_tasks.push(spawn_input_worker(
                     InputReceiver::Reliable(control_receiver),
                     input.clone(),
@@ -834,7 +791,6 @@ impl HostPeer {
             };
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
-            let v4_video_for_channel = v4_video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
             let audio_enabled_for_channel = audio_enabled.clone();
             let link_feedback_for_channel = link_feedback.clone();
@@ -853,95 +809,9 @@ impl HostPeer {
                 let viewer_limits = viewer_limits_for_channel.clone();
                 let input_revoked = input_revoked_for_channel.clone();
                 let link_feedback = link_feedback_for_channel.clone();
-                let label = channel.label();
-                if label == CONTROL_CHANNEL_LABEL || label == MOTION_CHANNEL_LABEL {
-                    let Some(input) = input.clone() else {
-                        return Box::pin(async {});
-                    };
-                    let control = label == CONTROL_CHANNEL_LABEL;
-                    let input_revoked = input_revoked.clone();
-                    let control_sender = v4_control_sender.clone();
-                    let motion_sender = v4_motion_sender.clone();
-                    let weak_channel = Arc::downgrade(&channel);
-                    channel.on_message(Box::new(move |message: DataChannelMessage| {
-                        if message.is_string
-                            || message.data.len() > MAX_CONTROL_MESSAGE_BYTES
-                            || input_revoked.load(Ordering::Acquire)
-                        {
-                            return Box::pin(async {});
-                        }
-                        if control {
-                            if control_sender.try_send(message.data.clone()).is_err() {
-                                input_revoked.store(true, Ordering::Release);
-                                let input = input.clone();
-                                let weak_channel = weak_channel.clone();
-                                tokio::spawn(async move {
-                                    if let Some(channel) = weak_channel.upgrade() {
-                                        let _ = channel.close().await;
-                                    }
-                                    tokio::task::spawn_blocking(move || {
-                                        if let Ok(mut input) = input.lock() {
-                                            input.release_all();
-                                            input.revoke_gamepads();
-                                        }
-                                    });
-                                });
-                            }
-                        } else {
-                            let is_gamepad = message.data.get(1).copied() == Some(0x08);
-                            let slot = if is_gamepad {
-                                &motion_sender.gamepad
-                            } else {
-                                &motion_sender.pointer
-                            };
-                            slot.send_replace(Some(message.data.clone()));
-                        }
-                        Box::pin(async {})
-                    }));
-                    return Box::pin(async {});
-                }
-                if label == VIDEO_DELTA_CHANNEL_LABEL || label == VIDEO_REFERENCE_CHANNEL_LABEL {
-                    let is_reference = label == VIDEO_REFERENCE_CHANNEL_LABEL;
-                    let slot = v4_video_for_channel.clone();
-                    let opened_channel = channel.clone();
-                    channel.on_open(Box::new(move || {
-                        let slot = slot.clone();
-                        let opened_channel = opened_channel.clone();
-                        Box::pin(async move {
-                            if is_reference {
-                                *slot.reference_channel.lock().unwrap() = Some(opened_channel);
-                            } else {
-                                *slot.delta_channel.lock().unwrap() = Some(opened_channel);
-                            }
-                            slot.request_keyframe();
-                            slot.ready.notify_waiters();
-                        })
-                    }));
-                    if is_reference {
-                        let requests = v4_video_for_channel.clone();
-                        channel.on_message(Box::new(move |message| {
-                            if nanoctl_core::video::VideoControlMessage::parse(
-                                message.data.as_ref(),
-                            )
-                            .is_ok()
-                            {
-                                requests.request_keyframe();
-                            }
-                            Box::pin(async {})
-                        }));
-                    }
-                    let close_slot = v4_video_for_channel.clone();
-                    channel.on_close(Box::new(move || {
-                        if is_reference {
-                            *close_slot.reference_channel.lock().unwrap() = None;
-                        } else {
-                            *close_slot.delta_channel.lock().unwrap() = None;
-                        }
-                        Box::pin(async {})
-                    }));
-                    return Box::pin(async {});
-                }
-                if label == "nanoctl.video.v1" || label == "nanoctl.video-idr.v1" {
+                if channel.label() == "nanoctl.video.v1"
+                    || channel.label() == "nanoctl.video-idr.v1"
+                {
                     if !video_dc_codec_ok {
                         tracing::info!(
                             codec = negotiated.codec.id(),
@@ -1447,8 +1317,6 @@ impl HostPeer {
             video,
             #[cfg(feature = "media")]
             video_data_channel,
-            #[cfg(feature = "media")]
-            v4_video_data_channel,
             video_codec: negotiated.codec,
             #[cfg(feature = "media")]
             h264_high: negotiated.h264_high,
@@ -1672,11 +1540,6 @@ impl HostPeer {
     }
 
     #[cfg(feature = "media")]
-    pub fn v4_video_data_channel(&self) -> Arc<V4DataChannelVideo> {
-        self.v4_video_data_channel.clone()
-    }
-
-    #[cfg(feature = "media")]
     pub fn keyframe_requests(&self) -> tokio::sync::watch::Receiver<u64> {
         self.keyframe_requests.subscribe()
     }
@@ -1746,77 +1609,6 @@ impl InputBlockedNotices {
             let _ = channel.send_text(INPUT_BLOCKED_NOTICE.to_owned()).await;
         });
     }
-}
-
-#[cfg(feature = "media")]
-fn spawn_v4_input_worker(
-    mut control_receiver: InputReceiver,
-    mut motion_receiver: InputReceiver,
-    input: Arc<std::sync::Mutex<crate::input::InputController>>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-    input_revoked: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    async fn apply_actions(
-        input: Arc<std::sync::Mutex<crate::input::InputController>>,
-        input_revoked: Arc<AtomicBool>,
-        actions: Vec<nanoctl_core::input::HostAction>,
-    ) {
-        if actions.is_empty() || input_revoked.load(Ordering::Acquire) {
-            return;
-        }
-        let result = tokio::task::spawn_blocking(move || {
-            let mut input = input
-                .lock()
-                .map_err(|_| anyhow::anyhow!("input controller lock poisoned"))?;
-            if input_revoked.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            for action in &actions {
-                input.apply_v4(action)?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(error = %error, "v4 input action rejected"),
-            Err(error) => tracing::warn!(error = %error, "v4 input worker action failed"),
-        }
-    }
-
-    tokio::spawn(async move {
-        let mut machine = nanoctl_core::input::InputStateMachine::new();
-        let started = Instant::now();
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
-        loop {
-            let now_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            tokio::select! {
-                _ = shutdown.changed() => break,
-                bytes = control_receiver.recv() => {
-                    let Some(bytes) = bytes else { break };
-                    if let Ok(message) = nanoctl_core::input::InputMessage::parse(&bytes) {
-                        let actions = machine.apply(&message, now_ms);
-                        apply_actions(input.clone(), input_revoked.clone(), actions).await;
-                    }
-                }
-                bytes = motion_receiver.recv() => {
-                    let Some(bytes) = bytes else { break };
-                    if let Ok(message) = nanoctl_core::input::InputMessage::parse(&bytes) {
-                        let actions = machine.apply(&message, now_ms);
-                        apply_actions(input.clone(), input_revoked.clone(), actions).await;
-                    }
-                }
-                _ = interval.tick() => {
-                    let actions = machine.tick(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
-                    apply_actions(input.clone(), input_revoked.clone(), actions).await;
-                }
-            }
-        }
-        if let Ok(mut input) = input.lock() {
-            input.release_all();
-            input.neutralize_gamepads();
-        }
-    })
 }
 
 #[cfg(feature = "media")]

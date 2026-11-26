@@ -3,58 +3,17 @@ import type { AudioOutput, ControlMessage } from "../../packages/protocol/src/in
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { closePanel, openPanel } from "./panel";
-import {
-  injectDataChannelSpy,
-  injectedWire,
-  v4InputMessages,
-  type InjectedWireMessage,
-} from "./v4-input";
 
-type SpyWindow = Window & { injected: InjectedWireMessage[] };
+type SpyWindow = Window & { injected: string[] };
 async function controls(page: Page): Promise<ControlMessage[]> {
-  return v4InputMessages(await injectedWire(page))
-    .map((message): ControlMessage | null => {
-      if (message.kind === "pointerMove") {
-        return {
-          type: "pointer",
-          action: "move",
-          x: message.point.x / 65535,
-          y: message.point.y / 65535,
-        };
-      }
-      if (message.kind === "pointerButton") {
-        return {
-          type: "pointer",
-          action: message.down ? "down" : "up",
-          x: message.point.x / 65535,
-          y: message.point.y / 65535,
-          button: message.button === "middle" ? 1 : message.button === "right" ? 2 : 0,
-        };
-      }
-      if (message.kind === "pointerWheel") {
-        return {
-          type: "pointer",
-          action: "wheel",
-          x: message.point.x / 65535,
-          y: message.point.y / 65535,
-          deltaX: message.deltaX,
-          deltaY: message.deltaY,
-        };
-      }
-      if (message.kind === "key") {
-        return {
-          type: "key",
-          action: message.down ? "down" : "up",
-          code: message.identity.code,
-          key: message.identity.key,
-          modifiers: 0,
-          repeat: message.browserRepeat,
-        };
-      }
-      if (message.kind === "text") return { type: "text", text: message.text };
-      return null;
-    })
-    .filter((message): message is ControlMessage => message !== null);
+  return page.evaluate(() =>
+    (window as unknown as SpyWindow).injected
+      .map((data) => JSON.parse(data))
+      .filter(
+        (message) =>
+          message.type === "pointer" || message.type === "key" || message.type === "text",
+      ),
+  );
 }
 async function clearControls(page: Page) {
   await page.evaluate(() => {
@@ -281,7 +240,14 @@ test("mobile live touch, scroll and keyboard control respect the input toggle", 
   context,
 }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
-  await page.addInitScript(injectDataChannelSpy);
+  await page.addInitScript(() => {
+    const send = RTCDataChannel.prototype.send;
+    (window as unknown as SpyWindow).injected = [];
+    RTCDataChannel.prototype.send = function (data: unknown) {
+      (window as unknown as SpyWindow).injected.push(String(data));
+      return Reflect.apply(send, this, [data]);
+    };
+  });
   await page.goto("/");
   await expect(page.getByTestId("connection-state")).toHaveText("Live", {
     timeout: 30_000,
