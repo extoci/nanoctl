@@ -9,6 +9,7 @@ import {
   type SignalPayload,
   type VideoCodec,
 } from "@nanoctl/protocol";
+import { createV4DataChannels } from "@nanoctl/client-core";
 import { recordDebugEvent } from "./debug-report";
 import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
 import { encodeBinaryInput, encodeGamepadHeartbeat, type GamepadStateInput } from "./binary-input";
@@ -17,7 +18,7 @@ import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
 import {
-  attachDataChannelVideo,
+  attachV4DataChannelVideo,
   attachWebCodecsVideo,
   createVideoEncodedStreams,
   supportsWebCodecsVideo,
@@ -705,45 +706,19 @@ export class RemoteSessionController {
         void this.options.video.play().catch(() => {});
       }
     };
-    // True low-latency path: raw AUs over an unreliable data channel feed
-    // WebCodecs directly — no jitter buffer anywhere. The channels are
-    // created whenever the choice allows a direct-decode codec, then kept only
-    // when the negotiated codec is one WebCodecs can decode that way —
-    // otherwise they close so the agent falls back to RTP.
+    // v4 low-latency path: canonical independent video lanes feed the bounded
+    // reassembler/reference tracker before WebCodecs. There is intentionally no
+    // RTP fallback in the clean-slate media plane.
     if (typeof VideoDecoder === "function" && directVideoEligible) {
-      const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
-        ordered: false,
-        // Time-bounded retransmission repairs isolated SCTP loss for a fraction
-        // of an IDR's cost. Unordered delivery means it cannot head-of-line
-        // block newer frames; after this lifetime copies would be too late for
-        // the small reorder window anyway, so SCTP stops paying for them.
-        maxPacketLifeTime: 80,
-      });
-      const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
-      // Compressed access units must arrive as ArrayBuffer. The spec default is
-      // Blob in some implementations, which would make the zero-copy feed path
-      // ignore every frame.
-      videoChannel.binaryType = "arraybuffer";
-      idrChannel.binaryType = "arraybuffer";
-      videoChannel.onopen = () => {
-        if (!this.isCurrent(lifecycle, peer)) return;
-        const directVideoCodec = negotiatedDirectVideoCodec(peer);
-        if (!directVideoCodec) {
-          videoChannel.close();
-          idrChannel.close();
-          return;
-        }
-        // The data-channel path beats the jitter-buffered transform tap.
-        this.webCodecsVideo?.drop();
-        this.webCodecsVideo = attachDataChannelVideo(
-          videoChannel,
-          idrChannel,
-          this.options.video,
-          restoreRemoteVideo,
-          directVideoCodec,
-          this.onDirectVideoFrame,
-        );
-      };
+      const lanes = createV4DataChannels(peer);
+      this.webCodecsVideo?.drop();
+      this.webCodecsVideo = attachV4DataChannelVideo(
+        lanes.videoDelta,
+        lanes.videoReference,
+        this.options.video,
+        restoreRemoteVideo,
+        this.onDirectVideoFrame,
+      );
     }
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });
     peer.ontrack = ({ receiver, streams, track }) => {
@@ -1594,6 +1569,36 @@ export class RemoteSessionController {
           nominatedPairs.push(stats);
         }
       });
+      const directStats = this.webCodecsVideo?.stats();
+      if (directStats) {
+        const sample: VideoSample = {
+          id: `v4-data-channel-${lifecycle}`,
+          bytes: directStats.bytes,
+          frames: directStats.decoded,
+          timestamp: performance.now(),
+        };
+        const rates = videoRates(sample, this.previousVideoSample);
+        this.previousVideoSample = sample;
+        const video = this.options.video;
+        this.metrics = {
+          resolution:
+            video.videoWidth > 0 && video.videoHeight > 0
+              ? `${video.videoWidth}×${video.videoHeight}`
+              : "—",
+          ...rates,
+          rttMs: null,
+          packetsLost: 0,
+          framesDropped: directStats.dropped,
+          lossPercent: null,
+          jitterMs: null,
+          route: "unknown",
+          codec: "H.264",
+          decoder: "WebCodecs",
+          decodeMs: null,
+        };
+        this.publishSnapshot();
+        return;
+      }
       if (!inbound) return;
       const sample: VideoSample = {
         id: inbound.id,

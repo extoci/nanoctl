@@ -34,10 +34,28 @@ impl MediaPipeline {
         encoder: Box<dyn VideoEncoder>,
         lane: Box<dyn LaneWriter>,
     ) -> Result<Self, MediaError> {
+        Self::start_with_keyframe_requests(
+            config,
+            source,
+            encoder,
+            lane,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Starts a pipeline whose reference recovery is driven by a transport-owned request flag.
+    /// The flag remains shared after startup so data-channel control messages can request a
+    /// keyframe without going through an unbounded command queue.
+    pub fn start_with_keyframe_requests(
+        config: MediaPipelineConfig,
+        source: Box<dyn VideoSource>,
+        encoder: Box<dyn VideoEncoder>,
+        lane: Box<dyn LaneWriter>,
+        keyframe_requested: Arc<AtomicBool>,
+    ) -> Result<Self, MediaError> {
         let config = config.validate()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let frame_slot = Arc::new(LatestSlot::new());
-        let keyframe_requested = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(Mutex::new(MediaPipelineSnapshot::default()));
 
         let capture_task = tokio::spawn(capture_loop(

@@ -41,6 +41,8 @@ mod tailnet;
 mod terminal;
 mod tls;
 mod update;
+#[cfg(feature = "media")]
+mod v4_media;
 #[cfg(all(feature = "media", target_os = "windows"))]
 mod windows_encoder;
 

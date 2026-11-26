@@ -79,6 +79,16 @@ describe("FrameSequencer", () => {
     expect(sequences(duplicate)).toEqual([]);
   });
 
+  test("keeps newer deltas that cross-lane reordering delivered before their keyframe", () => {
+    const sequencer = new FrameSequencer();
+    const first = sequencer.push(unit(1, true));
+    expect(first.emitted.map((emitted) => emitted.streamSequence)).toEqual([1]);
+    expect(sequencer.push(unit(4, false)).emitted).toEqual([]);
+    expect(sequencer.push(unit(3, false)).emitted).toEqual([]);
+    const recovered = sequencer.push(unit(2, true));
+    expect(recovered.emitted.map((emitted) => emitted.streamSequence)).toEqual([2, 3, 4]);
+  });
+
   test("handles u32 sequence wraparound", () => {
     const sequencer = new FrameSequencer(2);
     sequencer.push(unit(0xfffffffe, true));

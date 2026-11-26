@@ -2735,6 +2735,8 @@ dependencies = [
  "hostname",
  "interceptor",
  "libc",
+ "nanoctl-core",
+ "nanoctl-media",
  "nanoctl-update",
  "objc2",
  "objc2-core-graphics",
@@ -2772,6 +2774,25 @@ dependencies = [
  "xcap",
  "xcb",
  "xkeysym",
+ "yuv",
+]
+
+[[package]]
+name = "nanoctl-core"
+version = "0.1.0"
+
+[[package]]
+name = "nanoctl-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nanoctl-core",
+ "openh264",
+ "openh264-sys2",
+ "tokio",
+ "windows 0.62.2",
+ "xcap",
  "yuv",
 ]
 
