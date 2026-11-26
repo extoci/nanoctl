@@ -1427,7 +1427,10 @@ export class RemoteSessionController {
     const channel = this.controlChannel;
     if (channel?.readyState === "open") {
       try {
-        channel.send(JSON.stringify({ type: "release" } satisfies ControlMessage));
+        // Wire v3 is binary-only on the input lanes: the JSON form was
+        // rejected host-side, so stuck keys and buttons were never released.
+        const binary = this.options.binaryInput ? encodeBinaryInput({ type: "release" }) : null;
+        channel.send(binary ?? JSON.stringify({ type: "release" } satisfies ControlMessage));
       } catch {
         // Closing a channel is already a release boundary.
       }
