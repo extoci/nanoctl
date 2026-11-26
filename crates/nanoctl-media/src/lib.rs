@@ -2,6 +2,8 @@ mod chunking;
 mod latest;
 mod pipeline;
 mod types;
+#[cfg(feature = "capture")]
+mod xcap_capture;
 
 pub use chunking::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
 pub use latest::{LatestSlot, PutOutcome};
@@ -11,6 +13,8 @@ pub use types::{
     LaneWriter, MediaError, MediaPipelineConfig, MediaPipelineSnapshot, PixelFormat, RawFrame,
     VideoEncoder, VideoSource,
 };
+#[cfg(feature = "capture")]
+pub use xcap_capture::XcapCaptureSource;
 
 /// Capture-to-encode handoff capacity. Video intentionally has one hot spare at most:
 /// if encode or send falls behind, newer capture replaces the spare rather than queueing

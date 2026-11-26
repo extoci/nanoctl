@@ -224,6 +224,12 @@ jobs:
         run: cargo clippy --all-targets --manifest-path crates/nanoctl-media/Cargo.toml -- -D warnings
       - name: Test (media pipeline)
         run: cargo test --manifest-path crates/nanoctl-media/Cargo.toml
+      - name: Clippy (media capture backend)
+        if: runner.os == 'Windows'
+        run: cargo clippy --all-targets --features capture --manifest-path crates/nanoctl-media/Cargo.toml -- -D warnings
+      - name: Test (media capture backend)
+        if: runner.os == 'Windows'
+        run: cargo test --features capture --manifest-path crates/nanoctl-media/Cargo.toml
       - name: Clippy (rtc)
         run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - name: Clippy (media)
