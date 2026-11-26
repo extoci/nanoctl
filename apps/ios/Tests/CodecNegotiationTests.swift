@@ -20,7 +20,8 @@ final class CodecNegotiationTests: XCTestCase {
             hostCodecs: ["av1", "hevc", "h264"],
             receivableCodecs: ["av1", "h264"]
         ) { codec in codec == "av1" || codec == "hevc" }
-        XCTAssertEqual(order, ["av1", "hevc", "h264"])
+        // HEVC leads auto while the AV1 data-channel path is unproven on device.
+        XCTAssertEqual(order, ["hevc", "av1", "h264"])
     }
 
     func testAutoDoesNotOfferCodecHostCannotEncode() {
