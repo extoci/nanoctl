@@ -56,6 +56,14 @@ export function createVideoEncodedStreams(receiver: RTCRtpReceiver): EncodedStre
 
 export type DirectVideoCodec = "h264" | "hevc" | "av1";
 
+// Unordered SCTP commonly reorders neighboring access units under load. The
+// recovery window must absorb that ordinary reordering; treating the first
+// newer sequence as proof that an older frame or fragment died causes freezes
+// even at 0% packet loss.
+const DC_REORDER_WINDOW = 16;
+const DC_PARTIAL_REORDER_WINDOW = 16;
+const DC_KEYFRAME_RETRY_MS = 400;
+
 /**
  * True when an Annex-B access unit starts a random-access picture. Every
  * slice of a picture shares its keyframe-ness and parameter sets precede the
@@ -836,14 +844,15 @@ export function attachDataChannelVideo(
   delete dbg.firstMsgMs;
   delete dbg.firstDecodeMs;
   const requestKeyframe = () => {
-    if (Date.now() - kfRequestedAt <= 250) return;
-    kfRequestedAt = Date.now();
-    dbg.kf = (dbg.kf as number) + 1;
+    const now = Date.now();
+    if (now - kfRequestedAt <= 250) return;
     try {
       // The bounded-retransmit delta channel can still drop this one-byte recovery request
       // exactly when loss recovery is needed. The IDR channel is reliable and
       // the host accepts the request on either channel.
       (idrChannel ?? channel).send("KF");
+      kfRequestedAt = now;
+      dbg.kf = (dbg.kf as number) + 1;
     } catch {}
   };
   // Ask for a keyframe immediately: without it the request only goes out
@@ -851,11 +860,20 @@ export function attachDataChannelVideo(
   if (!(window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf) {
     requestKeyframe();
   }
+  // Video loss often happens immediately before the desktop goes idle, so no
+  // further frame or heartbeat may arrive to trigger another request. Keep
+  // retrying while frozen; the 400ms cadence outlives the host's 300ms
+  // forced-IDR cooldown without creating a keyframe storm.
+  let recoveryStopped = false;
+  const keyframeRetry = window.setInterval(() => {
+    if (!recoveryStopped && waitingForKey) requestKeyframe();
+  }, DC_KEYFRAME_RETRY_MS);
   const pending = new Map<
     number,
     { isKey: boolean; parts: number; got: Uint8Array[]; n: number }
   >();
   const reordered = new Map<number, { au: Uint8Array; isKey: boolean }>();
+  let newestSeq: number | null = null;
   const onFrame = (event: MessageEvent) => {
     try {
       const data = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
@@ -869,6 +887,7 @@ export function attachDataChannelVideo(
         dbg.firstMsgMs = performance.now() - joinAt;
       }
       const seq = data[0]! | (data[1]! << 8) | (data[2]! << 16) | (data[3]! << 24);
+      if (newestSeq === null || ((seq - newestSeq) | 0) > 0) newestSeq = seq;
       const flags = data[4]!;
       const isKey = (flags & 1) !== 0;
       let offset = 5;
@@ -908,6 +927,25 @@ export function attachDataChannelVideo(
       }
       if (data.length <= offset) return;
       const chunk = data.subarray(offset);
+      // Drop partials only after they fall outside the realistic reordering
+      // distance. Fragmented access units routinely interleave with newer
+      // sequences on the unordered channel; expiring them on the first newer
+      // sequence manufactures loss at 0% packet loss. Once they are genuinely
+      // behind the reorder window they can never complete usefully, so start
+      // keyframe recovery instead of waiting for more evidence.
+      let lostIncomplete = false;
+      for (const key of pending.keys()) {
+        if (newestSeq !== null && ((newestSeq - key) | 0) > DC_PARTIAL_REORDER_WINDOW) {
+          pending.delete(key);
+          lostIncomplete = true;
+        }
+      }
+      if (lostIncomplete && !waitingForKey) {
+        waitingForKey = true;
+        dbg.gaps = (dbg.gaps as number) + 1;
+        reordered.clear();
+        requestKeyframe();
+      }
       let au: Uint8Array | null = chunk;
       if (parts > 1) {
         let entry = pending.get(seq);
@@ -930,22 +968,6 @@ export function attachDataChannelVideo(
           off += g.length;
         }
         au = joined;
-      }
-      // Drop stale partials that can never complete. An incomplete delta
-      // means the reference chain is already broken, so start keyframe
-      // recovery now instead of waiting for the reorder window to overflow.
-      let lostIncomplete = false;
-      for (const key of pending.keys()) {
-        if (((seq - key) | 0) > 0) {
-          pending.delete(key);
-          lostIncomplete = true;
-        }
-      }
-      if (lostIncomplete && !waitingForKey) {
-        waitingForKey = true;
-        dbg.gaps = (dbg.gaps as number) + 1;
-        reordered.clear();
-        requestKeyframe();
       }
       if (!au) return;
       if (expectedSeq === null) {
@@ -973,7 +995,7 @@ export function attachDataChannelVideo(
           reordered.set(seq, { au, isKey });
           dbg.reordered = ((dbg.reordered as number) || 0) + 1;
         }
-        if (reordered.size > 4 && !waitingForKey) {
+        if (reordered.size > DC_REORDER_WINDOW && !waitingForKey) {
           waitingForKey = true;
           dbg.gaps = (dbg.gaps as number) + 1;
           reordered.clear();
@@ -1044,7 +1066,9 @@ export function attachDataChannelVideo(
     sink.teardown(true);
   }, 4000);
   const onClosed = () => {
+    recoveryStopped = true;
     window.clearTimeout(watchdog);
+    window.clearInterval(keyframeRetry);
     sink.teardown(true);
   };
   channel.onclose = onClosed;
@@ -1052,7 +1076,9 @@ export function attachDataChannelVideo(
   return {
     canvas: sink.canvas,
     drop: () => {
+      recoveryStopped = true;
       window.clearTimeout(watchdog);
+      window.clearInterval(keyframeRetry);
       sink.teardown(false);
     },
     stats: sink.stats,

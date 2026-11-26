@@ -61,6 +61,8 @@ mod resize;
 
 const VIDEO_DELIVERY_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const VIDEO_SAMPLE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const FORCED_IDR_COOLDOWN: Duration = Duration::from_millis(300);
+const PERIODIC_IDR_INTERVAL: Duration = Duration::from_secs(20);
 
 // SCTP caps a message at ~64KiB, so large access units are chunked. The compact
 // wire header is [u32 seq][u8 flags]; fragmented messages add u16 part/parts
@@ -3000,6 +3002,13 @@ pub fn spawn_video(
                 let mut damage_since_encode: Option<Vec<DirtyRect>> = None;
                 let mut forced_keyframe = false;
                 let mut last_forced_idr: Option<Instant> = None;
+                let mut dc_keyframes_seen = producer_video_channel
+                    .keyframe_requests
+                    .load(Ordering::Relaxed);
+                // Explicit requests are the low-latency repair path, but a bounded
+                // periodic IDR is the last-resort safety net when a request is lost
+                // to cooldown, teardown races, or an idle-transition edge case.
+                let mut last_idr_at = Instant::now();
                 let mut viewer_dimensions = (quality.max_width, quality.max_height);
                 let mut viewport_bitrate_scale = 1.0;
                 let mut waiting_since = Instant::now();
@@ -3026,12 +3035,26 @@ pub fn spawn_video(
                         delivery_recovery_requests.borrow_and_update();
                         forced_keyframe = true;
                     }
+                    let dc_keyframes = producer_video_channel
+                        .keyframe_requests
+                        .load(Ordering::Relaxed);
+                    if dc_keyframes != dc_keyframes_seen {
+                        dc_keyframes_seen = dc_keyframes;
+                        forced_keyframe = true;
+                    }
+                    if last_idr_at.elapsed() >= PERIODIC_IDR_INTERVAL {
+                        forced_keyframe = true;
+                    }
                     let now = Instant::now();
                     // The 16ms cap bounds how long a keyframe request stays
                     // unseen while the producer is blocked here: the channel
                     // is only polled after `take` returns. Idle wakeups are
                     // a few atomic ops, so the tighter cap is cheap.
-                    let wait = if forced_keyframe && last.is_some() {
+                    let keyframe_ready = forced_keyframe
+                        && last_forced_idr.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= FORCED_IDR_COOLDOWN
+                        });
+                    let wait = if keyframe_ready && last.is_some() {
                         Duration::ZERO
                     } else if last.is_some() {
                         pacer.next_deadline(now, fps).saturating_duration_since(now)
@@ -3055,6 +3078,16 @@ pub fn spawn_video(
                     }
                     if delivery_recovery_requests.has_changed().unwrap_or(false) {
                         delivery_recovery_requests.borrow_and_update();
+                        forced_keyframe = true;
+                    }
+                    let dc_keyframes = producer_video_channel
+                        .keyframe_requests
+                        .load(Ordering::Relaxed);
+                    if dc_keyframes != dc_keyframes_seen {
+                        dc_keyframes_seen = dc_keyframes;
+                        forced_keyframe = true;
+                    }
+                    if last_idr_at.elapsed() >= PERIODIC_IDR_INTERVAL {
                         forced_keyframe = true;
                     }
                     let now = Instant::now();
@@ -3184,11 +3217,28 @@ pub fn spawn_video(
                         }
                         continue;
                     };
-                    let keepalive = pacer.idle() && !changed && !forced_keyframe;
+                    // Forced IDRs must be rate-limited: each one costs
+                    // 50-200KB on the wire, so honoring every request or
+                    // recovery notice turns congestion into a keyframe storm
+                    // that deepens the congestion. A request that arrives during
+                    // the cooldown remains pending instead of being discarded;
+                    // the producer wakes at least every 16ms and performs it as
+                    // soon as the cooldown expires.
+                    let now = Instant::now();
+                    let force_now = forced_keyframe
+                        && last_forced_idr.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= FORCED_IDR_COOLDOWN
+                        });
+                    if force_now {
+                        encoder.encoder.force_keyframe();
+                        last_forced_idr = Some(now);
+                        forced_keyframe = false;
+                    }
+                    let keepalive = pacer.idle() && !changed && !force_now;
                     #[cfg(target_os = "windows")]
-                    let action = pacer.on_capture_frame(Instant::now(), changed, forced_keyframe);
+                    let action = pacer.on_capture_frame(Instant::now(), changed, force_now);
                     #[cfg(not(target_os = "windows"))]
-                    let action = pacer.on_frame(Instant::now(), changed, forced_keyframe);
+                    let action = pacer.on_frame(Instant::now(), changed, force_now);
                     if action == PaceAction::Skip {
                         producer_stats.pacer_skips.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -3201,24 +3251,6 @@ pub fn spawn_video(
                     if keepalive && producer_video_channel.channel.lock().unwrap().is_some() {
                         producer_stats.keepalives.fetch_add(1, Ordering::Relaxed);
                         continue;
-                    }
-                    if forced_keyframe {
-                        // Forced IDRs must be rate-limited: each one costs
-                        // 50-200KB on the wire, so honoring every request or
-                        // recovery notice turns congestion into a keyframe
-                        // storm that deepens the congestion (observed in the
-                        // field as an IDR every other frame). 300ms still
-                        // recovers quickly — clients re-request every 250ms
-                        // and new attach IDRs pass immediately — while
-                        // cutting storm bandwidth several-fold.
-                        let now = Instant::now();
-                        if last_forced_idr
-                            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(300))
-                        {
-                            encoder.encoder.force_keyframe();
-                            last_forced_idr = Some(now);
-                        }
-                        forced_keyframe = false;
                     }
                     let (scale_width, scale_height) =
                         scale.limits(quality.max_width, quality.max_height);
@@ -3255,6 +3287,9 @@ pub fn spawn_video(
                     )?;
                     if frame.bytes.is_empty() {
                         continue;
+                    }
+                    if is_keyframe(quality.codec, &frame.bytes) {
+                        last_idr_at = Instant::now();
                     }
                     if let Some(damage) = damage_since_encode.as_mut() {
                         damage.clear();
