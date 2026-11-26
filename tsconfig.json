@@ -1,4 +1,8 @@
 {
   "files": [],
-  "references": [{ "path": "./packages/protocol" }, { "path": "./apps/viewer" }]
+  "references": [
+    { "path": "./packages/protocol" },
+    { "path": "./packages/client-core" },
+    { "path": "./apps/viewer" }
+  ]
 }

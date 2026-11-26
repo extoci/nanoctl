@@ -1,0 +1,16 @@
+{
+  "name": "@nanoctl/client-core",
+  "version": "3.0.0-alpha.19",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --build"
+  },
+  "dependencies": {
+    "@nanoctl/protocol": "workspace:*"
+  }
+}
