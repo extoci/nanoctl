@@ -51,6 +51,12 @@ test("rejects catastrophic video and input latency regressions", () => {
   expect(errors).toContain("input p95");
 });
 
+test("rejects catastrophic presented-frame collapse", () => {
+  const record = evidence();
+  record.fps = 19.9;
+  expect(validateLatencyEvidence(record).join("\n")).toContain("presented fps");
+});
+
 test("rejects output above the reference resolution cap", () => {
   const record = evidence();
   record.videoSize.width = 1922;
