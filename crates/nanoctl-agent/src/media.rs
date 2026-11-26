@@ -2853,7 +2853,12 @@ pub fn prime_replay(
     encoder_preference: EncoderPreference,
 ) -> Result<()> {
     let replay = crate::rtc::video_replay();
-    if replay.lock().unwrap().snapshot().is_some() {
+    if replay
+        .lock()
+        .unwrap()
+        .snapshot(crate::codec::VideoCodec::H264)
+        .is_some()
+    {
         return Ok(());
     }
     let monitor = Monitor::all()
@@ -2919,7 +2924,7 @@ pub fn prime_replay(
     replay
         .lock()
         .unwrap()
-        .seed(video_data_messages(0, true, &frame.bytes));
+        .seed(VideoCodec::H264, video_data_messages(0, true, &frame.bytes));
     Ok(())
 }
 
@@ -3390,7 +3395,7 @@ pub fn spawn_video(
                             .replay
                             .lock()
                             .unwrap()
-                            .snapshot()
+                            .snapshot(quality.codec)
                             .map(|idr| {
                                 let mut queue = std::collections::VecDeque::new();
                                 queue.extend(idr);
@@ -3608,7 +3613,7 @@ pub fn spawn_video(
                     {
                         let mut replay = video_data_channel.replay.lock().unwrap();
                         for (part, msg) in messages.into_iter().enumerate() {
-                            replay.push(is_idr, part as u16, parts, msg);
+                            replay.push(quality.codec, is_idr, part as u16, parts, msg);
                         }
                     }
                     // While the data-channel path is live it carries every AU
