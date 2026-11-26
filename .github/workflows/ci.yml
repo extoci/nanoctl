@@ -77,7 +77,9 @@ jobs:
                 -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
             done
   viewer:
-    runs-on: ubuntu-latest
+    # Pin the media-capable browser leg while ubuntu-latest rolls forward;
+    # cros-libva 0.0.12 does not yet compile against Ubuntu 26.04's libva headers.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -101,6 +103,11 @@ jobs:
       - run: bun run check
       - run: bunx playwright install --with-deps chromium
       - run: bun run test:browser
+      - uses: ./.github/actions/linux-media-deps
+        with:
+          cache-suffix: viewer-media
+          extra-packages: xvfb
+          save-cache: ${{ github.event_name != 'pull_request' }}
       - name: Bad-network video regression
         run: xvfb-run -a bun run test:bad-network
       - name: Upload bad-network evidence

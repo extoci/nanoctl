@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { markerBits, readMarker, readMarkerRow, summarize } from "./latency-marker";
 import { closePanel, openPanel } from "./panel";
 
-const numInputs = 12;
+// Keep enough samples that nearest-rank p95 is not literally the maximum;
+// with only 12 samples one scheduler hiccup on a shared CI runner fails the gate.
+const numInputs = 24;
 const sampleMs = 10_000;
 
 interface Frame {
