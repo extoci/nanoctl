@@ -38,7 +38,8 @@ tc filter add dev lo protocol ipv6 parent 1: prio 2 flower ip_proto udp classid 
 tc -s -d qdisc show dev lo
 
 cd "$(dirname "$0")/.."
-args=(env NANOCTL_BROWSER_MEDIA=1 NANOCTL_BROWSER_BAD_NETWORK=1
+# sudo can restore a system-only PATH. The Playwright web server also launches Bun.
+args=(env "PATH=$(dirname "$bun"):$PATH" NANOCTL_BROWSER_MEDIA=1 NANOCTL_BROWSER_BAD_NETWORK=1
   "NANOCTL_BROWSER_AGENT_BIN=$agent"
   xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp"
   "$bun" node_modules/@playwright/test/cli.js test
