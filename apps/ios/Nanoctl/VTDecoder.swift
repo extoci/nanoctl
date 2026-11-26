@@ -82,8 +82,12 @@ final class VTDecoder {
                 dropped += 1
                 return
             }
-        } else if !parameters.isEmpty && parameters != self.parameters {
+        } else if !parameters.isEmpty && sortedHex(parameters) != sortedHex(self.parameters) {
             // Parameter sets changed (resize/encoder reset): rebuild on the spot.
+            // The comparison is order-independent because the encoder does not
+            // guarantee stable VPS/SPS/PPS ordering inside the access unit, and
+            // an order-only difference is not a format change — rebuilding the
+            // decode session every keyframe was a once-a-second visible hitch.
             invalidate()
             guard ensureSession(parameters: parameters) else {
                 fault()
@@ -218,6 +222,12 @@ final class VTDecoder {
         case 34: return 2
         default: return Int.max
         }
+    }
+
+    /// Order-independent comparison key for parameter sets: sorts by content
+    /// so NAL ordering inside the access unit cannot masquerade as a change.
+    private func sortedHex(_ sets: [Data]) -> [Data] {
+        sets.sorted { $0.lexicographicallyPrecedes($1) }
     }
 
     /// Builds a format description from the codec's parameter sets.
