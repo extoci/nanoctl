@@ -62,6 +62,10 @@ export type DirectVideoCodec = "h264" | "hevc" | "av1";
 // even at 0% packet loss.
 const DC_REORDER_WINDOW = 16;
 const DC_PARTIAL_REORDER_WINDOW = 16;
+// A frame-count window alone becomes seconds of dead time when congestion
+// adaptation lowers the frame rate. Beyond this age a missing frame is loss
+// for interactive purposes even if fewer than sixteen newer frames arrived.
+const DC_REORDER_AGE_MS = 400;
 const DC_KEYFRAME_RETRY_MS = 400;
 
 /**
@@ -870,10 +874,36 @@ export function attachDataChannelVideo(
   }, DC_KEYFRAME_RETRY_MS);
   const pending = new Map<
     number,
-    { isKey: boolean; parts: number; got: Uint8Array[]; n: number }
+    { isKey: boolean; parts: number; got: Uint8Array[]; n: number; firstSeen: number }
   >();
-  const reordered = new Map<number, { au: Uint8Array; isKey: boolean }>();
+  const reordered = new Map<number, { au: Uint8Array; isKey: boolean; firstSeen: number }>();
   let newestSeq: number | null = null;
+  const expireReorderState = () => {
+    if (recoveryStopped) return;
+    const now = Date.now();
+    let expired = false;
+    for (const [seq, entry] of pending) {
+      const distance = newestSeq === null ? 0 : (newestSeq - seq) | 0;
+      if (distance > DC_PARTIAL_REORDER_WINDOW || now - entry.firstSeen >= DC_REORDER_AGE_MS) {
+        pending.delete(seq);
+        expired = true;
+      }
+    }
+    for (const [seq, entry] of reordered) {
+      if (now - entry.firstSeen >= DC_REORDER_AGE_MS) {
+        reordered.delete(seq);
+        expired = true;
+      }
+    }
+    if (expired && !waitingForKey) {
+      waitingForKey = true;
+      dbg.waitingForKey = true;
+      dbg.gaps = (dbg.gaps as number) + 1;
+      reordered.clear();
+      requestKeyframe();
+    }
+  };
+  const reorderExpiry = window.setInterval(expireReorderState, 100);
   const onFrame = (event: MessageEvent) => {
     try {
       const data = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
@@ -926,31 +956,13 @@ export function attachDataChannelVideo(
         return;
       }
       if (data.length <= offset) return;
+      expireReorderState();
       const chunk = data.subarray(offset);
-      // Drop partials only after they fall outside the realistic reordering
-      // distance. Fragmented access units routinely interleave with newer
-      // sequences on the unordered channel; expiring them on the first newer
-      // sequence manufactures loss at 0% packet loss. Once they are genuinely
-      // behind the reorder window they can never complete usefully, so start
-      // keyframe recovery instead of waiting for more evidence.
-      let lostIncomplete = false;
-      for (const key of pending.keys()) {
-        if (newestSeq !== null && ((newestSeq - key) | 0) > DC_PARTIAL_REORDER_WINDOW) {
-          pending.delete(key);
-          lostIncomplete = true;
-        }
-      }
-      if (lostIncomplete && !waitingForKey) {
-        waitingForKey = true;
-        dbg.gaps = (dbg.gaps as number) + 1;
-        reordered.clear();
-        requestKeyframe();
-      }
       let au: Uint8Array | null = chunk;
       if (parts > 1) {
         let entry = pending.get(seq);
         if (!entry) {
-          entry = { isKey, parts, got: [], n: 0 };
+          entry = { isKey, parts, got: [], n: 0, firstSeen: Date.now() };
           entry.got.length = parts;
           pending.set(seq, entry);
         }
@@ -993,7 +1005,7 @@ export function attachDataChannelVideo(
         // in a small reorder window instead of declaring a gap. While waiting
         // for a key only keys are worth holding.
         if (isKey || !waitingForKey) {
-          reordered.set(seq, { au, isKey });
+          reordered.set(seq, { au, isKey, firstSeen: Date.now() });
           dbg.reordered = ((dbg.reordered as number) || 0) + 1;
         }
         if (reordered.size > DC_REORDER_WINDOW && !waitingForKey) {
@@ -1071,6 +1083,7 @@ export function attachDataChannelVideo(
     recoveryStopped = true;
     window.clearTimeout(watchdog);
     window.clearInterval(keyframeRetry);
+    window.clearInterval(reorderExpiry);
     sink.teardown(true);
   };
   channel.onclose = onClosed;
@@ -1081,6 +1094,7 @@ export function attachDataChannelVideo(
       recoveryStopped = true;
       window.clearTimeout(watchdog);
       window.clearInterval(keyframeRetry);
+      window.clearInterval(reorderExpiry);
       sink.teardown(false);
     },
     stats: sink.stats,

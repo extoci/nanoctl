@@ -1196,6 +1196,67 @@ describe("webcodecs video gating and teardown", () => {
     expect(channel.sent).toContain("KF");
   });
 
+  test("data-channel loss recovery does not wait for sixteen frames at low frame rates", () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+    const originalNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    try {
+      receive(0, true);
+      channel.sent = [];
+      now = 1_100;
+      receive(2);
+      receive(3);
+      expect(channel.sent).not.toContain("KF");
+      now = 1_501;
+      for (const callback of intervals) callback();
+      expect(channel.sent).toContain("KF");
+    } finally {
+      Date.now = originalNow;
+      handle.drop();
+    }
+  });
+
   test("data-channel reassembly tolerates fragmented frames interleaved with newer sequences", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
