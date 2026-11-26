@@ -17,7 +17,7 @@ export interface WebCodecsVideoHandle {
   stats(): { decoded: number; dropped: number; bytes: number };
   /** Rolling data-channel loss fraction since the previous call, when the
    * handle tracks sequence numbers (data-channel video). */
-  takeLinkLoss?(): number;
+  takeLinkLoss?(): number | undefined;
 }
 
 interface EncodedVideoFrameLike {
@@ -1132,5 +1132,6 @@ export function attachV4DataChannelVideo(
       sink.teardown(false);
     },
     stats: sink.stats,
+    takeLinkLoss: () => receiver.takeLinkLoss(),
   };
 }

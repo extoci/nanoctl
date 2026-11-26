@@ -130,10 +130,14 @@ pub struct RateController {
 
 impl RateController {
     pub fn new(ceiling_kbps: u32, max_fps: u16) -> Self {
+        Self::with_opening_limit(ceiling_kbps, max_fps, 6_000)
+    }
+
+    pub fn with_opening_limit(ceiling_kbps: u32, max_fps: u16, opening_kbps: u32) -> Self {
         // Start high enough for a presentable first frame — a 4Mbps opening undershoots a
         // LAN-scale link badly, and the probe-up path recovers in seconds on a real WAN.
         let initial = (ceiling_kbps / 4)
-            .min(6_000)
+            .min(opening_kbps)
             .clamp(ceiling_kbps.min(MIN_BITRATE_KBPS), ceiling_kbps);
         let max_fps = max_fps.max(1);
         let fps = Self::tier(initial as f64, max_fps);
@@ -177,6 +181,22 @@ impl RateController {
         self.low_fps_since = None;
         self.reported = self.decision();
         self.reported
+    }
+
+    #[cfg(feature = "media")]
+    pub fn backpressure(&mut self, now: Instant) {
+        if self
+            .last_congestion
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(250))
+        {
+            return;
+        }
+        self.last_congestion = Some(now);
+        self.congestion_rate = Some(self.rate);
+        self.clean_since = None;
+        self.rate = (self.rate * 0.8).max(f64::from(self.ceiling.min(MIN_BITRATE_KBPS)));
+        self.fps = Self::tier(self.rate, self.max_fps);
+        self.reported = self.decision();
     }
 
     pub fn decision(&self) -> RateDecision {
