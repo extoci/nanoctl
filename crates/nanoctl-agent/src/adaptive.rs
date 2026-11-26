@@ -607,6 +607,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn link_stats_parse_loss_reports() {
+        assert_eq!(
+            parse_link_stats(br#"{"type":"link-stats","loss":0.25}"#),
+            Some(0.25)
+        );
+        assert_eq!(parse_link_stats(br#"{"type":"link-stats"}"#), None);
+        assert_eq!(parse_link_stats(br#"{"type":"quality","loss":0.5}"#), None);
+        assert_eq!(parse_link_stats(b"binary"), None);
+    }
+
+    #[test]
+    fn dc_loss_feedback_drives_the_rate_controller_down() {
+        let mut controller = RateController::new(24_000, 60);
+        let start = controller.decision().bitrate_kbps;
+        let mut at = Instant::now();
+        let mut last = start;
+        for _ in 0..4 {
+            at += Duration::from_secs(1);
+            if let Some(decision) = controller.observe(LinkSample {
+                fraction_lost: 0.25,
+                rtt: None,
+                remb_kbps: None,
+                at,
+                receiver_report_at: Some(at),
+            }) {
+                last = decision.bitrate_kbps;
+            }
+        }
+        assert!(
+            last < start,
+            "sustained receiver-reported loss must cut bitrate: start={start} end={last}"
+        );
+    }
+
+    #[test]
     fn viewer_limits_lower_but_never_exceed_the_configured_maximums() {
         let limits =
             ViewerLimits::parse(br#"{"type":"quality","maxFps":30,"maxBitrateKbps":10000}"#)
