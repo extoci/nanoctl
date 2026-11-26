@@ -1,6 +1,9 @@
+mod bitstream;
 mod chunking;
+mod i420;
 mod latest;
 mod nv12;
+mod openh264_encoder;
 mod pipeline;
 mod types;
 #[cfg(target_os = "windows")]
@@ -9,8 +12,10 @@ mod windows_mft;
 mod xcap_capture;
 
 pub use chunking::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
+pub use i420::frame_to_i420;
 pub use latest::{LatestSlot, PutOutcome};
 pub use nv12::{frame_to_nv12, frame_to_nv12_slice};
+pub use openh264_encoder::OpenH264Encoder;
 pub use pipeline::{MediaPipeline, MediaPipelineReport};
 pub use types::{
     EncodeRequest, EncodedAccessUnit, EncodedBitstream, LaneWriteReport, LaneWriteStatus,

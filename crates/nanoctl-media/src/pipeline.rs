@@ -292,8 +292,16 @@ async fn encode_loop_inner(
             }
         };
         if encoded.payload.is_empty() {
-            record_metrics(metrics, |snapshot| snapshot.encode_errors += 1);
-            return Err(MediaError::EncoderContract("empty access unit"));
+            // Encoder rate-control skips are explicit drops, not corrupt partial access units.
+            // The next emitted frame must restart the reference chain because the skipped input
+            // still consumed a stream sequence number.
+            record_metrics(metrics, |snapshot| {
+                snapshot.encoder_skips += 1;
+                snapshot.total_encode_micros += encode_micros;
+                snapshot.max_encode_micros = snapshot.max_encode_micros.max(encode_micros);
+            });
+            force_next_keyframe = true;
+            continue;
         }
         if force_keyframe && !encoded.keyframe {
             record_metrics(metrics, |snapshot| snapshot.encode_errors += 1);
@@ -544,6 +552,67 @@ mod tests {
         assert!(report.encode_result.is_ok());
         assert_eq!(report.snapshot.access_units_dropped_before_write, 2);
         assert_eq!(report.snapshot.keyframes_encoded, 2);
+    }
+
+    struct SkipFirstEncoder {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl VideoEncoder for SkipFirstEncoder {
+        async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError> {
+            let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if attempt == 0 {
+                return Ok(EncodedBitstream {
+                    keyframe: false,
+                    payload: Vec::new(),
+                });
+            }
+            Ok(EncodedBitstream {
+                keyframe: request.force_keyframe,
+                payload: vec![if request.force_keyframe { 0x65 } else { 0x41 }],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn encoder_skip_is_visible_and_forces_next_keyframe() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(SkipFirstEncoder {
+                attempts: Arc::clone(&attempts),
+            }),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        frames_tx.send(frame(222)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+
+        let first_written = {
+            let written = units.lock().expect("collected units poisoned");
+            (written[0].stream_sequence, written[0].keyframe)
+        };
+        assert_eq!(first_written, (2, true));
+
+        let report = pipeline.stop().await;
+        assert_eq!(report.snapshot.encoder_skips, 1);
+        assert_eq!(report.snapshot.access_units_encoded, 1);
+        assert_eq!(report.snapshot.keyframes_encoded, 1);
     }
 
     struct NonKeyframeEncoder {

@@ -1,6 +1,6 @@
 use crate::types::{MediaError, PixelFormat, RawFrame};
 
-fn checked_dimensions(width: u32, height: u32) -> Result<usize, MediaError> {
+pub(crate) fn checked_dimensions(width: u32, height: u32) -> Result<usize, MediaError> {
     if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(MediaError::Encode(
             "NV12 dimensions must be non-zero and even".to_string(),
