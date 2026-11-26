@@ -5,7 +5,14 @@ import {
   VIDEO_REFERENCE_CHANNEL_LABEL,
 } from "@nanoctl/protocol";
 
-export type DataChannelFactory = Pick<RTCPeerConnection, "createDataChannel">;
+export type DataChannelFactory = Pick<RTCPeerConnection, "createDataChannel"> &
+  Partial<Pick<RTCPeerConnection, "getStats">>;
+
+const videoStats = new WeakMap<RTCDataChannel, () => Promise<RTCStatsReport>>();
+
+export function readV4IceStats(videoDelta: RTCDataChannel): Promise<RTCStatsReport | undefined> {
+  return videoStats.get(videoDelta)?.() ?? Promise.resolve(undefined);
+}
 
 export interface V4DataChannels {
   control: RTCDataChannel;
@@ -25,10 +32,14 @@ export function createV4DataChannels(peer: DataChannelFactory): V4DataChannels {
     ordered: false,
     maxRetransmits: 0,
   };
-  return {
+  const lanes = {
     control: peer.createDataChannel(CONTROL_CHANNEL_LABEL),
     motion: peer.createDataChannel(MOTION_CHANNEL_LABEL, lossTolerant),
     videoDelta: peer.createDataChannel(VIDEO_DELTA_CHANNEL_LABEL, lossTolerant),
     videoReference: peer.createDataChannel(VIDEO_REFERENCE_CHANNEL_LABEL),
   };
+  if (peer.getStats) {
+    videoStats.set(lanes.videoDelta, peer.getStats.bind(peer));
+  }
+  return lanes;
 }
