@@ -5,19 +5,19 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 use bytes::Bytes;
 use interceptor::registry::Registry;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 use nanoctl_core::{VIDEO_DELTA_CHANNEL_LABEL, VIDEO_REFERENCE_CHANNEL_LABEL};
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 use webrtc::data_channel::RTCDataChannel;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -71,37 +71,37 @@ const MAX_ICE_GENERATION: u64 = 1_000_000;
 // Level 5.2 is the highest H.264 level supported by the configured 4K60 release envelope. The
 // WebRTC matcher treats the level byte asymmetrically, so this remains compatible with Chromium's
 // lower-level offer while no longer advertising a 720p30 ceiling for a 4K-capable sender.
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 pub(crate) const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 1024;
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone)]
 enum InputSender {
     Reliable(tokio::sync::mpsc::Sender<Bytes>),
     Motion(MotionSlots<tokio::sync::watch::Sender<LatestReport>>),
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 enum InputReceiver {
     Reliable(tokio::sync::mpsc::Receiver<Bytes>),
     Motion(MotionSlots<tokio::sync::watch::Receiver<LatestReport>>),
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 type LatestReport = Option<Bytes>;
 
 /// The pointer lane keeps the latest report per kind: one shared slot would let a per-frame
 /// gamepad snapshot overwrite the pointer move sent in the same frame, and vice versa.
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone)]
 struct MotionSlots<T> {
     pointer: T,
     gamepad: T,
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 fn motion_channel() -> (
     MotionSlots<tokio::sync::watch::Sender<LatestReport>>,
     MotionSlots<tokio::sync::watch::Receiver<LatestReport>>,
@@ -117,7 +117,7 @@ fn motion_channel() -> (
     )
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 fn is_gamepad_report(bytes: &[u8]) -> bool {
     // Input wire v3: byte zero is the kind; kinds 2/12 are gamepad reports
     // and kind 11 their heartbeat. Keep this local because the input module exists
@@ -125,7 +125,7 @@ fn is_gamepad_report(bytes: &[u8]) -> bool {
     matches!(bytes.first().copied(), Some(2 | 11 | 12))
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 impl InputReceiver {
     async fn recv(&mut self) -> Option<Bytes> {
         match self {
@@ -147,7 +147,7 @@ impl InputReceiver {
     }
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum InputAdmission {
     Accepted,
@@ -155,12 +155,12 @@ enum InputAdmission {
     Closed,
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
     (bytes.len() == 2 && bytes[0] == 9).then(|| bytes[1] != 0)
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 async fn admit_input_message(sender: &InputSender, bytes: Bytes) -> InputAdmission {
     if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return InputAdmission::Oversized;
@@ -247,7 +247,7 @@ pub(crate) struct DataChannelVideo {
 /// Host-owned endpoints for the clean v4 video lanes. Channels are published only after
 /// WebRTC reports them open; before then the lane sink is deliberately full so encoded
 /// access units drop before their first byte instead of queueing startup latency.
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 #[derive(Default)]
 pub(crate) struct V4DataChannelVideo {
     pub delta_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
@@ -256,7 +256,7 @@ pub(crate) struct V4DataChannelVideo {
     pub ready: tokio::sync::Notify,
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 impl V4DataChannelVideo {
     pub fn lanes_ready(&self) -> bool {
         self.delta_channel.lock().unwrap().is_some()
@@ -273,7 +273,7 @@ impl V4DataChannelVideo {
 /// are deliberately not retained: replaying them can burst megabytes into SCTP
 /// and make the decoder catch up through stale video instead of presenting the
 /// current desktop.
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 #[derive(Default)]
 pub(crate) struct VideoReplay {
     idr: Vec<Bytes>,
@@ -283,7 +283,7 @@ pub(crate) struct VideoReplay {
 
 /// A reference-counted keyframe. Cloning the snapshot is cheap; messages are
 /// shared with the live send path instead of copied a second time.
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 pub(crate) type VideoReplaySnapshot = Vec<Bytes>;
 
 /// The replay window outlives a single peer connection: a freshly attached
@@ -300,7 +300,7 @@ pub(crate) fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
         .clone()
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 impl VideoReplay {
     /// Records a wire-format video message. `is_idr`, `part` and `parts` come
     /// from the message header the producer already computed.
