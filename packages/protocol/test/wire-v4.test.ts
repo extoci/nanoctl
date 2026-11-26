@@ -9,9 +9,11 @@ import {
   VideoReassembler,
   WireError,
   encodeInputMessage,
+  encodeVideoControlMessage,
   encodeVideoChunk,
   parseInputMessage,
   parseVideoChunk,
+  parseVideoControlMessage,
   type InputMessage,
   type VideoChunk,
 } from "../src/v4";
@@ -96,6 +98,16 @@ describe("v4 lane contract", () => {
     expect(MOTION_CHANNEL_LABEL).toBe("nanoctl.motion.v4");
     expect(VIDEO_DELTA_CHANNEL_LABEL).toBe("nanoctl.video-delta.v4");
     expect(VIDEO_REFERENCE_CHANNEL_LABEL).toBe("nanoctl.video-reference.v4");
+  });
+});
+
+describe("v4 video control", () => {
+  test("roundtrips keyframe requests and rejects payloads", () => {
+    const message = { kind: "keyframeRequest" } as const;
+    const encoded = encodeVideoControlMessage(message);
+    expect(Array.from(encoded)).toEqual([4, 0x41]);
+    expect(parseVideoControlMessage(encoded)).toEqual(message);
+    expect(() => parseVideoControlMessage(new Uint8Array([4, 0x41, 0]))).toThrow(WireError);
   });
 });
 

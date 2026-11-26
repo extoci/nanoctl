@@ -3,6 +3,7 @@ use crate::{
 };
 
 const KIND_VIDEO_CHUNK: u8 = 0x40;
+const KIND_KEYFRAME_REQUEST: u8 = 0x41;
 pub const MAX_VIDEO_CHUNK_BYTES: usize = 48 * 1_024;
 pub const MAX_VIDEO_PARTS: u16 = 512;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1_024 * 1_024;
@@ -31,6 +32,25 @@ impl VideoCodec {
             Self::Hevc => 2,
             Self::Av1 => 3,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoControlMessage {
+    KeyframeRequest,
+}
+
+impl VideoControlMessage {
+    pub fn encode(self) -> Vec<u8> {
+        vec![WIRE_VERSION, KIND_KEYFRAME_REQUEST]
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_KEYFRAME_REQUEST)?;
+        if bytes.len() != 2 {
+            return Err(WireError::InvalidLength);
+        }
+        Ok(Self::KeyframeRequest)
     }
 }
 
@@ -299,6 +319,20 @@ mod tests {
             chunk(1, 0, 1, false, b"x").encode().unwrap()[..VIDEO_HEADER_BYTES].to_vec();
         assert_eq!(
             VideoChunk::parse(&empty_payload),
+            Err(WireError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn keyframe_request_roundtrips_and_rejects_payload() {
+        let encoded = VideoControlMessage::KeyframeRequest.encode();
+        assert_eq!(encoded, vec![4, 0x41]);
+        assert_eq!(
+            VideoControlMessage::parse(&encoded),
+            Ok(VideoControlMessage::KeyframeRequest)
+        );
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x41, 0]),
             Err(WireError::InvalidLength)
         );
     }
