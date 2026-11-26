@@ -6,7 +6,7 @@ const KIND_VIDEO_CHUNK: u8 = 0x40;
 pub const MAX_VIDEO_CHUNK_BYTES: usize = 48 * 1_024;
 pub const MAX_VIDEO_PARTS: u16 = 512;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1_024 * 1_024;
-const VIDEO_HEADER_BYTES: usize = 20;
+pub const VIDEO_HEADER_BYTES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VideoCodec {
