@@ -36,6 +36,7 @@ pub(crate) fn is_keyframe(codec: VideoCodec, bytes: &[u8]) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn has_parameter_sets(codec: VideoCodec, bytes: &[u8]) -> bool {
     let headers = annex_b_nal_headers(bytes);
     match codec {
