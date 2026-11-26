@@ -1,7 +1,7 @@
 /**
  * Models the first four seconds of x264 adaptation on trivially easy scrolling
  * screen content. Packet sizes come from exact ffmpeg/libx264 encodes; the
- * frame schedule mirrors AdaptPolicy (one 60-frame ease window, then either
+ * frame schedule mirrors AdaptPolicy (one 30-frame trivial-content window, then either
  * the old 90-frame tier2 window or the direct top-tier jump).
  */
 import { execFileSync } from "node:child_process";
@@ -136,9 +136,9 @@ try {
   const tier2 = measured.get("tier2")!;
   const tier4 = measured.get("tier4")!;
   // Before: 1s tier0, 1.5s tier2, then 1.5s tier4 (plus one re-open IDR each).
-  // After: 1s tier0, then 3s directly in tier4 (one fewer re-open IDR).
+  // After: 0.5s tier0, then 3.5s directly in tier4 (one fewer re-open IDR).
   const before = cost(tier0, 60) + cost(tier2, 90) + cost(tier4, 90);
-  const after = cost(tier0, 60) + cost(tier4, 180);
+  const after = cost(tier0, 30) + cost(tier4, 210);
   const kbps = (bytes: number) => ((bytes * 8) / 4 / 1000).toFixed(1);
   const saved = (1 - after / before) * 100;
   for (const [name, packets] of measured) {

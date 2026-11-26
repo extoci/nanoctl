@@ -169,6 +169,9 @@ impl AdaptPolicy {
     /// (CABAC/8x8) engages fast, while the slower/single-slice top tiers stay
     /// careful. ~1s/1.5s/2.5s/4s at 60fps.
     const EASE_FRAMES: [u32; 4] = [60, 90, 150, 240];
+    /// Frames needed for the first clearly trivial stream to skip the ladder.
+    /// Later tier-0 stays use the normal conservative ease window.
+    const INITIAL_TRIVIAL_EASE_FRAMES: u32 = 30;
     /// Consecutive stressed frames before a demotion (~0.33s at 60fps).
     const STRESS_FRAMES: u32 = 20;
     /// Minimum frames between any two tier switches.
@@ -215,6 +218,19 @@ impl AdaptPolicy {
         }
         self.stress_frames = 0;
         self.ease_frames = self.ease_frames.saturating_add(1);
+        // Startup is the expensive path: every extra second in tier0 re-encodes
+        // trivial scrolling content without CABAC/UMH/long references. Thirty
+        // clean deltas are enough evidence when both encode time and produced
+        // bytes are far below budget; after any switch, the conservative ladder
+        // below prevents oscillation.
+        if self.tier == 0
+            && self.switches == 0
+            && self.ease_frames >= Self::INITIAL_TRIVIAL_EASE_FRAMES
+            && self.encode_ewma_ns < 0.12 * budget_ns
+            && (self.bytes_ewma < 0.20 * cap_bytes || self.network_constrained)
+        {
+            return Some(Self::MAX_TIER);
+        }
         if self.tier < Self::MAX_TIER
             && self.ease_frames >= Self::EASE_FRAMES[self.tier as usize]
             && self.cooldown >= Self::SWITCH_COOLDOWN
@@ -779,6 +795,25 @@ mod tests {
         }
         assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), Some(1));
         policy.committed(1);
+
+        // A fresh trivial stream skips the ladder after thirty clean deltas.
+        let mut startup = AdaptPolicy {
+            tier: 0,
+            encode_ewma_ns: 0.0,
+            bytes_ewma: 0.0,
+            ease_frames: 0,
+            stress_frames: 0,
+            cooldown: 0,
+            switches: 0,
+            network_constrained: false,
+        };
+        for _ in 0..AdaptPolicy::INITIAL_TRIVIAL_EASE_FRAMES - 1 {
+            assert_eq!(startup.observe(1_000_000, 500, budget, cap), None);
+        }
+        assert_eq!(
+            startup.observe(1_000_000, 500, budget, cap),
+            Some(AdaptPolicy::MAX_TIER)
+        );
         // Trivially easy frames jump straight to the most efficient tier.
         for _ in 0..AdaptPolicy::EASE_FRAMES[1] + AdaptPolicy::SWITCH_COOLDOWN {
             policy.observe(1_000_000, 500, budget, cap);
