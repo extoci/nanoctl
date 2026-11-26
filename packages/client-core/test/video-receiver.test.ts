@@ -73,3 +73,61 @@ describe("V4VideoReceiver", () => {
     expect(state.videoReference.onmessage).toBeNull();
   });
 });
+
+test("retries keyframe requests without more incoming video and stops on a reference", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(4, false, [4]));
+    expect(state.requests).toHaveLength(1);
+    await Bun.sleep(300);
+    expect(state.requests.length).toBeGreaterThan(1);
+    state.receiver.handle(encoded(5, true, [5]));
+    const recoveredRequests = state.requests.length;
+    await Bun.sleep(300);
+    expect(state.requests).toHaveLength(recoveredRequests);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a short unresolved gap requests recovery even below the frame limit", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encoded(12, false, [2]));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(150);
+    expect(state.requests).toEqual([[4, 0x41]]);
+    state.receiver.handle(encoded(11, false, [1]));
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a reliable video watermark detects a lost final delta on an idle desktop", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(150);
+    expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a late delta can catch up with the watermark before recovery starts", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    state.receiver.handle(encoded(11, false, [1]));
+    await Bun.sleep(150);
+    expect(state.requests).toHaveLength(0);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11]);
+  } finally {
+    state.receiver.dispose();
+  }
+});

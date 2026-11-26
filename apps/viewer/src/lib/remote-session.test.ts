@@ -1,7 +1,11 @@
-import { encodeVideoChunk, parseVideoControlMessage } from "@nanoctl/protocol";
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { parseInputMessage, type InputMessage } from "@nanoctl/protocol";
+import {
+  encodeVideoChunk,
+  parseInputMessage,
+  parseVideoControlMessage,
+  type InputMessage,
+} from "@nanoctl/protocol";
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
 import {
   attachDataChannelVideo,
@@ -1134,6 +1138,70 @@ describe("webcodecs video gating and teardown", () => {
       });
       expect(peer.channelConfigs.has("nanoctl.video-reference.v4")).toBe(true);
       await controller.stop("done", false);
+    }
+  });
+
+  test("v4 uses the wire codec and detects a decoder that accepts video without producing output", () => {
+    installBrowserGlobals(() => 0);
+    const configurations: string[] = [];
+    const faults: string[] = [];
+    const scheduled = new Map<number, () => void>();
+    let timerId = 0;
+    window.setTimeout = ((fn: () => void) => {
+      scheduled.set(++timerId, fn);
+      return timerId;
+    }) as typeof window.setTimeout;
+    window.clearTimeout = (id) => {
+      if (typeof id === "number") scheduled.delete(id);
+    };
+    defineGlobal(
+      "VideoDecoder",
+      class {
+        decodeQueueSize = 0;
+        configure(config: VideoDecoderConfig) {
+          configurations.push(config.codec);
+        }
+        decode() {}
+        close() {}
+      },
+    );
+    defineGlobal("EncodedVideoChunk", class {});
+    defineGlobal(
+      "MediaStreamTrackGenerator",
+      class {
+        track = { stop() {} };
+        writable = new WritableStream();
+      },
+    );
+    const video = Object.assign(new FakeVideo(), { ownerDocument: { createElement: () => ({}) } });
+    const delta = new FakeDataChannel();
+    const reference = new FakeDataChannel();
+    const handle = attachV4DataChannelVideo(
+      delta as unknown as RTCDataChannel,
+      reference as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+      undefined,
+      undefined,
+      (reason) => faults.push(reason),
+    );
+    try {
+      reference.onmessage?.({
+        data: encodeVideoChunk({
+          streamSequence: 1,
+          part: 0,
+          parts: 1,
+          keyframe: true,
+          codec: "hevc",
+          captureTimeUs: 1,
+          payload: new Uint8Array([0, 0, 0, 1, 0x26, 1]),
+        }),
+      } as MessageEvent);
+      expect(configurations[0]).toMatch(/^(hev1|hvc1)\./);
+      expect(scheduled.size).toBe(1);
+      for (const timeout of scheduled.values()) timeout();
+      expect(faults).toEqual(["v4 video decoder stalled"]);
+    } finally {
+      handle.drop();
     }
   });
 

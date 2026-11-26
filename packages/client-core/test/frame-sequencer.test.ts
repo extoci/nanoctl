@@ -97,3 +97,14 @@ describe("FrameSequencer", () => {
     expect(sequences(sequencer.push(unit(1)))).toEqual([1]);
   });
 });
+
+test("the default reorder window accepts sixteen later frames before the missing one arrives", () => {
+  const sequencer = new FrameSequencer();
+  sequencer.push(unit(0, true));
+  for (let sequence = 2; sequence <= 17; sequence += 1) {
+    expect(sequencer.push(unit(sequence)).requestKeyframe).toBe(false);
+  }
+  expect(sequencer.push(unit(1)).emitted.map((frame) => frame.streamSequence)).toEqual(
+    Array.from({ length: 17 }, (_, index) => index + 1),
+  );
+});

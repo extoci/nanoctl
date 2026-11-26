@@ -215,6 +215,7 @@ pub struct MediaPipelineSnapshot {
     pub unchanged_frames_skipped: u64,
     pub bytes_written: u64,
     pub max_buffered_bytes: u64,
+    pub next_video_sequence: Option<u32>,
     pub total_encode_micros: u64,
     pub max_encode_micros: u64,
 }

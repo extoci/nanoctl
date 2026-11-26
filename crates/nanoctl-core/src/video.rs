@@ -4,6 +4,7 @@ use crate::{
 
 const KIND_VIDEO_CHUNK: u8 = 0x40;
 const KIND_KEYFRAME_REQUEST: u8 = 0x41;
+const KIND_SEQUENCE_WATERMARK: u8 = 0x42;
 pub const MAX_VIDEO_CHUNK_BYTES: usize = 48 * 1_024;
 pub const MAX_VIDEO_PARTS: u16 = 512;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1_024 * 1_024;
@@ -38,19 +39,32 @@ impl VideoCodec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoControlMessage {
     KeyframeRequest,
+    SequenceWatermark { next_sequence: u32 },
 }
 
 impl VideoControlMessage {
     pub fn encode(self) -> Vec<u8> {
-        vec![WIRE_VERSION, KIND_KEYFRAME_REQUEST]
+        match self {
+            Self::KeyframeRequest => vec![WIRE_VERSION, KIND_KEYFRAME_REQUEST],
+            Self::SequenceWatermark { next_sequence } => {
+                let mut out = vec![WIRE_VERSION, KIND_SEQUENCE_WATERMARK];
+                push_u32(&mut out, next_sequence);
+                out
+            }
+        }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_KEYFRAME_REQUEST)?;
-        if bytes.len() != 2 {
-            return Err(WireError::InvalidLength);
+        match (
+            versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_SEQUENCE_WATERMARK)?,
+            bytes.len(),
+        ) {
+            (KIND_KEYFRAME_REQUEST, 2) => Ok(Self::KeyframeRequest),
+            (KIND_SEQUENCE_WATERMARK, 6) => Ok(Self::SequenceWatermark {
+                next_sequence: u32_at(bytes, 2)?,
+            }),
+            _ => Err(WireError::InvalidLength),
         }
-        Ok(Self::KeyframeRequest)
     }
 }
 
@@ -358,6 +372,19 @@ mod tests {
         );
         assert_eq!(
             VideoControlMessage::parse(&[4, 0x41, 0]),
+            Err(WireError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn sequence_watermark_has_a_little_endian_next_sequence() {
+        let message = VideoControlMessage::SequenceWatermark {
+            next_sequence: 0x0102_0304,
+        };
+        assert_eq!(message.encode(), [4, 0x42, 4, 3, 2, 1]);
+        assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x42, 1]),
             Err(WireError::InvalidLength)
         );
     }

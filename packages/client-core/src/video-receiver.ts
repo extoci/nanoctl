@@ -1,4 +1,8 @@
-import { encodeVideoControlMessage, type AccessUnit } from "@nanoctl/protocol";
+import {
+  encodeVideoControlMessage,
+  parseVideoControlMessage,
+  type AccessUnit,
+} from "@nanoctl/protocol";
 import { VideoStreamProcessor } from "./video";
 
 export type V4VideoReceiverOptions = {
@@ -24,8 +28,16 @@ function messageBytes(data: unknown): Uint8Array {
  * stream processor; lane transport reliability is deliberately not part of the reference
  * decision. Decode output is emitted only in a valid reference chain.
  */
+const REORDER_WAIT_MS = 100;
+const KEYFRAME_RETRY_MS = 250;
+
 export class V4VideoReceiver {
   private readonly processor = new VideoStreamProcessor();
+  private reorderTimer: ReturnType<typeof setTimeout> | undefined;
+  private keyframeTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
+  private watermark: number | undefined;
+  private buffered = 0;
   private readonly deltaHandler = (event: MessageEvent) => this.handle(event.data);
   private readonly referenceHandler = (event: MessageEvent) => this.handle(event.data);
 
@@ -38,14 +50,29 @@ export class V4VideoReceiver {
   }
 
   handle(data: unknown): void {
+    if (this.disposed) return;
     try {
-      const outcome = this.processor.pushEncodedChunk(messageBytes(data));
+      const bytes = messageBytes(data);
+      if (bytes[1] === 0x42) {
+        const message = parseVideoControlMessage(bytes);
+        if (message.kind === "sequenceWatermark") {
+          this.watermark = message.nextSequence;
+          this.updateReorderTimer();
+        }
+        return;
+      }
+      const outcome = this.processor.pushEncodedChunk(bytes);
+      this.buffered = outcome.buffered;
       if (outcome.received) this.options.onReceivedAccessUnit?.(outcome.received);
       for (const unit of outcome.emitted) {
+        if (unit.keyframe) this.stopKeyframeRetry();
         this.options.onAccessUnit(unit);
+        if (this.processor.waitingForReference) return;
       }
       if (outcome.requestKeyframe) {
         this.requestKeyframe();
+      } else {
+        this.updateReorderTimer();
       }
     } catch (error) {
       this.options.onError?.(error);
@@ -53,10 +80,46 @@ export class V4VideoReceiver {
   }
 
   requestKeyframe(): void {
-    this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
+    if (this.disposed) return;
+    this.processor.requireKeyframe();
+    this.buffered = 0;
+    this.stopReorderTimer();
+    if (this.keyframeTimer !== undefined) return;
+    this.keyframeTimer = setTimeout(() => {
+      this.keyframeTimer = undefined;
+      this.requestKeyframe();
+    }, KEYFRAME_RETRY_MS);
+    try {
+      this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
+    } catch (error) {
+      this.options.onError?.(error);
+    }
+  }
+
+  private updateReorderTimer(): void {
+    const watermarkGap =
+      this.watermark !== undefined && this.processor.isBehindWatermark(this.watermark);
+    if (this.buffered === 0 && !watermarkGap) {
+      this.stopReorderTimer();
+    } else {
+      this.reorderTimer ??= setTimeout(() => this.requestKeyframe(), REORDER_WAIT_MS);
+    }
+  }
+
+  private stopReorderTimer(): void {
+    clearTimeout(this.reorderTimer);
+    this.reorderTimer = undefined;
+  }
+
+  private stopKeyframeRetry(): void {
+    clearTimeout(this.keyframeTimer);
+    this.keyframeTimer = undefined;
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.stopReorderTimer();
+    this.stopKeyframeRetry();
     if (this.options.videoDelta.onmessage === this.deltaHandler) {
       this.options.videoDelta.onmessage = null;
     }

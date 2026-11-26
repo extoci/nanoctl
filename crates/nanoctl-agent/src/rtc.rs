@@ -920,11 +920,10 @@ impl HostPeer {
                     if is_reference {
                         let requests = v4_video_for_channel.clone();
                         channel.on_message(Box::new(move |message| {
-                            if nanoctl_core::video::VideoControlMessage::parse(
-                                message.data.as_ref(),
-                            )
-                            .is_ok()
-                            {
+                            if matches!(
+                                nanoctl_core::video::VideoControlMessage::parse(message.data.as_ref()),
+                                Ok(nanoctl_core::video::VideoControlMessage::KeyframeRequest)
+                            ) {
                                 requests.request_keyframe();
                             }
                             Box::pin(async {})

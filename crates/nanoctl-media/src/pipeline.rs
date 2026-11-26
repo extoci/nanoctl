@@ -374,6 +374,7 @@ async fn encode_loop_inner(
                         .max(report.buffered_bytes as u64);
                     if report.status == LaneWriteStatus::Written {
                         snapshot.bytes_written += payload_len;
+                        snapshot.next_video_sequence = Some(stream_sequence.wrapping_add(1));
                     } else {
                         snapshot.access_units_dropped_before_write += 1;
                     }

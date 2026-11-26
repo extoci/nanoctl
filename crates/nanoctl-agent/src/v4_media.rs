@@ -183,7 +183,26 @@ async fn run_pipeline(
         }
     };
     tracing::info!("v4 media pipeline started");
-    let _ = shutdown.changed().await;
+    let mut idle_tick = tokio::time::interval(Duration::from_millis(100));
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous_sequence = None;
+    let mut last_watermark = None;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = idle_tick.tick() => {
+                let next = pipeline.snapshot().next_video_sequence;
+                if let Some(sequence) = next
+                    && previous_sequence == next
+                    && last_watermark != next
+                    && send_watermark(&lanes, sequence).await
+                {
+                    last_watermark = next;
+                }
+                previous_sequence = next;
+            }
+        }
+    }
     let report = pipeline.stop().await;
     if let Err(error) = report.capture_result {
         tracing::warn!(%error, "v4 capture stopped with an error");
@@ -199,4 +218,22 @@ async fn run_pipeline(
         max_buffered = report.snapshot.max_buffered_bytes,
         "v4 media pipeline stopped"
     );
+}
+
+async fn send_watermark(lanes: &V4DataChannelVideo, next_sequence: u32) -> bool {
+    let channel = lanes.reference_channel.lock().unwrap().clone();
+    let Some(channel) = channel else { return false };
+    let message = Bytes::from(
+        nanoctl_core::video::VideoControlMessage::SequenceWatermark { next_sequence }.encode(),
+    );
+    matches!(
+        tokio::time::timeout(Duration::from_millis(75), async {
+            if channel.buffered_amount().await + message.len() > REFERENCE_LANE_CAPACITY {
+                return false;
+            }
+            channel.send(&message).await.is_ok()
+        })
+        .await,
+        Ok(true)
+    )
 }

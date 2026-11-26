@@ -29,8 +29,20 @@ export class VideoStreamProcessor {
   private readonly reassembler = new VideoReassembler();
   private readonly sequencer: FrameSequencer;
 
-  constructor(reorderCapacity = 2) {
+  constructor(reorderCapacity?: number) {
     this.sequencer = new FrameSequencer(reorderCapacity);
+  }
+
+  get waitingForReference(): boolean {
+    return this.sequencer.waitingForReference;
+  }
+
+  isBehindWatermark(next: number): boolean {
+    return this.sequencer.isBehindWatermark(next);
+  }
+
+  requireKeyframe(): void {
+    this.sequencer.requireKeyframe();
   }
 
   pushEncodedChunk(bytes: Uint8Array): VideoInputOutcome {

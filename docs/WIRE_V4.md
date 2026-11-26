@@ -152,3 +152,11 @@ transport or session layer owns any request timers and rate limits.
 
 Implementations must enforce these limits before allocation wherever possible and must cap total
 allocation even when lengths are internally consistent.
+
+### Idle video watermark
+
+The host sends `[0x04, 0x42, next_sequence: u32 little-endian]` on the reliable
+video reference channel when video stops advancing. It identifies the sequence
+after the last access unit accepted by the transport and does not consume a
+sequence number. A receiver gives late deltas the normal reorder grace period
+before requesting a keyframe if its expected sequence is behind the watermark.

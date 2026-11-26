@@ -524,16 +524,27 @@ export function parseVideoChunk(bytes: Uint8Array): VideoChunk {
   };
 }
 
-export type VideoControlMessage = { readonly kind: "keyframeRequest" };
+export type VideoControlMessage =
+  | { readonly kind: "keyframeRequest" }
+  | { readonly kind: "sequenceWatermark"; readonly nextSequence: number };
 
-export function encodeVideoControlMessage(_message: VideoControlMessage): Uint8Array {
-  return new Uint8Array([V4_WIRE_VERSION, 0x41]);
+export function encodeVideoControlMessage(message: VideoControlMessage): Uint8Array {
+  if (message.kind === "keyframeRequest") return new Uint8Array([V4_WIRE_VERSION, 0x41]);
+  if (!validUint(message.nextSequence, 32))
+    fail("invalidValue", "invalid video sequence watermark");
+  const out = new ByteWriter();
+  out.u8(V4_WIRE_VERSION);
+  out.u8(0x42);
+  out.u32(message.nextSequence);
+  return out.finish();
 }
 
 export function parseVideoControlMessage(bytes: Uint8Array): VideoControlMessage {
-  versioned(bytes, 0x41, 0x41);
-  if (bytes.length !== 2) fail("invalidLength", "invalid video control length");
-  return { kind: "keyframeRequest" };
+  const kind = versioned(bytes, 0x41, 0x42);
+  if (kind === 0x41 && bytes.length === 2) return { kind: "keyframeRequest" };
+  if (kind === 0x42 && bytes.length === 6)
+    return { kind: "sequenceWatermark", nextSequence: u32At(bytes, 2) };
+  fail("invalidLength", "invalid video control length");
 }
 
 export type ReassemblyOutcome = {
