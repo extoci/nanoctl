@@ -33,8 +33,10 @@ type ActiveSession = (watch::Sender<String>, tokio::task::JoinHandle<()>);
 
 async fn stop_session((stop, task): ActiveSession, reason: &'static str) {
     stop.send_replace(reason.into());
-    if let Err(error) = task.await {
-        tracing::warn!(%error, reason, "viewer session task failed");
+    match tokio::time::timeout(Duration::from_secs(5), task).await {
+        Ok(Err(error)) => tracing::warn!(%error, reason, "viewer session task failed"),
+        Err(_) => tracing::warn!(reason, "viewer session teardown timed out"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -416,7 +418,13 @@ async fn connect(
                 return;
             }
             if let Some(previous) = active.take() {
-                stop_session(previous, "replaced").await;
+                // Do not await the old session's teardown here: it can take
+                // seconds or hang on a dead transport, and this lock is held
+                // for the whole wait — so every reconnect wedged before the
+                // new session even existed (no hello, no ICE, exactly the
+                // field failure). The stop signal already started its exit;
+                // let it finish in the background.
+                tokio::spawn(stop_session(previous, "replaced"));
             }
             let (stop, receiver) = watch::channel(String::new());
             let session_state = state.clone();
