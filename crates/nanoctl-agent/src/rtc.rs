@@ -8,16 +8,16 @@ use anyhow::{Context, Result};
 #[cfg(any(feature = "media", test))]
 use bytes::Bytes;
 use interceptor::registry::Registry;
-#[cfg(any(feature = "media", test))]
+#[cfg(feature = "media")]
 use nanoctl_core::{VIDEO_DELTA_CHANNEL_LABEL, VIDEO_REFERENCE_CHANNEL_LABEL};
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
-#[cfg(any(feature = "media", test))]
+#[cfg(feature = "media")]
 use webrtc::data_channel::RTCDataChannel;
-#[cfg(any(feature = "media", test))]
+#[cfg(feature = "media")]
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -247,7 +247,7 @@ pub(crate) struct DataChannelVideo {
 /// Host-owned endpoints for the clean v4 video lanes. Channels are published only after
 /// WebRTC reports them open; before then the lane sink is deliberately full so encoded
 /// access units drop before their first byte instead of queueing startup latency.
-#[cfg(any(feature = "media", test))]
+#[cfg(feature = "media")]
 #[derive(Default)]
 pub(crate) struct V4DataChannelVideo {
     pub delta_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
@@ -256,7 +256,7 @@ pub(crate) struct V4DataChannelVideo {
     pub ready: tokio::sync::Notify,
 }
 
-#[cfg(any(feature = "media", test))]
+#[cfg(feature = "media")]
 impl V4DataChannelVideo {
     pub fn lanes_ready(&self) -> bool {
         self.delta_channel.lock().unwrap().is_some()
