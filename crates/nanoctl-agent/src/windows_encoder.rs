@@ -25,6 +25,18 @@ use windows::core::Interface;
 
 const MFT_STARTUP_BUDGET: Duration = Duration::from_secs(2);
 const MFT_FRAME_BUDGET: Duration = Duration::from_millis(500);
+const DEFAULT_H264_REF_FRAMES: u32 = 4;
+
+fn parse_h264_ref_frames(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(DEFAULT_H264_REF_FRAMES)
+}
+
+fn h264_ref_frames() -> u32 {
+    parse_h264_ref_frames(std::env::var("NANOCTL_MF_H264_REF_FRAMES").ok().as_deref())
+}
 
 struct MediaFoundationRuntime;
 
@@ -456,8 +468,19 @@ impl WindowsEncoder {
                     &CODECAPI_AVEncCommonQualityVsSpeed,
                     &ui4_variant(quality_speed),
                 );
-                if self.codec == VideoCodec::H264 && self.h264_high {
-                    let _ = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &low_latency);
+                if self.codec == VideoCodec::H264 {
+                    // Vendor low-latency H.264 MFTs can default to one reference
+                    // (NVIDIA exposes 1 of a 0..16 range). Multiple past references
+                    // add no frame-reordering latency with B-frames disabled, but let
+                    // scrolling desktops and repeated game/UI motion predict from older
+                    // matching frames. Static codec property: must be set before streaming.
+                    let _ = codec.SetValue(
+                        &CODECAPI_AVEncVideoMaxNumRefFrame,
+                        &ui4_variant(h264_ref_frames()),
+                    );
+                    if self.h264_high {
+                        let _ = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &low_latency);
+                    }
                 }
             }
         }
@@ -796,12 +819,22 @@ fn validate_annex_b(bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_annex_b;
+    use super::{DEFAULT_H264_REF_FRAMES, parse_h264_ref_frames, validate_annex_b};
 
     #[test]
     fn validates_only_annex_b_access_units() {
         assert!(validate_annex_b(&[0, 0, 0, 1, 0x67]).is_ok());
         assert!(validate_annex_b(&[0, 0, 1, 0x65]).is_ok());
         assert!(validate_annex_b(&[0, 0, 0, 2, 0x65]).is_err());
+    }
+
+    #[test]
+    fn parses_bounded_h264_reference_override() {
+        assert_eq!(parse_h264_ref_frames(None), DEFAULT_H264_REF_FRAMES);
+        assert_eq!(parse_h264_ref_frames(Some("1")), 1);
+        assert_eq!(parse_h264_ref_frames(Some("16")), 16);
+        assert_eq!(parse_h264_ref_frames(Some("0")), DEFAULT_H264_REF_FRAMES);
+        assert_eq!(parse_h264_ref_frames(Some("17")), DEFAULT_H264_REF_FRAMES);
+        assert_eq!(parse_h264_ref_frames(Some("bad")), DEFAULT_H264_REF_FRAMES);
     }
 }
