@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import {
   CONTROL_CHANNEL_LABEL,
+  MAX_ACCESS_UNIT_BYTES,
+  MAX_VIDEO_CHUNK_BYTES,
+  MAX_VIDEO_PARTS,
   MOTION_CHANNEL_LABEL,
   ReferenceTracker,
   VIDEO_DELTA_CHANNEL_LABEL,
@@ -171,13 +174,16 @@ function chunk(
 }
 
 describe("v4 video reassembly and reference validation", () => {
-  test("reassembles out-of-order parts and drops replaced incomplete units", () => {
+  test("reassembles out-of-order parts across sequences", () => {
     const reassembler = new VideoReassembler();
     expect(reassembler.push(chunk(7, 1, 2, true, [2])).complete).toBeUndefined();
     const replaced = reassembler.push(chunk(8, 0, 1, false, [3]));
-    expect(replaced.droppedIncompleteSequence).toBe(7);
+    expect(replaced.droppedIncompleteSequence).toBeUndefined();
     expect(replaced.complete?.streamSequence).toBe(8);
     expect(Array.from(replaced.complete?.payload ?? [])).toEqual([3]);
+
+    const kept = reassembler.push(chunk(7, 0, 2, true, [1]));
+    expect(Array.from(kept.complete?.payload ?? [])).toEqual([1, 2]);
 
     const first = reassembler.push(chunk(9, 1, 2, true, [2]));
     expect(first.complete).toBeUndefined();
@@ -195,4 +201,26 @@ describe("v4 video reassembly and reference validation", () => {
     expect(tracker.inspect(13, false)).toBe("requestKeyframe");
     expect(tracker.inspect(12, false)).toBe("dropAwaitingKeyframe");
   });
+});
+
+test("interleaved fragments share one reassembly byte budget", () => {
+  const reassembler = new VideoReassembler();
+  const fullChunk = new Uint8Array(MAX_VIDEO_CHUNK_BYTES);
+  const count = Math.floor(MAX_ACCESS_UNIT_BYTES / fullChunk.length);
+  const fragment = (sequence: number, part: number): VideoChunk => ({
+    streamSequence: sequence,
+    part,
+    parts: MAX_VIDEO_PARTS,
+    keyframe: false,
+    codec: "h264",
+    captureTimeUs: sequence,
+    payload: fullChunk,
+  });
+  for (let index = 0; index < count; index += 1) {
+    const outcome = reassembler.push(fragment(index % 2, Math.floor(index / 2)));
+    expect(outcome.complete).toBeUndefined();
+  }
+  expect(() => reassembler.push(fragment(count % 2, Math.floor(count / 2)))).toThrowError(
+    expect.objectContaining({ code: "invalidValue" }),
+  );
 });
