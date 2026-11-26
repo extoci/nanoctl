@@ -78,7 +78,7 @@ const encode = (directory: string, image: string, tier: Tier): Packets => {
       tier.profile,
       "-x264-params",
       `keyint=2147483647:scenecut=0:me=${tier.me}:subme=${tier.subme}:` +
-        `threads=${tier.threads}:sliced-threads=1:ref=${tier.refs}`,
+        `threads=${tier.threads}:sliced-threads=1:ref=${tier.refs}:trellis=0`,
       "-f",
       "h264",
       "-y",
