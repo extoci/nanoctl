@@ -167,6 +167,7 @@ jobs:
           workspaces: |
             crates/nanoctl-agent
             crates/nanoctl-core
+            crates/nanoctl-media
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: runner.os == 'Windows'
@@ -192,6 +193,7 @@ jobs:
         run: |
           cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
           cargo fmt --manifest-path crates/nanoctl-core/Cargo.toml -- --check
+          cargo fmt --manifest-path crates/nanoctl-media/Cargo.toml -- --check
           for script in install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh; do sh -n "$script"; done
           shellcheck install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh
       - name: Validate PowerShell package scripts
@@ -217,6 +219,10 @@ jobs:
         run: cargo clippy --all-targets --manifest-path crates/nanoctl-core/Cargo.toml -- -D warnings
       - name: Test (core)
         run: cargo test --manifest-path crates/nanoctl-core/Cargo.toml
+      - name: Clippy (media pipeline)
+        run: cargo clippy --all-targets --manifest-path crates/nanoctl-media/Cargo.toml -- -D warnings
+      - name: Test (media pipeline)
+        run: cargo test --manifest-path crates/nanoctl-media/Cargo.toml
       - name: Clippy (rtc)
         run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - name: Clippy (media)

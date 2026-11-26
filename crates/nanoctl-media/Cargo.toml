@@ -1,0 +1,14 @@
+[package]
+name = "nanoctl-media"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Clean-slate nanoctl bounded capture-encode-send media pipeline"
+
+[dependencies]
+async-trait = "0.1"
+nanoctl-core = { path = "../nanoctl-core" }
+tokio = { version = "1.49", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
