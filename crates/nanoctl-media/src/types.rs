@@ -76,6 +76,7 @@ pub enum PixelFormat {
     Nv12,
     I420,
     Rgba32,
+    Bgra32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
