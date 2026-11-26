@@ -117,6 +117,8 @@ final class Session {
     private(set) var audioOutputs: [AudioOutput] = []
     private(set) var selectedAudioOutput: String?
     private(set) var statsLine = ""
+    private var lastLoggedGaps = -1
+    private var lastLoggedKf = -1
     let pixelMailbox = PixelMailbox()
 
     var codecPreference: CodecPreference = {
@@ -189,7 +191,11 @@ final class Session {
         audioOutputs = []
         onChange?()
         timeout = Task { [weak self, weak current] in
-            try? await Task.sleep(for: .seconds(15))
+            // Six seconds, not fifteen: connectivity checks either complete in
+            // the first few seconds or the attempt is wedged, and the retry
+            // almost always connects at once — failing fast turns a stalled
+            // attempt into a quick recovery instead of a long black screen.
+            try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled, let self, let current, self.connection === current else { return }
             self.fail("The host did not establish a connection.", current)
         }
@@ -791,9 +797,17 @@ final class Session {
             onChange?()
             return
         }
-        let (_, transit, frames) = receiver.takeLinkStats()
-        statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount)"
+        let (loss, transit, frames) = receiver.takeLinkStats()
+        statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount) · loss \(String(format: "%.1f", loss * 100))%"
         onChange?()
+        // Loss/gap visibility is what distinguishes a congested or relayed
+        // transport from decoder trouble in the field; log it once a second
+        // only when there is something to say.
+        if loss > 0.01 || receiver.stats.gaps != lastLoggedGaps || receiver.stats.kfRequests != lastLoggedKf {
+            lastLoggedGaps = receiver.stats.gaps
+            lastLoggedKf = receiver.stats.kfRequests
+            sessionLog.info("dc link: loss \(String(format: "%.1f", loss * 100))% gaps \(receiver.stats.gaps) kf \(receiver.stats.kfRequests) fed \(receiver.stats.fed) decoded \(receiver.decodedCount) transit \(String(format: "%.0f", transit))ms")
+        }
 
         // Fallback: if the decoder faulted and never produced a frame after
         // plenty of traffic, restore RTP so the user still gets video.
