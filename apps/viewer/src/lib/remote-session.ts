@@ -176,10 +176,14 @@ export class RemoteSessionController {
   private clipboard: ClipboardSync | null = null;
   private gamepadFrame: number | null = null;
   private gamepadStatus: GamepadStatus = "waiting";
-  private readonly gamepad = new GamepadForwarder((message) =>
-    message.type === "gamepad" || message.type === "gamepad-sparse"
-      ? this.sendControl(message)
-      : this.sendGamepadHeartbeat(),
+  private lastInputLivenessAt = -Infinity;
+  private readonly gamepad = new GamepadForwarder(
+    (message) =>
+      message.type === "gamepad" || message.type === "gamepad-sparse"
+        ? this.sendControl(message)
+        : this.sendGamepadHeartbeat(),
+    undefined,
+    () => this.lastInputLivenessAt,
   );
   private keyQueue: Promise<void> = Promise.resolve();
   private lastKeyRepeatAt = 0;
@@ -572,6 +576,7 @@ export class RemoteSessionController {
     try {
       if (binary) channel.send(binary);
       else channel.send(serialized!);
+      this.lastInputLivenessAt = performance.now();
       return true;
     } catch {
       if (!isMotion) {

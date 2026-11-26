@@ -622,6 +622,13 @@ impl InputController {
             }
             (_, InputLane::Reliable) => {}
         }
+        if !self.gamepads_revoked {
+            // Any well-formed viewer input packet proves the reverse path is
+            // alive exactly like a gamepad heartbeat. Sharing that liveness
+            // lets clients skip redundant heartbeat datagrams while keys,
+            // text, pointer buttons, or control traffic are already flowing.
+            self.gamepads.heartbeat();
+        }
         if !matches!(
             &message,
             ControlMessage::Ping

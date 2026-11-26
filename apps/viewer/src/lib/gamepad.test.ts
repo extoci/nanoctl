@@ -125,3 +125,23 @@ test("repeats a change for 30ms, then heartbeats an unchanged pad about every 25
   for (; now <= 800; now += 20) gamepad.sample([pressed], now);
   expect(sentAt.slice(3)).toEqual([420, 440, 700]);
 });
+
+test("other input liveness suppresses redundant idle heartbeats", () => {
+  const types: string[] = [];
+  let inputLivenessAt = 0;
+  const gamepad = new GamepadForwarder(
+    (message) => Boolean(types.push(message.type)),
+    undefined,
+    () => inputLivenessAt,
+  );
+  const controller = pad(0);
+  gamepad.sample([controller], 0);
+  for (let now = 20; now <= 500; now += 20) {
+    inputLivenessAt = now;
+    gamepad.sample([controller], now);
+  }
+  expect(types).toEqual(["gamepad", "gamepad-sparse"]);
+  inputLivenessAt = -Infinity;
+  gamepad.sample([controller], 520);
+  expect(types).toEqual(["gamepad", "gamepad-sparse", "gamepad-heartbeat"]);
+});

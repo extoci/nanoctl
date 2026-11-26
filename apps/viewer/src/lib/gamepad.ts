@@ -176,6 +176,8 @@ export class GamepadForwarder {
       keepaliveMs: KEEPALIVE_MS,
       heartbeat: true,
     },
+    /** Latest viewer-to-host input packet time; any input proves the same liveness as a heartbeat. */
+    private readonly inputLivenessAt?: () => number,
   ) {}
 
   sample(pads: ArrayLike<InputPad | null>, now: number): GamepadStatus {
@@ -301,6 +303,8 @@ export class GamepadForwarder {
         now - this.changedAt >= this.timing.repeatMs &&
         now - this.fullAt < (this.timing.fullRefreshMs ?? FULL_REFRESH_MS)
       ) {
+        const inputLivenessAt = this.inputLivenessAt?.() ?? -Infinity;
+        if (now - inputLivenessAt < this.timing.keepaliveMs) return;
         if (this.send({ type: "gamepad-heartbeat" })) this.sentAt = now;
         return;
       }
