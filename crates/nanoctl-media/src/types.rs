@@ -122,6 +122,9 @@ pub struct EncodeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedBitstream {
     pub keyframe: bool,
+    /// Empty means the encoder deliberately skipped this frame for rate control. Such a frame
+    /// is not an access unit; the pipeline counts it as a visible drop and forces the next
+    /// emitted frame to be a keyframe so the reference chain remains explicit.
     pub payload: Vec<u8>,
 }
 
@@ -164,6 +167,7 @@ pub struct MediaPipelineSnapshot {
     pub lane_writes: u64,
     pub lane_write_errors: u64,
     pub access_units_dropped_before_write: u64,
+    pub encoder_skips: u64,
     pub bytes_written: u64,
     pub max_buffered_bytes: u64,
     pub total_encode_micros: u64,

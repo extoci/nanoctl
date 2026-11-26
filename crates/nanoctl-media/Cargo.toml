@@ -12,9 +12,11 @@ capture = ["dep:xcap"]
 [dependencies]
 async-trait = "0.1"
 nanoctl-core = { path = "../nanoctl-core" }
-tokio = { version = "1.49", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 yuv = "0.8.21"
+openh264 = "0.9.7"
+openh264-sys2 = "0.9.7"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
