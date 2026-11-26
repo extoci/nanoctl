@@ -199,24 +199,31 @@ final class Session {
             guard !Task.isCancelled, let self, let current, self.connection === current else { return }
             self.fail("The host did not establish a connection.", current)
         }
-        task = Task { [weak self] in
+        // Signaling runs detached from the main actor: reconnects previously
+        // inherited main-actor isolation, so while the UI thread was still
+        // busy tearing the old session down the new connection could not even
+        // start — codec switches visibly stalled for about a second before
+        // the first byte moved, on loopback and on real networks alike.
+        let network = self.network
+        task = Task.detached { [weak self] in
             guard let self else { return }
             do {
+                let infoStart = Date()
                 let (data, response) = try await network.data(from: endpoint.base.appending(path: "v1/info"))
+                sessionLog.info("v1/info fetched in \(Int(Date().timeIntervalSince(infoStart) * 1000))ms")
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                     throw ViewerError("Host authorization or discovery failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)).")
                 }
                 try Self.checkHost(JSONDecoder().decode(HostInfo.self, from: data))
-                try requireCurrent(current)
                 socket.resume()
                 while !Task.isCancelled {
                     let message = try await socket.receive()
-                    try requireCurrent(current)
                     guard case .string(let json) = message else { throw ViewerError("Expected JSON from host.") }
-                    try await receive(JSONDecoder().decode(ServerMessage.self, from: Data(json.utf8)), current)
+                    let decoded = try JSONDecoder().decode(ServerMessage.self, from: Data(json.utf8))
+                    try await self.receive(decoded, current)
                 }
             } catch {
-                if connection === current { fail(error.localizedDescription, current) }
+                await self.failIfCurrent(error.localizedDescription, current)
             }
         }
     }
@@ -238,6 +245,10 @@ final class Session {
 
     /// Connection dropped or failed; schedules a retry while the user still
     /// wants the session.
+    private func failIfCurrent(_ reason: String, _ current: Connection) {
+        if connection === current { fail(reason, current) }
+    }
+
     private func fail(_ reason: String, _ current: Connection) {
         guard connection === current else { return }
         sessionLog.error("connection failed: \(reason)")
@@ -268,7 +279,20 @@ final class Session {
         old?.statePoll?.cancel()
         old?.iceWatchdog?.cancel()
         old?.socket.cancel(with: .normalClosure, reason: nil)
-        old?.peer?.close()
+        // libwebrtc runs every peer connection of the factory on one shared
+        // signaling thread, and close() occupies that thread for about a
+        // second while the SCTP association shuts down — long enough to stall
+        // the replacement session's offer/answer negotiation behind it, which
+        // is why codec switches and reconnects idled for a second before the
+        // first candidate appeared. Data channels do not use the signaling
+        // thread once established, so deferring the close past the
+        // negotiation window hides it entirely.
+        if let peer = old?.peer {
+            Task.detached {
+                try? await Task.sleep(for: .seconds(3))
+                peer.close()
+            }
+        }
         track = nil
         audioTrack = nil
         statsLine = ""
@@ -441,13 +465,14 @@ final class Session {
         if connection !== current || Task.isCancelled { throw CancellationError() }
     }
 
-    private static func checkHost(_ host: HostInfo) throws {
+    private nonisolated static func checkHost(_ host: HostInfo) throws {
         guard host.capabilities.protocolVersion == SignalEnvelope.wireVersion else {
             throw ViewerError("This viewer requires agent protocol 2.")
         }
     }
 
     private func receive(_ message: ServerMessage, _ current: Connection) async throws {
+        try requireCurrent(current)
         switch message.type {
         case "hello":
             guard current.id == nil, let id = message.sessionId, !id.isEmpty, let host = message.host else {
