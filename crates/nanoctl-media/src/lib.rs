@@ -7,6 +7,7 @@ mod latest;
 mod nv12;
 mod openh264_encoder;
 mod pipeline;
+mod scaling;
 mod types;
 #[cfg(target_os = "windows")]
 mod windows_mft;

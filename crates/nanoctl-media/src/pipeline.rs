@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Instant as TokioInstant};
 
 use crate::latest::{LatestSlot, PutOutcome};
+use crate::scaling::FrameScaler;
 use crate::types::{
     EncodeRequest, EncodedAccessUnit, LaneWriteStatus, LaneWriter, MediaError, MediaPipelineConfig,
     MediaPipelineSnapshot, RawFrame, VideoEncoder, VideoSource,
@@ -271,6 +272,7 @@ async fn encode_loop_inner(
 ) -> Result<(), MediaError> {
     let mut stream_sequence = 0_u32;
     let mut force_next_keyframe = true;
+    let mut scaler = FrameScaler::default();
 
     while let Some(frame) = frame_slot.recv().await {
         if *shutdown.borrow() {
@@ -288,6 +290,16 @@ async fn encode_loop_inner(
         let force_keyframe = force_next_keyframe || keyframe_was_requested;
         force_next_keyframe = false;
         stream_sequence = stream_sequence.wrapping_add(1);
+        let capture_time_us = frame.capture_time_us;
+        let capture_sequence = frame.capture_sequence;
+        let encode_started = Instant::now();
+        let frame = match scaler.scale(frame, config.width, config.height) {
+            Ok(frame) => frame,
+            Err(error) => {
+                record_metrics(metrics, |snapshot| snapshot.encode_errors += 1);
+                return Err(error);
+            }
+        };
         let request = EncodeRequest {
             stream_sequence,
             force_keyframe,
@@ -295,10 +307,6 @@ async fn encode_loop_inner(
             codec: config.codec,
             frame,
         };
-
-        let capture_time_us = request.frame.capture_time_us;
-        let capture_sequence = request.frame.capture_sequence;
-        let encode_started = Instant::now();
         let encoded = tokio::select! {
             biased;
             _ = wait_for_shutdown(shutdown) => return Ok(()),
@@ -423,6 +431,24 @@ mod tests {
         }
     }
 
+    struct DimensionEncoder {
+        dimensions: Arc<Mutex<Vec<(u32, u32)>>>,
+    }
+
+    #[async_trait]
+    impl VideoEncoder for DimensionEncoder {
+        async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError> {
+            self.dimensions
+                .lock()
+                .expect("dimensions poisoned")
+                .push((request.frame.width, request.frame.height));
+            Ok(EncodedBitstream {
+                keyframe: request.force_keyframe,
+                payload: vec![0x65],
+            })
+        }
+    }
+
     struct CollectLane {
         units: Arc<Mutex<Vec<EncodedAccessUnit>>>,
         notify: Arc<Notify>,
@@ -498,6 +524,44 @@ mod tests {
         })
         .await
         .expect("timed out waiting for access unit");
+    }
+
+    #[tokio::test]
+    async fn pipeline_scales_capture_to_configured_resolution_bounds() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let dimensions = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(DimensionEncoder {
+                dimensions: Arc::clone(&dimensions),
+            }),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx
+            .send(RawFrame::new(
+                111,
+                128,
+                128,
+                PixelFormat::Bgra32,
+                vec![255; 128 * 128 * 4],
+            ))
+            .await
+            .unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        assert_eq!(
+            *dimensions.lock().expect("dimensions poisoned"),
+            vec![(64, 64)]
+        );
+
+        let report = pipeline.stop().await;
+        assert!(report.capture_result.is_ok());
+        assert!(report.encode_result.is_ok());
     }
 
     #[tokio::test]
