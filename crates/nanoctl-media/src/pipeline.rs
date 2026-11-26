@@ -271,11 +271,13 @@ async fn encode_loop_inner(
             frame,
         };
 
+        let capture_time_us = request.frame.capture_time_us;
+        let capture_sequence = request.frame.capture_sequence;
         let encode_started = Instant::now();
         let encoded = tokio::select! {
             biased;
             _ = wait_for_shutdown(shutdown) => return Ok(()),
-            result = encoder.encode(&request) => result,
+            result = encoder.encode(request) => result,
         };
         let encode_micros = encode_started.elapsed().as_micros() as u64;
         let encoded = match encoded {
@@ -304,8 +306,8 @@ async fn encode_loop_inner(
             stream_sequence,
             keyframe: encoded.keyframe,
             codec: config.codec,
-            capture_time_us: request.frame.capture_time_us,
-            capture_sequence: request.frame.capture_sequence,
+            capture_time_us,
+            capture_sequence,
             payload: encoded.payload,
         };
         let payload_len = access_unit.payload.len() as u64;
@@ -380,10 +382,7 @@ mod tests {
 
     #[async_trait]
     impl VideoEncoder for TestEncoder {
-        async fn encode(
-            &mut self,
-            request: &EncodeRequest,
-        ) -> Result<EncodedBitstream, MediaError> {
+        async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError> {
             Ok(EncodedBitstream {
                 keyframe: request.force_keyframe,
                 payload: vec![if request.force_keyframe { 0x65 } else { 0x41 }],
@@ -555,7 +554,7 @@ mod tests {
     impl VideoEncoder for NonKeyframeEncoder {
         async fn encode(
             &mut self,
-            _request: &EncodeRequest,
+            _request: EncodeRequest,
         ) -> Result<EncodedBitstream, MediaError> {
             self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(EncodedBitstream {

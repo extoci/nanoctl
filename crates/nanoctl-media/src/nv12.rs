@@ -17,11 +17,22 @@ fn checked_dimensions(width: u32, height: u32) -> Result<usize, MediaError> {
 ///
 /// The output buffer is resized exactly; every byte is rewritten before success is returned.
 pub fn frame_to_nv12(frame: &RawFrame, output: &mut Vec<u8>) -> Result<(), MediaError> {
+    let pixels = checked_dimensions(frame.width, frame.height)?;
+    output.resize(pixels + pixels / 2, 0);
+    frame_to_nv12_slice(frame, output)
+}
+
+/// Converts or copies a raw frame into an exactly sized caller-provided NV12 buffer.
+pub fn frame_to_nv12_slice(frame: &RawFrame, output: &mut [u8]) -> Result<(), MediaError> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     let pixels = checked_dimensions(frame.width, frame.height)?;
     let nv12_len = pixels + pixels / 2;
-    output.resize(nv12_len, 0);
+    if output.len() != nv12_len {
+        return Err(MediaError::Encode(
+            "NV12 output length does not match its dimensions".to_string(),
+        ));
+    }
 
     match frame.format {
         PixelFormat::Nv12 => {
@@ -136,16 +147,26 @@ mod tests {
 
     #[test]
     fn bgra_swizzles_channels() {
+        // Red in BGRA byte order. Black/white cannot catch channel-order regressions.
         let bgra = [
-            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+        ];
+        let rgba = [
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
         ];
         let mut output = Vec::new();
+        let mut expected = Vec::new();
         frame_to_nv12(
             &frame(PixelFormat::Bgra32, 2, 2, bgra.to_vec()),
             &mut output,
         )
         .unwrap();
-        assert_eq!(output, [16, 235, 16, 235, 128, 128]);
+        frame_to_nv12(
+            &frame(PixelFormat::Rgba32, 2, 2, rgba.to_vec()),
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(output, expected);
     }
 
     #[test]

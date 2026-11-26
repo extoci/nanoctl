@@ -3,18 +3,22 @@ mod latest;
 mod nv12;
 mod pipeline;
 mod types;
+#[cfg(target_os = "windows")]
+mod windows_mft;
 #[cfg(feature = "capture")]
 mod xcap_capture;
 
 pub use chunking::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
 pub use latest::{LatestSlot, PutOutcome};
-pub use nv12::frame_to_nv12;
+pub use nv12::{frame_to_nv12, frame_to_nv12_slice};
 pub use pipeline::{MediaPipeline, MediaPipelineReport};
 pub use types::{
     EncodeRequest, EncodedAccessUnit, EncodedBitstream, LaneWriteReport, LaneWriteStatus,
     LaneWriter, MediaError, MediaPipelineConfig, MediaPipelineSnapshot, PixelFormat, RawFrame,
     VideoEncoder, VideoSource,
 };
+#[cfg(target_os = "windows")]
+pub use windows_mft::WindowsEncoder;
 #[cfg(feature = "capture")]
 pub use xcap_capture::XcapCaptureSource;
 
