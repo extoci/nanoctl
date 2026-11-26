@@ -1190,13 +1190,64 @@ describe("webcodecs video gating and teardown", () => {
       channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
     receive(0, true);
     channel.sent = [];
-    receive(2);
-    receive(3);
-    receive(4);
-    receive(5);
+    for (let seq = 2; seq <= 17; seq += 1) receive(seq);
     expect(channel.sent).not.toContain("KF");
-    receive(6);
+    receive(18);
     expect(channel.sent).toContain("KF");
+  });
+
+  test("data-channel reassembly tolerates fragmented frames interleaved with newer sequences", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean, part = 0, parts = 1) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const fragmented = parts > 1;
+      const bytes = new Uint8Array((fragmented ? 9 : 5) + au.length);
+      bytes[0] = seq;
+      bytes[4] = (key ? 1 : 0) | (fragmented ? 2 : 0);
+      let offset = 5;
+      if (fragmented) {
+        bytes[5] = part;
+        bytes[7] = parts;
+        offset = 9;
+      }
+      bytes.set(au, offset);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false, part = 0, parts = 1) =>
+      channel.onmessage?.({ data: message(seq, key, part, parts) } as MessageEvent);
+    receive(0, true);
+    channel.sent = [];
+    receive(1, false, 0, 2);
+    for (let seq = 2; seq <= 17; seq += 1) receive(seq);
+    expect(channel.sent).not.toContain("KF");
+    receive(1, false, 1, 2);
+    expect(channel.sent).not.toContain("KF");
   });
 
   test("idle heartbeat sequence watermarks expose a lost final delta", () => {
@@ -1250,7 +1301,7 @@ describe("webcodecs video gating and teardown", () => {
     expect(channel.sent).toContain("KF");
   });
 
-  test("incomplete access-unit loss requests keyframe recovery immediately", () => {
+  test("incomplete access-unit loss requests keyframe recovery after the reorder window", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
       decodeQueueSize = 0;
@@ -1298,9 +1349,52 @@ describe("webcodecs video gating and teardown", () => {
     receive(0, true);
     channel.sent = [];
     receive(1, false, 0, 2);
+    for (let seq = 2; seq <= 17; seq += 1) receive(seq);
     expect(channel.sent).not.toContain("KF");
-    receive(2);
+    receive(18);
     expect(channel.sent).toContain("KF");
+  });
+
+  test("waiting for a keyframe retries the recovery request", () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    (window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf = true;
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    expect(channel.sent).not.toContain("KF");
+    for (const callback of intervals) callback();
+    expect(channel.sent).toContain("KF");
+    channel.sent = [];
+    handle.drop();
+    for (const callback of intervals) callback();
+    expect(channel.sent).not.toContain("KF");
   });
 
   test("webcodecs teardown does not clear an unowned video srcObject", async () => {
