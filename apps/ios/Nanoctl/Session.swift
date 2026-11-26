@@ -266,6 +266,7 @@ final class Session {
         statsTask?.cancel()
         statsTask = nil
         old?.statePoll?.cancel()
+        old?.iceWatchdog?.cancel()
         old?.socket.cancel(with: .normalClosure, reason: nil)
         old?.peer?.close()
         track = nil
@@ -557,8 +558,26 @@ final class Session {
                 break
             }
         }
-        delegate.onIceState = { state in
+        delegate.onIceState = { [weak self, weak current] state in
+            guard let self, let current, self.connection === current else { return }
             sessionLog.info("ice connection state: \(iceStateName(state))")
+            if state == .checking, current.iceWatchdog == nil {
+                // The establish timeout starts at TCP connect, but signaling
+                // alone can eat most of it over tailscale. ICE gets its own
+                // budget measured from when checks actually start: healthy
+                // attempts connect in milliseconds, so five seconds of
+                // checking means this attempt is wedged.
+                current.iceWatchdog = Task { [weak self, weak current] in
+                    try? await Task.sleep(for: .seconds(5))
+                    guard !Task.isCancelled, let self, let current, self.connection === current else { return }
+                    sessionLog.error("ice stuck in checking; abandoning attempt")
+                    self.fail("The host did not establish a connection.", current)
+                }
+            }
+            if state == .connected || state == .completed {
+                current.iceWatchdog?.cancel()
+                self.timeout?.cancel()
+            }
         }
         delegate.onControl = { [weak self, weak current] in
             guard let self, let current, self.connection === current else { return }
@@ -913,6 +932,7 @@ private final class Connection {
     var injectHevcAttempted = false
     var sentDisplayQualityCap = false
     var statePoll: Task<Void, Never>?
+    var iceWatchdog: Task<Void, Never>?
 
     init(socket: URLSessionWebSocketTask) { self.socket = socket }
 }
@@ -931,11 +951,24 @@ private final class PeerEvents: NSObject, RTCPeerConnectionDelegate, RTCDataChan
     func peerConnection(_ peer: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
         let payload = SignalPayload(type: "ice-candidate", candidate: candidate.sdp,
                                     sdpMid: candidate.sdpMid, sdpMLineIndex: candidate.sdpMLineIndex)
+        // Candidate-type visibility is what separates "no usable pair ever
+        // existed" from "pairs exist but checks die" in field logs. Redact
+        // the address; the type and protocol are the diagnostic content.
+        let sdp = candidate.sdp
+        let kind = sdp.components(separatedBy: "typ ").last?.components(separatedBy: " ").first ?? "?"
+        let transport = sdp.contains(" udp ") ? "udp" : sdp.contains(" tcp ") ? "tcp" : "?"
+        // A `.local` address means the candidate is mDNS-concealed: a host
+        // that cannot resolve mDNS (or form peer-reflexive pairs) can never
+        // complete checks against it, which is precisely the failure shape
+        // seen against the Windows agent.
+        let concealment = sdp.contains(".local") ? "mdns" : "ip"
+        sessionLog.info("ice candidate: \(kind)/\(transport)/\(concealment)")
         DispatchQueue.main.async { [weak self] in self?.onCandidate?(payload) }
     }
 
     func peerConnection(_ peer: RTCPeerConnection, didChange state: RTCIceGatheringState) {
         if state == .complete {
+            sessionLog.info("ice gathering complete")
             DispatchQueue.main.async { [weak self] in self?.onCandidate?(SignalPayload(type: "ice-complete")) }
         }
     }
