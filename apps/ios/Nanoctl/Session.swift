@@ -259,6 +259,7 @@ final class Session {
         timeout = nil
         statsTask?.cancel()
         statsTask = nil
+        old?.statePoll?.cancel()
         old?.socket.cancel(with: .normalClosure, reason: nil)
         old?.peer?.close()
         track = nil
@@ -639,6 +640,34 @@ final class Session {
         }
         control.delegate = delegate
 
+        // libwebrtc does not reliably deliver state callbacks on every
+        // network path: over some transports the SCTP channels are provably
+        // open (host traffic answers on them) while the delegate never fires
+        // and ICE sits in "checking" until the connect timeout kills a
+        // working session. Poll the actual channel state and activate on
+        // evidence rather than event delivery. The activation paths are
+        // idempotent, so overlapping delegate delivery is harmless.
+        current.statePoll = Task { [weak self, weak current] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled, let self, let current, self.connection === current else { return }
+                if current.video?.readyState == .open || current.control?.readyState == .open {
+                    // Any open channel proves DTLS/SCTP is alive regardless of
+                    // what the ICE state machine reports.
+                    self.timeout?.cancel()
+                    self.reconnectAttempts = 0
+                }
+                if current.control?.readyState == .open {
+                    self.onControlOpen(current)
+                }
+                self.activateDataChannelVideo(current)
+                if current.video?.readyState == .open && current.videoIdr?.readyState == .open,
+                   current.control?.readyState == .open {
+                    return
+                }
+            }
+        }
+
         current.injectHevcAttempted = injectHevc
         let offer = try await peer.offer(for: constraints)
         try requireCurrent(current)
@@ -869,6 +898,7 @@ private final class Connection {
     var sequence = 0
     var injectHevcAttempted = false
     var sentDisplayQualityCap = false
+    var statePoll: Task<Void, Never>?
 
     init(socket: URLSessionWebSocketTask) { self.socket = socket }
 }
