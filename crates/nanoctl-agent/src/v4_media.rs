@@ -4,8 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use nanoctl_media::{
-    ChunkingLaneWriter, MediaPipeline, MediaPipelineConfig, OpenH264Encoder, VideoChunkSink,
-    VideoLane,
+    ChunkingLaneWriter, EncoderSelection, MediaPipeline, MediaPipelineConfig, PlatformEncoder,
+    VideoChunkSink, VideoLane,
 };
 use webrtc::data_channel::RTCDataChannel;
 
@@ -81,10 +81,15 @@ impl V4MediaRuntime {
             target_bitrate: config.quality.max_bitrate_kbps.saturating_mul(1000),
             codec: nanoctl_core::video::VideoCodec::H264,
         };
+        let encoder_selection = match config.quality.encoder {
+            crate::config::EncoderPreference::Auto => EncoderSelection::Auto,
+            crate::config::EncoderPreference::Hardware => EncoderSelection::Hardware,
+            crate::config::EncoderPreference::Software => EncoderSelection::Software,
+        };
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_pipeline(lanes, pipeline_config, shutdown_rx).await;
+            run_pipeline(lanes, pipeline_config, encoder_selection, shutdown_rx).await;
             drop(task_shutdown);
         });
         Self { shutdown, task }
@@ -101,6 +106,7 @@ impl V4MediaRuntime {
 async fn run_pipeline(
     lanes: Arc<V4DataChannelVideo>,
     config: MediaPipelineConfig,
+    encoder_selection: EncoderSelection,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     while !lanes.lanes_ready() {
@@ -147,7 +153,12 @@ async fn run_pipeline(
             }
         };
 
-    let encoder = match OpenH264Encoder::new(config.target_bitrate, config.frame_rate) {
+    let encoder = match PlatformEncoder::new(
+        encoder_selection,
+        config.target_bitrate,
+        config.frame_rate,
+        config.codec,
+    ) {
         Ok(encoder) => encoder,
         Err(error) => {
             tracing::warn!(%error, "v4 encoder failed to start");

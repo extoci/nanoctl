@@ -2811,6 +2811,7 @@ dependencies = [
  "openh264-sys2",
  "rayon",
  "tokio",
+ "tracing",
  "windows 0.62.2",
  "xcap",
  "yuv",

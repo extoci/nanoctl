@@ -7,6 +7,7 @@ mod latest;
 mod nv12;
 mod openh264_encoder;
 mod pipeline;
+mod platform_encoder;
 mod scaling;
 mod types;
 #[cfg(target_os = "windows")]
@@ -22,6 +23,7 @@ pub use latest::{LatestSlot, PutOutcome};
 pub use nv12::{frame_to_nv12, frame_to_nv12_slice};
 pub use openh264_encoder::OpenH264Encoder;
 pub use pipeline::{MediaPipeline, MediaPipelineReport};
+pub use platform_encoder::{EncoderSelection, PlatformEncoder};
 pub use types::{
     EncodeRequest, EncodedAccessUnit, EncodedBitstream, LaneWriteReport, LaneWriteStatus,
     LaneWriter, MediaError, MediaPipelineConfig, MediaPipelineSnapshot, PixelFormat, RawFrame,
