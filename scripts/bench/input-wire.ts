@@ -123,7 +123,8 @@ console.log(
 );
 
 // Held-key typematic repeat: before, every browser repeat occupied an SCTP
-// datagram; after host-side synthesis, only sparse liveness ticks cross the wire.
+// datagram; after host-side synthesis, only one reliable liveness tick per
+// second crosses the wire.
 const heldKey = { ...key("a", true), repeat: true };
 const repeatBefore = total([
   key("a", true),
@@ -132,7 +133,7 @@ const repeatBefore = total([
 ]);
 const repeatAfter = total([
   key("a", true),
-  ...Array.from({ length: 4 }, () => heldKey),
+  ...Array.from({ length: 1 }, () => heldKey),
   key("a", false),
 ]);
 console.log(

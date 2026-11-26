@@ -1082,9 +1082,12 @@ export class RemoteSessionController {
     event.preventDefault();
     // The host synthesizes typematic repeats from the held key state. Browser
     // repeats are throttled to liveness ticks so a stuck key still times out
-    // when the viewer or network dies, without paying a datagram at typematic rate.
+    // when the viewer or network dies. They ride the reliable control stream,
+    // so a one-second cadence preserves a full second of margin before the
+    // host's two-second stuck-input timeout without paying typematic-rate
+    // or quarter-second datagrams.
     if (event.type === "keydown" && event.repeat) {
-      if (event.timeStamp - this.lastKeyRepeatAt < 250) return;
+      if (event.timeStamp - this.lastKeyRepeatAt < 1_000) return;
       this.lastKeyRepeatAt = event.timeStamp;
     }
     const message: ControlMessage = {

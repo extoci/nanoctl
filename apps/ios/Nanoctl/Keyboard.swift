@@ -115,7 +115,7 @@ final class KeyboardForwarder {
                 // key, so throttle them like the web viewer. Reuse the initial
                 // key identity even if modifiers changed while the key stayed down.
                 let now = Date.timeIntervalSinceReferenceDate
-                if now - (repeatSentAt[key.keyCode] ?? 0) < 0.25 { return true }
+                if now - (repeatSentAt[key.keyCode] ?? 0) < 1.0 { return true }
                 repeatSentAt[key.keyCode] = now
                 return sendKey(true, held, true)
             }
