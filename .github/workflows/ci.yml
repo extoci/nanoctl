@@ -164,7 +164,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: agent-${{ matrix.os }}
-          workspaces: crates/nanoctl-agent
+          workspaces: |
+            crates/nanoctl-agent
+            crates/nanoctl-core
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: runner.os == 'Windows'
@@ -189,6 +191,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
+          cargo fmt --manifest-path crates/nanoctl-core/Cargo.toml -- --check
           for script in install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh; do sh -n "$script"; done
           shellcheck install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh
       - name: Validate PowerShell package scripts
@@ -210,6 +213,10 @@ jobs:
             $parseErrors | Format-List | Out-String | Write-Error
             exit 1
           }
+      - name: Clippy (core)
+        run: cargo clippy --all-targets --manifest-path crates/nanoctl-core/Cargo.toml -- -D warnings
+      - name: Test (core)
+        run: cargo test --manifest-path crates/nanoctl-core/Cargo.toml
       - name: Clippy (rtc)
         run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - name: Clippy (media)
