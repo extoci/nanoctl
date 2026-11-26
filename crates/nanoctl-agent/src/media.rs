@@ -284,7 +284,11 @@ impl EncodeScale {
     }
 }
 
-fn viewport_scaled_rate(bitrate_kbps: u32, ceiling_kbps: u32, pixel_ratio: f64) -> (u32, u32) {
+pub(crate) fn viewport_scaled_rate(
+    bitrate_kbps: u32,
+    ceiling_kbps: u32,
+    pixel_ratio: f64,
+) -> (u32, u32) {
     if pixel_ratio >= 1.0 {
         return (bitrate_kbps, ceiling_kbps);
     }

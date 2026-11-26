@@ -62,6 +62,8 @@ impl XcapCaptureSource {
 
 impl Drop for XcapCaptureSource {
     fn drop(&mut self) {
+        // Release a capture worker waiting to publish the last response.
+        self.frame_rx.close();
         self.request_tx.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

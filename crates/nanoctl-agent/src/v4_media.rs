@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -9,6 +9,7 @@ use nanoctl_media::{
 };
 use webrtc::data_channel::RTCDataChannel;
 
+use crate::adaptive::{LinkSample, RateController, ViewerLimits};
 use crate::config::AgentConfig;
 use crate::rtc::{HostPeer, V4DataChannelVideo};
 
@@ -74,6 +75,8 @@ pub struct V4MediaRuntime {
 impl V4MediaRuntime {
     pub fn spawn(peer: &HostPeer, config: &AgentConfig) -> Self {
         let lanes = peer.v4_video_data_channel();
+        let viewer_limits = peer.viewer_limits();
+        let link_feedback = peer.link_feedback();
         let pipeline_config = MediaPipelineConfig {
             width: config.quality.max_width,
             height: config.quality.max_height,
@@ -89,10 +92,22 @@ impl V4MediaRuntime {
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_pipeline(lanes, pipeline_config, encoder_selection, shutdown_rx).await;
+            run_pipeline(
+                lanes,
+                pipeline_config,
+                encoder_selection,
+                viewer_limits,
+                link_feedback,
+                shutdown_rx,
+            )
+            .await;
             drop(task_shutdown);
         });
         Self { shutdown, task }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
     }
 
     pub async fn stop(self) {
@@ -105,8 +120,10 @@ impl V4MediaRuntime {
 
 async fn run_pipeline(
     lanes: Arc<V4DataChannelVideo>,
-    config: MediaPipelineConfig,
+    configured: MediaPipelineConfig,
     encoder_selection: EncoderSelection,
+    mut viewer_limits: tokio::sync::watch::Receiver<ViewerLimits>,
+    mut link_feedback: tokio::sync::watch::Receiver<Option<LinkSample>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     while !lanes.lanes_ready() {
@@ -153,6 +170,12 @@ async fn run_pipeline(
             }
         };
 
+    let mut limits = *viewer_limits.borrow_and_update();
+    let ceiling_kbps = (configured.target_bitrate / 1_000).max(1);
+    let max_fps = configured.frame_rate as u16;
+    let (ceiling, fps) = limits.resolve(ceiling_kbps, max_fps);
+    let mut rate = RateController::with_opening_limit(ceiling, fps, 1_800);
+    let config = media_settings(configured, limits, &rate);
     let encoder = match PlatformEncoder::new(
         encoder_selection,
         config.target_bitrate,
@@ -187,6 +210,10 @@ async fn run_pipeline(
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous_sequence = None;
     let mut last_watermark = None;
+    let mut feedback_tick = tokio::time::interval(Duration::from_millis(250));
+    feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous = pipeline.snapshot();
+    let mut last_sample = Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -200,6 +227,40 @@ async fn run_pipeline(
                     last_watermark = next;
                 }
                 previous_sequence = next;
+            }
+            _ = feedback_tick.tick() => {
+                if pipeline.is_finished() {
+                    break;
+                }
+                if viewer_limits.has_changed().unwrap_or(false) {
+                    limits = *viewer_limits.borrow_and_update();
+                    let (ceiling, fps) = limits.resolve(ceiling_kbps, max_fps);
+                    rate.set_limits(ceiling, fps);
+                }
+                let now = Instant::now();
+                let snapshot = pipeline.snapshot();
+                let elapsed = now.saturating_duration_since(last_sample).as_secs_f64();
+                let bytes = snapshot.bytes_written.saturating_sub(previous.bytes_written);
+                let dropped = snapshot.access_units_dropped_before_write > previous.access_units_dropped_before_write;
+                if elapsed >= 0.05 {
+                    rate.update_sender(bytes as f64 * 8.0 / (1_000.0 * elapsed), bytes == 0 && !dropped, now);
+                }
+                if dropped {
+                    rate.backpressure(now);
+                }
+                if link_feedback.has_changed().unwrap_or(false)
+                    && let Some(mut feedback) = *link_feedback.borrow_and_update()
+                {
+                    // RTP bitrate estimates describe a different media path.
+                    feedback.remb_kbps = None;
+                    rate.observe(feedback);
+                }
+                if let Err(error) = pipeline.update_settings(media_settings(configured, limits, &rate)) {
+                    tracing::warn!(%error, "could not update v4 media settings");
+                    break;
+                }
+                previous = snapshot;
+                last_sample = now;
             }
         }
     }
@@ -236,4 +297,29 @@ async fn send_watermark(lanes: &V4DataChannelVideo, next_sequence: u32) -> bool 
         .await,
         Ok(true)
     )
+}
+
+fn media_settings(
+    config: MediaPipelineConfig,
+    limits: ViewerLimits,
+    rate: &RateController,
+) -> MediaPipelineConfig {
+    let (width, height) = limits.resolve_dimensions(config.width, config.height);
+    let pixels = f64::from(width) * f64::from(height);
+    let base_pixels = f64::from(config.width) * f64::from(config.height);
+    let decision = rate.decision();
+    let (kbps, _) = crate::media::viewport_scaled_rate(
+        decision.bitrate_kbps,
+        limits
+            .resolve(config.target_bitrate / 1_000, config.frame_rate as u16)
+            .0,
+        pixels / base_pixels,
+    );
+    MediaPipelineConfig {
+        width,
+        height,
+        target_bitrate: kbps.saturating_mul(1_000),
+        frame_rate: u32::from(decision.fps),
+        ..config
+    }
 }

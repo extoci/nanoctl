@@ -4,6 +4,7 @@ import {
   type AccessUnit,
 } from "@nanoctl/protocol";
 import { VideoStreamProcessor } from "./video";
+import { VideoLossWindow } from "./video-loss";
 
 export type V4VideoReceiverOptions = {
   readonly videoDelta: RTCDataChannel;
@@ -38,6 +39,7 @@ export class V4VideoReceiver {
   private disposed = false;
   private watermark: number | undefined;
   private buffered = 0;
+  private readonly linkLoss = new VideoLossWindow();
   private readonly deltaHandler = (event: MessageEvent) => this.handle(event.data);
   private readonly referenceHandler = (event: MessageEvent) => this.handle(event.data);
 
@@ -63,7 +65,10 @@ export class V4VideoReceiver {
       }
       const outcome = this.processor.pushEncodedChunk(bytes);
       this.buffered = outcome.buffered;
-      if (outcome.received) this.options.onReceivedAccessUnit?.(outcome.received);
+      if (outcome.received) {
+        this.linkLoss.observe(outcome.received.streamSequence);
+        this.options.onReceivedAccessUnit?.(outcome.received);
+      }
       for (const unit of outcome.emitted) {
         if (unit.keyframe) this.stopKeyframeRetry();
         this.options.onAccessUnit(unit);
@@ -114,6 +119,10 @@ export class V4VideoReceiver {
   private stopKeyframeRetry(): void {
     clearTimeout(this.keyframeTimer);
     this.keyframeTimer = undefined;
+  }
+
+  takeLinkLoss(): number | undefined {
+    return this.linkLoss.take();
   }
 
   dispose(): void {

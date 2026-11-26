@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -13,7 +13,10 @@ use crate::types::{
     MediaPipelineSnapshot, RawFrame, VideoEncoder, VideoSource,
 };
 
+const MIN_FORCED_KEYFRAME_INTERVAL: Duration = Duration::from_millis(350);
+
 pub struct MediaPipeline {
+    settings: watch::Sender<MediaPipelineConfig>,
     shutdown_tx: watch::Sender<bool>,
     capture_task: Option<JoinHandle<Result<(), MediaError>>>,
     encode_task: Option<JoinHandle<Result<(), MediaError>>>,
@@ -55,12 +58,13 @@ impl MediaPipeline {
         keyframe_requested: Arc<AtomicBool>,
     ) -> Result<Self, MediaError> {
         let config = config.validate()?;
+        let (settings, updates) = watch::channel(config);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let frame_slot = Arc::new(LatestSlot::new());
         let metrics = Arc::new(Mutex::new(MediaPipelineSnapshot::default()));
 
         let capture_task = tokio::spawn(capture_loop(
-            config,
+            updates.clone(),
             source,
             Arc::clone(&frame_slot),
             shutdown_rx,
@@ -68,7 +72,7 @@ impl MediaPipeline {
             Arc::clone(&metrics),
         ));
         let encode_task = tokio::spawn(encode_loop(EncodeLoopContext {
-            config,
+            updates,
             frame_slot: Arc::clone(&frame_slot),
             encoder,
             lane,
@@ -79,6 +83,7 @@ impl MediaPipeline {
         }));
 
         Ok(Self {
+            settings,
             shutdown_tx,
             capture_task: Some(capture_task),
             encode_task: Some(encode_task),
@@ -88,8 +93,36 @@ impl MediaPipeline {
         })
     }
 
+    pub fn update_settings(&self, config: MediaPipelineConfig) -> Result<(), MediaError> {
+        let config = config.validate()?;
+        if config.codec != self.settings.borrow().codec {
+            return Err(MediaError::InvalidConfig(
+                "codec cannot change within one media pipeline",
+            ));
+        }
+        self.settings.send_if_modified(|current| {
+            if *current == config {
+                false
+            } else {
+                *current = config;
+                true
+            }
+        });
+        Ok(())
+    }
+
     pub fn request_keyframe(&self) {
         self.keyframe_requested.store(true, Ordering::Release);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.capture_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            || self
+                .encode_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
     }
 
     pub fn snapshot(&self) -> MediaPipelineSnapshot {
@@ -148,7 +181,7 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 }
 
 async fn capture_loop(
-    config: MediaPipelineConfig,
+    updates: watch::Receiver<MediaPipelineConfig>,
     mut source: Box<dyn VideoSource>,
     frame_slot: Arc<LatestSlot<RawFrame>>,
     mut shutdown: watch::Receiver<bool>,
@@ -156,7 +189,7 @@ async fn capture_loop(
     metrics: Arc<Mutex<MediaPipelineSnapshot>>,
 ) -> Result<(), MediaError> {
     let result =
-        capture_loop_inner(config, &mut source, &frame_slot, &mut shutdown, &metrics).await;
+        capture_loop_inner(&updates, &mut source, &frame_slot, &mut shutdown, &metrics).await;
     frame_slot.close();
     if result.is_err() {
         let _ = shutdown_tx.send(true);
@@ -165,13 +198,12 @@ async fn capture_loop(
 }
 
 async fn capture_loop_inner(
-    config: MediaPipelineConfig,
+    updates: &watch::Receiver<MediaPipelineConfig>,
     source: &mut Box<dyn VideoSource>,
     frame_slot: &LatestSlot<RawFrame>,
     shutdown: &mut watch::Receiver<bool>,
     metrics: &Mutex<MediaPipelineSnapshot>,
 ) -> Result<(), MediaError> {
-    let period = config.frame_interval();
     let mut next_deadline = TokioInstant::now();
     let mut first_tick = true;
     let mut capture_sequence = 0_u64;
@@ -180,6 +212,7 @@ async fn capture_loop_inner(
         if *shutdown.borrow() {
             return Ok(());
         }
+        let period = updates.borrow().frame_interval();
         let now = TokioInstant::now();
         if !first_tick {
             while next_deadline <= now {
@@ -223,7 +256,7 @@ async fn capture_loop_inner(
 }
 
 struct EncodeLoopContext {
-    config: MediaPipelineConfig,
+    updates: watch::Receiver<MediaPipelineConfig>,
     frame_slot: Arc<LatestSlot<RawFrame>>,
     encoder: Box<dyn VideoEncoder>,
     lane: Box<dyn LaneWriter>,
@@ -235,7 +268,7 @@ struct EncodeLoopContext {
 
 async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
     let EncodeLoopContext {
-        config,
+        updates,
         frame_slot,
         mut encoder,
         mut lane,
@@ -245,7 +278,7 @@ async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
         metrics,
     } = context;
     let result = encode_loop_inner(
-        config,
+        &updates,
         &frame_slot,
         &mut encoder,
         &mut lane,
@@ -262,7 +295,7 @@ async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
 }
 
 async fn encode_loop_inner(
-    config: MediaPipelineConfig,
+    updates: &watch::Receiver<MediaPipelineConfig>,
     frame_slot: &LatestSlot<RawFrame>,
     encoder: &mut Box<dyn VideoEncoder>,
     lane: &mut Box<dyn LaneWriter>,
@@ -272,6 +305,8 @@ async fn encode_loop_inner(
 ) -> Result<(), MediaError> {
     let mut stream_sequence = 0_u32;
     let mut force_next_keyframe = true;
+    let mut next_forced_keyframe = TokioInstant::now();
+    let mut last_dimensions = None;
     let mut scaler = FrameScaler::default();
 
     while let Some(frame) = frame_slot.recv().await {
@@ -279,6 +314,8 @@ async fn encode_loop_inner(
             return Ok(());
         }
         record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
+        let mut config = *updates.borrow();
+        force_next_keyframe |= last_dimensions != Some((config.width, config.height));
         if !frame.has_new_damage
             && !force_next_keyframe
             && !keyframe_requested.load(Ordering::Acquire)
@@ -288,6 +325,17 @@ async fn encode_loop_inner(
         }
         let keyframe_was_requested = keyframe_requested.swap(false, Ordering::Acquire);
         let force_keyframe = force_next_keyframe || keyframe_was_requested;
+        if force_keyframe {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown) => return Ok(()),
+                _ = time::sleep_until(next_forced_keyframe) => {}
+            }
+            next_forced_keyframe = TokioInstant::now() + MIN_FORCED_KEYFRAME_INTERVAL;
+            config = *updates.borrow();
+            keyframe_requested.swap(false, Ordering::Acquire);
+        }
+        last_dimensions = Some((config.width, config.height));
         force_next_keyframe = false;
         stream_sequence = stream_sequence.wrapping_add(1);
         let capture_time_us = frame.capture_time_us;
@@ -360,11 +408,13 @@ async fn encode_loop_inner(
             snapshot.max_encode_micros = snapshot.max_encode_micros.max(encode_micros);
         });
 
-        // Lane writes are deliberately not cancellation-selected. A writer may emit
-        // several wire chunks for one access unit, and cancelling between chunks could
-        // publish a partial reference. Lane implementations must finish or reject one
-        // access unit in bounded time and report that atomic outcome.
-        let report = lane.write_access_unit(access_unit).await;
+        // Only cancel an in-flight access unit when the session is closing. This
+        // lets teardown proceed even if SCTP is still waiting for acknowledgments.
+        let report = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            result = lane.write_access_unit(access_unit) => result,
+        };
         match report {
             Ok(report) => {
                 record_metrics(metrics, |snapshot| {
@@ -629,6 +679,12 @@ mod tests {
         frames_tx.send(frame(111)).await.unwrap();
         wait_for_len(&units, &notify, 1).await;
         frames_tx.send(frame(222)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            units.lock().unwrap().len(),
+            1,
+            "backpressure must not immediately send another IDR"
+        );
         wait_for_len(&units, &notify, 2).await;
 
         let both_keyframes = {
