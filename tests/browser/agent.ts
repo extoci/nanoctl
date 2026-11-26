@@ -19,7 +19,7 @@ tls = "off"
 allow_users = ["dev@example.com"]
 serve_loopback = false
 [quality]
-encoder = "software"
+encoder = "auto"
 max_width = ${latency ? 1920 : 1280}
 max_height = ${latency ? 1080 : 720}
 max_fps = ${latency ? 60 : 30}

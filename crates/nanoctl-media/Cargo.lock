@@ -883,6 +883,7 @@ dependencies = [
  "openh264-sys2",
  "rayon",
  "tokio",
+ "tracing",
  "windows",
  "xcap",
  "yuv",
