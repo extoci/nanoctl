@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import {
+  CONTROL_CHANNEL_LABEL,
+  MOTION_CHANNEL_LABEL,
   ReferenceTracker,
+  VIDEO_DELTA_CHANNEL_LABEL,
+  VIDEO_REFERENCE_CHANNEL_LABEL,
   VideoReassembler,
   WireError,
   encodeInputMessage,
@@ -84,6 +88,15 @@ describe("shared v4 wire golden vectors", () => {
       }
     });
   }
+});
+
+describe("v4 lane contract", () => {
+  test("exposes canonical data-channel labels", () => {
+    expect(CONTROL_CHANNEL_LABEL).toBe("nanoctl.control.v4");
+    expect(MOTION_CHANNEL_LABEL).toBe("nanoctl.motion.v4");
+    expect(VIDEO_DELTA_CHANNEL_LABEL).toBe("nanoctl.video-delta.v4");
+    expect(VIDEO_REFERENCE_CHANNEL_LABEL).toBe("nanoctl.video-reference.v4");
+  });
 });
 
 describe("v4 input wire", () => {
