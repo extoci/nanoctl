@@ -2991,6 +2991,7 @@ pub fn spawn_video(
                 // relative to the last frame the decoder actually saw.
                 let mut damage_since_encode: Option<Vec<DirtyRect>> = None;
                 let mut forced_keyframe = false;
+                let mut last_forced_idr: Option<Instant> = None;
                 let mut viewer_dimensions = (quality.max_width, quality.max_height);
                 let mut viewport_bitrate_scale = 1.0;
                 let mut waiting_since = Instant::now();
@@ -3194,7 +3195,21 @@ pub fn spawn_video(
                         continue;
                     }
                     if forced_keyframe {
-                        encoder.encoder.force_keyframe();
+                        // Forced IDRs must be rate-limited: each one costs
+                        // 50-200KB on the wire, so honoring every request or
+                        // recovery notice turns congestion into a keyframe
+                        // storm that deepens the congestion (observed in the
+                        // field as an IDR every other frame). 300ms still
+                        // recovers quickly — clients re-request every 250ms
+                        // and new attach IDRs pass immediately — while
+                        // cutting storm bandwidth several-fold.
+                        let now = Instant::now();
+                        if last_forced_idr.is_none_or(|at| {
+                            now.duration_since(at) >= Duration::from_millis(300)
+                        }) {
+                            encoder.encoder.force_keyframe();
+                            last_forced_idr = Some(now);
+                        }
                         forced_keyframe = false;
                     }
                     let (scale_width, scale_height) =
