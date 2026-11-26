@@ -663,6 +663,17 @@ impl HostPeer {
             })
             .await?,
         );
+        // ICE-state visibility host-side: the client log cannot distinguish
+        // "host never saw the checks" from "host answered but the response
+        // died", and these transitions are the only ground truth for that.
+        peer.on_ice_connection_state_change(Box::new(|state| {
+            tracing::info!(state = %state, "ice connection state");
+            Box::pin(async {})
+        }));
+        peer.on_peer_connection_state_change(Box::new(|state| {
+            tracing::info!(state = %state, "peer connection state");
+            Box::pin(async {})
+        }));
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
