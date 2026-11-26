@@ -69,7 +69,7 @@ jobs:
         run: bunx playwright install chromium
       - name: Measure on Xvfb
         if: runner.os == 'Linux'
-        run: xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" bun run test:latency
+        run: xvfb-run -a -s "-screen 0 1920x1080x24 -nolisten tcp" bun run test:latency
       - name: Measure on Windows desktop (experimental)
         id: windows
         if: runner.os == 'Windows'

@@ -195,7 +195,7 @@ test("measures video and input through the real agent", async ({ page, browser }
       arch: process.arch,
       chromium: browser.version(),
       encoder: "software",
-      quality: { maxWidth: 1280, maxHeight: 720, maxFps: 30 },
+      quality: { maxWidth: 1920, maxHeight: 1080, maxFps: 60 },
       videoSize: size,
       durationMs,
       clockUncertaintyMs: uncertaintyMs,
