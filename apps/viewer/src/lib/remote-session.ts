@@ -1569,6 +1569,36 @@ export class RemoteSessionController {
           nominatedPairs.push(stats);
         }
       });
+      const directStats = this.webCodecsVideo?.stats();
+      if (directStats) {
+        const sample: VideoSample = {
+          id: `v4-data-channel-${lifecycle}`,
+          bytes: directStats.bytes,
+          frames: directStats.decoded,
+          timestamp: performance.now(),
+        };
+        const rates = videoRates(sample, this.previousVideoSample);
+        this.previousVideoSample = sample;
+        const video = this.options.video;
+        this.metrics = {
+          resolution:
+            video.videoWidth > 0 && video.videoHeight > 0
+              ? `${video.videoWidth}×${video.videoHeight}`
+              : "—",
+          ...rates,
+          rttMs: null,
+          packetsLost: 0,
+          framesDropped: directStats.dropped,
+          lossPercent: null,
+          jitterMs: null,
+          route: "unknown",
+          codec: "H.264",
+          decoder: "WebCodecs",
+          decodeMs: null,
+        };
+        this.publishSnapshot();
+        return;
+      }
       if (!inbound) return;
       const sample: VideoSample = {
         id: inbound.id,

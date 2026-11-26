@@ -13,7 +13,7 @@ import { V4VideoReceiver } from "@nanoctl/client-core";
 export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
   drop(): void;
-  stats(): { decoded: number; dropped: number };
+  stats(): { decoded: number; dropped: number; bytes: number };
   /** Rolling data-channel loss fraction since the previous call, when the
    * handle tracks sequence numbers (data-channel video). */
   takeLinkLoss?(): number;
@@ -368,7 +368,7 @@ interface VideoSink {
   canvas: HTMLCanvasElement;
   feed(data: Uint8Array, isKey: boolean, timestampUs: number): boolean;
   teardown(notify?: boolean): void;
-  stats(): { decoded: number; dropped: number };
+  stats(): { decoded: number; dropped: number; bytes: number };
 }
 
 interface VideoTrackGeneratorLike {
@@ -432,6 +432,7 @@ function createVideoSink(
   let decoder: VideoDecoder | null = null;
   let decoded = 0;
   let dropped = 0;
+  let receivedBytes = 0;
   let decoderErrors = 0;
   let firstFrameFired = false;
   const fireFirstFrame = () => {
@@ -651,6 +652,7 @@ function createVideoSink(
 
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number): boolean => {
     if (closed) return false;
+    receivedBytes += data.byteLength;
     // Scan the Annex-B form for random-access pictures and parameter sets;
     // the payload actually fed may be repacked as AVCC below.
     const scanned = videoCodec === "av1" ? data : toAnnexB(data);
@@ -762,7 +764,7 @@ function createVideoSink(
     canvas: canvas ?? video.ownerDocument.createElement("canvas"),
     feed,
     teardown,
-    stats: () => ({ decoded, dropped }),
+    stats: () => ({ decoded, dropped, bytes: receivedBytes }),
   };
 }
 
