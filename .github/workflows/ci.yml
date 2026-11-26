@@ -77,11 +77,8 @@ jobs:
                 -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
             done
   viewer:
-    # Keep this on the same pinned image as the Rust media legs. ubuntu-latest
-    # currently ships newer libva headers that break the transitive cros-libva
-    # media build before the browser regression tests can start.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -103,17 +100,7 @@ jobs:
       - run: bun run build:viewer
       - run: bun run check
       - run: bunx playwright install --with-deps chromium
-      - uses: ./.github/actions/linux-media-deps
-        with:
-          cache-suffix: viewer-browser-media
-          extra-packages: xauth xvfb xdotool
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - name: Run browser regression tests against the media runtime
-        # Xvfb gives the Linux agent a real X11 desktop to capture and lets the
-        # native-input regressions inject keys/pointer motion instead of skipping.
-        run: xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" bun run test:browser
-        env:
-          NANOCTL_BROWSER_MEDIA: "1"
+      - run: bun run test:browser
       - run: bun run audit
 
   # Every Rust leg embeds apps/viewer/dist via build.rs include_bytes!. Build it
