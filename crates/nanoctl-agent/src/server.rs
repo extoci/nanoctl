@@ -504,6 +504,8 @@ async fn session(
     #[cfg(feature = "media")]
     let mut media: Option<crate::media::VideoPipeline> = None;
     #[cfg(feature = "media")]
+    let mut v4_media: Option<crate::v4_media::V4MediaRuntime> = None;
+    #[cfg(feature = "media")]
     let mut media_restarts = 0;
     #[cfg(feature = "rtc")]
     let mut last_sequence = None;
@@ -588,7 +590,10 @@ async fn session(
                             state.config.features.system_audio.then(|| audio_output.subscribe())).await {
                             Ok(new_peer) => {
                                 #[cfg(feature = "media")]
-                                { media = Some(crate::service::spawn_media(&new_peer, &state.config)); }
+                                {
+                                    media = None;
+                                    v4_media = Some(crate::v4_media::V4MediaRuntime::spawn(&new_peer, &state.config));
+                                }
                                 peer = Some(new_peer);
                                 Ok(true)
                             }
@@ -607,6 +612,9 @@ async fn session(
         peer.revoke_input();
     }
     #[cfg(feature = "media")]
+    if let Some(v4_media) = v4_media {
+        v4_media.stop().await;
+    }
     if let Some(media) = media {
         media.stop().await;
     }

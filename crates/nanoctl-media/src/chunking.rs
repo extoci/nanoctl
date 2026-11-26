@@ -17,8 +17,8 @@ pub enum VideoLane {
 /// chunk of an access unit or drops it before emitting the first byte.
 #[async_trait]
 pub trait VideoChunkSink: Send {
-    fn buffered_bytes(&self, lane: VideoLane) -> usize;
-    fn lane_capacity(&self, lane: VideoLane) -> usize;
+    async fn buffered_bytes(&self, lane: VideoLane) -> usize;
+    async fn lane_capacity(&self, lane: VideoLane) -> usize;
     async fn write_chunk(&mut self, lane: VideoLane, bytes: Vec<u8>) -> Result<(), MediaError>;
 }
 
@@ -64,10 +64,11 @@ where
             VideoLane::Delta
         };
         let wire_bytes = access_unit.payload.len() + parts * VIDEO_HEADER_BYTES;
-        let buffered_before = self.sink.buffered_bytes(lane);
+        let buffered_before = self.sink.buffered_bytes(lane).await;
         let available = self
             .sink
             .lane_capacity(lane)
+            .await
             .saturating_sub(buffered_before);
         if wire_bytes > available {
             return Ok(LaneWriteReport {
@@ -97,7 +98,7 @@ where
 
         Ok(LaneWriteReport {
             status: LaneWriteStatus::Written,
-            buffered_bytes: self.sink.buffered_bytes(lane),
+            buffered_bytes: self.sink.buffered_bytes(lane).await,
         })
     }
 }
@@ -118,11 +119,11 @@ mod tests {
 
     #[async_trait]
     impl VideoChunkSink for MemorySink {
-        fn buffered_bytes(&self, _lane: VideoLane) -> usize {
+        async fn buffered_bytes(&self, _lane: VideoLane) -> usize {
             self.buffered
         }
 
-        fn lane_capacity(&self, _lane: VideoLane) -> usize {
+        async fn lane_capacity(&self, _lane: VideoLane) -> usize {
             self.capacity
         }
 

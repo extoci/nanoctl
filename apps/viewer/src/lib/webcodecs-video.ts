@@ -8,6 +8,8 @@
  * re-enqueued downstream), so stats and the <video> fallback keep working.
  */
 
+import { V4VideoReceiver } from "@nanoctl/client-core";
+
 export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
   drop(): void;
@@ -1064,5 +1066,53 @@ export function attachDataChannelVideo(
       const total = lost + received;
       return total > 0 ? lost / total : 0;
     },
+  };
+}
+
+/** v4 video delivery: the protocol package owns bounded chunk reassembly and
+ * reference-chain recovery; this adapter only decodes emitted access units. */
+export function attachV4DataChannelVideo(
+  videoDelta: RTCDataChannel,
+  videoReference: RTCDataChannel,
+  video: HTMLVideoElement,
+  onTeardown?: () => void,
+  onFirstFrame?: () => void,
+): WebCodecsVideoHandle {
+  const sink = createVideoSink(video, onTeardown, performance.now(), "h264", {
+    onFirstFrame,
+    onFatal: () => {
+      try {
+        videoDelta.close();
+      } catch {}
+      try {
+        videoReference.close();
+      } catch {}
+    },
+  });
+  const receiver = new V4VideoReceiver({
+    videoDelta,
+    videoReference,
+    onAccessUnit: (unit) => {
+      sink.feed(unit.payload, unit.keyframe, unit.captureTimeUs);
+    },
+    sendKeyframeRequest: (bytes) => {
+      if (videoReference.readyState === "open") {
+        const copy = new Uint8Array(new ArrayBuffer(bytes.length));
+        copy.set(bytes);
+        videoReference.send(copy);
+      }
+    },
+    onError: (error) => console.warn("v4 video lane error", error),
+  });
+  const onClosed = () => sink.teardown(true);
+  videoDelta.onclose = onClosed;
+  videoReference.onclose = onClosed;
+  return {
+    canvas: sink.canvas,
+    drop: () => {
+      receiver.dispose();
+      sink.teardown(false);
+    },
+    stats: sink.stats,
   };
 }

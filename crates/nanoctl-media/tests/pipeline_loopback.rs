@@ -33,11 +33,11 @@ struct SharedMemorySink {
 
 #[async_trait]
 impl VideoChunkSink for SharedMemorySink {
-    fn buffered_bytes(&self, _lane: VideoLane) -> usize {
+    async fn buffered_bytes(&self, _lane: VideoLane) -> usize {
         self.buffered.load(Ordering::Acquire)
     }
 
-    fn lane_capacity(&self, _lane: VideoLane) -> usize {
+    async fn lane_capacity(&self, _lane: VideoLane) -> usize {
         usize::MAX
     }
 
