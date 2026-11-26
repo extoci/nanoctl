@@ -615,6 +615,7 @@ async fn session(
     if let Some(v4_media) = v4_media {
         v4_media.stop().await;
     }
+    #[cfg(feature = "media")]
     if let Some(media) = media {
         media.stop().await;
     }

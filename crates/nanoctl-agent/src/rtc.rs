@@ -15,9 +15,9 @@ use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 use webrtc::data_channel::RTCDataChannel;
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
