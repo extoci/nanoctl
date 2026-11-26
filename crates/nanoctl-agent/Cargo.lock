@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctl-agent"
-version = "3.0.0-alpha.14"
+version = "3.0.0-alpha.15"
 dependencies = [
  "anstyle-query",
  "anyhow",
