@@ -100,7 +100,17 @@ jobs:
       - run: bun run build:viewer
       - run: bun run check
       - run: bunx playwright install --with-deps chromium
-      - run: bun run test:browser
+      - uses: ./.github/actions/linux-media-deps
+        with:
+          cache-suffix: viewer-browser-media
+          extra-packages: xauth xvfb xdotool
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Run browser regression tests against the media runtime
+        # Xvfb gives the Linux agent a real X11 desktop to capture and lets the
+        # native-input regressions inject keys/pointer motion instead of skipping.
+        run: xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" bun run test:browser
+        env:
+          NANOCTL_BROWSER_MEDIA: "1"
       - run: bun run audit
 
   # Every Rust leg embeds apps/viewer/dist via build.rs include_bytes!. Build it
