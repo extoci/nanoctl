@@ -6,3 +6,6 @@ license = "MIT"
 description = "Clean-slate nanoctl protocol and deterministic state machines"
 
 [dependencies]
+
+[dev-dependencies]
+serde_json = "1.0"
