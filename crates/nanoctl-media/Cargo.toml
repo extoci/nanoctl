@@ -5,10 +5,15 @@ edition = "2024"
 license = "MIT"
 description = "Clean-slate nanoctl bounded capture-encode-send media pipeline"
 
+[features]
+default = []
+capture = ["dep:xcap"]
+
 [dependencies]
 async-trait = "0.1"
 nanoctl-core = { path = "../nanoctl-core" }
 tokio = { version = "1.49", features = ["macros", "rt", "sync", "time"] }
+xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
