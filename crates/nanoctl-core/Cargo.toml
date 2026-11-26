@@ -1,0 +1,8 @@
+[package]
+name = "nanoctl-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Clean-slate nanoctl protocol and deterministic state machines"
+
+[dependencies]
