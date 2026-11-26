@@ -16,7 +16,7 @@
     },
     "apps/viewer": {
       "name": "@nanoctl/viewer",
-      "version": "3.0.0-alpha.19",
+      "version": "3.0.0-alpha.20",
       "dependencies": {
         "@nanoctl/client-core": "workspace:*",
         "@nanoctl/protocol": "workspace:*",
@@ -30,14 +30,14 @@
     },
     "packages/client-core": {
       "name": "@nanoctl/client-core",
-      "version": "3.0.0-alpha.19",
+      "version": "3.0.0-alpha.20",
       "dependencies": {
         "@nanoctl/protocol": "workspace:*",
       },
     },
     "packages/protocol": {
       "name": "@nanoctl/protocol",
-      "version": "3.0.0-alpha.19",
+      "version": "3.0.0-alpha.20",
     },
   },
   "overrides": {
