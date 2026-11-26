@@ -25,9 +25,11 @@ fixtures exist.
 | `nanoctl.video-delta.v4`     | unordered, loss-tolerant | non-keyframe video chunks                                                    |
 | `nanoctl.video-reference.v4` | reliable, ordered        | keyframe video chunks and reference-recovery control                         |
 
-Every sender-lane pair owns an independent `u32` sequence counter. On loss-tolerant lanes receivers
-drop non-newer sequences using wrapping sequence comparison. Reliable lanes keep ordering through the
-transport; their sequence is diagnostic and liveness metadata, not permission to reorder discrete input.
+Every independent input stream owns a `u32` sequence counter: reliable control is one stream, while
+pointer motion and gamepad snapshots use separate counters even though they share the motion lane. On
+loss-tolerant lanes receivers drop non-newer sequences within the same stream using wrapping sequence
+comparison. Reliable lanes keep ordering through the transport; their sequence is diagnostic and
+liveness metadata, not permission to reorder discrete input.
 
 ## Input messages
 
@@ -102,7 +104,7 @@ Each entry is 14 bytes:
 ```text
 u8 slot       # 0..=3, unique within the snapshot
 u8 kind       # 0 = Xbox 360, 1 = DualShock 4, 2 = DualSense
-u16 buttons   # XInput-compatible button bitfield
+u16 buttons   # XInput-compatible button bitfield; bit 15 is the PlayStation touchpad click
 u8 left_trigger
 u8 right_trigger
 i16 left_x    # positive right

@@ -47,16 +47,18 @@ type ControlPayload =
   | { readonly kind: "heartbeat" };
 
 /**
- * Browser-independent v4 input lane writer. Control and motion sequences are
- * intentionally independent: each sender-lane pair owns its own u32 sequence.
- * Loss-tolerant motion is never queued behind a saturated SCTP buffer; stale
- * analog state is dropped instead of delayed. Reliable control is bounded, and
- * saturation is surfaced to the caller because silently dropping discrete
- * input would violate ordering semantics.
+ * Browser-independent v4 input lane writer. Control, pointer motion, and
+ * gamepad motion each own an independent u32 sequence: one analog stream must
+ * never make the other stream's newest state look stale. Loss-tolerant motion
+ * is never queued behind a saturated SCTP buffer; stale analog state is
+ * dropped instead of delayed. Reliable control is bounded, and saturation is
+ * surfaced to the caller because silently dropping discrete input would
+ * violate ordering semantics.
  */
 export class V4InputSender {
   private controlSequence = 1;
-  private motionSequence = 1;
+  private pointerSequence = 1;
+  private gamepadSequence = 1;
 
   constructor(
     private readonly control: V4InputChannel,
@@ -64,13 +66,13 @@ export class V4InputSender {
   ) {}
 
   pointerMove(point: NormalizedPoint): V4InputSendResult {
-    return this.sendMotion({ kind: "pointerMove", sequence: this.nextMotionSequence(), point });
+    return this.sendMotion({ kind: "pointerMove", sequence: this.nextPointerSequence(), point });
   }
 
   gamepadSnapshot(pads: readonly GamepadState[]): V4InputSendResult {
     return this.sendMotion({
       kind: "gamepadSnapshot",
-      sequence: this.nextMotionSequence(),
+      sequence: this.nextGamepadSequence(),
       pads,
     });
   }
@@ -131,9 +133,15 @@ export class V4InputSender {
     return sequence;
   }
 
-  private nextMotionSequence(): number {
-    const sequence = this.motionSequence;
-    this.motionSequence = (this.motionSequence + 1) >>> 0;
+  private nextPointerSequence(): number {
+    const sequence = this.pointerSequence;
+    this.pointerSequence = (this.pointerSequence + 1) >>> 0;
+    return sequence;
+  }
+
+  private nextGamepadSequence(): number {
+    const sequence = this.gamepadSequence;
+    this.gamepadSequence = (this.gamepadSequence + 1) >>> 0;
     return sequence;
   }
 }

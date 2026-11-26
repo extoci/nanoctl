@@ -91,7 +91,7 @@ plus data channels. nanoctl 4 treats it as a substrate, not as the application a
   controller/host epochs, ICE generation/ufrag, sequence, and monotonic send time;
 - reliable ordered control carries session commands, discrete input, clipboard, capability changes,
   and recovery requests;
-- unordered loss-tolerant motion carries pointer and gamepad latest-state snapshots;
+- unordered loss-tolerant motion carries pointer and gamepad latest-state snapshots in independent sequence spaces;
 - unordered loss-tolerant video carries delta access-unit chunks;
 - reference-safe video carries complete IDR access units with redundancy/retry policy designed for
   SCTP behavior rather than relying on periodic keyframes;
