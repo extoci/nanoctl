@@ -27,6 +27,13 @@
         "@types/react-dom": "^19.2.0",
       },
     },
+    "packages/client-core": {
+      "name": "@nanoctl/client-core",
+      "version": "3.0.0-alpha.19",
+      "dependencies": {
+        "@nanoctl/protocol": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@nanoctl/protocol",
       "version": "3.0.0-alpha.19",
@@ -36,6 +43,8 @@
     "tinypool": "2.2.0",
   },
   "packages": {
+    "@nanoctl/client-core": ["@nanoctl/client-core@workspace:packages/client-core"],
+
     "@nanoctl/protocol": ["@nanoctl/protocol@workspace:packages/protocol"],
 
     "@nanoctl/viewer": ["@nanoctl/viewer@workspace:apps/viewer"],

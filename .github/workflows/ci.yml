@@ -125,6 +125,7 @@ jobs:
           v=$(jq -r .version package.json)
           [ "$(jq -r .version apps/viewer/package.json)" = "$v" ]
           [ "$(jq -r .version packages/protocol/package.json)" = "$v" ]
+          [ "$(jq -r .version packages/client-core/package.json)" = "$v" ]
           grep -qF "version = \"$v\"" crates/nanoctl-agent/Cargo.toml
           grep -qF "version = \"$v\"" crates/nanoctl-agent/Cargo.lock
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
