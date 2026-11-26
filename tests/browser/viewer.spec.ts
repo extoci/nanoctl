@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { closePanel, openPanel } from "./panel";
 import { injectDataChannelSpy, injectedWire, v4InputMessages } from "./v4-input";
+import { encodeInputMessage } from "../../packages/protocol/src/index";
 
 test("host picker lists tailnet machines and supports keyboard", async ({ page }, testInfo) => {
   await page.route("**/v1/hosts", (route) =>
@@ -70,7 +71,7 @@ test("an unpaced 200-character key burst reaches native input in order", async (
     const create = RTCPeerConnection.prototype.createDataChannel;
     RTCPeerConnection.prototype.createDataChannel = function (...args) {
       const channel = Reflect.apply(create, this, args) as RTCDataChannel;
-      if (args[0] === "nanoctl.control.v1")
+      if (args[0] === "nanoctl.control.v4")
         (window as unknown as { control: RTCDataChannel }).control = channel;
       return channel;
     };
@@ -84,32 +85,36 @@ test("an unpaced 200-character key burst reaches native input in order", async (
     await target.bringToFront();
     await target.getByRole("textbox").focus();
     const text = "abcdefghijklmnopqrstuvwxyz".repeat(8).slice(0, 200);
-    await page.evaluate((text) => {
+    let sequence = 1;
+    const keyWire = [...text].flatMap((key) =>
+      [true, false].map((down) =>
+        Array.from(
+          encodeInputMessage({
+            kind: "key",
+            sequence: sequence++,
+            down,
+            browserRepeat: false,
+            identity: { code: `Key${key.toUpperCase()}`, key },
+          }),
+        ),
+      ),
+    );
+    await page.evaluate((messages) => {
       const channel = (window as unknown as { control: RTCDataChannel }).control;
-      for (const key of text) {
-        for (const action of ["down", "up"])
-          channel.send(
-            JSON.stringify({
-              type: "key",
-              action,
-              code: `Key${key.toUpperCase()}`,
-              key,
-              repeat: false,
-            }),
-          );
-      }
-    }, text);
+      for (const message of messages) channel.send(new Uint8Array(message));
+    }, keyWire);
     await expect(target.getByRole("textbox")).toHaveValue(text, {
       timeout: 5000,
     });
     let expected = text;
     const commitText = async (label: string, commit: string, timeout: number) => {
       const started = performance.now();
-      await page.evaluate((text) => {
-        (window as unknown as { control: RTCDataChannel }).control.send(
-          JSON.stringify({ type: "text", text }),
-        );
-      }, commit);
+      const wire = Array.from(
+        encodeInputMessage({ kind: "text", sequence: sequence++, text: commit }),
+      );
+      await page.evaluate((message) => {
+        (window as unknown as { control: RTCDataChannel }).control.send(new Uint8Array(message));
+      }, wire);
       expected += commit;
       await target
         .waitForFunction(
