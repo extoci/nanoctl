@@ -2,11 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { encodeVideoChunk, type AccessUnit, type VideoChunk } from "@nanoctl/protocol";
 import { V4VideoReceiver } from "../src/index";
 
-function chunk(
-  streamSequence: number,
-  keyframe: boolean,
-  payload: number[],
-): VideoChunk {
+function chunk(streamSequence: number, keyframe: boolean, payload: number[]): VideoChunk {
   return {
     streamSequence,
     part: 0,
