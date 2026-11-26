@@ -613,10 +613,16 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
     let mut dup = Some(dup);
     // A process/system suspend can invalidate the desktop-duplication session
     // without returning ACCESS_LOST: after resume AcquireNextFrame only times
-    // out. Do not infer staleness from a static desktop — timeouts are normal
-    // there. Infer suspension from the capture loop itself missing its normal
-    // ~100ms cadence by a wide margin instead.
+    // out. The same silent death happens after some desktop composition events
+    // (observed: opening certain legacy windows): the session keeps timing out
+    // while the real desktop changes underneath. Timeouts alone are normal on
+    // a static desktop, but a session that delivers nothing for seconds at a
+    // time is indistinguishable from a dead one, so rebuild it on sustained
+    // starvation. The rebuild cost on a genuinely idle desktop is one full
+    // frame acquire every few seconds, which the unchanged-frame diff then
+    // discards — cheap insurance against a permanently black stream.
     let mut previous_loop = Instant::now();
+    let mut starvation_since: Option<Instant> = None;
     let mut recreate_failures = 0_u8;
     let mut recreate_bounded = |dup: &mut Option<Duplication>| {
         if recreate(h_monitor, dup) {
@@ -656,6 +662,7 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
         let resumed = resumed || capture_loop_resumed(acquire_started, Instant::now());
         match acquired {
             Ok(Some((frame, dirty))) => {
+                starvation_since = None;
                 // Backend-verified change: producer skips the memcmp.
                 if !latest.replace_hint(
                     frame,
@@ -668,16 +675,31 @@ fn run(h_monitor_raw: usize, dup: Duplication, slot: Weak<LatestFrame>) {
                 }
             }
             Ok(None) => {
+                let starved = match starvation_since {
+                    Some(since) => since.elapsed() >= Duration::from_secs(3),
+                    None => {
+                        starvation_since = Some(Instant::now());
+                        false
+                    }
+                };
                 // Give the existing session one acquire after a resume: if
                 // the compositor can still deliver accumulated changes, no
                 // rebuild is needed. The stale post-suspend session observed
                 // in cycle 48 only timed out, so a timeout here is the safe
-                // signal to replace it.
-                if resumed && !recreate_bounded(&mut dup) {
+                // signal to replace it. Sustained starvation is treated the
+                // same way: a live session on a changing desktop never goes
+                // seconds without a frame.
+                if (resumed || starved) && !recreate_bounded(&mut dup) {
                     tracing::warn!(
                         "DXGI duplication recovery failed repeatedly; capture thread exiting"
                     );
                     return;
+                }
+                if starved {
+                    // The rebuild restarts the starvation clock either way: a
+                    // healthy fresh session delivers its initial frame, and a
+                    // failing one must not be rebuilt every 100ms.
+                    starvation_since = None;
                 }
             }
             Err(error) => {
