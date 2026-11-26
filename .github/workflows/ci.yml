@@ -297,14 +297,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            platform: linux
-            architecture: x64
-            binary: nanoctl
-          - runner: ubuntu-24.04-arm
-            platform: linux
-            architecture: arm64
-            binary: nanoctl
           - runner: macos-15
             platform: macos
             architecture: arm64

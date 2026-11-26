@@ -129,10 +129,6 @@ jobs:
         run: |
           set -euo pipefail
           expected=(
-            nanoctl-linux-x64
-            nanoctl-linux-x64.sha256
-            nanoctl-linux-arm64
-            nanoctl-linux-arm64.sha256
             nanoctl-macos-arm64
             nanoctl-macos-arm64.sha256
             nanoctl-windows-x64.exe
