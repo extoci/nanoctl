@@ -191,13 +191,21 @@ final class Session {
         audioOutputs = []
         onChange?()
         timeout = Task { [weak self, weak current] in
-            // Six seconds, not fifteen: connectivity checks either complete in
-            // the first few seconds or the attempt is wedged, and the retry
-            // almost always connects at once — failing fast turns a stalled
-            // attempt into a quick recovery instead of a long black screen.
-            try? await Task.sleep(for: .seconds(6))
-            guard !Task.isCancelled, let self, let current, self.connection === current else { return }
-            self.fail("The host did not establish a connection.", current)
+            // Progress-driven, not a fixed budget: signaling alone can take
+            // seconds on a slow path and connectivity checks retransmit
+            // silently, so any static limit either strangles slow-but-working
+            // attempts or leaves wedged ones hanging. Any state transition,
+            // candidate, track or channel event is proof of life; the attempt
+            // only dies after twelve seconds of total silence.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self, let current, self.connection === current else { return }
+                if Date().timeIntervalSince(current.lastProgress) > 12 {
+                    sessionLog.error("no connection progress for 12s; abandoning attempt")
+                    self.fail("The host did not establish a connection.", current)
+                    return
+                }
+            }
         }
         // Signaling runs detached from the main actor: reconnects previously
         // inherited main-actor isolation, so while the UI thread was still
@@ -559,6 +567,7 @@ final class Session {
         }
         delegate.onTrack = { [weak self, weak current] receiver in
             guard let self, let current, self.connection === current else { return }
+            current.lastProgress = Date()
             if let video = receiver.track as? RTCVideoTrack {
                 sessionLog.info("video track arrived (RTP leg)")
                 self.track = video
@@ -570,6 +579,7 @@ final class Session {
         }
         delegate.onState = { [weak self, weak current] status in
             guard let self, let current, self.connection === current else { return }
+            current.lastProgress = Date()
             sessionLog.info("peer connection state: \(peerStateName(status))")
             switch status {
             case .connected:
@@ -586,21 +596,8 @@ final class Session {
         delegate.onIceState = { [weak self, weak current] state in
             guard let self, let current, self.connection === current else { return }
             sessionLog.info("ice connection state: \(iceStateName(state))")
-            if state == .checking, current.iceWatchdog == nil {
-                // The establish timeout starts at TCP connect, but signaling
-                // alone can eat most of it over tailscale. ICE gets its own
-                // budget measured from when checks actually start: healthy
-                // attempts connect in milliseconds, so five seconds of
-                // checking means this attempt is wedged.
-                current.iceWatchdog = Task { [weak self, weak current] in
-                    try? await Task.sleep(for: .seconds(5))
-                    guard !Task.isCancelled, let self, let current, self.connection === current else { return }
-                    sessionLog.error("ice stuck in checking; abandoning attempt")
-                    self.fail("The host did not establish a connection.", current)
-                }
-            }
+            current.lastProgress = Date()
             if state == .connected || state == .completed {
-                current.iceWatchdog?.cancel()
                 self.timeout?.cancel()
             }
         }
@@ -958,6 +955,7 @@ private final class Connection {
     var sentDisplayQualityCap = false
     var statePoll: Task<Void, Never>?
     var iceWatchdog: Task<Void, Never>?
+    var lastProgress = Date()
 
     init(socket: URLSessionWebSocketTask) { self.socket = socket }
 }
