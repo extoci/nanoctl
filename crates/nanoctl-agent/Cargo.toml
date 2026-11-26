@@ -1,6 +1,6 @@
 [package]
 name = "nanoctl-agent"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.19"
 edition = "2024"
 license = "MIT"
 description = "Headless nanoctl remote desktop agent"
@@ -38,7 +38,6 @@ media = [
   "dep:vigem-client",
   "dep:x11rb",
   "dep:xkeysym",
-  "nanoctl-media/capture",
   "rtc",
 ]
 rtc = ["dep:interceptor", "dep:webrtc", "dep:bytes"]
@@ -63,8 +62,6 @@ enigo = { version = "0.6.1", optional = true }
 futures-util = "=0.3.32"
 hostname = "0.4"
 interceptor = { version = "0.17.1", optional = true }
-nanoctl-core = { path = "../nanoctl-core" }
-nanoctl-media = { path = "../nanoctl-media", default-features = false }
 nanoctl-update = { path = "../nanoctl-update" }
 reqwest = { version = "0.13", default-features = false, features = [
   "json",

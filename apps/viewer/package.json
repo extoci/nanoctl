@@ -1,6 +1,6 @@
 {
   "name": "@nanoctl/viewer",
-  "version": "3.0.0-alpha.20",
+  "version": "3.0.0-alpha.19",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,6 @@
     "typecheck": "tsc --build"
   },
   "dependencies": {
-    "@nanoctl/client-core": "workspace:*",
     "@nanoctl/protocol": "workspace:*",
     "react": "19.2.0",
     "react-dom": "19.2.0"

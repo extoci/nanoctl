@@ -77,11 +77,8 @@ jobs:
                 -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
             done
   viewer:
-    # Keep this on the same pinned image as the Rust media legs. ubuntu-latest
-    # currently ships newer libva headers that break the transitive cros-libva
-    # media build before the browser regression tests can start.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -103,17 +100,7 @@ jobs:
       - run: bun run build:viewer
       - run: bun run check
       - run: bunx playwright install --with-deps chromium
-      - uses: ./.github/actions/linux-media-deps
-        with:
-          cache-suffix: viewer-browser-media
-          extra-packages: xauth xvfb xdotool
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - name: Run browser regression tests against the media runtime
-        # Xvfb gives the Linux agent a real X11 desktop to capture and lets the
-        # native-input regressions inject keys/pointer motion instead of skipping.
-        run: xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp" bun run test:browser
-        env:
-          NANOCTL_BROWSER_MEDIA: "1"
+      - run: bun run test:browser
       - run: bun run audit
 
   # Every Rust leg embeds apps/viewer/dist via build.rs include_bytes!. Build it
@@ -138,7 +125,6 @@ jobs:
           v=$(jq -r .version package.json)
           [ "$(jq -r .version apps/viewer/package.json)" = "$v" ]
           [ "$(jq -r .version packages/protocol/package.json)" = "$v" ]
-          [ "$(jq -r .version packages/client-core/package.json)" = "$v" ]
           grep -qF "version = \"$v\"" crates/nanoctl-agent/Cargo.toml
           grep -qF "version = \"$v\"" crates/nanoctl-agent/Cargo.lock
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -178,10 +164,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: agent-${{ matrix.os }}
-          workspaces: |
-            crates/nanoctl-agent
-            crates/nanoctl-core
-            crates/nanoctl-media
+          workspaces: crates/nanoctl-agent
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Exclude build outputs from Defender
         if: runner.os == 'Windows'
@@ -206,8 +189,6 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
-          cargo fmt --manifest-path crates/nanoctl-core/Cargo.toml -- --check
-          cargo fmt --manifest-path crates/nanoctl-media/Cargo.toml -- --check
           for script in install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh; do sh -n "$script"; done
           shellcheck install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh
       - name: Validate PowerShell package scripts
@@ -229,20 +210,6 @@ jobs:
             $parseErrors | Format-List | Out-String | Write-Error
             exit 1
           }
-      - name: Clippy (core)
-        run: cargo clippy --all-targets --manifest-path crates/nanoctl-core/Cargo.toml -- -D warnings
-      - name: Test (core)
-        run: cargo test --manifest-path crates/nanoctl-core/Cargo.toml
-      - name: Clippy (media pipeline)
-        run: cargo clippy --all-targets --manifest-path crates/nanoctl-media/Cargo.toml -- -D warnings
-      - name: Test (media pipeline)
-        run: cargo test --manifest-path crates/nanoctl-media/Cargo.toml
-      - name: Clippy (media capture backend)
-        if: runner.os == 'Windows'
-        run: cargo clippy --all-targets --features capture --manifest-path crates/nanoctl-media/Cargo.toml -- -D warnings
-      - name: Test (media capture backend)
-        if: runner.os == 'Windows'
-        run: cargo test --features capture --manifest-path crates/nanoctl-media/Cargo.toml
       - name: Clippy (rtc)
         run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
       - name: Clippy (media)

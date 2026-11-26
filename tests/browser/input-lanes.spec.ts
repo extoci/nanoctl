@@ -2,7 +2,6 @@ import { expect, test } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { closePanel, openPanel } from "./panel";
-import { injectDataChannelSpy, injectedWire } from "./v4-input";
 
 const moves = 40;
 
@@ -28,32 +27,32 @@ test("pointer motion and active gamepad snapshots never clobber each other", asy
     !reports || process.platform !== "linux" || !process.env.DISPLAY || !hasXdotool,
     "Requires the media agent with a mock virtual gamepad, Linux native input and xdotool",
   );
-  await page.addInitScript(injectDataChannelSpy);
   await page.addInitScript(() => {
-    const pad = {
-      axes: [0, 0, 0, 0],
-      buttons: Array.from({ length: 17 }, () => ({ pressed: false, value: 0 })),
-      connected: true,
-      id: "Xbox Wireless Controller",
-      index: 0,
-      mapping: "standard",
-    };
-    Object.defineProperty(navigator, "getGamepads", { value: () => [pad] });
-    const state = { gamepad: 0 };
+    const state = { pointer: null as RTCDataChannel | null, gamepad: 0 };
     Object.assign(window, { state });
+    const create = RTCPeerConnection.prototype.createDataChannel;
+    RTCPeerConnection.prototype.createDataChannel = function (...args) {
+      const channel = Reflect.apply(create, this, args) as RTCDataChannel;
+      if (args[0] === "nanoctl.pointer.v1") state.pointer = channel;
+      return channel;
+    };
+  });
+  await page.goto("/");
+  await openPanel(page);
+  await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  // A held, drifting analog stick: one changed snapshot per frame on the pointer lane, sent from
+  // requestAnimationFrame like the viewer and iOS forwarders, after that frame's pointer move.
+  await page.evaluate(() => {
+    const state = (window as unknown as { state: { pointer: RTCDataChannel; gamepad: number } })
+      .state;
     const frame = () => {
-      pad.axes[0] = ((state.gamepad % 200) - 100) / 100;
+      const axis = ((state.gamepad % 200) - 100) * 300;
+      state.pointer.send(JSON.stringify({ type: "gamepad", pads: [[0, 0, 0, 0, axis, 0, 0, 0]] }));
       state.gamepad += 1;
       requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);
   });
-  await page.goto("/");
-  await openPanel(page);
-  await expect(page.getByTestId("connection-state")).toHaveText("Live");
-  // A held, drifting analog stick produces latest-state snapshots on the same
-  // unordered v4 motion lane as pointer movement.
-  await page.getByRole("button", { name: "Gamepad off" }).click();
   await expect.poll(() => readFile(reports!, "utf8").catch(() => "")).toContain("0 attached");
   await closePanel(page);
   const [width, height] = execFileSync("xdotool", ["getdisplaygeometry"], {
@@ -76,9 +75,9 @@ test("pointer motion and active gamepad snapshots never clobber each other", asy
     };
   });
   const before = (await readFile(reports!, "utf8")).split("\n").length;
-  const sentBefore = (await injectedWire(page)).filter(
-    (message) => message.channel === "nanoctl.motion.v4" && message.binary?.[1] === 0x08,
-  ).length;
+  const sentBefore = await page.evaluate(
+    () => (window as unknown as { state: { gamepad: number } }).state.gamepad,
+  );
   const settle: number[] = [];
   let lost = 0;
   for (let index = 0; index < moves; index++) {
@@ -104,9 +103,9 @@ test("pointer motion and active gamepad snapshots never clobber each other", asy
     await page.waitForTimeout(30);
   }
   const sent =
-    (await injectedWire(page)).filter(
-      (message) => message.channel === "nanoctl.motion.v4" && message.binary?.[1] === 0x08,
-    ).length - sentBefore;
+    (await page.evaluate(
+      () => (window as unknown as { state: { gamepad: number } }).state.gamepad,
+    )) - sentBefore;
   const applied = (await readFile(reports!, "utf8"))
     .split("\n")
     .slice(before - 1)

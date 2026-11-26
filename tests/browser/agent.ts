@@ -19,10 +19,10 @@ tls = "off"
 allow_users = ["dev@example.com"]
 serve_loopback = false
 [quality]
-encoder = "auto"
-max_width = ${latency ? 1920 : 1280}
-max_height = ${latency ? 1080 : 720}
-max_fps = ${latency ? 60 : 30}
+encoder = "software"
+max_width = 1280
+max_height = 720
+max_fps = 30
 `,
 );
 const env = {

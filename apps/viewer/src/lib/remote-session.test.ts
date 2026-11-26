@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { parseInputMessage, type InputMessage } from "@nanoctl/protocol";
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
 import { attachDataChannelVideo, attachWebCodecsVideo } from "./webcodecs-video";
 
@@ -22,10 +21,6 @@ afterEach(() => {
   defineGlobal("EncodedVideoChunk", originalEncodedVideoChunk);
   defineGlobal("MediaStreamTrackGenerator", originalMediaStreamTrackGenerator);
 });
-
-function v4Input(channel: FakeDataChannel): InputMessage[] {
-  return channel.sent.map((message) => parseInputMessage(message as Uint8Array));
-}
 
 describe("remote session lifecycle", () => {
   test("uses the selected video ICE pair and distinguishes missing RTT from zero latency", async () => {
@@ -151,13 +146,13 @@ describe("remote session lifecycle", () => {
       const channel = peer.channels.get("nanoctl.control.v1")!;
       channel.sent = [];
       channel.onopen?.();
-      expect(channel.sent.map((message) => JSON.parse(message as string))).toContainEqual({
+      expect(channel.sent.map((message) => JSON.parse(message))).toContainEqual({
         type: "audio",
         enabled: initialAudioEnabled,
       });
       channel.sent = [];
       expect(controller.setAudioEnabled(!initialAudioEnabled)).toBe(true);
-      expect(channel.sent.map((message) => JSON.parse(message as string))).toContainEqual({
+      expect(channel.sent.map((message) => JSON.parse(message))).toContainEqual({
         type: "audio",
         enabled: !initialAudioEnabled,
       });
@@ -194,7 +189,7 @@ describe("remote session lifecycle", () => {
     await controller.start();
     peer.channels.get("nanoctl.control.v1")!.onopen?.();
     expect(
-      peer.channels.get("nanoctl.control.v1")!.sent.map((message) => JSON.parse(message as string)),
+      peer.channels.get("nanoctl.control.v1")!.sent.map((message) => JSON.parse(message)),
     ).toContainEqual({ type: "quality", maxWidth: 1280, maxHeight: 720 });
     await controller.stop();
   });
@@ -233,9 +228,9 @@ describe("remote session lifecycle", () => {
         await flushSignals();
         expect(peer.sent.map(([label]) => label)).toEqual([
           "nanoctl.clipboard.v1",
-          "nanoctl.control.v4",
+          "nanoctl.control.v1",
         ]);
-        expect(JSON.parse(peer.sent[0]![1] as string).text).toBe("local paste");
+        expect(JSON.parse(peer.sent[0]![1]).text).toBe("local paste");
       }
       await controller.stop();
     }
@@ -268,23 +263,27 @@ describe("remote session lifecycle", () => {
     await controller.start();
     peer.connectionState = "connected";
     peer.onconnectionstatechange?.();
-    const controlChannel = peer.channels.get("nanoctl.control.v4")!;
-    const channel = peer.channels.get("nanoctl.motion.v4")!;
-    expect(peer.channelConfigs.get("nanoctl.motion.v4")).toMatchObject({
+    const controlChannel = peer.channels.get("nanoctl.control.v1")!;
+    const channel = peer.channels.get("nanoctl.gamepad.v1")!;
+    expect(peer.channelConfigs.get("nanoctl.gamepad.v1")).toMatchObject({
       ordered: false,
-      maxRetransmits: 0,
+      maxPacketLifeTime: 100,
     });
     controller.setGamepadEnabled(true);
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     controlChannel.sent = [];
     channel.sent = [];
     flushAnimationFrame(1_000);
-    expect(v4Input(channel).at(-1)).toMatchObject({
-      kind: "gamepadSnapshot",
-      pads: [{ slot: 0, buttons: 0, leftTrigger: 0, rightTrigger: 0 }],
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
+      type: "gamepad",
+      pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
-    expect(controlChannel.sent).toEqual([]);
+    expect(channel.sent).toEqual([]);
     channel.sent = [];
+    expect(controller.sendControl({ type: "gamepad", pads: [] })).toBe(true);
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toEqual({ type: "gamepad", pads: [] });
+    expect(channel.sent).toEqual([]);
+    controlChannel.sent = [];
 
     peer.connectionState = "disconnected";
     peer.onconnectionstatechange?.();
@@ -297,11 +296,11 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     channel.sent = [];
     flushAnimationFrame(2_000);
-    expect(v4Input(channel).at(-1)).toMatchObject({
-      kind: "gamepadSnapshot",
-      pads: [{ slot: 0, buttons: 0, leftTrigger: 0, rightTrigger: 0 }],
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
+      type: "gamepad",
+      pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
-    expect(v4Input(controlChannel).some((message) => message.kind === "releaseAll")).toBe(true);
+    expect(channel.sent).toEqual([]);
 
     controller.setInputEnabled(false);
     expect(controller.snapshot.gamepadEnabled).toBe(false);
@@ -309,81 +308,11 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     channel.sent = [];
     flushAnimationFrame(3_000);
-    expect(v4Input(channel).at(-1)).toMatchObject({
-      kind: "gamepadSnapshot",
-      pads: [{ slot: 0, buttons: 0, leftTrigger: 0, rightTrigger: 0 }],
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
+      type: "gamepad",
+      pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
-    expect(v4Input(controlChannel).some((message) => message.kind === "releaseAll")).toBe(true);
-    await controller.stop();
-  });
-
-  test("touch-style control input uses the v4 control and motion lanes", async () => {
-    installBrowserGlobals();
-    const peer = new FakePeer();
-    const controller = new RemoteSessionController({
-      sessionId: "session",
-      controllerEpoch: "controller",
-      displays: [],
-      iceServers: [],
-      video: new FakeVideo() as unknown as HTMLVideoElement,
-      preferences: { inputEnabled: true },
-      operations: { sendSignal: async () => null, endSession: async () => null },
-      peerFactory: () => peer as unknown as RTCPeerConnection,
-      onSnapshot: () => {},
-    });
-    await controller.start();
-    const control = peer.channels.get("nanoctl.control.v4")!;
-    const motion = peer.channels.get("nanoctl.motion.v4")!;
-    control.sent = [];
-    motion.sent = [];
-
-    expect(controller.sendControl({ type: "pointer", action: "move", x: 0.25, y: 0.75 })).toBe(
-      true,
-    );
-    expect(v4Input(motion)).toContainEqual({
-      kind: "pointerMove",
-      sequence: 1,
-      point: { x: 16384, y: 49151 },
-    });
-    expect(
-      controller.sendControl({
-        type: "pointer",
-        action: "down",
-        x: 0.25,
-        y: 0.75,
-        button: 0,
-      }),
-    ).toBe(true);
-    expect(v4Input(control)).toContainEqual({
-      kind: "pointerButton",
-      sequence: 1,
-      down: true,
-      button: "left",
-      point: { x: 16384, y: 49151 },
-    });
-    expect(
-      controller.sendControl({
-        type: "key",
-        action: "down",
-        code: "Enter",
-        key: "Enter",
-        modifiers: 0,
-        repeat: false,
-      }),
-    ).toBe(true);
-    expect(controller.sendControl({ type: "text", text: "hello" })).toBe(true);
-    expect(
-      v4Input(control).filter((message) => message.kind === "key" || message.kind === "text"),
-    ).toEqual([
-      {
-        kind: "key",
-        sequence: 2,
-        down: true,
-        browserRepeat: false,
-        identity: { code: "Enter", key: "Enter" },
-      },
-      { kind: "text", sequence: 3, text: "hello" },
-    ]);
+    expect(channel.sent).toEqual([]);
     await controller.stop();
   });
 
@@ -428,17 +357,17 @@ describe("remote session lifecycle", () => {
       onSnapshot: () => {},
     });
     await controller.start();
-    const channel = peer.channels.get("nanoctl.control.v4")!;
+    const channel = peer.channels.get("nanoctl.control.v1")!;
     channel.sent = [];
     video.focus();
     video.dispatchEvent(Object.assign(new Event("lostpointercapture"), { buttons: 0 }));
     expect(video.focused).toBe(true);
     expect(channel.sent).toEqual([]);
     pressKey("keydown", video, { code: "Space", key: " ", repeat: false });
-    expect(v4Input(channel).at(-1)).toMatchObject({
-      kind: "key",
-      down: true,
-      identity: { code: "Space" },
+    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+      type: "key",
+      action: "down",
+      code: "Space",
     });
     for (const [type, buttons] of [
       ["lostpointercapture", 1],
@@ -447,7 +376,7 @@ describe("remote session lifecycle", () => {
       video.focus();
       video.dispatchEvent(Object.assign(new Event(type), { buttons }));
       expect(video.focused).toBe(false);
-      expect(v4Input(channel).at(-1)).toMatchObject({ kind: "releaseAll" });
+      expect(JSON.parse(channel.sent.at(-1)!)).toEqual({ type: "release" });
     }
     controller.setInputEnabled(false);
     channel.sent = [];
@@ -476,7 +405,7 @@ describe("remote session lifecycle", () => {
       onSnapshot: () => {},
     });
     await controller.start();
-    const channel = peer.channels.get("nanoctl.control.v4")!;
+    const channel = peer.channels.get("nanoctl.control.v1")!;
     channel.sent = [];
     pressKey("keydown", { tagName: "BUTTON" }, { code: "Space", key: " " });
     pressKey("keydown", body, { code: "Tab", key: "Tab" });
@@ -486,18 +415,18 @@ describe("remote session lifecycle", () => {
       [body, "KeyB"],
     ] as const) {
       pressKey("keydown", target, { code, key: code.at(-1)!.toLowerCase() });
-      expect(v4Input(channel).at(-1)).toMatchObject({ kind: "key", identity: { code } });
+      expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({ type: "key", code });
     }
     channel.sent = [];
     pressKey("keyup", { tagName: "BUTTON" }, { code: "KeyC", key: "c" });
     expect(channel.sent).toEqual([]);
     pressKey("keydown", body, { code: "ShiftLeft", key: "Shift", shiftKey: true });
     pressKey("keyup", { tagName: "BUTTON" }, { code: "ShiftLeft", key: "Shift" });
-    expect(v4Input(channel).map((data) => data.kind === "key" && data.down)).toEqual([true, false]);
+    expect(channel.sent.map((data) => JSON.parse(data).action)).toEqual(["down", "up"]);
     channel.sent = [];
     for (const timeStamp of [500, 600, 760])
       pressKey("keydown", body, { code: "KeyD", key: "d", repeat: true, timeStamp });
-    expect(channel.sent).toEqual([]);
+    expect(channel.sent.map((data) => JSON.parse(data).repeat)).toEqual([true, true]);
     await controller.stop();
   });
 
@@ -878,10 +807,10 @@ describe("remote session lifecycle", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 320));
     const keys = peer.sent
-      .filter(([label]) => label === "nanoctl.control.v4")
-      .map(([, message]) => parseInputMessage(message as Uint8Array))
-      .filter((message) => message.kind === "key")
-      .map((message) => (message.kind === "key" ? message.identity.code : ""));
+      .filter(([label]) => label === "nanoctl.control.v1")
+      .map(([, message]) => JSON.parse(message) as { type?: string; code?: string })
+      .filter((message) => message.type === "key")
+      .map((message) => message.code);
     expect(keys).toEqual(["KeyV", "KeyA"]);
 
     await controller.stop();
@@ -1003,15 +932,15 @@ class FakeMediaStream {
 }
 
 class FakeDataChannel {
-  constructor(private readonly record: (message: unknown) => void = () => {}) {}
-  sent: unknown[] = [];
+  constructor(private readonly record: (message: string) => void = () => {}) {}
+  sent: string[] = [];
   readyState: RTCDataChannelState = "open";
   bufferedAmount = 0;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
 
-  send(message: unknown): void {
+  send(message: string): void {
     this.sent.push(message);
     this.record(message);
   }
@@ -1027,7 +956,7 @@ class FakePeer {
   transceivers: [string, RTCRtpTransceiverDirection | undefined][] = [];
   channels = new Map<string, FakeDataChannel>();
   channelConfigs = new Map<string, RTCDataChannelInit | undefined>();
-  sent: [string, unknown][] = [];
+  sent: [string, string][] = [];
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription: RTCSessionDescriptionInit | null = null;
@@ -1081,13 +1010,6 @@ describe("webcodecs video gating and teardown", () => {
   test("creates WebCodecs encoded streams whenever the choice allows H.264", async () => {
     installBrowserGlobals(() => 0);
     defineGlobal("VideoDecoder", class FakeVideoDecoder {});
-    defineGlobal(
-      "MediaStreamTrackGenerator",
-      class FakeTrackGenerator {
-        track = { stop() {} };
-        writable = new WritableStream();
-      },
-    );
     for (const codecChoice of ["auto", "av1", "hevc", "h264"] as const) {
       let createEncodedStreamsCalls = 0;
       const peer = new FakePeer();
@@ -1105,9 +1027,7 @@ describe("webcodecs video gating and teardown", () => {
           },
         } as unknown as RTCRtpTransceiver;
       };
-      const video = Object.assign(new FakeVideo(), {
-        ownerDocument: { createElement: () => ({}) },
-      });
+      const video = new FakeVideo();
       const controller = new RemoteSessionController({
         sessionId: `session-${codecChoice}`,
         controllerEpoch: "controller",
@@ -1123,11 +1043,10 @@ describe("webcodecs video gating and teardown", () => {
       expect(createEncodedStreamsCalls).toBe(
         codecChoice === "av1" || codecChoice === "hevc" ? 0 : 1,
       );
-      expect(peer.channelConfigs.get("nanoctl.video-delta.v4")).toMatchObject({
+      expect(peer.channelConfigs.get("nanoctl.video.v1")).toMatchObject({
         ordered: false,
-        maxRetransmits: 0,
+        maxPacketLifeTime: 80,
       });
-      expect(peer.channelConfigs.has("nanoctl.video-reference.v4")).toBe(true);
       await controller.stop("done", false);
     }
   });
