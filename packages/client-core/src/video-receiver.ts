@@ -43,11 +43,15 @@ export class V4VideoReceiver {
         this.options.onAccessUnit(unit);
       }
       if (outcome.requestKeyframe) {
-        this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
+        this.requestKeyframe();
       }
     } catch (error) {
       this.options.onError?.(error);
     }
+  }
+
+  requestKeyframe(): void {
+    this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
   }
 
   dispose(): void {
