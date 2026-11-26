@@ -37,8 +37,10 @@ enum CodecPreference: String, CaseIterable {
         }
     }
 
-    /// Highest compression efficiency first, matching the browser viewer.
-    static let efficiency = ["av1", "hevc", "h264"]
+    /// Highest compression efficiency first — except AV1, whose data-channel
+    /// bitstream path has never once been verified decoding on a device;
+    /// HEVC leads auto until AV1 is proven end to end.
+    static let efficiency = ["hevc", "av1", "h264"]
 
     /// Orders codecs by what both sides support, preferring hardware decode in
     /// auto mode. HEVC is representable through SDP injection even though the
