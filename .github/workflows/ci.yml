@@ -101,6 +101,11 @@ jobs:
       - run: bun run check
       - run: bunx playwright install --with-deps chromium
       - run: bun run test:browser
+      - uses: ./.github/actions/linux-media-deps
+        with:
+          cache-suffix: viewer-media
+          extra-packages: xvfb
+          save-cache: ${{ github.event_name != 'pull_request' }}
       - name: Bad-network video regression
         run: xvfb-run -a bun run test:bad-network
       - name: Upload bad-network evidence
