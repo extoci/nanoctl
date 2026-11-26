@@ -25,6 +25,7 @@
     "test:browser": "bun run build:viewer && playwright test -c tests/browser/playwright.config.ts",
     "test:latency": "bun run build:viewer && NANOCTL_BROWSER_LATENCY=1 playwright test -c tests/browser/playwright.config.ts latency.spec.ts",
     "test:agent": "bun run scripts/cargo.ts test --features rtc",
+    "evidence:latency": "bun run scripts/verify-latency-evidence.ts",
     "evidence:media": "bun run scripts/verify-media-evidence.ts",
     "evidence:network": "bun run scripts/verify-network-evidence.ts",
     "evidence:performance": "bun run scripts/verify-performance-evidence.ts",

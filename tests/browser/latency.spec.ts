@@ -204,14 +204,14 @@ test("measures video and input through the real agent", async ({ page, browser }
       input: { ...summarize(inputMs), samplesMs: inputMs },
     };
     const row = (label: string, result: ReturnType<typeof summarize>) =>
-      `| ${label} | ${result.count} | ${result.p50.toFixed(1)} | ${result.p95.toFixed(1)} | ${result.p99.toFixed(1)} | ${result.max.toFixed(1)} |`;
+      `| ${label} | ${result.count} | ${result.mean.toFixed(1)} | ${result.p50.toFixed(1)} | ${result.p95.toFixed(1)} | ${result.p99.toFixed(1)} | ${result.max.toFixed(1)} |`;
     const markdown = [
       `### nanoctl latency — ${report.platform}/${report.arch}`,
       "",
       `Chromium ${report.chromium}, ${size.width}×${size.height} at ${fps.toFixed(1)} presented fps (software H.264, loopback). Display estimates cannot precede compositor submission. Clock alignment uncertainty: ±${uncertaintyMs.toFixed(2)} ms.`,
       "",
-      "| Metric | Samples | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |",
-      "| --- | ---: | ---: | ---: | ---: | ---: |",
+      "| Metric | Samples | Mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |",
+      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
       row("Video (host draw → viewer presentation)", report.video),
       row("Input (viewer keydown → response presentation)", report.input),
       "",

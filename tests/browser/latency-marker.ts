@@ -48,6 +48,7 @@ export function summarize(samples: number[]) {
   const quantile = (p: number) => sorted[Math.ceil(sorted.length * p) - 1];
   return {
     count: sorted.length,
+    mean: sorted.reduce((sum, sample) => sum + sample, 0) / sorted.length,
     p50: quantile(0.5),
     p95: quantile(0.95),
     p99: quantile(0.99),

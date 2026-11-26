@@ -75,6 +75,10 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         run: bun run test:latency
+      - name: Verify latency regression evidence
+        if: steps.windows.outcome != 'failure'
+        shell: bash
+        run: bun run evidence:latency -- test-results/*/latency.json
       - name: Summarize latency
         shell: bash
         env:
