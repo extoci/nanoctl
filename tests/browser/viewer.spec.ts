@@ -4,6 +4,7 @@ import { copyFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { closePanel, openPanel } from "./panel";
+import { injectDataChannelSpy, injectedWire, v4InputMessages } from "./v4-input";
 
 test("host picker lists tailnet machines and supports keyboard", async ({ page }, testInfo) => {
   await page.route("**/v1/hosts", (route) =>
@@ -148,14 +149,7 @@ test("an unpaced 200-character key burst reaches native input in order", async (
 
 test("enabled input retains keyboard focus after video clicks", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
-  await page.addInitScript(() => {
-    const send = RTCDataChannel.prototype.send;
-    (window as unknown as { injected: string[] }).injected = [];
-    RTCDataChannel.prototype.send = function (data: unknown) {
-      (window as unknown as { injected: string[] }).injected.push(String(data));
-      return Reflect.apply(send, this, [data]);
-    };
-  });
+  await page.addInitScript(injectDataChannelSpy);
   await page.goto("/");
   await expect(page.getByTestId("connection-state")).toHaveText("Live");
   for (let i = 0; i < 2; i++) {
@@ -164,15 +158,13 @@ test("enabled input retains keyboard focus after video clicks", async ({ page })
     await page.keyboard.press("Space");
   }
   expect(
-    await page.evaluate(() =>
-      (window as unknown as { injected: string[] }).injected
-        .map((data) => JSON.parse(data))
-        .filter((data) => data.type === "key"),
-    ),
+    v4InputMessages(await injectedWire(page))
+      .filter((message) => message.kind === "key" && message.identity.code === "Space")
+      .map((message) => (message.kind === "key" ? [message.down, message.identity.key] : [])),
   ).toEqual(
     Array.from({ length: 2 }, () => [
-      { type: "key", action: "down", code: "Space", key: " ", modifiers: 0, repeat: false },
-      { type: "key", action: "up", code: "Space", key: " ", modifiers: 0, repeat: false },
+      [true, " "],
+      [false, " "],
     ]).flat(),
   );
 
@@ -182,11 +174,10 @@ test("enabled input retains keyboard focus after video clicks", async ({ page })
   await page.keyboard.press("a");
   await expect
     .poll(() =>
-      page.evaluate(() =>
-        (window as unknown as { injected: string[] }).injected
-          .map((data) => JSON.parse(data))
-          .filter((data) => data.type === "key" && data.code === "KeyA")
-          .map((data) => data.action),
+      injectedWire(page).then((messages) =>
+        v4InputMessages(messages)
+          .filter((message) => message.kind === "key" && message.identity.code === "KeyA")
+          .map((message) => (message.kind === "key" && message.down ? "down" : "up")),
       ),
     )
     .toEqual(["down", "up"]);
@@ -201,14 +192,7 @@ test("enabled input retains keyboard focus after video clicks", async ({ page })
 
 test("disabled input stays off across repeated video clicks", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
-  await page.addInitScript(() => {
-    const send = RTCDataChannel.prototype.send;
-    (window as unknown as { injected: string[] }).injected = [];
-    RTCDataChannel.prototype.send = function (data: unknown) {
-      (window as unknown as { injected: string[] }).injected.push(String(data));
-      return Reflect.apply(send, this, [data]);
-    };
-  });
+  await page.addInitScript(injectDataChannelSpy);
   await page.goto("/");
   await expect(page.getByTestId("connection-state")).toHaveText("Live");
   await openPanel(page);
@@ -236,10 +220,12 @@ test("disabled input stays off across repeated video clicks", async ({ page }) =
     "false",
   );
   expect(
-    await page.evaluate(() =>
-      (window as unknown as { injected: string[] }).injected.filter((data) =>
-        /"type":"(?:pointer|key)"/.test(data),
-      ),
+    v4InputMessages(await injectedWire(page)).filter(
+      (message) =>
+        message.kind === "pointerButton" ||
+        message.kind === "pointerMove" ||
+        message.kind === "pointerWheel" ||
+        message.kind === "key",
     ),
   ).toEqual([]);
 });
@@ -388,14 +374,7 @@ test("unsupported browsers get an actionable error", async ({ page }) => {
 
 test("session panel sends shortcuts, switches scale and disconnects cleanly", async ({ page }) => {
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
-  await page.addInitScript(() => {
-    const send = RTCDataChannel.prototype.send;
-    (window as unknown as { injected: string[] }).injected = [];
-    RTCDataChannel.prototype.send = function (data: unknown) {
-      (window as unknown as { injected: string[] }).injected.push(String(data));
-      return Reflect.apply(send, this, [data]);
-    };
-  });
+  await page.addInitScript(injectDataChannelSpy);
   const directory = join(homedir(), "crd-shots");
   await mkdir(directory, { recursive: true });
   await page.goto("/");
@@ -410,10 +389,11 @@ test("session panel sends shortcuts, switches scale and disconnects cleanly", as
   await page.getByRole("group", { name: "Send keys" }).getByRole("button").first().click();
   await expect
     .poll(async () =>
-      (await page.evaluate(() => (window as unknown as { injected: string[] }).injected))
-        .map((data) => JSON.parse(data))
-        .filter((m) => m.type === "key")
-        .map((m) => `${m.action}:${m.code}`),
+      v4InputMessages(await injectedWire(page))
+        .filter((message) => message.kind === "key")
+        .map((message) =>
+          message.kind === "key" ? `${message.down ? "down" : "up"}:${message.identity.code}` : "",
+        ),
     )
     .toEqual(["down:AltLeft", "down:Tab", "up:Tab", "up:AltLeft"]);
   await page.getByRole("button", { name: "Shrink to fit", exact: true }).click();

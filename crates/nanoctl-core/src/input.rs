@@ -18,6 +18,8 @@ pub const INPUT_LIVENESS_TIMEOUT_MS: u64 = 2_000;
 pub const MAX_KEY_FIELD_BYTES: usize = 64;
 pub const MAX_TEXT_BYTES: usize = 1_024;
 pub const MAX_GAMEPADS: usize = 4;
+/// High bit of the v4 button mask: PlayStation touchpad click, outside the XInput bits.
+pub const GAMEPAD_TOUCHPAD_BUTTON: u16 = 0x8000;
 const GAMEPAD_ENTRY_BYTES: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -461,7 +463,8 @@ pub struct InputStateMachine {
     held_keys: BTreeMap<KeyIdentity, HeldKey>,
     held_buttons: BTreeSet<PointerButton>,
     gamepads_present: bool,
-    last_motion_sequence: Option<u32>,
+    last_pointer_sequence: Option<u32>,
+    last_gamepad_sequence: Option<u32>,
     last_point: Option<NormalizedPoint>,
     last_seen_ms: Option<u64>,
     released_after_timeout: bool,
@@ -477,7 +480,7 @@ impl InputStateMachine {
         self.released_after_timeout = false;
         match message {
             InputMessage::PointerMove { sequence, point } => {
-                if self.is_stale_motion(*sequence) {
+                if Self::is_stale_sequence(&mut self.last_pointer_sequence, *sequence) {
                     return Vec::new();
                 }
                 self.last_point = Some(*point);
@@ -545,7 +548,7 @@ impl InputStateMachine {
             InputMessage::ReleaseAll { .. } => self.release_all_actions(),
             InputMessage::Heartbeat { .. } => Vec::new(),
             InputMessage::GamepadSnapshot { sequence, snapshot } => {
-                if self.is_stale_motion(*sequence) {
+                if Self::is_stale_sequence(&mut self.last_gamepad_sequence, *sequence) {
                     return Vec::new();
                 }
                 self.gamepads_present = !snapshot.pads.is_empty();
@@ -577,14 +580,11 @@ impl InputStateMachine {
                 .is_some_and(|seen| now_ms.saturating_sub(seen) > INPUT_LIVENESS_TIMEOUT_MS)
     }
 
-    fn is_stale_motion(&mut self, sequence: u32) -> bool {
-        if self
-            .last_motion_sequence
-            .is_some_and(|last| !sequence_is_newer(sequence, last))
-        {
+    fn is_stale_sequence(last_sequence: &mut Option<u32>, sequence: u32) -> bool {
+        if last_sequence.is_some_and(|last| !sequence_is_newer(sequence, last)) {
             return true;
         }
-        self.last_motion_sequence = Some(sequence);
+        *last_sequence = Some(sequence);
         false
     }
 
@@ -978,5 +978,27 @@ mod tests {
             vec![HostAction::PointerMove(point)]
         );
         assert!(machine.apply(&older, 1).is_empty());
+
+        // Pointer and gamepad streams share the motion lane but not a sequence
+        // space: a fast gamepad stream must not make newer pointer motion stale.
+        let gamepad = GamepadSnapshot { pads: Vec::new() };
+        assert_eq!(
+            machine.apply(
+                &InputMessage::GamepadSnapshot {
+                    sequence: 100,
+                    snapshot: gamepad.clone(),
+                },
+                2,
+            ),
+            vec![HostAction::GamepadSnapshot(gamepad)]
+        );
+        let next_pointer = InputMessage::PointerMove {
+            sequence: 11,
+            point,
+        };
+        assert_eq!(
+            machine.apply(&next_pointer, 3),
+            vec![HostAction::PointerMove(point)]
+        );
     }
 }

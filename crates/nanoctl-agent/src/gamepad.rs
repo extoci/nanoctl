@@ -325,27 +325,7 @@ impl Gamepads {
             if slot >= MAX_PADS {
                 continue;
             }
-            let ds4 = match pad.kind {
-                nanoctl_core::input::ControllerKind::DualShock4
-                | nanoctl_core::input::ControllerKind::DualSense => Some(Ds4Buttons {
-                    left_trigger_pressed: pad.left_trigger >= 16,
-                    right_trigger_pressed: pad.right_trigger >= 16,
-                    touchpad_pressed: false,
-                }),
-                nanoctl_core::input::ControllerKind::Xbox360 => None,
-            };
-            replacement[slot] = Some(PadReport {
-                state: Report(
-                    pad.buttons,
-                    pad.left_trigger,
-                    pad.right_trigger,
-                    pad.left_x,
-                    pad.left_y,
-                    pad.right_x,
-                    pad.right_y,
-                ),
-                ds4,
-            });
+            replacement[slot] = Some(v4_pad_report(pad));
         }
         for (current, report) in self.pads.iter_mut().zip(replacement) {
             if report.is_none()
@@ -398,6 +378,32 @@ impl Gamepads {
         {
             self.neutralize();
         }
+    }
+}
+
+fn v4_pad_report(pad: &nanoctl_core::input::GamepadState) -> PadReport {
+    let touchpad_pressed = pad.buttons & nanoctl_core::input::GAMEPAD_TOUCHPAD_BUTTON != 0;
+    let buttons = pad.buttons & !nanoctl_core::input::GAMEPAD_TOUCHPAD_BUTTON;
+    let ds4 = match pad.kind {
+        nanoctl_core::input::ControllerKind::DualShock4
+        | nanoctl_core::input::ControllerKind::DualSense => Some(Ds4Buttons {
+            left_trigger_pressed: pad.left_trigger >= 16,
+            right_trigger_pressed: pad.right_trigger >= 16,
+            touchpad_pressed,
+        }),
+        nanoctl_core::input::ControllerKind::Xbox360 => None,
+    };
+    PadReport {
+        state: Report(
+            buttons,
+            pad.left_trigger,
+            pad.right_trigger,
+            pad.left_x,
+            pad.left_y,
+            pad.right_x,
+            pad.right_y,
+        ),
+        ds4,
     }
 }
 
@@ -787,6 +793,30 @@ mod tests {
         for invalid in [&[1][..], &[4], &[2, 2]] {
             assert!(input(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn v4_touchpad_bit_becomes_dualshock_metadata_not_xinput_state() {
+        let report = v4_pad_report(&nanoctl_core::input::GamepadState {
+            slot: 0,
+            kind: nanoctl_core::input::ControllerKind::DualShock4,
+            buttons: 0x1000 | nanoctl_core::input::GAMEPAD_TOUCHPAD_BUTTON,
+            left_trigger: 32,
+            right_trigger: 0,
+            left_x: 1,
+            left_y: 2,
+            right_x: 3,
+            right_y: 4,
+        });
+        assert_eq!(report.state.0, 0x1000);
+        assert_eq!(
+            report.ds4,
+            Some(Ds4Buttons {
+                left_trigger_pressed: true,
+                right_trigger_pressed: false,
+                touchpad_pressed: true,
+            })
+        );
     }
 
     #[test]

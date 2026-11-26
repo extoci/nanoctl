@@ -2,6 +2,8 @@ export const V4_WIRE_VERSION = 4 as const;
 export const MAX_KEY_FIELD_BYTES = 64;
 export const MAX_TEXT_BYTES = 1024;
 export const MAX_GAMEPADS = 4;
+/** High bit of the v4 button mask: PlayStation touchpad click, outside the XInput bits. */
+export const GAMEPAD_TOUCHPAD_BUTTON = 0x8000;
 export const MAX_VIDEO_CHUNK_BYTES = 48 * 1024;
 export const MAX_VIDEO_PARTS = 512;
 export const MAX_ACCESS_UNIT_BYTES = 16 * 1024 * 1024;

@@ -13,7 +13,7 @@ class FakeChannel implements V4InputChannel {
   }
 }
 
-test("routes discrete input to control and analog state to motion with independent sequences", () => {
+test("routes input streams to their lanes with independent sequence spaces", () => {
   const control = new FakeChannel();
   const motion = new FakeChannel();
   const sender = new V4InputSender(control, motion);
@@ -30,7 +30,7 @@ test("routes discrete input to control and analog state to motion with independe
   expect(key).toMatchObject({ kind: "key", sequence: 1 });
   expect(heartbeat).toMatchObject({ kind: "heartbeat", sequence: 2 });
   expect(move).toMatchObject({ kind: "pointerMove", sequence: 1 });
-  expect(gamepad).toMatchObject({ kind: "gamepadSnapshot", sequence: 2 });
+  expect(gamepad).toMatchObject({ kind: "gamepadSnapshot", sequence: 1 });
 });
 
 test("drops loss-tolerant motion instead of queueing it behind a full SCTP buffer", () => {
