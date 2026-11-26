@@ -383,6 +383,7 @@ interface VideoSinkHooks {
   onDecodedFrame?: (width: number, height: number, decodeMs: number | undefined) => void;
   /** Decoder failed beyond recovery; the caller should abandon this path. */
   onFatal?: () => void;
+  onBackpressure?: () => void;
 }
 
 function createVideoSink(
@@ -728,6 +729,7 @@ function createVideoSink(
       // next keyframe instead; the data-channel caller requests one.
       dropped += 1;
       resyncing = true;
+      hooks?.onBackpressure?.();
       return false;
     }
     try {
@@ -1098,6 +1100,7 @@ export function attachV4DataChannelVideo(
         videoReference.close();
       } catch {}
     },
+    onBackpressure: () => receiver.requestKeyframe(),
   });
   const receiver = new V4VideoReceiver({
     videoDelta,
