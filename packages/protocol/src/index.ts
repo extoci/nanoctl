@@ -172,7 +172,12 @@ export type ControlMessage =
   | { readonly type: "audio"; readonly enabled: boolean }
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }
-  | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number };
+  | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number }
+  | {
+      /** Viewer-measured data-channel loss fraction; the host adapts bitrate and fps to it. */
+      readonly type: "link-stats";
+      readonly loss: number;
+    };
 
 export type DeviceCapabilities = {
   readonly protocolVersion: SupportedProtocolVersion;

@@ -1430,7 +1430,8 @@ export class RemoteSessionController {
         // Wire v3 is binary-only on the input lanes: the JSON form was
         // rejected host-side, so stuck keys and buttons were never released.
         const binary = this.options.binaryInput ? encodeBinaryInput({ type: "release" }) : null;
-        channel.send(binary ?? JSON.stringify({ type: "release" } satisfies ControlMessage));
+        if (binary) channel.send(binary);
+        else channel.send(JSON.stringify({ type: "release" } satisfies ControlMessage));
       } catch {
         // Closing a channel is already a release boundary.
       }
@@ -1565,6 +1566,11 @@ export class RemoteSessionController {
   }
 
   private async collectStats(lifecycle: number): Promise<void> {
+    // Receiver-measured data-channel loss is the host's only congestion
+    // signal while video rides the data channel — RTP feedback describes the
+    // thin keepalive leg — so report it every second before any early return.
+    const dcLoss = this.webCodecsVideo?.takeLinkLoss?.();
+    if (dcLoss !== undefined) this.sendControl({ type: "link-stats", loss: dcLoss });
     const peer = this.peer;
     if (!peer || !this.isCurrent(lifecycle, peer) || this.statsInFlight) return;
     this.statsInFlight = true;

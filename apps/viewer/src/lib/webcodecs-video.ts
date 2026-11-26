@@ -12,6 +12,9 @@ export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
   drop(): void;
   stats(): { decoded: number; dropped: number };
+  /** Rolling data-channel loss fraction since the previous call, when the
+   * handle tracks sequence numbers (data-channel video). */
+  takeLinkLoss?(): number;
 }
 
 interface EncodedVideoFrameLike {
@@ -822,6 +825,8 @@ export function attachDataChannelVideo(
   let expectedSeq: number | null = null;
   let waitingForKey = true;
   let kfRequestedAt = 0;
+  let dcLost = 0;
+  let dcReceived = 0;
   const dbg = ((
     window as unknown as { __dcv?: Record<string, number | boolean | string> }
   ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
@@ -979,6 +984,11 @@ export function attachDataChannelVideo(
       }
       // Drain the reorder window in sequence.
       const deliver = (s: number, a: Uint8Array, k: boolean) => {
+        if (expectedSeq !== null) {
+          const skipped = (s - expectedSeq) | 0;
+          if (skipped > 0) dcLost += skipped;
+        }
+        dcReceived += 1;
         expectedSeq = (s + 1) >>> 0;
         if (waitingForKey) {
           requestKeyframe();
@@ -1046,5 +1056,13 @@ export function attachDataChannelVideo(
       sink.teardown(false);
     },
     stats: sink.stats,
+    takeLinkLoss: () => {
+      const lost = dcLost;
+      const received = dcReceived;
+      dcLost = 0;
+      dcReceived = 0;
+      const total = lost + received;
+      return total > 0 ? lost / total : 0;
+    },
   };
 }
