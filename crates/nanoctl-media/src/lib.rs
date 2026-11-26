@@ -1,5 +1,7 @@
 mod bitstream;
 mod chunking;
+#[cfg(all(windows, feature = "capture"))]
+mod dxgi_capture;
 mod i420;
 mod latest;
 mod nv12;
@@ -12,6 +14,8 @@ mod windows_mft;
 mod xcap_capture;
 
 pub use chunking::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
+#[cfg(all(windows, feature = "capture"))]
+pub use dxgi_capture::DxgiCaptureSource;
 pub use i420::frame_to_i420;
 pub use latest::{LatestSlot, PutOutcome};
 pub use nv12::{frame_to_nv12, frame_to_nv12_slice};

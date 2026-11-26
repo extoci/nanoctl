@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -88,7 +89,11 @@ pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
-    pub pixels: Vec<u8>,
+    /// Whether the pixels contain new desktop damage since the previously captured frame.
+    /// Backends without damage detection leave this true; DXGI can reuse shared pixels with it
+    /// false so the encoder does not burn time on unchanged screens unless a keyframe is due.
+    pub has_new_damage: bool,
+    pub pixels: Arc<[u8]>,
 }
 
 impl RawFrame {
@@ -105,6 +110,45 @@ impl RawFrame {
             width,
             height,
             format,
+            has_new_damage: true,
+            pixels: pixels.into(),
+        }
+    }
+
+    /// Creates a frame backed by shared immutable pixels so repeated unchanged desktop frames do
+    /// not require another full-screen memcpy before encode.
+    pub fn from_shared(
+        capture_time_us: u64,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        pixels: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            capture_time_us,
+            capture_sequence: 0,
+            width,
+            height,
+            format,
+            has_new_damage: true,
+            pixels,
+        }
+    }
+
+    pub fn unchanged_shared(
+        capture_time_us: u64,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        pixels: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            capture_time_us,
+            capture_sequence: 0,
+            width,
+            height,
+            format,
+            has_new_damage: false,
             pixels,
         }
     }
@@ -168,6 +212,7 @@ pub struct MediaPipelineSnapshot {
     pub lane_write_errors: u64,
     pub access_units_dropped_before_write: u64,
     pub encoder_skips: u64,
+    pub unchanged_frames_skipped: u64,
     pub bytes_written: u64,
     pub max_buffered_bytes: u64,
     pub total_encode_micros: u64,

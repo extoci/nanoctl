@@ -259,10 +259,17 @@ async fn encode_loop_inner(
             return Ok(());
         }
         record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
-        stream_sequence = stream_sequence.wrapping_add(1);
+        if !frame.has_new_damage
+            && !force_next_keyframe
+            && !keyframe_requested.load(Ordering::Acquire)
+        {
+            record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
+            continue;
+        }
         let keyframe_was_requested = keyframe_requested.swap(false, Ordering::Acquire);
         let force_keyframe = force_next_keyframe || keyframe_was_requested;
         force_next_keyframe = false;
+        stream_sequence = stream_sequence.wrapping_add(1);
         let request = EncodeRequest {
             stream_sequence,
             force_keyframe,
@@ -613,6 +620,44 @@ mod tests {
         assert_eq!(report.snapshot.encoder_skips, 1);
         assert_eq!(report.snapshot.access_units_encoded, 1);
         assert_eq!(report.snapshot.keyframes_encoded, 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_frames_skip_encode_but_keyframe_requests_still_emit() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(TestEncoder),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        let mut unchanged = frame(222);
+        unchanged.has_new_damage = false;
+        frames_tx.send(unchanged).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(units.lock().expect("collected units poisoned").len(), 1);
+
+        pipeline.request_keyframe();
+        let mut unchanged = frame(333);
+        unchanged.has_new_damage = false;
+        frames_tx.send(unchanged).await.unwrap();
+        wait_for_len(&units, &notify, 2).await;
+        let second = {
+            let written = units.lock().expect("collected units poisoned");
+            (written[1].stream_sequence, written[1].keyframe)
+        };
+        assert_eq!(second, (2, true));
+
+        let report = pipeline.stop().await;
+        assert_eq!(report.snapshot.unchanged_frames_skipped, 1);
+        assert_eq!(report.snapshot.access_units_encoded, 2);
     }
 
     struct NonKeyframeEncoder {
