@@ -310,6 +310,63 @@ impl Gamepads {
         error.map_or(Ok(()), Err)
     }
 
+    /// Applies a v4 absolute replacement snapshot. Unlike wire-v3 sparse
+    /// snapshots, v4 motion-lane ordering/staleness is already decided by
+    /// `nanoctl_core::input::InputStateMachine`, so this path deliberately
+    /// does not run the legacy u8 sequence filter. Omitted slots are detached.
+    pub fn update_v4(&mut self, snapshot: &nanoctl_core::input::GamepadSnapshot) -> Result<()> {
+        if !available() {
+            return Ok(());
+        }
+        self.last_snapshot = Some(Instant::now());
+        let mut replacement = [None; MAX_PADS];
+        for pad in &snapshot.pads {
+            let slot = usize::from(pad.slot);
+            if slot >= MAX_PADS {
+                continue;
+            }
+            let ds4 = match pad.kind {
+                nanoctl_core::input::ControllerKind::DualShock4
+                | nanoctl_core::input::ControllerKind::DualSense => Some(Ds4Buttons {
+                    left_trigger_pressed: pad.left_trigger >= 16,
+                    right_trigger_pressed: pad.right_trigger >= 16,
+                    touchpad_pressed: false,
+                }),
+                nanoctl_core::input::ControllerKind::Xbox360 => None,
+            };
+            replacement[slot] = Some(PadReport {
+                state: Report(
+                    pad.buttons,
+                    pad.left_trigger,
+                    pad.right_trigger,
+                    pad.left_x,
+                    pad.left_y,
+                    pad.right_x,
+                    pad.right_y,
+                ),
+                ds4,
+            });
+        }
+        for (current, report) in self.pads.iter_mut().zip(replacement) {
+            if report.is_none()
+                || current.as_ref().map(|pad| pad.kind) != report.map(PadReport::kind)
+            {
+                *current = None;
+            }
+        }
+        let mut error = None;
+        for (slot, (current, report)) in self.pads.iter_mut().zip(replacement).enumerate() {
+            let Some(report) = report else {
+                continue;
+            };
+            if let Err(err) = apply(current, slot, report) {
+                *current = None;
+                error = Some(err);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+
     /// A heartbeat proves the viewer is alive but carries no replacement
     /// state. Once pads have been neutralized it must not resurrect them.
     pub fn heartbeat(&mut self) {
