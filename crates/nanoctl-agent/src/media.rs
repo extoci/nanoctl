@@ -2537,7 +2537,10 @@ pub fn effective_max_fps(configured: u16) -> u16 {
 }
 
 fn refresh_to_fps(hz: f32) -> Option<u16> {
-    (hz.is_finite() && hz >= 23.5).then(|| (hz.round() as u16).clamp(24, 240))
+    // Display-following tops out at 120: no client decodes faster, and pacing
+    // an encoder at 240fps on a 240Hz monitor quadrupled encode cost for zero
+    // benefit — on a constrained link the overload alone collapsed the stream.
+    (hz.is_finite() && hz >= 23.5).then(|| (hz.round() as u16).clamp(24, 120))
 }
 
 pub fn run_smoke(
@@ -4658,8 +4661,8 @@ mod tests {
     #[test]
     fn display_refresh_rates_map_to_frame_rate_caps() {
         assert_eq!(super::refresh_to_fps(59.94), Some(60));
-        assert_eq!(super::refresh_to_fps(143.9), Some(144));
-        assert_eq!(super::refresh_to_fps(360.0), Some(240));
+        assert_eq!(super::refresh_to_fps(143.9), Some(120));
+        assert_eq!(super::refresh_to_fps(360.0), Some(120));
         assert_eq!(super::refresh_to_fps(0.0), None);
         assert_eq!(super::refresh_to_fps(f32::NAN), None);
         assert_eq!(super::effective_max_fps(90), 90);
