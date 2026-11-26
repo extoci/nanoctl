@@ -3440,7 +3440,16 @@ pub fn spawn_video(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or_default();
-                            replay_msg[9..17].copy_from_slice(&replay_ms.to_le_bytes());
+                            // The timestamp offset depends on the fragmentation
+                            // flag: chunked messages carry part/parts u16s before
+                            // it (offset 9), whole ones do not (offset 5). A fixed
+                            // offset clobbered the first payload bytes — the
+                            // Annex-B start code — of every unfragmented replayed
+                            // keyframe, which is why first-frame decodes failed
+                            // with a garbage head until the next natural keyframe.
+                            let ts_offset = if replay_msg[4] & 0x02 != 0 { 9 } else { 5 };
+                            replay_msg[ts_offset..ts_offset + 8]
+                                .copy_from_slice(&replay_ms.to_le_bytes());
                             if let Err(error) = channel.send(&Bytes::from(replay_msg)).await {
                                 tracing::warn!(%error, "video data channel replay failed");
                                 queue.clear();
