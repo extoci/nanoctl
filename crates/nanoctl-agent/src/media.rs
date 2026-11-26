@@ -3204,9 +3204,9 @@ pub fn spawn_video(
                         // and new attach IDRs pass immediately — while
                         // cutting storm bandwidth several-fold.
                         let now = Instant::now();
-                        if last_forced_idr.is_none_or(|at| {
-                            now.duration_since(at) >= Duration::from_millis(300)
-                        }) {
+                        if last_forced_idr
+                            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(300))
+                        {
                             encoder.encoder.force_keyframe();
                             last_forced_idr = Some(now);
                         }
