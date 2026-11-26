@@ -11,7 +11,7 @@
 export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
   drop(): void;
-  stats(): { decoded: number; dropped: number };
+  stats(): { decoded: number; dropped: number; decoderErrors?: number };
   /** Rolling data-channel loss fraction since the previous call, when the
    * handle tracks sequence numbers (data-channel video). */
   takeLinkLoss?(): number;
@@ -374,7 +374,7 @@ interface VideoSink {
   canvas: HTMLCanvasElement;
   feed(data: Uint8Array, isKey: boolean, timestampUs: number): boolean;
   teardown(notify?: boolean): void;
-  stats(): { decoded: number; dropped: number };
+  stats(): { decoded: number; dropped: number; decoderErrors?: number };
 }
 
 interface VideoTrackGeneratorLike {
@@ -768,7 +768,7 @@ function createVideoSink(
     canvas: canvas ?? video.ownerDocument.createElement("canvas"),
     feed,
     teardown,
-    stats: () => ({ decoded, dropped }),
+    stats: () => ({ decoded, dropped, decoderErrors }),
   };
 }
 
@@ -970,6 +970,7 @@ export function attachDataChannelVideo(
         au = joined;
       }
       if (!au) return;
+      if (isKey) dbg.keys = ((dbg.keys as number) || 0) + 1;
       if (expectedSeq === null) {
         expectedSeq = seq;
       }
@@ -1042,6 +1043,7 @@ export function attachDataChannelVideo(
       const st = sink.stats();
       dbg.decoded = st.decoded;
       dbg.decodeDropped = st.dropped;
+      dbg.decoderErrors = st.decoderErrors || 0;
       return;
     } catch {
       // Decoder must never break the channel.

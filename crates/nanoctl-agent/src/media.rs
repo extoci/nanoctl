@@ -74,6 +74,140 @@ const VIDEO_FLAG_FRAGMENTED: u8 = 2;
 const VIDEO_FLAG_TIMESTAMP: u8 = 4;
 const VIDEO_FLAG_HEARTBEAT: u8 = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoImpairmentPlan {
+    SendNow,
+    Drop,
+    Delay(Duration),
+}
+
+/// Deterministic test-only impairment applied at the real SCTP send boundary.
+/// Browser loopback otherwise has no packet loss, so bad-network regression
+/// tests use environment variables to drop, delay and reorder actual wire
+/// messages while keeping the encoder, SCTP transport and browser decoder real.
+struct VideoNetworkImpairment {
+    loss_ppm: u32,
+    reorder_ppm: u32,
+    jitter_ms: u64,
+    bytes_per_second: u64,
+    tokens: f64,
+    token_at: Instant,
+    random: u64,
+}
+
+impl VideoNetworkImpairment {
+    fn from_env() -> Option<Self> {
+        let parse = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let loss_ppm = parse("NANOCTL_TEST_VIDEO_LOSS_PPM") as u32;
+        let reorder_ppm = parse("NANOCTL_TEST_VIDEO_REORDER_PPM") as u32;
+        let jitter_ms = parse("NANOCTL_TEST_VIDEO_JITTER_MS");
+        let bandwidth_kbps = parse("NANOCTL_TEST_VIDEO_BANDWIDTH_KBPS");
+        if loss_ppm == 0 && reorder_ppm == 0 && jitter_ms == 0 && bandwidth_kbps == 0 {
+            return None;
+        }
+        let bytes_per_second = bandwidth_kbps.saturating_mul(1000) / 8;
+        Some(Self {
+            loss_ppm,
+            reorder_ppm,
+            jitter_ms,
+            bytes_per_second,
+            tokens: bytes_per_second as f64 / 4.0,
+            token_at: Instant::now(),
+            random: 0x9e37_79b9_7f4a_7c15,
+        })
+    }
+
+    fn next_random(&mut self) -> u32 {
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 7;
+        self.random ^= self.random << 17;
+        (self.random >> 32) as u32
+    }
+
+    fn chance(&mut self, ppm: u32) -> bool {
+        ppm != 0 && self.next_random() % 1_000_000 < ppm
+    }
+
+    fn plan(&mut self, len: usize, reliable: bool) -> VideoImpairmentPlan {
+        let mut delay = Duration::ZERO;
+        if self.bytes_per_second != 0 {
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(self.token_at).as_secs_f64();
+            self.token_at = now;
+            let capacity = self.bytes_per_second as f64 / 4.0;
+            self.tokens = (self.tokens + elapsed * self.bytes_per_second as f64).min(capacity);
+            let len = len as f64;
+            if self.tokens >= len {
+                self.tokens -= len;
+            } else if reliable {
+                let deficit = len - self.tokens;
+                self.tokens = 0.0;
+                delay += Duration::from_secs_f64(deficit / self.bytes_per_second as f64);
+            } else {
+                return VideoImpairmentPlan::Drop;
+            }
+        }
+        // Reliable SCTP retransmission hides ordinary packet loss, so message
+        // deletion is only applied to the bounded-retransmit delta lane. The
+        // reliable IDR lane still receives bandwidth delay and jitter.
+        if !reliable && self.chance(self.loss_ppm) {
+            return VideoImpairmentPlan::Drop;
+        }
+        if self.jitter_ms != 0 {
+            delay += Duration::from_millis(self.next_random() as u64 % (self.jitter_ms + 1));
+        }
+        if !reliable && self.chance(self.reorder_ppm) {
+            // A long tail is what exercises the reorder window. Ordinary
+            // jitter alone often preserves order on a single-core loopback.
+            delay += Duration::from_millis(40 + self.next_random() as u64 % 40);
+        }
+        if delay.is_zero() {
+            VideoImpairmentPlan::SendNow
+        } else {
+            VideoImpairmentPlan::Delay(delay)
+        }
+    }
+}
+
+fn spawn_delayed_video_send(
+    channel: &Arc<webrtc::data_channel::RTCDataChannel>,
+    message: &Bytes,
+    delay: Duration,
+) {
+    let channel = channel.clone();
+    let message = message.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if let Err(error) = channel.send(&message).await {
+            tracing::debug!(%error, "delayed impaired video data channel send failed");
+        }
+    });
+}
+
+async fn send_video_data_message(
+    channel: &Arc<webrtc::data_channel::RTCDataChannel>,
+    message: &Bytes,
+    reliable: bool,
+    impairment: &mut Option<VideoNetworkImpairment>,
+) -> std::result::Result<bool, webrtc::Error> {
+    if let Some(impairment) = impairment {
+        match impairment.plan(message.len(), reliable) {
+            VideoImpairmentPlan::Drop => return Ok(false),
+            VideoImpairmentPlan::Delay(delay) => {
+                spawn_delayed_video_send(channel, message, delay);
+                return Ok(true);
+            }
+            VideoImpairmentPlan::SendNow => {}
+        }
+    }
+    channel.send(message).await.map(|_| true)
+}
+
 fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
     let parts = data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
     let timestamped = is_keyframe || seq.is_multiple_of(16);
@@ -3378,6 +3512,10 @@ pub fn spawn_video(
         let mut replay_last_new = 0_u32;
         let mut dc_was_live = false;
         let mut dc_skips = 0_u64;
+        let mut dc_impairment = VideoNetworkImpairment::from_env();
+        if dc_impairment.is_some() {
+            tracing::info!("test video network impairment enabled");
+        }
         let mut reference_recovery = ReferenceRecovery {
             codec: quality.codec,
             ..ReferenceRecovery::default()
@@ -3406,11 +3544,15 @@ pub fn spawn_video(
                             && channel.buffered_amount().await <= 64 * 1024
                         {
                             let msg = video_heartbeat_message(dc_seq);
-                            if let Err(error) = channel.send(&msg).await {
-                                tracing::warn!(%error, "video data channel heartbeat failed");
-                            } else {
-                                writer_stats.bytes_sent.fetch_add(msg.len() as u64, Ordering::Relaxed);
-                                writer_stats.send_window.lock().unwrap().writes.push_back((now, msg.len()));
+                            match send_video_data_message(&channel, &msg, false, &mut dc_impairment).await {
+                                Ok(true) => {
+                                    writer_stats.bytes_sent.fetch_add(msg.len() as u64, Ordering::Relaxed);
+                                    writer_stats.send_window.lock().unwrap().writes.push_back((now, msg.len()));
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "video data channel heartbeat failed")
+                                }
                             }
                         }
                     }
@@ -3493,12 +3635,15 @@ pub fn spawn_video(
                             let ts_offset = if replay_msg[4] & 0x02 != 0 { 9 } else { 5 };
                             replay_msg[ts_offset..ts_offset + 8]
                                 .copy_from_slice(&replay_ms.to_le_bytes());
-                            if let Err(error) = channel.send(&Bytes::from(replay_msg)).await {
-                                tracing::warn!(%error, "video data channel replay failed");
-                                queue.clear();
-                                break;
+                            let replay_msg = Bytes::from(replay_msg);
+                            match send_video_data_message(channel, &replay_msg, true, &mut dc_impairment).await {
+                                Ok(_) => last_dc_activity = Some(Instant::now()),
+                                Err(error) => {
+                                    tracing::warn!(%error, "video data channel replay failed");
+                                    queue.clear();
+                                    break;
+                                }
                             }
-                            last_dc_activity = Some(Instant::now());
                         }
                         if queue.is_empty() {
                             dc_replay = None;
@@ -3602,19 +3747,23 @@ pub fn spawn_video(
                                         }
                                         tokio::time::sleep(Duration::from_millis(1)).await;
                                     }
-                                    if let Err(error) = channel.send(msg).await {
-                                        tracing::warn!(%error, "video data channel send failed");
-                                        dc_backed_up = true;
-                                        break;
+                                    match send_video_data_message(channel, msg, true, &mut dc_impairment).await {
+                                        Ok(_) => dc_backed_up = false,
+                                        Err(error) => {
+                                            tracing::warn!(%error, "video data channel send failed");
+                                            dc_backed_up = true;
+                                            break;
+                                        }
                                     }
-                                    dc_backed_up = false;
                                 } else if channel.buffered_amount().await <= 64 * 1024 {
-                                    if let Err(error) = channel.send(msg).await {
-                                        tracing::warn!(%error, "video data channel send failed");
-                                        dc_backed_up = true;
-                                        break;
+                                    match send_video_data_message(channel, msg, false, &mut dc_impairment).await {
+                                        Ok(_) => dc_backed_up = false,
+                                        Err(error) => {
+                                            tracing::warn!(%error, "video data channel send failed");
+                                            dc_backed_up = true;
+                                            break;
+                                        }
                                     }
-                                    dc_backed_up = false;
                                 } else {
                                     dc_skips += 1;
                                     if !dc_backed_up {

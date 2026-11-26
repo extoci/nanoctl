@@ -9,6 +9,7 @@ const directory = await mkdtemp(join(cache, "nanoctl-browser-"));
 const config = join(directory, "config.toml");
 const port = Number(process.env.NANOCTL_BROWSER_PORT);
 const latency = process.env.NANOCTL_BROWSER_LATENCY === "1";
+const badNetwork = process.env.NANOCTL_BROWSER_BAD_NETWORK === "1";
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Browser-test port required");
 await writeFile(
@@ -23,6 +24,7 @@ encoder = "software"
 max_width = 1280
 max_height = 720
 max_fps = 30
+max_bitrate_kbps = ${badNetwork ? 3000 : 100000}
 `,
 );
 const env = {
@@ -30,6 +32,14 @@ const env = {
   NANOCTL_DEV_LOOPBACK_USER: "dev@example.com",
   XDG_DATA_HOME: directory,
   XDG_CONFIG_HOME: directory,
+  ...(badNetwork
+    ? {
+        NANOCTL_TEST_VIDEO_LOSS_PPM: "50000",
+        NANOCTL_TEST_VIDEO_REORDER_PPM: "200000",
+        NANOCTL_TEST_VIDEO_JITTER_MS: "25",
+        NANOCTL_TEST_VIDEO_BANDWIDTH_KBPS: "3000",
+      }
+    : {}),
   ...(process.platform === "linux" && !process.env.CC ? { CC: "gcc" } : {}),
 };
 const start = () =>
@@ -39,7 +49,7 @@ const start = () =>
       "run",
       "--features",
       latency || process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
-      ...(latency ? ["--release", "--locked"] : []),
+      ...(latency || badNetwork ? ["--release", "--locked"] : []),
       "--manifest-path",
       "crates/nanoctl-agent/Cargo.toml",
       "--",
