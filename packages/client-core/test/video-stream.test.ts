@@ -49,12 +49,14 @@ describe("VideoStreamProcessor", () => {
     expect(outcome.emitted.map((unit) => unit.streamSequence)).toEqual([11, 12]);
   });
 
-  test("surfaces replaced incomplete reassembly while accepting the replacement", () => {
+  test("surfaces eviction when starting a fourth incomplete access unit", () => {
     const processor = new VideoStreamProcessor();
     processor.pushChunk(chunk(7, 0, 2, true, [1]));
-    const outcome = processor.pushChunk(chunk(8, 0, 1, true, [2]));
+    processor.pushChunk(chunk(8, 0, 2, true, [2]));
+    processor.pushChunk(chunk(9, 0, 2, true, [3]));
+    const outcome = processor.pushChunk(chunk(10, 0, 2, true, [4]));
     expect(outcome.droppedIncompleteSequence).toBe(7);
-    expect(outcome.emitted[0]?.streamSequence).toBe(8);
+    expect(processor.pushChunk(chunk(8, 1, 2, true, [5])).emitted[0]?.streamSequence).toBe(8);
   });
 
   test("requests keyframe for first delta and malformed bytes do not mutate state", () => {
@@ -64,4 +66,14 @@ describe("VideoStreamProcessor", () => {
     const recovery = processor.pushChunk(chunk(9, 0, 1, true, [1]));
     expect(recovery.emitted[0]?.streamSequence).toBe(9);
   });
+});
+
+test("a complete newer frame does not evict an earlier delta's partial fragments", () => {
+  const processor = new VideoStreamProcessor();
+  processor.pushEncodedChunk(encoded(10, 0, 1, true, [0]));
+  processor.pushEncodedChunk(encoded(11, 0, 2, false, [1]));
+  expect(processor.pushEncodedChunk(encoded(12, 0, 1, false, [3])).emitted).toEqual([]);
+  const outcome = processor.pushEncodedChunk(encoded(11, 1, 2, false, [2]));
+  expect(outcome.emitted.map((unit) => [...unit.payload])).toEqual([[1, 2], [3]]);
+  expect(outcome.requestKeyframe).toBe(false);
 });
