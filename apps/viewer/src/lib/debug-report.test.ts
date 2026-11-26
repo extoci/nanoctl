@@ -114,3 +114,34 @@ test("host report failures become readable text", async () => {
   }) as unknown as typeof fetch;
   expect(await fetchHostReport(offline)).toBe("Host report unavailable: network down");
 });
+
+test("reports v4 measurements and the host encoder separately from RTP stats", async () => {
+  recordMetrics(metrics);
+  const report = await buildDebugReport({
+    info: null,
+    snapshot,
+    socketStatus: "online",
+    socketDetail: "",
+    codecChoice: "auto",
+    hostReport:
+      '## Recent agent log\n\nINFO v4 platform encoder initialized backend="software-openh264"\n',
+    decodeSupport: async () => ({ supported: true, powerEfficient: false }),
+    v4Video: {
+      resolution: "960×540",
+      rttMs: 0,
+      route: "direct",
+      jitterMs: null,
+      skippedFrames: 2,
+      skippedPercent: 40,
+      decodeMs: 3,
+      decodeSamples: 2,
+    },
+  });
+  expect(report).toContain("decoded resolution: 960×540");
+  expect(report).toContain("direct; RTT: 0.00 ms");
+  expect(report).toContain("arrival jitter: unavailable");
+  expect(report).toContain("skipped stream frames: 2 (40.00%)");
+  expect(report).toContain("WebCodecs submit to output: 3.00 ms (2 samples)");
+  expect(report).toContain("last reported encoder backend: software-openh264");
+  expect(report).not.toContain("| packetsLost |");
+});
