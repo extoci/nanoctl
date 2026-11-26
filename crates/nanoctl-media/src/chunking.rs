@@ -65,15 +65,13 @@ where
         };
         let wire_bytes = access_unit.payload.len() + parts * VIDEO_HEADER_BYTES;
         let buffered_before = self.sink.buffered_bytes(lane).await;
-        let available = self
-            .sink
-            .lane_capacity(lane)
-            .await
-            .saturating_sub(buffered_before);
+        let lane_capacity = self.sink.lane_capacity(lane).await;
+        let available = lane_capacity.saturating_sub(buffered_before);
         if wire_bytes > available {
             return Ok(LaneWriteReport {
                 status: LaneWriteStatus::DroppedBeforeWrite,
                 buffered_bytes: buffered_before,
+                lane_capacity,
             });
         }
 
@@ -99,6 +97,7 @@ where
         Ok(LaneWriteReport {
             status: LaneWriteStatus::Written,
             buffered_bytes: self.sink.buffered_bytes(lane).await,
+            lane_capacity,
         })
     }
 }

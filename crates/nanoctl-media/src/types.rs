@@ -46,6 +46,36 @@ pub struct MediaPipelineConfig {
     pub codec: VideoCodec,
 }
 
+/// Dynamic viewer/link ceilings applied to an already-running pipeline. Values are
+/// ceilings, never expansions beyond the static host configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaQuality {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: u32,
+    pub target_bitrate: u32,
+}
+
+impl MediaQuality {
+    pub fn from_config(config: MediaPipelineConfig) -> Self {
+        Self {
+            width: config.width,
+            height: config.height,
+            frame_rate: config.frame_rate,
+            target_bitrate: config.target_bitrate,
+        }
+    }
+
+    pub fn clamped(self, config: MediaPipelineConfig) -> Self {
+        Self {
+            width: self.width.max(2).min(config.width) & !1,
+            height: self.height.max(2).min(config.height) & !1,
+            frame_rate: self.frame_rate.clamp(1, config.frame_rate),
+            target_bitrate: self.target_bitrate.clamp(1, config.target_bitrate),
+        }
+    }
+}
+
 impl MediaPipelineConfig {
     pub const MAX_FRAME_RATE: u32 = 240;
 
@@ -195,6 +225,9 @@ pub enum LaneWriteStatus {
 pub struct LaneWriteReport {
     pub status: LaneWriteStatus,
     pub buffered_bytes: usize,
+    /// Total byte budget for the lane used by this write. Exposing it keeps congestion
+    /// decisions independent of any one WebRTC implementation's internal constants.
+    pub lane_capacity: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

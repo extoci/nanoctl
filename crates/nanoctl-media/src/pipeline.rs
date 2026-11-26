@@ -10,7 +10,7 @@ use crate::latest::{LatestSlot, PutOutcome};
 use crate::scaling::FrameScaler;
 use crate::types::{
     EncodeRequest, EncodedAccessUnit, LaneWriteStatus, LaneWriter, MediaError, MediaPipelineConfig,
-    MediaPipelineSnapshot, RawFrame, VideoEncoder, VideoSource,
+    MediaPipelineSnapshot, MediaQuality, RawFrame, VideoEncoder, VideoSource,
 };
 
 pub struct MediaPipeline {
@@ -54,6 +54,37 @@ impl MediaPipeline {
         lane: Box<dyn LaneWriter>,
         keyframe_requested: Arc<AtomicBool>,
     ) -> Result<Self, MediaError> {
+        Self::start_inner(config, source, encoder, lane, keyframe_requested, None)
+    }
+
+    /// Starts a pipeline that follows live viewer/link quality ceilings. Static config remains
+    /// the hard upper bound; quality updates may only reduce resolution, rate or bitrate.
+    pub fn start_with_quality(
+        config: MediaPipelineConfig,
+        source: Box<dyn VideoSource>,
+        encoder: Box<dyn VideoEncoder>,
+        lane: Box<dyn LaneWriter>,
+        keyframe_requested: Arc<AtomicBool>,
+        quality: watch::Receiver<MediaQuality>,
+    ) -> Result<Self, MediaError> {
+        Self::start_inner(
+            config,
+            source,
+            encoder,
+            lane,
+            keyframe_requested,
+            Some(quality),
+        )
+    }
+
+    fn start_inner(
+        config: MediaPipelineConfig,
+        source: Box<dyn VideoSource>,
+        encoder: Box<dyn VideoEncoder>,
+        lane: Box<dyn LaneWriter>,
+        keyframe_requested: Arc<AtomicBool>,
+        quality: Option<watch::Receiver<MediaQuality>>,
+    ) -> Result<Self, MediaError> {
         let config = config.validate()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let frame_slot = Arc::new(LatestSlot::new());
@@ -66,6 +97,7 @@ impl MediaPipeline {
             shutdown_rx,
             shutdown_tx.clone(),
             Arc::clone(&metrics),
+            quality.clone(),
         ));
         let encode_task = tokio::spawn(encode_loop(EncodeLoopContext {
             config,
@@ -76,6 +108,7 @@ impl MediaPipeline {
             shutdown_tx: shutdown_tx.clone(),
             keyframe_requested: Arc::clone(&keyframe_requested),
             metrics: Arc::clone(&metrics),
+            quality,
         }));
 
         Ok(Self {
@@ -147,6 +180,71 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.changed().await;
 }
 
+fn current_quality(
+    config: MediaPipelineConfig,
+    quality: &Option<watch::Receiver<MediaQuality>>,
+) -> MediaQuality {
+    quality.as_ref().map_or_else(
+        || MediaQuality::from_config(config),
+        |quality| quality.borrow().clamped(config),
+    )
+}
+
+#[derive(Debug)]
+struct LaneBitrateController {
+    current_bps: u32,
+    next_decrease: Instant,
+    next_increase: Instant,
+}
+
+impl LaneBitrateController {
+    const MIN_BPS: u32 = 350_000;
+    const START_BPS: u32 = 2_000_000;
+
+    fn new(ceiling_bps: u32) -> Self {
+        Self {
+            current_bps: Self::START_BPS
+                .min(ceiling_bps)
+                .max(Self::MIN_BPS.min(ceiling_bps)),
+            next_decrease: Instant::now(),
+            next_increase: Instant::now(),
+        }
+    }
+
+    fn current(&mut self, ceiling_bps: u32) -> u32 {
+        self.current_bps = self
+            .current_bps
+            .min(ceiling_bps)
+            .max(Self::MIN_BPS.min(ceiling_bps));
+        self.current_bps
+    }
+
+    fn update(
+        &mut self,
+        ceiling_bps: u32,
+        status: LaneWriteStatus,
+        buffered_bytes: usize,
+        lane_capacity: usize,
+    ) {
+        let ceiling = ceiling_bps.max(Self::MIN_BPS);
+        self.current_bps = self.current_bps.min(ceiling);
+        let now = Instant::now();
+        let high_water = lane_capacity / 2;
+        let low_water = lane_capacity / 8;
+        if status == LaneWriteStatus::DroppedBeforeWrite || buffered_bytes > high_water {
+            if now >= self.next_decrease {
+                self.current_bps = (self.current_bps * 2 / 3).max(Self::MIN_BPS);
+                self.next_decrease = now + std::time::Duration::from_millis(250);
+                self.next_increase = now + std::time::Duration::from_secs(1);
+            }
+        } else if buffered_bytes < low_water && now >= self.next_increase {
+            let step = (self.current_bps / 4).max(100_000);
+            self.current_bps = self.current_bps.saturating_add(step).min(ceiling);
+            self.next_increase = now + std::time::Duration::from_millis(500);
+        }
+    }
+}
+
 async fn capture_loop(
     config: MediaPipelineConfig,
     mut source: Box<dyn VideoSource>,
@@ -154,9 +252,17 @@ async fn capture_loop(
     mut shutdown: watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
     metrics: Arc<Mutex<MediaPipelineSnapshot>>,
+    quality: Option<watch::Receiver<MediaQuality>>,
 ) -> Result<(), MediaError> {
-    let result =
-        capture_loop_inner(config, &mut source, &frame_slot, &mut shutdown, &metrics).await;
+    let result = capture_loop_inner(
+        config,
+        &mut source,
+        &frame_slot,
+        &mut shutdown,
+        &metrics,
+        &quality,
+    )
+    .await;
     frame_slot.close();
     if result.is_err() {
         let _ = shutdown_tx.send(true);
@@ -170,8 +276,8 @@ async fn capture_loop_inner(
     frame_slot: &LatestSlot<RawFrame>,
     shutdown: &mut watch::Receiver<bool>,
     metrics: &Mutex<MediaPipelineSnapshot>,
+    quality: &Option<watch::Receiver<MediaQuality>>,
 ) -> Result<(), MediaError> {
-    let period = config.frame_interval();
     let mut next_deadline = TokioInstant::now();
     let mut first_tick = true;
     let mut capture_sequence = 0_u64;
@@ -180,6 +286,8 @@ async fn capture_loop_inner(
         if *shutdown.borrow() {
             return Ok(());
         }
+        let quality = current_quality(config, quality);
+        let period = std::time::Duration::from_nanos(1_000_000_000 / u64::from(quality.frame_rate));
         let now = TokioInstant::now();
         if !first_tick {
             while next_deadline <= now {
@@ -231,6 +339,7 @@ struct EncodeLoopContext {
     shutdown_tx: watch::Sender<bool>,
     keyframe_requested: Arc<AtomicBool>,
     metrics: Arc<Mutex<MediaPipelineSnapshot>>,
+    quality: Option<watch::Receiver<MediaQuality>>,
 }
 
 async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
@@ -243,16 +352,18 @@ async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
         shutdown_tx,
         keyframe_requested,
         metrics,
+        quality,
     } = context;
-    let result = encode_loop_inner(
+    let result = encode_loop_inner(EncodeLoopParts {
         config,
-        &frame_slot,
-        &mut encoder,
-        &mut lane,
-        &mut shutdown,
-        &keyframe_requested,
-        &metrics,
-    )
+        frame_slot: &frame_slot,
+        encoder: &mut encoder,
+        lane: &mut lane,
+        shutdown: &mut shutdown,
+        keyframe_requested: &keyframe_requested,
+        metrics: &metrics,
+        quality_updates: &quality,
+    })
     .await;
     frame_slot.close();
     if result.is_err() {
@@ -261,39 +372,58 @@ async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
     result
 }
 
-async fn encode_loop_inner(
+struct EncodeLoopParts<'a> {
     config: MediaPipelineConfig,
-    frame_slot: &LatestSlot<RawFrame>,
-    encoder: &mut Box<dyn VideoEncoder>,
-    lane: &mut Box<dyn LaneWriter>,
-    shutdown: &mut watch::Receiver<bool>,
-    keyframe_requested: &AtomicBool,
-    metrics: &Mutex<MediaPipelineSnapshot>,
-) -> Result<(), MediaError> {
+    frame_slot: &'a LatestSlot<RawFrame>,
+    encoder: &'a mut Box<dyn VideoEncoder>,
+    lane: &'a mut Box<dyn LaneWriter>,
+    shutdown: &'a mut watch::Receiver<bool>,
+    keyframe_requested: &'a AtomicBool,
+    metrics: &'a Mutex<MediaPipelineSnapshot>,
+    quality_updates: &'a Option<watch::Receiver<MediaQuality>>,
+}
+
+async fn encode_loop_inner(parts: EncodeLoopParts<'_>) -> Result<(), MediaError> {
+    let EncodeLoopParts {
+        config,
+        frame_slot,
+        encoder,
+        lane,
+        shutdown,
+        keyframe_requested,
+        metrics,
+        quality_updates,
+    } = parts;
     let mut stream_sequence = 0_u32;
     let mut force_next_keyframe = true;
     let mut scaler = FrameScaler::default();
+    let mut bitrate = LaneBitrateController::new(config.target_bitrate);
+    let mut quality_dimensions: Option<(u32, u32)> = None;
 
     while let Some(frame) = frame_slot.recv().await {
         if *shutdown.borrow() {
             return Ok(());
         }
         record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
+        let quality = current_quality(config, quality_updates);
+        let dimensions_changed = quality_dimensions != Some((quality.width, quality.height));
+        quality_dimensions = Some((quality.width, quality.height));
         if !frame.has_new_damage
             && !force_next_keyframe
             && !keyframe_requested.load(Ordering::Acquire)
+            && !dimensions_changed
         {
             record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
             continue;
         }
         let keyframe_was_requested = keyframe_requested.swap(false, Ordering::Acquire);
-        let force_keyframe = force_next_keyframe || keyframe_was_requested;
+        let force_keyframe = force_next_keyframe || keyframe_was_requested || dimensions_changed;
         force_next_keyframe = false;
         stream_sequence = stream_sequence.wrapping_add(1);
         let capture_time_us = frame.capture_time_us;
         let capture_sequence = frame.capture_sequence;
         let encode_started = Instant::now();
-        let frame = match scaler.scale(frame, config.width, config.height) {
+        let frame = match scaler.scale(frame, quality.width, quality.height) {
             Ok(frame) => frame,
             Err(error) => {
                 record_metrics(metrics, |snapshot| snapshot.encode_errors += 1);
@@ -303,7 +433,7 @@ async fn encode_loop_inner(
         let request = EncodeRequest {
             stream_sequence,
             force_keyframe,
-            target_bitrate: config.target_bitrate,
+            target_bitrate: bitrate.current(quality.target_bitrate),
             codec: config.codec,
             frame,
         };
@@ -378,6 +508,12 @@ async fn encode_loop_inner(
                         snapshot.access_units_dropped_before_write += 1;
                     }
                 });
+                bitrate.update(
+                    quality.target_bitrate,
+                    report.status,
+                    report.buffered_bytes,
+                    report.lane_capacity,
+                );
                 if report.status == LaneWriteStatus::DroppedBeforeWrite {
                     force_next_keyframe = true;
                 }
@@ -393,19 +529,19 @@ async fn encode_loop_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use nanoctl_core::video::VideoCodec;
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{Notify, mpsc, watch};
 
     use super::MediaPipeline;
     use crate::types::{
         EncodeRequest, EncodedAccessUnit, EncodedBitstream, LaneWriteReport, LaneWriteStatus,
-        LaneWriter, MediaError, MediaPipelineConfig, PixelFormat, RawFrame, VideoEncoder,
-        VideoSource,
+        LaneWriter, MediaError, MediaPipelineConfig, MediaQuality, PixelFormat, RawFrame,
+        VideoEncoder, VideoSource,
     };
 
     struct ChannelSource {
@@ -453,6 +589,7 @@ mod tests {
         units: Arc<Mutex<Vec<EncodedAccessUnit>>>,
         notify: Arc<Notify>,
         status: LaneWriteStatus,
+        buffered_bytes: usize,
     }
 
     #[async_trait]
@@ -468,7 +605,8 @@ mod tests {
             self.notify.notify_one();
             Ok(LaneWriteReport {
                 status: self.status,
-                buffered_bytes: 0,
+                buffered_bytes: self.buffered_bytes,
+                lane_capacity: 128 * 1024,
             })
         }
     }
@@ -503,6 +641,7 @@ mod tests {
                 units: Arc::clone(&units),
                 notify: Arc::clone(&notify),
                 status,
+                buffered_bytes: 0,
             },
             units,
             notify,
@@ -558,6 +697,162 @@ mod tests {
             *dimensions.lock().expect("dimensions poisoned"),
             vec![(64, 64)]
         );
+
+        let report = pipeline.stop().await;
+        assert!(report.capture_result.is_ok());
+        assert!(report.encode_result.is_ok());
+    }
+
+    struct QualityEncoder {
+        observations: Arc<Mutex<Vec<(u32, u32, bool, u32)>>>,
+    }
+
+    #[async_trait]
+    impl VideoEncoder for QualityEncoder {
+        async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError> {
+            self.observations
+                .lock()
+                .expect("quality observations poisoned")
+                .push((
+                    request.frame.width,
+                    request.frame.height,
+                    request.force_keyframe,
+                    request.target_bitrate,
+                ));
+            Ok(EncodedBitstream {
+                keyframe: request.force_keyframe,
+                payload: vec![if request.force_keyframe { 0x65 } else { 0x41 }],
+            })
+        }
+    }
+
+    fn rgba_frame(capture_time_us: u64) -> RawFrame {
+        RawFrame::new(
+            capture_time_us,
+            64,
+            64,
+            PixelFormat::Bgra32,
+            vec![255; 64 * 64 * 4],
+        )
+    }
+
+    #[tokio::test]
+    async fn live_quality_updates_scale_and_force_keyframe() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let config = config();
+        let (quality_tx, quality_rx) = watch::channel(MediaQuality::from_config(config));
+        let pipeline = MediaPipeline::start_with_quality(
+            config,
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(QualityEncoder {
+                observations: Arc::clone(&observations),
+            }),
+            Box::new(collecting),
+            Arc::new(AtomicBool::new(false)),
+            quality_rx,
+        )
+        .unwrap();
+
+        frames_tx.send(rgba_frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        quality_tx.send_replace(MediaQuality {
+            width: 32,
+            height: 32,
+            frame_rate: 30,
+            target_bitrate: 500_000,
+        });
+        frames_tx.send(rgba_frame(222)).await.unwrap();
+        wait_for_len(&units, &notify, 2).await;
+
+        let observed = observations
+            .lock()
+            .expect("quality observations poisoned")
+            .clone();
+        assert_eq!(observed[1].0, 32);
+        assert_eq!(observed[1].1, 32);
+        assert!(observed[1].2);
+        assert_eq!(observed[1].3, 500_000);
+
+        let report = pipeline.stop().await;
+        assert!(report.capture_result.is_ok());
+        assert!(report.encode_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn congested_lane_reduces_next_encoder_bitrate() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let units = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let congested = CollectLane {
+            units: Arc::clone(&units),
+            notify: Arc::clone(&notify),
+            status: LaneWriteStatus::Written,
+            buffered_bytes: 100 * 1024,
+        };
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(QualityEncoder {
+                observations: Arc::clone(&observations),
+            }),
+            Box::new(congested),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        frames_tx.send(frame(222)).await.unwrap();
+        wait_for_len(&units, &notify, 2).await;
+
+        let observed = observations
+            .lock()
+            .expect("quality observations poisoned")
+            .clone();
+        assert_eq!(observed[0].3, 1_000_000);
+        assert!(
+            observed[1].3 < 800_000,
+            "congestion did not lower bitrate: {observed:?}"
+        );
+
+        let report = pipeline.stop().await;
+        assert!(report.capture_result.is_ok());
+        assert!(report.encode_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn high_bitrate_config_starts_at_conservative_probe() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = MediaPipeline::start(
+            MediaPipelineConfig {
+                target_bitrate: 100_000_000,
+                ..config()
+            },
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(QualityEncoder {
+                observations: Arc::clone(&observations),
+            }),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        let observed = observations
+            .lock()
+            .expect("quality observations poisoned")
+            .clone();
+        assert_eq!(observed[0].3, 2_000_000);
 
         let report = pipeline.stop().await;
         assert!(report.capture_result.is_ok());
@@ -723,7 +1018,13 @@ mod tests {
         let mut unchanged = frame(222);
         unchanged.has_new_damage = false;
         frames_tx.send(unchanged).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pipeline.snapshot().unchanged_frames_skipped == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unchanged frame was not skipped");
         assert_eq!(units.lock().expect("collected units poisoned").len(), 1);
 
         pipeline.request_keyframe();

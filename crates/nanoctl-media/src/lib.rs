@@ -26,8 +26,8 @@ pub use pipeline::{MediaPipeline, MediaPipelineReport};
 pub use platform_encoder::{EncoderSelection, PlatformEncoder};
 pub use types::{
     EncodeRequest, EncodedAccessUnit, EncodedBitstream, LaneWriteReport, LaneWriteStatus,
-    LaneWriter, MediaError, MediaPipelineConfig, MediaPipelineSnapshot, PixelFormat, RawFrame,
-    VideoEncoder, VideoSource,
+    LaneWriter, MediaError, MediaPipelineConfig, MediaPipelineSnapshot, MediaQuality, PixelFormat,
+    RawFrame, VideoEncoder, VideoSource,
 };
 #[cfg(target_os = "windows")]
 pub use windows_mft::WindowsEncoder;
