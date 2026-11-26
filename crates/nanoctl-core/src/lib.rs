@@ -6,6 +6,7 @@
 //! canonical contract.
 
 pub mod input;
+pub mod session;
 pub mod video;
 
 pub const WIRE_VERSION: u8 = 4;
