@@ -23,9 +23,9 @@ export interface V4DataChannels {
 
 /**
  * Creates the four canonical v4 lanes. Discrete control and reference-recovery
- * bytes use WebRTC's reliable ordered defaults; high-frequency motion and delta
- * video are unordered with zero retransmissions so stale bytes are never
- * retransmitted ahead of newer state.
+ * bytes use WebRTC's reliable ordered defaults. Motion can be superseded by a
+ * newer update. Video deltas can repair transport loss within a short deadline
+ * because losing one delta also makes later deltas unusable.
  */
 export function createV4DataChannels(peer: DataChannelFactory): V4DataChannels {
   const lossTolerant: RTCDataChannelInit = {
@@ -35,7 +35,10 @@ export function createV4DataChannels(peer: DataChannelFactory): V4DataChannels {
   const lanes = {
     control: peer.createDataChannel(CONTROL_CHANNEL_LABEL),
     motion: peer.createDataChannel(MOTION_CHANNEL_LABEL, lossTolerant),
-    videoDelta: peer.createDataChannel(VIDEO_DELTA_CHANNEL_LABEL, lossTolerant),
+    videoDelta: peer.createDataChannel(VIDEO_DELTA_CHANNEL_LABEL, {
+      ordered: false,
+      maxPacketLifeTime: 150,
+    }),
     videoReference: peer.createDataChannel(VIDEO_REFERENCE_CHANNEL_LABEL),
   };
   if (peer.getStats) {

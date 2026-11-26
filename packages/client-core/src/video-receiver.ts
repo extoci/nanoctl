@@ -29,7 +29,7 @@ function messageBytes(data: unknown): Uint8Array {
  * stream processor; lane transport reliability is deliberately not part of the reference
  * decision. Decode output is emitted only in a valid reference chain.
  */
-const REORDER_WAIT_MS = 100;
+const REORDER_WAIT_MS = 180;
 const KEYFRAME_RETRY_MS = 250;
 
 export class V4VideoReceiver {
