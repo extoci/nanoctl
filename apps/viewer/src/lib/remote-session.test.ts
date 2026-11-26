@@ -1010,6 +1010,13 @@ describe("webcodecs video gating and teardown", () => {
   test("creates WebCodecs encoded streams whenever the choice allows H.264", async () => {
     installBrowserGlobals(() => 0);
     defineGlobal("VideoDecoder", class FakeVideoDecoder {});
+    defineGlobal(
+      "MediaStreamTrackGenerator",
+      class FakeTrackGenerator {
+        track = { stop() {} };
+        writable = new WritableStream();
+      },
+    );
     for (const codecChoice of ["auto", "av1", "hevc", "h264"] as const) {
       let createEncodedStreamsCalls = 0;
       const peer = new FakePeer();
@@ -1027,7 +1034,9 @@ describe("webcodecs video gating and teardown", () => {
           },
         } as unknown as RTCRtpTransceiver;
       };
-      const video = new FakeVideo();
+      const video = Object.assign(new FakeVideo(), {
+        ownerDocument: { createElement: () => ({}) },
+      });
       const controller = new RemoteSessionController({
         sessionId: `session-${codecChoice}`,
         controllerEpoch: "controller",
@@ -1043,10 +1052,11 @@ describe("webcodecs video gating and teardown", () => {
       expect(createEncodedStreamsCalls).toBe(
         codecChoice === "av1" || codecChoice === "hevc" ? 0 : 1,
       );
-      expect(peer.channelConfigs.get("nanoctl.video.v1")).toMatchObject({
+      expect(peer.channelConfigs.get("nanoctl.video-delta.v4")).toMatchObject({
         ordered: false,
-        maxPacketLifeTime: 80,
+        maxRetransmits: 0,
       });
+      expect(peer.channelConfigs.has("nanoctl.video-reference.v4")).toBe(true);
       await controller.stop("done", false);
     }
   });
