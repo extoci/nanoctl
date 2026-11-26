@@ -1,5 +1,6 @@
 mod chunking;
 mod latest;
+mod nv12;
 mod pipeline;
 mod types;
 #[cfg(feature = "capture")]
@@ -7,6 +8,7 @@ mod xcap_capture;
 
 pub use chunking::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
 pub use latest::{LatestSlot, PutOutcome};
+pub use nv12::frame_to_nv12;
 pub use pipeline::{MediaPipeline, MediaPipelineReport};
 pub use types::{
     EncodeRequest, EncodedAccessUnit, EncodedBitstream, LaneWriteReport, LaneWriteStatus,

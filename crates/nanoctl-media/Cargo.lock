@@ -837,6 +837,7 @@ dependencies = [
  "nanoctl-core",
  "tokio",
  "xcap",
+ "yuv",
 ]
 
 [[package]]
@@ -1988,6 +1989,15 @@ dependencies = [
  "quote",
  "syn 3.0.10",
  "synstructure",
+]
+
+[[package]]
+name = "yuv"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2145858fb536669bf8eef4ddfdd3dee3504239af508c4468705c4dc4d518112"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
