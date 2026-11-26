@@ -49,9 +49,14 @@ const start = () =>
     ],
     { env, stdio: "inherit" },
   );
+const pidFile = process.env.NANOCTL_BROWSER_AGENT_PID_FILE;
+const childPidFile = pidFile && process.platform === "linux" ? pidFile + ".child" : undefined;
+async function recordAgentPid(pid: number | undefined) {
+  if (childPidFile && pid !== undefined) await writeFile(childPidFile, String(pid));
+}
 let child = start();
-if (process.env.NANOCTL_BROWSER_AGENT_PID_FILE)
-  await writeFile(process.env.NANOCTL_BROWSER_AGENT_PID_FILE, String(process.pid));
+if (pidFile) await writeFile(pidFile, String(process.pid));
+await recordAgentPid(child.pid);
 let restarting = false;
 process.on("SIGUSR2", () => {
   restarting = true;
@@ -75,9 +80,12 @@ try {
     if (restarting && !stopping) {
       await new Promise((resolve) => setTimeout(resolve, 1500));
       child = start();
+      await recordAgentPid(child.pid);
     } else break;
   } while (!stopping);
   process.exitCode = code;
 } finally {
   await rm(directory, { recursive: true, force: true });
+  if (childPidFile) await rm(childPidFile, { force: true });
+  if (pidFile) await rm(pidFile, { force: true });
 }
