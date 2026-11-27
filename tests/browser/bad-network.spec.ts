@@ -129,10 +129,17 @@ async function monitorBrowser(page: Page) {
           probe.decodeSubmissions.push(performance.now());
         };
       }
+      const keyframesByPeer = new WeakMap<RTCPeerConnection, Set<number>>();
       const create = RTCPeerConnection.prototype.createDataChannel;
       RTCPeerConnection.prototype.createDataChannel = function (...args) {
         const channel = Reflect.apply(create, this, args) as RTCDataChannel;
         if (channel.label === delta || channel.label === reference) {
+          let seenKeyframes = keyframesByPeer.get(this);
+          if (!seenKeyframes) {
+            seenKeyframes = new Set<number>();
+            keyframesByPeer.set(this, seenKeyframes);
+          }
+          const seen = seenKeyframes;
           channel.addEventListener("message", ({ data }) => {
             if (!(data instanceof ArrayBuffer) || data.byteLength < 20) return;
             const now = performance.now();
@@ -141,12 +148,13 @@ async function monitorBrowser(page: Page) {
             const lastSample = probe.wireArrivals.at(-1);
             if (lastSample === undefined || now - lastSample >= 10) probe.wireArrivals.push(now);
             const wire = new DataView(data);
-            if (
-              channel.label === reference &&
-              wire.getUint8(11) & 1 &&
-              wire.getUint16(6, true) === 0
-            )
-              probe.keyframes.push(now);
+            if ((wire.getUint8(11) & 1) !== 0 && wire.getUint16(6, true) === 0) {
+              const sequence = wire.getUint32(2, true);
+              if (!seen.has(sequence)) {
+                seen.add(sequence);
+                probe.keyframes.push(now);
+              }
+            }
           });
         }
         return channel;

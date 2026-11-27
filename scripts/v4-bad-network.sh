@@ -11,17 +11,19 @@ if [[ ${1:-} != --inside ]]; then
   gate_script=$(realpath "$0")
   agent=$(realpath "$1")
   bun=$(command -v bun)
+  node=$(command -v node)
   if unshare --user --map-root-user --net -- bash -c '
     ip link set lo up && ip link add probe0 type veth peer name probe1 &&
       tc qdisc add dev lo root netem limit 1
   ' >/dev/null 2>&1; then
-    exec unshare --user --map-root-user --net -- bash "$gate_script" --inside "$agent" "$bun"
+    exec unshare --user --map-root-user --net -- bash "$gate_script" --inside "$agent" "$bun" "$node"
   fi
-  exec sudo -n -E unshare --net -- bash "$gate_script" --inside "$agent" "$bun"
+  exec sudo -n -E unshare --net -- bash "$gate_script" --inside "$agent" "$bun" "$node"
 fi
 
 agent=$2
 bun=$3
+node=$4
 ip link set lo up
 # Chromium needs an ordinary host ICE address. Traffic to this locally owned
 # address still traverses loopback and the UDP filter in this namespace.
@@ -42,7 +44,7 @@ cd "$(dirname "$0")/.."
 args=(env "PATH=$(dirname "$bun"):$PATH" NANOCTL_BROWSER_MEDIA=1 NANOCTL_BROWSER_BAD_NETWORK=1
   "NANOCTL_BROWSER_AGENT_BIN=$agent"
   xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp"
-  "$bun" node_modules/@playwright/test/cli.js test
+  "$node" node_modules/@playwright/test/cli.js test
   -c tests/browser/playwright.config.ts bad-network.spec.ts --project chromium)
 if [[ -n ${SUDO_USER:-} ]]; then
   exec runuser -u "$SUDO_USER" --preserve-environment -- "${args[@]}"

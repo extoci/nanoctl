@@ -22,7 +22,7 @@ fixtures exist.
 | ---------------------------- | ------------------------ | ---------------------------------------------------------------------------- |
 | `nanoctl.control.v4`         | reliable, ordered        | key, text, pointer button/wheel, release, heartbeat, future session commands |
 | `nanoctl.motion.v4`          | unordered, loss-tolerant | pointer movement and gamepad latest-state snapshots                          |
-| `nanoctl.video-delta.v4`     | unordered, loss-tolerant | non-keyframe video chunks                                                    |
+| `nanoctl.video-delta.v4`     | unordered, loss-tolerant | delta chunks and optional copies of reference chunks                         |
 | `nanoctl.video-reference.v4` | reliable, unordered      | keyframe video chunks and reference-recovery control                         |
 
 Every independent input stream owns a `u32` sequence counter: reliable control is one stream, while
@@ -142,8 +142,9 @@ Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCT
 It gives the outstanding reference 350 ms to drain before it can submit another. Every retry must
 fit within the reference lane's byte budget. The wire limits below still apply to received messages.
 
-The host can send a second copy of a delta chunk with the same sequence and part index. Both
-copies count toward the send budget.
+The host can send a second copy of a video chunk on the delta lane with the same sequence and
+part index. Both copies count toward the send budget. If the delta lane is full, the host still
+sends the original reference on the reliable lane.
 
 A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when it
 receives an incomplete expected delta or sees a gap before a complete later frame. If the timer

@@ -28,7 +28,7 @@ pub trait VideoChunkSink: Send {
 
 pub struct ChunkingLaneWriter<S> {
     sink: S,
-    repeat_deltas: bool,
+    repeat_chunks: bool,
     last_reference_sent: Option<Instant>,
 }
 
@@ -36,14 +36,14 @@ impl<S> ChunkingLaneWriter<S> {
     pub fn new(sink: S) -> Self {
         Self {
             sink,
-            repeat_deltas: false,
+            repeat_chunks: false,
             last_reference_sent: None,
         }
     }
 
-    pub fn with_repeated_deltas(sink: S) -> Self {
+    pub fn with_repeated_chunks(sink: S) -> Self {
         Self {
-            repeat_deltas: true,
+            repeat_chunks: true,
             ..Self::new(sink)
         }
     }
@@ -89,16 +89,19 @@ where
         } else {
             VideoLane::Delta
         };
-        let repeat = self.repeat_deltas && lane == VideoLane::Delta;
-        let copies = if repeat { 2 } else { 1 };
-        let wire_bytes = (access_unit.payload.len() + parts * VIDEO_HEADER_BYTES) * copies;
+        let frame_wire_bytes = access_unit.payload.len() + parts * VIDEO_HEADER_BYTES;
+        let primary_budget = if self.repeat_chunks && lane == VideoLane::Delta {
+            frame_wire_bytes * 2
+        } else {
+            frame_wire_bytes
+        };
         let buffered_before = self.sink.buffered_bytes(lane).await;
         let available = self
             .sink
             .lane_capacity(lane)
             .await
             .saturating_sub(buffered_before);
-        if wire_bytes > available
+        if primary_budget > available
             || parts > usize::from(MAX_VIDEO_PARTS)
             || (lane == VideoLane::Reference && !self.reference_can_write(buffered_before))
         {
@@ -109,6 +112,16 @@ where
             });
         }
 
+        // The extra copy of a reference can expire independently. A full delta
+        // queue must never prevent writing the original to the reference lane.
+        let repeat = self.repeat_chunks
+            && (lane == VideoLane::Delta
+                || frame_wire_bytes
+                    <= self
+                        .sink
+                        .lane_capacity(VideoLane::Delta)
+                        .await
+                        .saturating_sub(self.sink.buffered_bytes(VideoLane::Delta).await));
         let mut repeated = Vec::new();
         let parts = parts as u16;
         for part in 0..parts {
@@ -133,20 +146,24 @@ where
         }
         if repeat {
             // Give SCTP a chance to send the originals before it queues the copies,
-            // including when a delta fits inside one short chunk.
+            // including when the frame fits inside one short chunk.
             tokio::time::sleep(Duration::from_millis(8)).await;
             for bytes in repeated {
-                self.sink.write_chunk(lane, bytes).await?;
+                self.sink.write_chunk(VideoLane::Delta, bytes).await?;
             }
         }
         if lane == VideoLane::Reference {
             self.last_reference_sent = Some(Instant::now());
         }
 
+        let mut buffered_bytes = self.sink.buffered_bytes(lane).await;
+        if lane == VideoLane::Reference && repeat {
+            buffered_bytes = buffered_bytes.max(self.sink.buffered_bytes(VideoLane::Delta).await);
+        }
         Ok(LaneWriteReport {
             status: LaneWriteStatus::Written,
-            buffered_bytes: self.sink.buffered_bytes(lane).await,
-            wire_bytes,
+            buffered_bytes,
+            wire_bytes: frame_wire_bytes * (1 + usize::from(repeat)),
         })
     }
 }
@@ -167,8 +184,14 @@ mod tests {
 
     #[async_trait]
     impl VideoChunkSink for MemorySink {
-        async fn buffered_bytes(&self, _lane: VideoLane) -> usize {
+        async fn buffered_bytes(&self, lane: VideoLane) -> usize {
             self.buffered
+                + self
+                    .chunks
+                    .iter()
+                    .filter(|(queued_lane, _)| *queued_lane == lane)
+                    .map(|(_, chunk)| chunk.len())
+                    .sum::<usize>()
         }
 
         async fn lane_capacity(&self, _lane: VideoLane) -> usize {
@@ -176,7 +199,6 @@ mod tests {
         }
 
         async fn write_chunk(&mut self, lane: VideoLane, bytes: Vec<u8>) -> Result<(), MediaError> {
-            self.buffered += bytes.len();
             self.chunks.push((lane, bytes));
             Ok(())
         }
@@ -325,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delta_with_repetition_reserves_space_for_both_copies() {
-        let mut writer = ChunkingLaneWriter::with_repeated_deltas(MemorySink {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 239,
@@ -338,7 +360,7 @@ mod tests {
         assert_eq!(report.wire_bytes, 0);
         assert!(writer.into_sink().chunks.is_empty());
 
-        let mut writer = ChunkingLaneWriter::with_repeated_deltas(MemorySink {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 240,
@@ -352,5 +374,45 @@ mod tests {
         let sink = writer.into_sink();
         assert_eq!(sink.chunks.len(), 2);
         assert_eq!(sink.chunks[0], sink.chunks[1]);
+    }
+
+    #[tokio::test]
+    async fn a_reference_copy_uses_the_delta_lane() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 240,
+        });
+        let report = writer
+            .write_access_unit(access_unit(100, true))
+            .await
+            .unwrap();
+        assert_eq!(report.wire_bytes, 240);
+        let sink = writer.into_sink();
+        assert_eq!(sink.chunks[0].0, VideoLane::Reference);
+        assert_eq!(sink.chunks[1].0, VideoLane::Delta);
+        assert_eq!(sink.chunks[0].1, sink.chunks[1].1);
+    }
+
+    #[tokio::test]
+    async fn a_full_delta_lane_does_not_block_the_reliable_reference() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 240,
+        });
+        writer
+            .write_access_unit(access_unit(100, false))
+            .await
+            .unwrap();
+        let report = writer
+            .write_access_unit(access_unit(100, true))
+            .await
+            .unwrap();
+        assert_eq!(report.status, LaneWriteStatus::Written);
+        assert_eq!(report.wire_bytes, 120);
+        let sink = writer.into_sink();
+        assert_eq!(sink.chunks.len(), 3);
+        assert_eq!(sink.chunks[2].0, VideoLane::Reference);
     }
 }

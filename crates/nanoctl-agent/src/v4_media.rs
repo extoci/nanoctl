@@ -191,7 +191,7 @@ async fn run_pipeline(
     let sink = WebRtcVideoSink {
         lanes: lanes.clone(),
     };
-    let lane = ChunkingLaneWriter::with_repeated_deltas(sink);
+    let lane = ChunkingLaneWriter::with_repeated_chunks(sink);
     let pipeline = match MediaPipeline::start_with_keyframe_requests(
         config,
         source,
@@ -321,7 +321,7 @@ fn media_settings(
             .0,
         pixels / base_pixels,
     );
-    // Reserve room for the second copy on the delta lane.
+    // Reserve room for the second copies on the delta lane.
     let kbps = kbps.div_ceil(2);
     // A constrained link needs enough bits per pixel to encode useful deltas
     // between recovery references. Keep the connection budget when scaling down.
