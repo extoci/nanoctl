@@ -146,5 +146,6 @@ keyframe rates, host RSS growth, and queue limits. The run writes the profile,
 observed counters, and timestamps to `test-results/*/bad-network.json`.
 
 The v4 release build uses a 200 ms minimum SCTP retransmission timeout. The
-network trial branch runs the full gate on three independent CI runners using
-the same locked build. Each run uploads its own evidence.
+network trial branch runs the same gate three times on that build and three
+times with a 150 ms minimum. Only the trial runner's checkout uses 150 ms.
+Each run uploads its own evidence.
