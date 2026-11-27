@@ -19,11 +19,6 @@ Request immediate SACKs on timeout retransmissions and new sends under the
 one-packet congestion window. The sender can resume after one RTT when the peer
 honors the request. See [RFC 7053 section 4.2](https://www.rfc-editor.org/rfc/rfc7053.html#section-4.2).
 
-For complete unordered data messages with a positive lifetime, start the lifetime
-at enqueue. Drop expired messages before TSN assignment and release their stream
-buffer space. In-flight recovery uses the same deadline. See
-[RFC 3758 section 4.1](https://www.rfc-editor.org/rfc/rfc3758.html#section-4.1).
-
 Update the audit entry in `.github/workflows/ci.yml` when changing the upstream
 version. Before removing the patch, verify the timer setting, cancellation
 behavior, and the v4 bad-network gate with the new dependency.

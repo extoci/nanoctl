@@ -304,50 +304,6 @@ async fn new_data_requests_an_immediate_ack_with_a_single_packet_window() {
     assert!(!unblocked[0].immediate_sack);
 }
 
-#[tokio::test(start_paused = true)]
-async fn expired_timed_datagrams_leave_the_pending_queue_without_a_tsn() {
-    let mut a = create_association_internal(Config {
-        net_conn: Arc::new(DumbConn {}),
-        max_receive_buffer_size: 0,
-        max_message_size: 0,
-        mtu: 0,
-        name: "client".to_owned(),
-        local_port: 5000,
-        remote_port: 5000,
-    });
-    a.set_state(AssociationState::Established);
-    a.use_forward_tsn = true;
-    a.rwnd = 65_535;
-    let timed = a.create_stream(1, false).unwrap();
-    timed.set_reliability_params(true, ReliabilityType::Timed, 150);
-    let reliable = a.create_stream(2, false).unwrap();
-    reliable.set_reliability_params(true, ReliabilityType::Reliable, 0);
-    let initial_tsn = a.my_next_tsn;
-    timed
-        .write_sctp(&Bytes::from_static(b"stale"), PayloadProtocolIdentifier::Binary)
-        .await
-        .unwrap();
-    reliable
-        .write_sctp(&Bytes::from_static(b"reference"), PayloadProtocolIdentifier::Binary)
-        .await
-        .unwrap();
-    tokio::time::advance(std::time::Duration::from_millis(151)).await;
-    timed
-        .write_sctp(&Bytes::from_static(b"fresh"), PayloadProtocolIdentifier::Binary)
-        .await
-        .unwrap();
-
-    let (sent, _) = a.pop_pending_data_chunks_to_send().await;
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent[0].user_data, Bytes::from_static(b"reference"));
-    assert_eq!(sent[0].tsn, initial_tsn);
-    assert_eq!(sent[1].user_data, Bytes::from_static(b"fresh"));
-    assert_eq!(sent[1].tsn, initial_tsn + 1);
-    assert_eq!(timed.buffered_amount(), 5);
-    assert_eq!(reliable.buffered_amount(), 9);
-    assert!(a.pending_queue.is_empty());
-}
-
 #[tokio::test]
 async fn test_handle_forward_tsn_forward_3unreceived_chunks() -> Result<()> {
     let mut a = create_association_internal(Config {
