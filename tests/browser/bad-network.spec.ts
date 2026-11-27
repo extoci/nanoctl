@@ -29,6 +29,13 @@ interface GateProbe {
   }[];
   keyframeRequests: number[];
   deltaRepairRequests: { timestampMs: number; streamSequence: number }[];
+  startupFragments: {
+    timestampMs: number;
+    streamSequence: number;
+    part: number;
+    parts: number;
+    lane: "delta" | "reference";
+  }[];
   wireArrivals: number[];
   decodeSubmissions: number[];
   lastWireMs: number | null;
@@ -127,6 +134,7 @@ async function monitorBrowser(page: Page) {
         keyframeArrivals: [],
         keyframeRequests: [],
         deltaRepairRequests: [],
+        startupFragments: [],
         wireArrivals: [],
         decodeSubmissions: [],
         lastWireMs: null,
@@ -161,17 +169,23 @@ async function monitorBrowser(page: Page) {
           });
         }
       };
-      const keyframesByPeer = new WeakMap<RTCPeerConnection, Set<number>>();
+      const videoPeers = new WeakMap<
+        RTCPeerConnection,
+        { startup: boolean; keyframes: Set<number> }
+      >();
+      let startupPeerAssigned = false;
       const create = RTCPeerConnection.prototype.createDataChannel;
       RTCPeerConnection.prototype.createDataChannel = function (...args) {
         const channel = Reflect.apply(create, this, args) as RTCDataChannel;
         if (channel.label === delta || channel.label === reference) {
-          let seenKeyframes = keyframesByPeer.get(this);
-          if (!seenKeyframes) {
-            seenKeyframes = new Set<number>();
-            keyframesByPeer.set(this, seenKeyframes);
+          const lane = channel.label === delta ? "delta" : "reference";
+          let peer = videoPeers.get(this);
+          if (!peer) {
+            peer = { startup: !startupPeerAssigned, keyframes: new Set<number>() };
+            videoPeers.set(this, peer);
+            startupPeerAssigned = true;
           }
-          const seen = seenKeyframes;
+          const { startup, keyframes: seen } = peer;
           channel.addEventListener("message", ({ data }) => {
             if (!(data instanceof ArrayBuffer) || data.byteLength < 20) return;
             const now = performance.now();
@@ -180,8 +194,18 @@ async function monitorBrowser(page: Page) {
             const lastSample = probe.wireArrivals.at(-1);
             if (lastSample === undefined || now - lastSample >= 10) probe.wireArrivals.push(now);
             const wire = new DataView(data);
-            if ((wire.getUint8(11) & 1) !== 0 && wire.getUint16(6, true) === 0) {
-              const sequence = wire.getUint32(2, true);
+            const sequence = wire.getUint32(2, true);
+            const part = wire.getUint16(6, true);
+            if (startup && sequence <= 16 && probe.startupFragments.length < 2_048) {
+              probe.startupFragments.push({
+                timestampMs: now,
+                streamSequence: sequence,
+                part,
+                parts: wire.getUint16(8, true),
+                lane,
+              });
+            }
+            if ((wire.getUint8(11) & 1) !== 0 && part === 0) {
               if (!seen.has(sequence)) {
                 seen.add(sequence);
                 probe.keyframes.push(now);
@@ -189,7 +213,7 @@ async function monitorBrowser(page: Page) {
                   timestampMs: now,
                   captureTimeUs: Number(wire.getBigUint64(12, true)),
                   streamSequence: sequence,
-                  lane: channel.label === delta ? "delta" : "reference",
+                  lane,
                 });
               }
             }
@@ -316,6 +340,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
       keyframeArrivals: probe.keyframeArrivals,
       keyframeRequests: probe.keyframeRequests,
       deltaRepairRequests: probe.deltaRepairRequests,
+      startupFragments: probe.startupFragments,
       wireArrivals: probe.wireArrivals,
       decodeSubmissions: probe.decodeSubmissions,
       sampleEnd,

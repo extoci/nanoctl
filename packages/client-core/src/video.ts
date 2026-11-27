@@ -70,6 +70,10 @@ export class VideoStreamProcessor {
       };
     }
     const sequenced = this.sequencer.push(reassembled.complete);
+    const lastEmitted = sequenced.emitted.at(-1);
+    if (lastEmitted !== undefined) {
+      this.reassembler.discardBefore((lastEmitted.streamSequence + 1) >>> 0);
+    }
     return {
       ...sequenced,
       received: reassembled.complete,

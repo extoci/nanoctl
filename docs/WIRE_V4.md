@@ -137,6 +137,8 @@ capture timestamp. Reassembly keeps up to three incomplete references and sixtee
 with one shared 16 MiB payload budget. It ignores duplicate parts and evicts the oldest pending unit
 of the same kind when its limit is reached. Delta fragments cannot evict a pending reference.
 Complete single-chunk units do not evict pending fragments.
+After the receiver advances its decode position, older fragments leave the reassembly buffer and
+late copies of those fragments are discarded on arrival.
 
 Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCTP fragmentation.
 It gives the outstanding reference 350 ms to drain. If it is still pending, the next recovery

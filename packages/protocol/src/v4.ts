@@ -572,6 +572,18 @@ const MAX_PENDING_DELTAS = 16;
 export class VideoReassembler {
   private readonly pending = new Map<number, PartialAccessUnit>();
   private pendingBytes = 0;
+  private minimumSequence: number | undefined;
+
+  /** Advance to the next useful decode sequence, including across u32 wraparound. */
+  discardBefore(sequence: number): void {
+    this.minimumSequence = sequence;
+    for (const [pendingSequence, frame] of this.pending) {
+      if (((pendingSequence - sequence) | 0) < 0) {
+        this.pending.delete(pendingSequence);
+        this.pendingBytes -= frame.byteLength;
+      }
+    }
+  }
 
   hasIncompleteFrameAtOrAfter(sequence: number): boolean {
     for (const pendingSequence of this.pending.keys()) {
@@ -583,6 +595,9 @@ export class VideoReassembler {
   push(chunk: VideoChunk): ReassemblyOutcome {
     validateVideoChunk(chunk);
     const sequence = chunk.streamSequence;
+    if (this.minimumSequence !== undefined && ((sequence - this.minimumSequence) | 0) < 0) {
+      return {};
+    }
     let current = this.pending.get(sequence);
     if (current === undefined && chunk.parts === 1) {
       return {
