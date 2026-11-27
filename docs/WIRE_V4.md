@@ -149,8 +149,8 @@ keyframe goes on the expiring delta lane. Both copies must fit within the delta 
 The reliable lane takes a new reference once the previous one drains.
 
 The host can send a second copy of a video chunk on the delta lane with the same sequence and
-part index. Both copies count toward the send budget. When the reliable lane can accept a new
-reference, the host sends its original there even if the delta lane has no room for the copy.
+part index. Both copies count toward the send budget. A keyframe larger than 8 KiB sent on the
+reliable lane has no second copy. Smaller keyframes can use spare room on the delta lane.
 
 A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when the
 expected frame is incomplete or a fragment of a later frame arrives. When the timer expires, the

@@ -14,7 +14,7 @@ use crate::types::{EncodedAccessUnit, LaneWriteReport, LaneWriteStatus, LaneWrit
 const CHUNK_PAYLOAD_BYTES: usize = 1_100;
 const REFERENCE_ACK_GRACE: Duration = Duration::from_millis(350);
 const DELTA_REPAIR_CACHE_FRAMES: usize = 16;
-const DELTA_REPAIR_SEND_BYTES: usize = 8 * 1024;
+const VIDEO_REDUNDANCY_BUDGET_BYTES: usize = 8 * 1024;
 const DELTA_REPAIR_CACHE_BYTES: usize = 128 * 1024;
 const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
 const DATAGRAM_BURST_CHUNKS: usize = 4;
@@ -178,7 +178,7 @@ where
             return Ok(None);
         }
         let repair_chunks = if request.parts.is_empty() {
-            if delta.wire_bytes > DELTA_REPAIR_SEND_BYTES {
+            if delta.wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES {
                 return Ok(None);
             }
             delta.chunks.clone()
@@ -196,7 +196,7 @@ where
         let lane = VideoLane::Delta;
         let capacity = self.sink.lane_capacity(lane).await;
         let buffered = self.sink.buffered_bytes(lane).await;
-        if wire_bytes > DELTA_REPAIR_SEND_BYTES
+        if wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES
             || wire_bytes > capacity.div_ceil(2).saturating_sub(buffered)
         {
             return Ok(None);
@@ -250,8 +250,12 @@ where
             )
         };
         let frame_wire_bytes = access_unit.payload.len() + parts * VIDEO_HEADER_BYTES;
-        let large_delta = !access_unit.keyframe && frame_wire_bytes > DELTA_REPAIR_SEND_BYTES;
-        let allow_repeat = self.repeat_chunks && !large_delta;
+        let large_frame = frame_wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES;
+        // A bulk copy of a reliable keyframe holds up fresh video on the same
+        // SCTP association. Keep repetition for recovery keyframes sent only
+        // on the expiring lane because they have no reliable copy.
+        let allow_repeat = self.repeat_chunks
+            && (!large_frame || (access_unit.keyframe && lane == VideoLane::Delta));
         let primary_budget = if allow_repeat && lane == VideoLane::Delta {
             frame_wire_bytes * 2
         } else {
@@ -283,7 +287,7 @@ where
         let cache_delta = self.repeat_chunks
             && !access_unit.keyframe
             && frame_wire_bytes <= DELTA_REPAIR_CACHE_BYTES;
-        let mut pacer = if access_unit.keyframe || large_delta {
+        let mut pacer = if access_unit.keyframe || large_frame {
             self.sink.frame_pacing_bps().map(DatagramPacer::new)
         } else {
             None
@@ -687,6 +691,30 @@ mod tests {
         assert_eq!(sink.chunks[0].0, VideoLane::Reference);
         assert_eq!(sink.chunks[1].0, VideoLane::Delta);
         assert_eq!(sink.chunks[0].1, sink.chunks[1].1);
+    }
+
+    #[tokio::test]
+    async fn a_large_reliable_reference_leaves_the_delta_lane_free() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 128 * 1024,
+            repair_request: None,
+        });
+        let report = writer
+            .write_access_unit(access_unit(42_900, true))
+            .await
+            .unwrap();
+        assert_eq!(report.status, LaneWriteStatus::Written);
+        assert_eq!(report.wire_bytes, 42_900 + 39 * 20);
+        assert_eq!(writer.sink.chunks.len(), 39);
+        assert!(
+            writer
+                .sink
+                .chunks
+                .iter()
+                .all(|(lane, _)| *lane == VideoLane::Reference)
+        );
     }
 
     #[tokio::test]
