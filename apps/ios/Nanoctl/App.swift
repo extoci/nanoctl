@@ -35,6 +35,10 @@ final class ViewerModel {
     }
     var recents = UserDefaults.standard.stringArray(forKey: "recentHosts")
         ?? UserDefaults.standard.string(forKey: "host").map { [$0] } ?? []
+    var discoveredHosts: [DiscoveredHost] = []
+    var discoveringHosts = false
+    var discoveryNotice: String?
+    var gamepads: [GamepadStatus] = []
 }
 
 @MainActor
@@ -48,12 +52,16 @@ final class Desktop {
     private var track: RTCVideoTrack?
     private var toastTask: Task<Void, Never>?
     private var airPlayCheck: Task<Void, Never>?
+    private var discoveryTask: Task<Void, Never>?
     #if DEBUG && targetEnvironment(simulator)
     var probe: LatencyProbe?
     #endif
 
     init() {
         session.onChange = { [weak self] in self?.update() }
+        gamepad.onStatuses = { [weak self] statuses in
+            self?.model.gamepads = statuses
+        }
         stage.onKeyboardVisible = { [weak self] visible in
             self?.model.keyboardVisible = visible
         }
@@ -115,6 +123,90 @@ final class Desktop {
     func forget(_ address: String) {
         model.recents.removeAll { $0 == address }
         UserDefaults.standard.set(model.recents, forKey: "recentHosts")
+    }
+
+    /// Uses any reachable nanoctl agent as a tailnet directory. Moonlight makes
+    /// host selection feel instant because hosts are already visible; recents
+    /// are the bootstrap seeds here and every directory query runs in parallel.
+    func refreshHosts(extraSeed: String? = nil) {
+        discoveryTask?.cancel()
+        var seeds = model.recents
+        if let extraSeed {
+            let trimmed = extraSeed.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !seeds.contains(trimmed) { seeds.insert(trimmed, at: 0) }
+        }
+        guard !seeds.isEmpty else {
+            model.discoveredHosts = []
+            model.discoveringHosts = false
+            model.discoveryNotice = nil
+            return
+        }
+        model.discoveringHosts = true
+        model.discoveryNotice = nil
+        discoveryTask = Task { [weak self] in
+            var found: [String: DiscoveredHost] = [:]
+            var failures = 0
+            await withTaskGroup(of: Result<[DiscoveredHost], Error>.self) { group in
+                for seed in seeds {
+                    group.addTask {
+                        do {
+                            return .success(try await Self.fetchDirectory(seed))
+                        } catch {
+                            return .failure(error)
+                        }
+                    }
+                }
+                for await result in group {
+                    switch result {
+                    case .success(let hosts):
+                        for host in hosts where !host.url.isEmpty {
+                            if var existing = found[host.url] {
+                                if !existing.online, host.online { existing = host }
+                                found[host.url] = existing
+                            } else {
+                                found[host.url] = host
+                            }
+                        }
+                    case .failure:
+                        failures += 1
+                    }
+                }
+            }
+            guard !Task.isCancelled, let self else { return }
+            let sorted = found.values.sorted {
+                if $0.online != $1.online { return $0.online && !$1.online }
+                return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+            model.discoveredHosts = sorted
+            model.discoveringHosts = false
+            if sorted.isEmpty {
+                model.discoveryNotice = failures == 0 ? "No nanoctl hosts found" : "Host discovery unavailable"
+            } else if failures > 0 {
+                model.discoveryNotice = "\(failures) director\(failures == 1 ? "y" : "ies") unavailable"
+            } else {
+                model.discoveryNotice = nil
+            }
+        }
+    }
+
+    private nonisolated static func fetchDirectory(_ seed: String) async throws -> [DiscoveredHost] {
+        #if DEBUG && targetEnvironment(simulator)
+        let endpoint = try HostEndpoint(seed, allowSimulatorLoopback: true)
+        #else
+        let endpoint = try HostEndpoint(seed)
+        #endif
+        var request = URLRequest(url: endpoint.base.appending(path: "v1/hosts"))
+        request.timeoutInterval = 5
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw ViewerError("Host discovery failed")
+        }
+        let directory = try JSONDecoder().decode(HostDirectory.self, from: data)
+        return ([directory.selfHost] + directory.hosts).map { host in
+            var host = host
+            host.source = seed
+            return host
+        }
     }
 
     func setTouchMode(_ mode: TouchMode) {

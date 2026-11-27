@@ -14,11 +14,20 @@ import Foundation
 final class DCVideoReceiver {
     struct Stats {
         var msgs = 0
+        var heartbeats = 0
         var fed = 0
         var gaps = 0
         var kfRequests = 0
         var late = 0
         var transitMs = 0.0
+    }
+
+    struct Status {
+        let stats: Stats
+        let codec: VTDecoder.Codec?
+        let decoded: Int
+        let dropped: Int
+        let faulted: Bool
     }
 
     // Match the browser viewer: four frames bounds reordering without making
@@ -43,7 +52,8 @@ final class DCVideoReceiver {
     /// should close the channels and use the RTP video track instead.
     var onPersistentFault: () -> Void = {}
 
-    private(set) var stats = Stats()
+    /// Only mutated on `queue`; read through `snapshot()` from other actors.
+    private var stats = Stats()
     // Link-quality counters drained by `takeLinkStats`.
     private var received = 0
     private var lost = 0
@@ -83,9 +93,12 @@ final class DCVideoReceiver {
         return (total > 0 ? Double(lost) / Double(total) : 0, transit, received)
     }
 
-    var decodedCount: Int { decoder?.decoded ?? 0 }
-    var droppedCount: Int { decoder?.dropped ?? 0 }
-    var hasFaulted: Bool { (decoder?.faults ?? 0) > 0 }
+    func statusSnapshot() -> Status {
+        queue.sync {
+            Status(stats: stats, codec: codec, decoded: decoder?.decoded ?? 0,
+                   dropped: decoder?.dropped ?? 0, faulted: (decoder?.faults ?? 0) > 0)
+        }
+    }
 
     private func onDecoderFault() {
         waitingForKey = true
@@ -125,6 +138,7 @@ final class DCVideoReceiver {
             offset += 8
         }
         if flags & 8 != 0 {
+            stats.heartbeats += 1
             // Heartbeats carry the next live sequence as a watermark rather
             // than consuming it. A watermark ahead of the decoder means the
             // final delta before the idle period was lost even though no newer
@@ -157,6 +171,21 @@ final class DCVideoReceiver {
             }
             if entry.n < parts {
                 pending[seq] = entry
+                // Bounded repair state: loss must never turn fragmented-frame
+                // bookkeeping into an hours-long memory leak. Thirty-two access
+                // units is far beyond the reorder window but tiny in memory.
+                if pending.count > 32 {
+                    pending.removeAll(keepingCapacity: true)
+                    if !waitingForKey {
+                        waitingForKey = true
+                        stats.gaps += 1
+                        if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
+                            kfRequestedAt = CFAbsoluteTimeGetCurrent()
+                            stats.kfRequests += 1
+                            requestKeyframe()
+                        }
+                    }
+                }
                 return
             }
             pending.removeValue(forKey: seq)

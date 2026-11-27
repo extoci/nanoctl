@@ -48,6 +48,43 @@ struct AudioOutput: Decodable, Identifiable {
     let isDefault: Bool?
 }
 
+struct DiscoveredHost: Decodable, Equatable, Identifiable {
+    let hostName: String
+    let dnsName: String?
+    let os: String?
+    let online: Bool
+    let url: String
+    /// Directory agent that told us about this host; populated locally, not by the wire.
+    var source: String?
+
+    var id: String { url }
+    var displayName: String { hostName.isEmpty ? (dnsName ?? url) : hostName }
+
+    enum CodingKeys: String, CodingKey {
+        case hostName, dnsName, os, online, url
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        hostName = try values.decodeIfPresent(String.self, forKey: .hostName) ?? "nanoctl host"
+        dnsName = try values.decodeIfPresent(String.self, forKey: .dnsName)
+        os = try values.decodeIfPresent(String.self, forKey: .os)
+        online = try values.decodeIfPresent(Bool.self, forKey: .online) ?? true
+        url = try values.decodeIfPresent(String.self, forKey: .url) ?? ""
+        source = nil
+    }
+}
+
+struct HostDirectory: Decodable {
+    let selfHost: DiscoveredHost
+    let hosts: [DiscoveredHost]
+
+    enum CodingKeys: String, CodingKey {
+        case selfHost = "self"
+        case hosts
+    }
+}
+
 struct HostInfo: Decodable {
     struct Viewer: Decodable { let mayControl: Bool }
     struct Capabilities: Decodable {

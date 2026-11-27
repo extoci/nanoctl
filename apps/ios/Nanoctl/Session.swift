@@ -214,17 +214,13 @@ final class Session {
         // busy tearing the old session down the new connection could not even
         // start — codec switches visibly stalled for about a second before
         // the first byte moved, on loopback and on real networks alike.
-        let network = self.network
         task = Task.detached { [weak self] in
             guard let self else { return }
             do {
-                let infoStart = Date()
-                let (data, response) = try await network.data(from: endpoint.base.appending(path: "v1/info"))
-                sessionLog.info("v1/info fetched in \(Int(Date().timeIntervalSince(infoStart) * 1000))ms")
-                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                    throw ViewerError("Host authorization or discovery failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)).")
-                }
-                try Self.checkHost(JSONDecoder().decode(HostInfo.self, from: data))
+                // The WebSocket hello already carries the complete HostInfo
+                // payload. Fetching /v1/info first cost one full TCP/TLS round
+                // trip before signaling could even start; Moonlight-style fast
+                // attach starts the only required channel immediately.
                 socket.resume()
                 while !Task.isCancelled {
                     let message = try await socket.receive()
@@ -278,6 +274,8 @@ final class Session {
     }
 
     private func teardown() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
         let old = connection
         connection = nil
         task?.cancel()
@@ -587,8 +585,23 @@ final class Session {
             case .connected:
                 self.timeout?.cancel()
                 self.reconnectAttempts = 0
+                current.disconnectedSince = nil
                 self.state = "Live · \(current.host?.hostName ?? "nanoctl")"
                 self.onChange?()
+            case .disconnected:
+                // ICE commonly flaps for a moment on Wi-Fi/cellular transitions.
+                // Give the transport a bounded chance to recover, but never let
+                // a silent black frame masquerade as a live session.
+                if current.disconnectedSince == nil {
+                    current.disconnectedSince = Date()
+                    Task { [weak self, weak current] in
+                        try? await Task.sleep(for: .seconds(6))
+                        guard !Task.isCancelled, let self, let current,
+                              self.connection === current,
+                              current.disconnectedSince != nil else { return }
+                        self.fail("Connection lost.", current)
+                    }
+                }
             case .failed, .closed:
                 self.fail("Connection lost.", current)
             default:
@@ -840,6 +853,8 @@ final class Session {
             onChange?()
             return
         }
+        let status = receiver.statusSnapshot()
+        let wire = status.stats
         let (loss, transit, frames) = receiver.takeLinkStats()
         // Receiver-measured loss is the host's only congestion signal while
         // video rides the data channel: RTP feedback describes the thin
@@ -847,20 +862,38 @@ final class Session {
         // these reports instead — the difference between a stream that
         // degrades gracefully and one that collapses on a bad link.
         _ = sendControlFree(["type": "link-stats", "loss": loss])
-        statsLine = "DC · \(receiver.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(receiver.droppedCount) · loss \(String(format: "%.1f", loss * 100))%"
+        statsLine = "DC · \(status.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(status.dropped) · loss \(String(format: "%.1f", loss * 100))%"
         onChange?()
         // Loss/gap visibility is what distinguishes a congested or relayed
         // transport from decoder trouble in the field; log it once a second
         // only when there is something to say.
-        if loss > 0.01 || receiver.stats.gaps != lastLoggedGaps || receiver.stats.kfRequests != lastLoggedKf {
-            lastLoggedGaps = receiver.stats.gaps
-            lastLoggedKf = receiver.stats.kfRequests
-            sessionLog.info("dc link: loss \(String(format: "%.1f", loss * 100))% gaps \(receiver.stats.gaps) kf \(receiver.stats.kfRequests) fed \(receiver.stats.fed) decoded \(receiver.decodedCount) transit \(String(format: "%.0f", transit))ms")
+        if loss > 0.01 || wire.gaps != lastLoggedGaps || wire.kfRequests != lastLoggedKf {
+            lastLoggedGaps = wire.gaps
+            lastLoggedKf = wire.kfRequests
+            sessionLog.info("dc link: loss \(String(format: "%.1f", loss * 100))% gaps \(wire.gaps) kf \(wire.kfRequests) fed \(wire.fed) decoded \(status.decoded) transit \(String(format: "%.0f", transit))ms")
         }
 
-        // Fallback: if the decoder faulted and never produced a frame after
-        // plenty of traffic, restore RTP so the user still gets video.
-        if receiver.decodedCount == 0, receiver.stats.msgs > 90, receiver.hasFaulted {
+        // Moonlight-style liveness supervision: never trust an open channel as
+        // proof of video. Silence means the transport is lying to us; accepted
+        // access units without decoded output mean the decoder is wedged. Both
+        // paths fall back instead of leaving a black screen until the user gives up.
+        let messagesDelta = wire.msgs - current.lastVideoMessages
+        let fedDelta = wire.fed - current.lastVideoFed
+        let decodedDelta = status.decoded - current.lastVideoDecoded
+        current.lastVideoMessages = wire.msgs
+        current.lastVideoFed = wire.fed
+        current.lastVideoDecoded = status.decoded
+        current.videoSilentSeconds = messagesDelta == 0 ? current.videoSilentSeconds + 1 : 0
+        current.decoderStallSeconds = fedDelta > 0 && decodedDelta == 0 ? current.decoderStallSeconds + 1 : 0
+        if current.videoSilentSeconds >= 8 {
+            sessionLog.error("data-channel video silent for 8s; falling back to RTP")
+            current.video?.close()
+            current.videoIdr?.close()
+            deactivateDataChannelVideo(current)
+            return
+        }
+        if current.decoderStallSeconds >= 3 || (status.decoded == 0 && wire.msgs > 90 && status.faulted) {
+            sessionLog.error("data-channel decoder produced no frames; falling back to RTP")
             current.video?.close()
             current.videoIdr?.close()
             deactivateDataChannelVideo(current)
@@ -961,6 +994,12 @@ private final class Connection {
     var sequence = 0
     var injectHevcAttempted = false
     var sentDisplayQualityCap = false
+    var disconnectedSince: Date?
+    var lastVideoMessages = 0
+    var lastVideoFed = 0
+    var lastVideoDecoded = 0
+    var videoSilentSeconds = 0
+    var decoderStallSeconds = 0
     var statePoll: Task<Void, Never>?
     var iceWatchdog: Task<Void, Never>?
     var lastProgress = Date()

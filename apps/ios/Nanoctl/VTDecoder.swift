@@ -27,17 +27,23 @@ final class VTDecoder {
     /// Decoder or bitstream failure; caller should drop deltas until a keyframe.
     var onFault: (() -> Void)?
 
+    private let stateLock = NSLock()
     private var faultPending = false
-    private(set) var decoded = 0
-    private(set) var dropped = 0
-    private(set) var faults = 0
+    private var decodedCount = 0
+    private var droppedCount = 0
+    private var faultCount = 0
 
     private var session: VTDecompressionSession?
     private var av1Core: VTAV1CoreDecoder?
     private var format: CMFormatDescription?
     private var parameters: [Data] = []
     private var inflight = 0
+    private var generation = 0
     private let maxInflight = 3
+
+    var decoded: Int { stateLock.withLock { decodedCount } }
+    var dropped: Int { stateLock.withLock { droppedCount } }
+    var faults: Int { stateLock.withLock { faultCount } }
 
     init(codec: Codec) { self.codec = codec }
 
@@ -48,30 +54,31 @@ final class VTDecoder {
     /// Feeds one Annex-B access unit. `seq` drives presentation ordering and
     /// timestamps, mirroring the browser's `seq * 16_000` microseconds.
     func decode(_ au: Data, isKey: Bool, seq: UInt32) {
-        if faultPending { fault() }
+        if takeCallbackFault() { fault() }
         if codec == .av1 {
             if av1Core == nil {
                 let core = VTAV1CoreDecoder(maxInflight: maxInflight)
                 core.onFrame = { [weak self] buffer, _ in
-                    self?.decoded += 1
-                    self?.onFrame?(buffer)
+                    guard let self else { return }
+                    self.stateLock.withLock { self.decodedCount += 1 }
+                    self.onFrame?(buffer)
                 }
                 core.onFault = { [weak self] in
                     guard let self else { return }
-                    self.faults += 1
+                    self.stateLock.withLock { self.faultCount += 1 }
                     self.onFault?()
                 }
                 av1Core = core
             }
             if av1Core?.decode(au, timestamp: Int64(seq) * 16_000,
                                timescale: 1_000_000, isKey: isKey) != true {
-                dropped += 1
+                stateLock.withLock { droppedCount += 1 }
             }
             return
         }
         var parameters: [Data] = []
         guard let avcc = Self.avcc(au, codec: codec, parameters: &parameters) else {
-            dropped += 1
+            stateLock.withLock { droppedCount += 1 }
             return
         }
         if session == nil {
@@ -79,7 +86,7 @@ final class VTDecoder {
                 let head = au.prefix(12).map { String(format: "%02x", $0) }.joined()
                 log.error("no session: \(parameters.count) param sets, codec=\(self.codec.rawValue), head=\(head), isKey=\(isKey)")
                 if isKey { fault() }
-                dropped += 1
+                stateLock.withLock { droppedCount += 1 }
                 return
             }
         } else if !parameters.isEmpty && sortedHex(parameters) != sortedHex(self.parameters) {
@@ -94,8 +101,8 @@ final class VTDecoder {
                 return
             }
         }
-        if inflight > maxInflight && !isKey {
-            dropped += 1
+        if inflightCount() > maxInflight && !isKey {
+            stateLock.withLock { droppedCount += 1 }
             // The dropped delta is a reference-frame loss. Decode errors are
             // not the only resync trigger: silently continuing here would
             // smear every following delta until the next periodic keyframe.
@@ -138,29 +145,33 @@ final class VTDecoder {
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
 
-        inflight += 1
-        guard let session else { return }
+        let decodeGeneration = generationValue()
+        incrementInflight()
+        guard let session else {
+            decrementInflight(generation: decodeGeneration)
+            return
+        }
         let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
             flags: [._EnableAsynchronousDecompression, ._1xRealTimePlayback],
             infoFlagsOut: nil
         ) { [weak self] status, _, buffer, _, _ in
             guard let self else { return }
-            self.inflight -= 1
+            self.decrementInflight(generation: decodeGeneration)
             guard status == noErr else {
                 log.error("decode callback status=\(status)")
                 // Invalidating here would wait on this very callback.
-                self.faultPending = true
+                self.markCallbackFault()
                 return
             }
-            guard let buffer else { return }
-            self.decoded += 1
+            guard self.isCurrentGeneration(decodeGeneration), let buffer else { return }
+            self.stateLock.withLock { self.decodedCount += 1 }
             self.onFrame?(buffer)
         }
         if status != noErr {
-            inflight -= 1
+            decrementInflight(generation: decodeGeneration)
             fault()
-        } else if faultPending {
+        } else if takeCallbackFault() {
             fault()
         }
     }
@@ -170,14 +181,54 @@ final class VTDecoder {
         session = nil
         format = nil
         parameters = []
-        inflight = 0
+        stateLock.withLock {
+            generation += 1
+            inflight = 0
+        }
     }
 
     private func fault() {
-        faultPending = false
-        faults += 1
+        stateLock.withLock {
+            faultPending = false
+            faultCount += 1
+        }
         invalidate()
         onFault?()
+    }
+
+    private func takeCallbackFault() -> Bool {
+        stateLock.withLock {
+            let faulted = faultPending
+            faultPending = false
+            return faulted
+        }
+    }
+
+    private func markCallbackFault() {
+        stateLock.withLock { faultPending = true }
+    }
+
+    private func incrementInflight() {
+        stateLock.withLock { inflight += 1 }
+    }
+
+    private func decrementInflight(generation: Int) {
+        stateLock.withLock {
+            guard self.generation == generation else { return }
+            inflight -= 1
+        }
+    }
+
+    private func inflightCount() -> Int {
+        stateLock.withLock { inflight }
+    }
+
+    private func generationValue() -> Int {
+        stateLock.withLock { generation }
+    }
+
+    private func isCurrentGeneration(_ generation: Int) -> Bool {
+        stateLock.withLock { self.generation == generation }
     }
 
     private func ensureSession(parameters: [Data]) -> Bool {

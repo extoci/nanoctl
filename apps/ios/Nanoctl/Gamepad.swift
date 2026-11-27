@@ -1,6 +1,21 @@
 import GameController
 import UIKit
 
+struct GamepadStatus: Identifiable, Equatable {
+    let id: Int
+    let slot: Int
+    let name: String
+    let recognition: String
+    let hostDevice: String
+    let batteryPercent: Int?
+    let batteryState: String
+
+    var batteryLabel: String {
+        guard let batteryPercent else { return "Battery unknown" }
+        return batteryState.isEmpty ? "\(batteryPercent)%" : "\(batteryPercent)% · \(batteryState)"
+    }
+}
+
 @MainActor
 final class Gamepad {
     private let session: Session
@@ -14,7 +29,12 @@ final class Gamepad {
     private var changedAt: TimeInterval?
     private var fullAt: TimeInterval?
     private var heartbeatAt: TimeInterval?
+    private var statusTimer: Timer?
+    private(set) var statuses: [GamepadStatus] = []
     var onChange: (() -> Void)?
+    var onStatuses: (([GamepadStatus]) -> Void)? {
+        didSet { onStatuses?(statuses) }
+    }
 
     init(session: Session) {
         self.session = session
@@ -23,17 +43,20 @@ final class Gamepad {
         NotificationCenter.default.addObserver(self, selector: #selector(controllerNotification),
                                                name: .GCControllerDidDisconnect, object: nil)
         controllersChanged()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.publishStatuses() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        statusTimer = timer
+    }
+
+    deinit {
+        statusTimer?.invalidate()
     }
 
     var status: String {
-        let connected = controllers.compactMap { $0 }
-        guard !connected.isEmpty else { return "No gamepad paired" }
-        let names = connected.map { controller in
-            let profile = controller.extendedGamepad
-            if profile is GCDualSenseGamepad { return "DualSense → DualShock 4" }
-            if profile is GCDualShockGamepad { return "DualShock → DualShock 4" }
-            return "\(controller.vendorName ?? "Gamepad") → Xbox 360"
-        }
+        guard !statuses.isEmpty else { return "No gamepad paired" }
+        let names = statuses.map { "\($0.recognition) → \($0.hostDevice)" }
         let name = names.count == 1 ? names[0] : "\(names.count) gamepads · \(names.joined(separator: " + "))"
         return session.gamepadAllowed ? name : "\(name) · host gamepad unavailable"
     }
@@ -81,6 +104,7 @@ final class Gamepad {
             controller.extendedGamepad?.valueChangedHandler = nil
         }
         controllers = next
+        publishStatuses()
         for controller in controllers.compactMap({ $0 }) {
             controller.handlerQueue = .main
             controller.extendedGamepad?.valueChangedHandler = { [weak self] _, _ in
@@ -93,6 +117,45 @@ final class Gamepad {
         resetState()
         send(force: true)
         onChange?()
+    }
+
+    private func publishStatuses() {
+        let next = controllers.enumerated().compactMap { slot, controller -> GamepadStatus? in
+            guard let controller, let pad = controller.extendedGamepad else { return nil }
+            let recognition: String
+            let hostDevice: String
+            if pad is GCDualSenseGamepad {
+                recognition = "DualSense"
+                hostDevice = "DualShock 4"
+            } else if pad is GCDualShockGamepad {
+                recognition = "DualShock 4"
+                hostDevice = "DualShock 4"
+            } else if pad is GCXboxGamepad {
+                recognition = controller.vendorName?.contains("Xbox") == true ? "Xbox controller" : (controller.vendorName ?? "Xbox-compatible")
+                hostDevice = "Xbox 360"
+            } else {
+                recognition = controller.vendorName ?? "MFi gamepad"
+                hostDevice = "Xbox 360"
+            }
+            var percent: Int?
+            var batteryState = ""
+            if let battery = controller.battery {
+                percent = Int((min(1, max(0, battery.batteryLevel)) * 100).rounded())
+                switch battery.batteryState {
+                case .charging: batteryState = "charging"
+                case .full: batteryState = "full"
+                case .discharging: batteryState = "on battery"
+                default: batteryState = ""
+                }
+            }
+            return GamepadStatus(id: slot, slot: slot + 1,
+                                 name: controller.vendorName ?? recognition,
+                                 recognition: recognition, hostDevice: hostDevice,
+                                 batteryPercent: percent, batteryState: batteryState)
+        }
+        guard next != statuses else { return }
+        statuses = next
+        onStatuses?(next)
     }
 
     private func resetState() {
