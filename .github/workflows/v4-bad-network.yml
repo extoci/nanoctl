@@ -13,17 +13,13 @@ permissions:
 
 jobs:
   bad-network:
-    name: >-
-      ${{ matrix.rto_ms == 150 && format('Real media SCTP 150 ms trial (repeat {0})', matrix.sample)
-      || matrix.sample == 1 && 'Real media at 5% loss, 25% reorder, 3 Mbps'
-      || format('Real media at 5% loss, 25% reorder, 3 Mbps (repeat {0})', matrix.sample) }}
+    name: ${{ matrix.sample == 1 && 'Real media at 5% loss, 25% reorder, 3 Mbps' || format('Real media at 5% loss, 25% reorder, 3 Mbps (repeat {0})', matrix.sample) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         sample: ${{ fromJSON(github.head_ref == 'codex/v4-network-trial' && '[1,2,3]' || '[1]') }}
-        rto_ms: ${{ fromJSON(github.head_ref == 'codex/v4-network-trial' && '[200,150]' || '[200]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -44,19 +40,6 @@ jobs:
           extra-packages: xauth xvfb iproute2
           save-cache: ${{ github.event_name != 'pull_request' }}
       - run: bunx playwright install --with-deps chromium
-      - name: Set the SCTP timeout for this trial build
-        if: matrix.rto_ms == 150
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          timer = Path("crates/vendor/webrtc-sctp/src/timer/rtx_timer.rs")
-          source = timer.read_text()
-          baseline = "const RTO_MIN: u64 = 200;"
-          if source.count(baseline) != 1:
-              raise SystemExit("The release SCTP minimum is no longer 200 ms")
-          timer.write_text(source.replace(baseline, "const RTO_MIN: u64 = 150;", 1))
-          PY
       - name: Build the release media agent
         run: |
           bun run build:viewer
@@ -65,9 +48,6 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: >-
-            ${{ matrix.rto_ms == 150 && format('v4-bad-network-evidence-sctp-150ms-{0}', matrix.sample)
-            || matrix.sample == 1 && 'v4-bad-network-evidence'
-            || format('v4-bad-network-evidence-repeat-{0}', matrix.sample) }}
+          name: ${{ matrix.sample == 1 && 'v4-bad-network-evidence' || format('v4-bad-network-evidence-repeat-{0}', matrix.sample) }}
           path: test-results/
           if-no-files-found: warn
