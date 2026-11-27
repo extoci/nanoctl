@@ -319,6 +319,15 @@ fn media_settings(
             .0,
         pixels / base_pixels,
     );
+    // A constrained link needs enough bits per pixel to encode useful deltas
+    // between recovery references. Keep the connection budget when scaling down.
+    let (width, height) = if kbps < 1_500 {
+        (width.min(640), height.min(360))
+    } else if kbps < 2_250 {
+        (width.min(960), height.min(540))
+    } else {
+        (width, height)
+    };
     MediaPipelineConfig {
         width,
         height,
