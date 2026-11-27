@@ -22,7 +22,7 @@ fixtures exist.
 | ---------------------------- | ------------------------ | ---------------------------------------------------------------------------- |
 | `nanoctl.control.v4`         | reliable, ordered        | key, text, pointer button/wheel, release, heartbeat, future session commands |
 | `nanoctl.motion.v4`          | unordered, loss-tolerant | pointer movement and gamepad latest-state snapshots                          |
-| `nanoctl.video-delta.v4`     | unordered, loss-tolerant | delta chunks and optional copies of reference chunks                         |
+| `nanoctl.video-delta.v4`     | unordered, loss-tolerant | delta chunks and reference chunks                                            |
 | `nanoctl.video-reference.v4` | reliable, unordered      | keyframe video chunks and reference-recovery control                         |
 
 Every independent input stream owns a `u32` sequence counter: reliable control is one stream, while
@@ -139,12 +139,13 @@ of the same kind when its limit is reached. Delta fragments cannot evict a pendi
 Complete single-chunk units do not evict pending fragments.
 
 Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCTP fragmentation.
-It gives the outstanding reference 350 ms to drain before it can submit another. Every retry must
-fit within the reference lane's byte budget. The wire limits below still apply to received messages.
+It gives the outstanding reference 350 ms to drain. If it is still pending, the next recovery
+keyframe goes on the expiring delta lane. Both copies must fit within the delta lane's byte budget.
+The reliable lane takes a new reference once the previous one drains.
 
 The host can send a second copy of a video chunk on the delta lane with the same sequence and
-part index. Both copies count toward the send budget. If the delta lane is full, the host still
-sends the original reference on the reliable lane.
+part index. Both copies count toward the send budget. When the reliable lane can accept a new
+reference, the host sends its original there even if the delta lane has no room for the copy.
 
 A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when the
 expected frame is incomplete or a fragment of a later frame arrives. When the timer expires, the

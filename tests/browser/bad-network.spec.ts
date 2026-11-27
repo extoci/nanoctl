@@ -21,6 +21,12 @@ const reconnects = 20;
 interface GateProbe {
   frames: number[];
   keyframes: number[];
+  keyframeArrivals: {
+    timestampMs: number;
+    captureTimeUs: number;
+    streamSequence: number;
+    lane: "delta" | "reference";
+  }[];
   keyframeRequests: number[];
   deltaRepairRequests: { timestampMs: number; streamSequence: number }[];
   wireArrivals: number[];
@@ -118,6 +124,7 @@ async function monitorBrowser(page: Page) {
       const probe: GateProbe = {
         frames: [],
         keyframes: [],
+        keyframeArrivals: [],
         keyframeRequests: [],
         deltaRepairRequests: [],
         wireArrivals: [],
@@ -178,6 +185,12 @@ async function monitorBrowser(page: Page) {
               if (!seen.has(sequence)) {
                 seen.add(sequence);
                 probe.keyframes.push(now);
+                probe.keyframeArrivals.push({
+                  timestampMs: now,
+                  captureTimeUs: Number(wire.getBigUint64(12, true)),
+                  streamSequence: sequence,
+                  lane: channel.label === delta ? "delta" : "reference",
+                });
               }
             }
           });
@@ -300,6 +313,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     Object.assign(evidence, {
       frames: probe.frames,
       keyframes,
+      keyframeArrivals: probe.keyframeArrivals,
       keyframeRequests: probe.keyframeRequests,
       deltaRepairRequests: probe.deltaRepairRequests,
       wireArrivals: probe.wireArrivals,

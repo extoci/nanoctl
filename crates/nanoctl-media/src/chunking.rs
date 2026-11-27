@@ -69,13 +69,19 @@ impl<S> ChunkingLaneWriter<S> {
         self.sink
     }
 
-    fn reference_can_write(&self, buffered: usize) -> bool {
-        // A few control bytes can remain queued. If the previous reference still has
-        // chunks awaiting acknowledgment, allow a paced retry instead of waiting forever.
-        buffered <= VIDEO_HEADER_BYTES
-            || self
-                .last_reference_sent
-                .is_none_or(|sent| sent.elapsed() >= REFERENCE_ACK_GRACE)
+    fn reference_lane(&self, buffered: usize) -> Option<VideoLane> {
+        // A few control bytes can remain queued without a reference in flight.
+        if buffered <= VIDEO_HEADER_BYTES {
+            return Some(VideoLane::Reference);
+        }
+        let lane = if self.repeat_chunks {
+            VideoLane::Delta
+        } else {
+            VideoLane::Reference
+        };
+        self.last_reference_sent
+            .is_none_or(|sent| sent.elapsed() >= REFERENCE_ACK_GRACE)
+            .then_some(lane)
     }
 }
 
@@ -86,7 +92,11 @@ where
 {
     async fn reference_ready(&mut self) -> bool {
         let buffered = self.sink.buffered_bytes(VideoLane::Reference).await;
-        self.reference_can_write(buffered)
+        match self.reference_lane(buffered) {
+            Some(VideoLane::Reference) => true,
+            Some(VideoLane::Delta) => self.delta_ready().await,
+            None => false,
+        }
     }
 
     async fn delta_ready(&mut self) -> bool {
@@ -137,10 +147,29 @@ where
         }
         let parts = access_unit.payload.len().div_ceil(CHUNK_PAYLOAD_BYTES);
 
-        let lane = if access_unit.keyframe {
-            VideoLane::Reference
+        let (lane, buffered_before) = if access_unit.keyframe {
+            let buffered = self.sink.buffered_bytes(VideoLane::Reference).await;
+            match self.reference_lane(buffered) {
+                Some(VideoLane::Reference) => (VideoLane::Reference, buffered),
+                // Keep at most one large reference on the reliable lane. Newer
+                // recovery keyframes can expire without extending that backlog.
+                Some(VideoLane::Delta) => (
+                    VideoLane::Delta,
+                    self.sink.buffered_bytes(VideoLane::Delta).await,
+                ),
+                None => {
+                    return Ok(LaneWriteReport {
+                        status: LaneWriteStatus::DroppedBeforeWrite,
+                        buffered_bytes: buffered,
+                        wire_bytes: 0,
+                    });
+                }
+            }
         } else {
-            VideoLane::Delta
+            (
+                VideoLane::Delta,
+                self.sink.buffered_bytes(VideoLane::Delta).await,
+            )
         };
         let frame_wire_bytes = access_unit.payload.len() + parts * VIDEO_HEADER_BYTES;
         let primary_budget = if self.repeat_chunks && lane == VideoLane::Delta {
@@ -148,16 +177,12 @@ where
         } else {
             frame_wire_bytes
         };
-        let buffered_before = self.sink.buffered_bytes(lane).await;
         let available = self
             .sink
             .lane_capacity(lane)
             .await
             .saturating_sub(buffered_before);
-        if primary_budget > available
-            || parts > usize::from(MAX_VIDEO_PARTS)
-            || (lane == VideoLane::Reference && !self.reference_can_write(buffered_before))
-        {
+        if primary_budget > available || parts > usize::from(MAX_VIDEO_PARTS) {
             return Ok(LaneWriteReport {
                 status: LaneWriteStatus::DroppedBeforeWrite,
                 buffered_bytes: buffered_before,
@@ -201,7 +226,7 @@ where
             // Give SCTP a chance to send the originals before it queues the copies,
             // including when the frame fits inside one short chunk.
             tokio::time::sleep(Duration::from_millis(8)).await;
-            if lane == VideoLane::Delta && frame_wire_bytes <= DELTA_REPAIR_FRAME_BYTES {
+            if !access_unit.keyframe && frame_wire_bytes <= DELTA_REPAIR_FRAME_BYTES {
                 if self.repair_cache.len() == DELTA_REPAIR_CACHE_FRAMES {
                     self.repair_cache.pop_front();
                 }
@@ -499,6 +524,37 @@ mod tests {
         assert_eq!(sink.chunks[0].0, VideoLane::Reference);
         assert_eq!(sink.chunks[1].0, VideoLane::Delta);
         assert_eq!(sink.chunks[0].1, sink.chunks[1].1);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_keyframe_uses_the_expiring_lane_while_the_reference_is_pending() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 1024,
+            repair_sequence: None,
+        });
+        writer
+            .write_access_unit(access_unit(100, true))
+            .await
+            .unwrap();
+        assert!(!writer.reference_ready().await);
+        writer.last_reference_sent = Some(super::Instant::now() - super::REFERENCE_ACK_GRACE);
+        assert!(writer.reference_ready().await);
+
+        let mut recovery = access_unit(100, true);
+        recovery.stream_sequence = 8;
+        let report = writer.write_access_unit(recovery).await.unwrap();
+        assert_eq!(report.status, LaneWriteStatus::Written);
+        assert_eq!(report.wire_bytes, 240);
+        assert_eq!(writer.sink.chunks[0].0, VideoLane::Reference);
+        assert_eq!(writer.sink.chunks.len(), 4);
+        assert_eq!(writer.sink.chunks[2], writer.sink.chunks[3]);
+        assert_eq!(writer.sink.chunks[2].0, VideoLane::Delta);
+        let keyframe = VideoChunk::parse(&writer.sink.chunks[2].1).unwrap();
+        assert_eq!(keyframe.stream_sequence, 8);
+        assert!(keyframe.keyframe);
+        assert!(writer.repair_cache.is_empty());
     }
 
     #[tokio::test]
