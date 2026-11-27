@@ -3329,27 +3329,37 @@ pub fn spawn_video(
                 Ordering::Relaxed,
             );
             (|| -> Result<()> {
+                let mut keyframe_requests = keyframe_requests;
+                let mut link_feedback = link_feedback;
+                let mut viewer_limits = viewer_limits;
+                // A control channel can send viewport limits before this producer
+                // subscribes. watch::subscribe starts at the current version, so
+                // has_changed alone would silently lose that already-current
+                // value; initialize from it explicitly before building the encoder.
+                let startup_limits = *viewer_limits.borrow_and_update();
+                let startup_dimensions =
+                    startup_limits.resolve_dimensions(quality.max_width, quality.max_height);
+                let (startup_ceiling, startup_fps_limit) =
+                    startup_limits.resolve(quality.max_bitrate_kbps, quality.max_fps);
+                let mut controller = controller;
+                let startup = controller.set_limits(startup_ceiling, startup_fps_limit);
                 let mut encoder = CaptureEncoder::primary(
-                    initial.bitrate_kbps,
-                    quality.max_fps,
-                    quality.max_width,
-                    quality.max_height,
+                    startup.bitrate_kbps,
+                    startup_fps_limit,
+                    startup_dimensions.0,
+                    startup_dimensions.1,
                     quality.latency_mode,
                     quality.encoder_preference,
                     quality.codec,
                     quality.h264_high,
                     producer_stats.clone(),
                 )?;
-                let mut keyframe_requests = keyframe_requests;
-                let mut link_feedback = link_feedback;
-                let mut viewer_limits = viewer_limits;
-                let mut bitrate_ceiling = quality.max_bitrate_kbps;
+                let mut bitrate_ceiling = startup_ceiling;
                 let mut display_selection = display_selection;
                 let display_selection_feedback = display_selection_feedback;
-                let mut controller = controller;
-                let mut fps = initial.fps;
+                let mut fps = startup.fps;
                 let mut pacer = DamagePacer::new(fps);
-                let mut scale = EncodeScale::new(initial.bitrate_kbps);
+                let mut scale = EncodeScale::new(startup.bitrate_kbps);
                 let mut last: Option<Arc<CapturedFrame>> = None;
                 let mut last_encoded: Option<Arc<CapturedFrame>> = None;
                 // Damage for captures the pacer dropped still has to reach the
@@ -3365,7 +3375,13 @@ pub fn spawn_video(
                 // periodic IDR is the last-resort safety net when a request is lost
                 // to cooldown, teardown races, or an idle-transition edge case.
                 let mut last_idr_at = Instant::now();
-                let mut viewer_dimensions = (quality.max_width, quality.max_height);
+                let mut viewer_dimensions = startup_dimensions;
+                producer_stats
+                    .target_kbps
+                    .store(startup.bitrate_kbps, Ordering::Relaxed);
+                producer_stats
+                    .target_fps
+                    .store(startup.fps, Ordering::Relaxed);
                 let mut viewport_bitrate_scale = 1.0;
                 let mut waiting_since = Instant::now();
                 loop {

@@ -63,6 +63,24 @@ test("iPhone session options explain standalone launch in a narrow viewport", as
   await expect(card).toBeVisible();
 });
 
+test("mobile viewport caps the host encode resolution", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires real media harness");
+  await page.setViewportSize({ width: 200, height: 300 });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  const cap = await page.evaluate(
+    () =>
+      Math.ceil(
+        (document.querySelector("video")!.getBoundingClientRect().width * devicePixelRatio) / 2,
+      ) * 2,
+  );
+  expect(cap).toBeGreaterThan(0);
+  const videoWidth = () =>
+    page.locator("video").evaluate((video) => (video as HTMLVideoElement).videoWidth);
+  await expect.poll(videoWidth, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect.poll(videoWidth, { timeout: 15_000 }).toBeLessThanOrEqual(cap + 2);
+});
+
 test("mobile layout, reachable touch targets, keyboard focus and persisted mode", async ({
   page,
 }) => {
