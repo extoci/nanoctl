@@ -20,6 +20,7 @@ const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
 const DELTA_REPAIR_ATTEMPTS: u8 = 2;
 const DELTA_REPAIR_TOTAL_BYTES: usize =
     VIDEO_REDUNDANCY_BUDGET_BYTES * DELTA_REPAIR_ATTEMPTS as usize;
+const RELIABLE_REPAIR_BYTES: usize = 4 * (CHUNK_PAYLOAD_BYTES + VIDEO_HEADER_BYTES);
 const DELTA_QUEUE_TIME_MS: u64 = 75;
 const DATAGRAM_BURST_CHUNKS: usize = 4;
 const DATAGRAM_OVERHEAD_BYTES: usize = 80;
@@ -99,6 +100,7 @@ pub struct ChunkingLaneWriter<S> {
     sink: S,
     repeat_chunks: bool,
     last_reference_sent: Option<Instant>,
+    reference_repair_bytes: usize,
     repair_cache: VecDeque<CachedDelta>,
     repair_cache_bytes: usize,
 }
@@ -109,6 +111,7 @@ impl<S> ChunkingLaneWriter<S> {
             sink,
             repeat_chunks: false,
             last_reference_sent: None,
+            reference_repair_bytes: 0,
             repair_cache: VecDeque::new(),
             repair_cache_bytes: 0,
         }
@@ -126,8 +129,8 @@ impl<S> ChunkingLaneWriter<S> {
     }
 
     fn reference_lane(&self, buffered: usize) -> Option<VideoLane> {
-        // A few control bytes can remain queued without a reference in flight.
-        if buffered <= VIDEO_HEADER_BYTES {
+        // A bounded repair or a few control bytes can precede a new keyframe.
+        if buffered <= self.reference_repair_bytes + VIDEO_HEADER_BYTES {
             return Some(VideoLane::Reference);
         }
         let lane = if self.repeat_chunks {
@@ -220,7 +223,15 @@ where
             chunks
         };
         let wire_bytes = repair_chunks.iter().map(Vec::len).sum::<usize>();
-        let lane = VideoLane::Delta;
+        let lane = if !whole_delta
+            && delta.repairs_remaining < DELTA_REPAIR_ATTEMPTS
+            && wire_bytes <= RELIABLE_REPAIR_BYTES
+            && self.sink.buffered_bytes(VideoLane::Reference).await <= VIDEO_HEADER_BYTES
+        {
+            VideoLane::Reference
+        } else {
+            VideoLane::Delta
+        };
         let capacity = self.sink.lane_capacity(lane).await;
         let buffered = self.sink.buffered_bytes(lane).await;
         if wire_bytes > repair_budget || wire_bytes > capacity.div_ceil(2).saturating_sub(buffered)
@@ -233,6 +244,9 @@ where
         if delta.repairs_remaining == 0 || delta.repair_bytes_remaining == 0 {
             self.repair_cache_bytes -= delta.wire_bytes;
             self.repair_cache.remove(slot);
+        }
+        if lane == VideoLane::Reference {
+            self.reference_repair_bytes = wire_bytes;
         }
         let mut pacer = if wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES {
             self.sink.frame_pacing_bps().map(DatagramPacer::new)
@@ -333,6 +347,7 @@ where
         };
         if lane == VideoLane::Reference {
             self.last_reference_sent = Some(Instant::now());
+            self.reference_repair_bytes = 0;
         }
         let mut retained = Vec::new();
         let parts = parts as u16;
@@ -759,12 +774,15 @@ mod tests {
             .sink
             .chunks
             .iter()
-            .map(|(_, bytes)| {
+            .map(|(lane, bytes)| {
                 let chunk = VideoChunk::parse(bytes).unwrap();
-                (chunk.stream_sequence, chunk.part, chunk.parts)
+                (*lane, chunk.stream_sequence, chunk.part, chunk.parts)
             })
             .collect();
-        assert_eq!(parts, [(7, 4, 37), (7, 36, 37)]);
+        assert_eq!(
+            parts,
+            [(VideoLane::Delta, 7, 4, 37), (VideoLane::Delta, 7, 36, 37)]
+        );
         assert_eq!(writer.repair_cache_bytes, original.wire_bytes);
         writer.sink.repair_request = Some(DeltaRepairRequest {
             stream_sequence: 7,
@@ -772,7 +790,17 @@ mod tests {
         });
         let retry = writer.repair_pending_delta().await.unwrap().unwrap();
         assert_eq!(retry.wire_bytes, 1120);
+        let (lane, bytes) = writer.sink.chunks.last().unwrap();
+        assert_eq!(*lane, VideoLane::Reference);
+        assert_eq!(VideoChunk::parse(bytes).unwrap().part, 36);
         assert_eq!(writer.repair_cache_bytes, 0);
+        assert!(writer.reference_ready().await);
+
+        let mut keyframe = access_unit(100, true);
+        keyframe.stream_sequence = 8;
+        writer.write_access_unit(keyframe).await.unwrap();
+        assert_eq!(writer.sink.chunks[3].0, VideoLane::Reference);
+        assert!(!writer.reference_ready().await);
     }
 
     #[tokio::test]
