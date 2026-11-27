@@ -8,10 +8,26 @@
  * re-enqueued downstream), so stats and the <video> fallback keep working.
  */
 
+export type WebCodecsVideoStats = {
+  decoded: number;
+  dropped: number;
+  decoderErrors?: number;
+  bytes?: number;
+  width?: number;
+  height?: number;
+  codec?: DirectVideoCodec;
+  decodeTimeMs?: number;
+  decodeTimedFrames?: number;
+  packetsLost?: number;
+};
+
 export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
   drop(): void;
-  stats(): { decoded: number; dropped: number; decoderErrors?: number };
+  stats(): WebCodecsVideoStats;
+  /** True when this handle owns the low-latency data-channel path rather than
+   * tapping the RTP receiver. */
+  directDataChannel?: boolean;
   /** Rolling data-channel loss fraction since the previous call, when the
    * handle tracks sequence numbers (data-channel video). */
   takeLinkLoss?(): number;
@@ -378,7 +394,7 @@ interface VideoSink {
   canvas: HTMLCanvasElement;
   feed(data: Uint8Array, isKey: boolean, timestampUs: number): boolean;
   teardown(notify?: boolean): void;
-  stats(): { decoded: number; dropped: number; decoderErrors?: number };
+  stats(): WebCodecsVideoStats;
 }
 
 interface VideoTrackGeneratorLike {
@@ -443,6 +459,11 @@ function createVideoSink(
   let decoded = 0;
   let dropped = 0;
   let decoderErrors = 0;
+  let receivedBytes = 0;
+  let decodedWidth = 0;
+  let decodedHeight = 0;
+  let decodeTimeMs = 0;
+  let decodeTimedFrames = 0;
   let firstFrameFired = false;
   const fireFirstFrame = () => {
     if (firstFrameFired) return;
@@ -565,6 +586,8 @@ function createVideoSink(
         if (submit !== undefined) {
           decodeSubmit.delete(frame.timestamp);
           const ms = performance.now() - submit;
+          decodeTimeMs += ms;
+          decodeTimedFrames += 1;
           if (dbg) {
             dbg.decodeSum = ((dbg.decodeSum as number) ?? 0) + ms;
             dbg.decodeN = ((dbg.decodeN as number) ?? 0) + 1;
@@ -576,6 +599,8 @@ function createVideoSink(
         if (decodeOutput.size > 256) {
           decodeOutput.delete(decodeOutput.keys().next().value!);
         }
+        decodedWidth = frame.displayWidth;
+        decodedHeight = frame.displayHeight;
         fireFirstFrame();
         if (writer) {
           decoded += 1;
@@ -661,6 +686,7 @@ function createVideoSink(
 
   const feed = (data: Uint8Array, isKey: boolean, timestampUs: number): boolean => {
     if (closed) return false;
+    receivedBytes += data.byteLength;
     // Scan the Annex-B form for random-access pictures and parameter sets;
     // the payload actually fed may be repacked as AVCC below.
     const scanned = videoCodec === "av1" ? data : toAnnexB(data);
@@ -772,7 +798,17 @@ function createVideoSink(
     canvas: canvas ?? video.ownerDocument.createElement("canvas"),
     feed,
     teardown,
-    stats: () => ({ decoded, dropped, decoderErrors }),
+    stats: () => ({
+      decoded,
+      dropped,
+      decoderErrors,
+      bytes: receivedBytes,
+      width: decodedWidth,
+      height: decodedHeight,
+      codec: videoCodec,
+      decodeTimeMs,
+      decodeTimedFrames,
+    }),
   };
 }
 
@@ -838,7 +874,9 @@ export function attachDataChannelVideo(
   let waitingForKey = true;
   let kfRequestedAt = 0;
   let dcLost = 0;
+  let dcLostTotal = 0;
   let dcReceived = 0;
+  let dcBytes = 0;
   const dbg = ((
     window as unknown as { __dcv?: Record<string, number | boolean | string> }
   ).__dcv ??= { msgs: 0, fed: 0, gaps: 0, nonArrayBuffer: 0, kf: 0 });
@@ -913,6 +951,7 @@ export function attachDataChannelVideo(
       }
       dbg.msgs = (dbg.msgs as number) + 1;
       dbg.bytes = ((dbg.bytes as number) || 0) + data.byteLength;
+      dcBytes += data.byteLength;
       if (dbg.firstMsgMs === undefined) {
         dbg.firstMsgMs = performance.now() - joinAt;
       }
@@ -1021,7 +1060,10 @@ export function attachDataChannelVideo(
       const deliver = (s: number, a: Uint8Array, k: boolean) => {
         if (expectedSeq !== null) {
           const skipped = (s - expectedSeq) | 0;
-          if (skipped > 0) dcLost += skipped;
+          if (skipped > 0) {
+            dcLost += skipped;
+            dcLostTotal += skipped;
+          }
         }
         dcReceived += 1;
         expectedSeq = (s + 1) >>> 0;
@@ -1097,7 +1139,8 @@ export function attachDataChannelVideo(
       window.clearInterval(reorderExpiry);
       sink.teardown(false);
     },
-    stats: sink.stats,
+    stats: () => ({ ...sink.stats(), bytes: dcBytes, packetsLost: dcLostTotal }),
+    directDataChannel: true,
     takeLinkLoss: () => {
       const lost = dcLost;
       const received = dcReceived;
