@@ -164,9 +164,10 @@ After a gap persists for 70 ms, the viewer can request the missing delta on the 
 If the gap persists at 140 ms, the viewer requests the parts that are still missing.
 Kind `0x43` carries its `u32 stream_sequence` followed by up to six distinct `u16` part indices.
 An empty list requests the whole delta. The host retains up to 16 recent deltas within a shared
-128 KiB budget. It sends at most two repairs per delta, each up to 8 KiB, within 500 ms of the
-original send. It skips a repair that would fill more than half of the delta lane. The 180 ms
-keyframe deadline still applies if the delta does not arrive.
+128 KiB budget. It sends at most two repairs and 16 KiB total per delta within 500 ms of the
+original send. A whole-delta repair can use the remaining byte budget. A selective repair can use
+up to 8 KiB. The host paces repairs larger than 8 KiB and skips repairs that would fill more than
+half of the delta lane. The 180 ms keyframe deadline still applies if the delta does not arrive.
 
 Before the first complete reference, the viewer sends a keyframe request if it has waited 350 ms.
 It retries until a reference arrives, even if there have been no video messages.

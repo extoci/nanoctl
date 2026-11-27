@@ -18,6 +18,8 @@ const VIDEO_REDUNDANCY_BUDGET_BYTES: usize = 8 * 1024;
 const DELTA_REPAIR_CACHE_BYTES: usize = 128 * 1024;
 const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
 const DELTA_REPAIR_ATTEMPTS: u8 = 2;
+const DELTA_REPAIR_TOTAL_BYTES: usize =
+    VIDEO_REDUNDANCY_BUDGET_BYTES * DELTA_REPAIR_ATTEMPTS as usize;
 const DATAGRAM_BURST_CHUNKS: usize = 4;
 const DATAGRAM_OVERHEAD_BYTES: usize = 80;
 
@@ -79,6 +81,7 @@ struct CachedDelta {
     sent_at: Instant,
     wire_bytes: usize,
     repairs_remaining: u8,
+    repair_bytes_remaining: usize,
     chunks: Vec<Vec<u8>>,
 }
 
@@ -139,6 +142,7 @@ impl<S> ChunkingLaneWriter<S> {
             sent_at: Instant::now(),
             wire_bytes,
             repairs_remaining: DELTA_REPAIR_ATTEMPTS,
+            repair_bytes_remaining: DELTA_REPAIR_TOTAL_BYTES,
             chunks,
         });
         self.repair_cache_bytes += wire_bytes;
@@ -180,8 +184,16 @@ where
         if delta.sent_at.elapsed() > DELTA_REPAIR_MAX_AGE {
             return Ok(None);
         }
-        let repair_chunks = if request.parts.is_empty() {
-            if delta.wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES {
+        let whole_delta = request.parts.is_empty();
+        let repair_budget = if whole_delta {
+            delta.repair_bytes_remaining
+        } else {
+            delta
+                .repair_bytes_remaining
+                .min(VIDEO_REDUNDANCY_BUDGET_BYTES)
+        };
+        let repair_chunks = if whole_delta {
+            if delta.wire_bytes > repair_budget {
                 return Ok(None);
             }
             delta.chunks.clone()
@@ -199,18 +211,26 @@ where
         let lane = VideoLane::Delta;
         let capacity = self.sink.lane_capacity(lane).await;
         let buffered = self.sink.buffered_bytes(lane).await;
-        if wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES
-            || wire_bytes > capacity.div_ceil(2).saturating_sub(buffered)
+        if wire_bytes > repair_budget || wire_bytes > capacity.div_ceil(2).saturating_sub(buffered)
         {
             return Ok(None);
         }
         let delta = &mut self.repair_cache[slot];
         delta.repairs_remaining -= 1;
-        if delta.repairs_remaining == 0 {
+        delta.repair_bytes_remaining -= wire_bytes;
+        if delta.repairs_remaining == 0 || delta.repair_bytes_remaining == 0 {
             self.repair_cache_bytes -= delta.wire_bytes;
             self.repair_cache.remove(slot);
         }
+        let mut pacer = if wire_bytes > VIDEO_REDUNDANCY_BUDGET_BYTES {
+            self.sink.frame_pacing_bps().map(DatagramPacer::new)
+        } else {
+            None
+        };
         for bytes in repair_chunks {
+            if let Some(pacer) = &mut pacer {
+                pacer.before_chunk(bytes.len()).await;
+            }
             self.sink.write_chunk(lane, bytes).await?;
         }
         Ok(Some(LaneWriteReport {
@@ -645,6 +665,41 @@ mod tests {
         });
         assert!(writer.repair_pending_delta().await.unwrap().is_none());
         assert_eq!(writer.sink.chunks.len(), 12);
+    }
+
+    #[tokio::test]
+    async fn a_whole_delta_repair_can_use_the_shared_byte_budget() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 128 * 1024,
+            repair_request: None,
+        });
+        let original = writer
+            .write_access_unit(access_unit(12_100, false))
+            .await
+            .unwrap();
+        assert_eq!(original.wire_bytes, 12_320);
+        writer.sink.repair_request = Some(DeltaRepairRequest {
+            stream_sequence: 7,
+            parts: vec![],
+        });
+        let whole = writer.repair_pending_delta().await.unwrap().unwrap();
+        assert_eq!(whole.wire_bytes, original.wire_bytes);
+        assert_eq!(writer.sink.chunks[..11], writer.sink.chunks[11..]);
+
+        writer.sink.repair_request = Some(DeltaRepairRequest {
+            stream_sequence: 7,
+            parts: vec![0, 1, 2, 3],
+        });
+        assert!(writer.repair_pending_delta().await.unwrap().is_none());
+        writer.sink.repair_request = Some(DeltaRepairRequest {
+            stream_sequence: 7,
+            parts: vec![1, 2, 3],
+        });
+        let selective = writer.repair_pending_delta().await.unwrap().unwrap();
+        assert_eq!(selective.wire_bytes, 3360);
+        assert_eq!(writer.repair_cache_bytes, 0);
     }
 
     #[tokio::test]
