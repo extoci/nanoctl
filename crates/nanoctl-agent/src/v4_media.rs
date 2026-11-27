@@ -273,7 +273,11 @@ async fn run_pipeline(
     }
     tracing::info!(
         captured = report.snapshot.frames_captured,
+        taken = report.snapshot.frames_taken_for_encode,
         encoded = report.snapshot.access_units_encoded,
+        encoder_skips = report.snapshot.encoder_skips,
+        keyframes = report.snapshot.keyframes_encoded,
+        max_encode_us = report.snapshot.max_encode_micros,
         written = report.snapshot.lane_writes,
         dropped = report.snapshot.access_units_dropped_before_write,
         max_buffered = report.snapshot.max_buffered_bytes,

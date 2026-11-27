@@ -337,7 +337,7 @@ async fn encode_loop_inner(
         }
         last_dimensions = Some((config.width, config.height));
         force_next_keyframe = false;
-        stream_sequence = stream_sequence.wrapping_add(1);
+        let next_sequence = stream_sequence.wrapping_add(1);
         let capture_time_us = frame.capture_time_us;
         let capture_sequence = frame.capture_sequence;
         let encode_started = Instant::now();
@@ -349,7 +349,7 @@ async fn encode_loop_inner(
             }
         };
         let request = EncodeRequest {
-            stream_sequence,
+            stream_sequence: next_sequence,
             force_keyframe,
             target_bitrate: config.target_bitrate,
             codec: config.codec,
@@ -373,15 +373,14 @@ async fn encode_loop_inner(
             }
         };
         if encoded.payload.is_empty() {
-            // Encoder rate-control skips are explicit drops, not corrupt partial access units.
-            // The next emitted frame must restart the reference chain because the skipped input
-            // still consumed a stream sequence number.
+            // A rate-control skip leaves the previous reference intact. Retry an outstanding
+            // keyframe request, but do not spend a wire sequence on an unencoded image.
             record_metrics(metrics, |snapshot| {
                 snapshot.encoder_skips += 1;
                 snapshot.total_encode_micros += encode_micros;
                 snapshot.max_encode_micros = snapshot.max_encode_micros.max(encode_micros);
             });
-            force_next_keyframe = true;
+            force_next_keyframe = force_keyframe;
             continue;
         }
         if force_keyframe && !encoded.keyframe {
@@ -391,6 +390,7 @@ async fn encode_loop_inner(
             ));
         }
 
+        stream_sequence = next_sequence;
         let access_unit = EncodedAccessUnit {
             stream_sequence,
             keyframe: encoded.keyframe,
@@ -700,15 +700,17 @@ mod tests {
         assert_eq!(report.snapshot.keyframes_encoded, 2);
     }
 
-    struct SkipFirstEncoder {
-        attempts: Arc<AtomicUsize>,
+    struct SkippingEncoder {
+        attempts: usize,
+        skip_at: usize,
     }
 
     #[async_trait]
-    impl VideoEncoder for SkipFirstEncoder {
+    impl VideoEncoder for SkippingEncoder {
         async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError> {
-            let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
-            if attempt == 0 {
+            let skip = self.attempts == self.skip_at;
+            self.attempts += 1;
+            if skip {
                 return Ok(EncodedBitstream {
                     keyframe: false,
                     payload: Vec::new(),
@@ -722,42 +724,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encoder_skip_is_visible_and_forces_next_keyframe() {
+    async fn encoder_skip_retries_a_requested_keyframe_and_preserves_a_delta_chain() {
+        for skip_at in [0, 1] {
+            check_encoder_skip(skip_at).await;
+        }
+    }
+
+    async fn check_encoder_skip(skip_at: usize) {
         let (frames_tx, frames_rx) = mpsc::channel(4);
         let (collecting, units, notify) = lane(LaneWriteStatus::Written);
-        let attempts = Arc::new(AtomicUsize::new(0));
         let pipeline = MediaPipeline::start(
             config(),
             Box::new(ChannelSource {
                 receiver: frames_rx,
             }),
-            Box::new(SkipFirstEncoder {
-                attempts: Arc::clone(&attempts),
+            Box::new(SkippingEncoder {
+                attempts: 0,
+                skip_at,
             }),
             Box::new(collecting),
         )
         .unwrap();
 
-        frames_tx.send(frame(111)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while attempts.load(AtomicOrdering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
+        let mut expected_frames = 0;
+        for attempt in 0..3 {
+            frames_tx
+                .send(frame(111 * (attempt as u64 + 1)))
+                .await
+                .unwrap();
+            if attempt == skip_at {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while pipeline.snapshot().encoder_skips == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                expected_frames += 1;
+                wait_for_len(&units, &notify, expected_frames).await;
             }
-        })
-        .await
-        .unwrap();
-        frames_tx.send(frame(222)).await.unwrap();
-        wait_for_len(&units, &notify, 1).await;
+        }
 
-        let first_written = {
+        let written_frames = {
             let written = units.lock().expect("collected units poisoned");
-            (written[0].stream_sequence, written[0].keyframe)
+            written
+                .iter()
+                .map(|unit| (unit.stream_sequence, unit.keyframe))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(first_written, (2, true));
+        assert_eq!(written_frames, [(1, true), (2, false)]);
 
         let report = pipeline.stop().await;
         assert_eq!(report.snapshot.encoder_skips, 1);
-        assert_eq!(report.snapshot.access_units_encoded, 1);
+        assert_eq!(report.snapshot.access_units_encoded, 2);
         assert_eq!(report.snapshot.keyframes_encoded, 1);
     }
 
