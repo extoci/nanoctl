@@ -133,7 +133,7 @@ impl RateController {
         // Start high enough for a presentable first frame — a 4Mbps opening undershoots a
         // LAN-scale link badly, and the probe-up path recovers in seconds on a real WAN.
         let initial = (ceiling_kbps / 4)
-            .min(6_000)
+            .min(2_000)
             .clamp(ceiling_kbps.min(MIN_BITRATE_KBPS), ceiling_kbps);
         let max_fps = max_fps.max(1);
         let fps = Self::tier(initial as f64, max_fps);
@@ -685,8 +685,8 @@ mod tests {
         assert_eq!(
             initial,
             RateDecision {
-                bitrate_kbps: 6_000,
-                fps: 120
+                bitrate_kbps: 2_000,
+                fps: 60
             }
         );
         assert_eq!(
@@ -821,9 +821,9 @@ mod tests {
     fn clean_feedback_reaches_a_fifty_megabit_ceiling() {
         let now = Instant::now();
         let mut controller = RateController::new(50_000, 60);
-        assert_eq!(controller.decision().bitrate_kbps, 6_000);
+        assert_eq!(controller.decision().bitrate_kbps, 2_000);
         let mut ceiling_at = None;
-        for second in 0..=14 {
+        for second in 0..=20 {
             let mut input = sample(now + Duration::from_secs(second), 0.0);
             input.rtt = Some(Duration::from_millis(20));
             if let Some(decision) = controller.observe(input)
@@ -833,7 +833,7 @@ mod tests {
                 assert_eq!(decision.fps, 60);
             }
         }
-        assert!(ceiling_at.is_some_and(|second| second <= 13));
+        assert!(ceiling_at.is_some_and(|second| second <= 19));
     }
 
     #[test]
@@ -867,7 +867,7 @@ mod tests {
             input.rtt = Some(Duration::from_millis(1));
             controller.observe(input);
         }
-        assert_eq!(controller.decision().bitrate_kbps, 17_544);
+        assert_eq!(controller.decision().bitrate_kbps, 5_848);
     }
 
     #[test]
