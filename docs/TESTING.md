@@ -144,3 +144,8 @@ content for 60 seconds with gaps no longer than 500 ms, then pass 20 reattach
 cycles under the same profile. The gate also checks peak and sustained
 keyframe rates, host RSS growth, and queue limits. The run writes the profile,
 observed counters, and timestamps to `test-results/*/bad-network.json`.
+
+The draft v4 network trial runs the same gate a second time with the host SCTP
+minimum retransmission timeout set to 200 ms. That job patches a temporary copy
+of the locked dependency and uploads a separate artifact. The stock build still
+runs the full gate.

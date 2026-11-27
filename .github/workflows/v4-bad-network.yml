@@ -13,9 +13,13 @@ permissions:
 
 jobs:
   bad-network:
-    name: Real media at 5% loss, 25% reorder, 3 Mbps
+    name: ${{ matrix.variant == 'stock' && 'Real media at 5% loss, 25% reorder, 3 Mbps' || 'SCTP 200 ms minimum RTO trial' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(github.head_ref == 'codex/v4-network-trial' && '["stock","rto-200ms"]' || '["stock"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -28,7 +32,7 @@ jobs:
         with:
           key: release-ubuntu-24.04
           workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.event_name != 'pull_request' && matrix.variant == 'stock' }}
       - run: bun install --frozen-lockfile
       - uses: ./.github/actions/linux-media-deps
         with:
@@ -36,11 +40,21 @@ jobs:
           extra-packages: xauth xvfb iproute2
           save-cache: ${{ github.event_name != 'pull_request' }}
       - run: bunx playwright install --with-deps chromium
-      - run: bun run build:agent
+      - name: Build the stock media agent
+        if: matrix.variant == 'stock'
+        run: bun run build:agent
+      - name: Build the SCTP timer trial
+        if: matrix.variant == 'rto-200ms'
+        run: |
+          trial_dir=$(mktemp -d)
+          trap 'rm -rf -- "$trial_dir"' EXIT
+          bun run scripts/prepare-v4-sctp-trial.ts "$trial_dir"
+          bun run build:viewer
+          bun run scripts/cargo.ts --config "$trial_dir/sctp-trial.toml" build --release --features media
       - run: scripts/v4-bad-network.sh crates/nanoctl-agent/target/release/nanoctl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: v4-bad-network-evidence
+          name: ${{ matrix.variant == 'stock' && 'v4-bad-network-evidence' || 'v4-bad-network-evidence-sctp-rto-200ms' }}
           path: test-results/
           if-no-files-found: warn
