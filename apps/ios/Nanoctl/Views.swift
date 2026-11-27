@@ -156,7 +156,7 @@ struct ConnectView: View {
                                                         Text(host.displayName)
                                                             .font(.subheadline.weight(.semibold))
                                                             .lineLimit(1)
-                                                        Text(host.dnsName ?? ConnectView.label(host.url))
+                                                        Text(host.endpointLabel)
                                                             .font(.caption)
                                                             .foregroundStyle(.secondary)
                                                             .lineLimit(1)

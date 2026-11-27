@@ -49,7 +49,7 @@ struct GamepadStatusRow: View {
                 Text(status.recognition)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
-                Text("Maps to \(status.hostDevice) · player \(status.slot)")
+                Text("Maps to \(status.hostDevice)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

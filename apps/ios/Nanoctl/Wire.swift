@@ -64,6 +64,11 @@ struct DiscoveredHost: Decodable, Equatable, Identifiable {
         return URL(string: url)?.host() ?? url
     }
 
+    var endpointLabel: String {
+        guard let endpoint = URL(string: url), let host = endpoint.host() else { return url }
+        return endpoint.port.map { "\(host):\($0)" } ?? host
+    }
+
     enum CodingKeys: String, CodingKey {
         case hostName, dnsName, os, online, url
     }
