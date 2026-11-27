@@ -31,6 +31,7 @@ function messageBytes(data: unknown): Uint8Array {
  */
 const REORDER_WAIT_MS = 180;
 const FIRST_REFERENCE_WAIT_MS = 350;
+const FIRST_KEYFRAME_RETRY_MS = 125;
 const KEYFRAME_RETRY_MS = 250;
 
 export class V4VideoReceiver {
@@ -101,12 +102,12 @@ export class V4VideoReceiver {
     this.sendKeyframeRequestWithRetry();
   }
 
-  private sendKeyframeRequestWithRetry(): void {
+  private sendKeyframeRequestWithRetry(retryAfterMs = FIRST_KEYFRAME_RETRY_MS): void {
     if (this.disposed || this.keyframeTimer !== undefined) return;
     this.keyframeTimer = setTimeout(() => {
       this.keyframeTimer = undefined;
-      this.sendKeyframeRequestWithRetry();
-    }, KEYFRAME_RETRY_MS);
+      this.sendKeyframeRequestWithRetry(KEYFRAME_RETRY_MS);
+    }, retryAfterMs);
     try {
       this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
     } catch (error) {

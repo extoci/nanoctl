@@ -93,13 +93,13 @@ test("requests the first keyframe even if the viewer has received no video", asy
   }
 });
 
-test("retries keyframe requests without more incoming video and stops on a reference", async () => {
+test("retries the first keyframe request quickly and stops on a reference", async () => {
   const state = receiver();
   try {
     state.receiver.handle(encoded(4, false, [4]));
     expect(state.requests).toHaveLength(1);
-    await Bun.sleep(300);
-    expect(state.requests.length).toBeGreaterThan(1);
+    await Bun.sleep(180);
+    expect(state.requests).toHaveLength(2);
     state.receiver.handle(encoded(5, true, [5]));
     const recoveredRequests = state.requests.length;
     await Bun.sleep(300);
