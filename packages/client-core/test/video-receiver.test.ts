@@ -62,8 +62,12 @@ describe("V4VideoReceiver", () => {
 
   test("reports malformed bytes without throwing from the lane callback", () => {
     const state = receiver();
-    expect(() => state.receiver.handle(Uint8Array.from([4, 0x40]))).not.toThrow();
-    expect(state.errors.length).toBe(1);
+    try {
+      expect(() => state.receiver.handle(Uint8Array.from([4, 0x40]))).not.toThrow();
+      expect(state.errors.length).toBe(1);
+    } finally {
+      state.receiver.dispose();
+    }
   });
 
   test("dispose detaches only its own handlers", () => {
@@ -72,6 +76,21 @@ describe("V4VideoReceiver", () => {
     expect(state.videoDelta.onmessage).toBeNull();
     expect(state.videoReference.onmessage).toBeNull();
   });
+});
+
+test("requests the first keyframe even if the viewer has received no video", async () => {
+  const state = receiver();
+  try {
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(400);
+    expect(state.requests).toEqual([[4, 0x41]]);
+    state.receiver.handle(encoded(1, true, [1]));
+    await Bun.sleep(300);
+    expect(state.requests).toHaveLength(1);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([1]);
+  } finally {
+    state.receiver.dispose();
+  }
 });
 
 test("retries keyframe requests without more incoming video and stops on a reference", async () => {

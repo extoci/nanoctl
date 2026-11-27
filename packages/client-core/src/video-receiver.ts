@@ -30,12 +30,14 @@ function messageBytes(data: unknown): Uint8Array {
  * decision. Decode output is emitted only in a valid reference chain.
  */
 const REORDER_WAIT_MS = 180;
+const FIRST_REFERENCE_WAIT_MS = 350;
 const KEYFRAME_RETRY_MS = 250;
 
 export class V4VideoReceiver {
   private readonly processor = new VideoStreamProcessor();
   private reorderTimer: ReturnType<typeof setTimeout> | undefined;
   private reorderSequence: number | undefined;
+  private firstReferenceTimer: ReturnType<typeof setTimeout> | undefined;
   private keyframeTimer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
   private watermark: number | undefined;
@@ -49,6 +51,7 @@ export class V4VideoReceiver {
     }
     options.videoDelta.onmessage = this.deltaHandler;
     options.videoReference.onmessage = this.referenceHandler;
+    this.firstReferenceTimer = setTimeout(() => this.requestKeyframe(), FIRST_REFERENCE_WAIT_MS);
   }
 
   handle(data: unknown): void {
@@ -73,7 +76,10 @@ export class V4VideoReceiver {
         this.options.onReceivedAccessUnit?.(outcome.received);
       }
       for (const unit of outcome.emitted) {
-        if (unit.keyframe) this.stopKeyframeRetry();
+        if (unit.keyframe) {
+          this.stopFirstReferenceTimer();
+          this.stopKeyframeRetry();
+        }
         this.options.onAccessUnit(unit);
         if (this.processor.waitingForReference) return;
       }
@@ -89,6 +95,7 @@ export class V4VideoReceiver {
 
   requestKeyframe(): void {
     if (this.disposed) return;
+    this.stopFirstReferenceTimer();
     this.processor.requireKeyframe();
     this.stopReorderTimer();
     this.sendKeyframeRequestWithRetry();
@@ -134,6 +141,11 @@ export class V4VideoReceiver {
     this.reorderSequence = undefined;
   }
 
+  private stopFirstReferenceTimer(): void {
+    clearTimeout(this.firstReferenceTimer);
+    this.firstReferenceTimer = undefined;
+  }
+
   private stopKeyframeRetry(): void {
     clearTimeout(this.keyframeTimer);
     this.keyframeTimer = undefined;
@@ -145,6 +157,7 @@ export class V4VideoReceiver {
 
   dispose(): void {
     this.disposed = true;
+    this.stopFirstReferenceTimer();
     this.stopReorderTimer();
     this.stopKeyframeRetry();
     if (this.options.videoDelta.onmessage === this.deltaHandler) {

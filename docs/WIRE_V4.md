@@ -153,6 +153,9 @@ the reorder window fills or the decoder loses its reference, the receiver discar
 deltas and waits for a fresh keyframe. The transport or session layer owns the request timers and
 rate limits.
 
+Before the first complete reference, the viewer sends a keyframe request if it has waited 350 ms.
+It retries until a reference arrives, even if there have been no video messages.
+
 ## Size and memory limits
 
 - Single video chunk payload: 48 KiB.
