@@ -91,10 +91,14 @@ export class V4VideoReceiver {
     if (this.disposed) return;
     this.processor.requireKeyframe();
     this.stopReorderTimer();
-    if (this.keyframeTimer !== undefined) return;
+    this.sendKeyframeRequestWithRetry();
+  }
+
+  private sendKeyframeRequestWithRetry(): void {
+    if (this.disposed || this.keyframeTimer !== undefined) return;
     this.keyframeTimer = setTimeout(() => {
       this.keyframeTimer = undefined;
-      this.requestKeyframe();
+      this.sendKeyframeRequestWithRetry();
     }, KEYFRAME_RETRY_MS);
     try {
       this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
@@ -108,13 +112,20 @@ export class V4VideoReceiver {
       this.watermark !== undefined && this.processor.isBehindWatermark(this.watermark);
     if (!this.processor.hasFrameGap && !watermarkGap) {
       this.stopReorderTimer();
+      if (!this.processor.waitingForReference) this.stopKeyframeRetry();
       return;
     }
+    if (this.keyframeTimer !== undefined) return;
     const expected = this.processor.nextExpectedSequence;
     if (this.reorderTimer !== undefined && this.reorderSequence === expected) return;
     this.stopReorderTimer();
     this.reorderSequence = expected;
-    this.reorderTimer = setTimeout(() => this.requestKeyframe(), REORDER_WAIT_MS);
+    this.reorderTimer = setTimeout(() => {
+      this.stopReorderTimer();
+      // A deadline tells us to start recovery. Late deltas may still complete
+      // the current chain before a new reference arrives.
+      this.sendKeyframeRequestWithRetry();
+    }, REORDER_WAIT_MS);
   }
 
   private stopReorderTimer(): void {

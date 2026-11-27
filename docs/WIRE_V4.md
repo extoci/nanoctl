@@ -147,9 +147,11 @@ part index. Both copies count toward the send budget. If the delta lane is full,
 sends the original reference on the reliable lane.
 
 A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when it
-receives an incomplete expected delta or sees a gap before a complete later frame. If the timer
-expires or the reorder window fills, the receiver discards dependent deltas and requests a
-keyframe. The transport or session layer owns the request timers and rate limits.
+receives an incomplete expected delta or sees a gap before a complete later frame. When the timer
+expires, the receiver requests a keyframe. Late deltas can still fill the gap and stop retries. If
+the reorder window fills or the decoder loses its reference, the receiver discards dependent
+deltas and waits for a fresh keyframe. The transport or session layer owns the request timers and
+rate limits.
 
 ## Size and memory limits
 

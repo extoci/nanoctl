@@ -110,7 +110,7 @@ test("a short unresolved gap requests recovery even below the frame limit", asyn
     await Bun.sleep(250);
     expect(state.requests).toEqual([[4, 0x41]]);
     state.receiver.handle(encoded(11, false, [1]));
-    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10]);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
   } finally {
     state.receiver.dispose();
   }
@@ -171,6 +171,22 @@ test("a late delta can catch up with the watermark before recovery starts", asyn
     await Bun.sleep(250);
     expect(state.requests).toHaveLength(0);
     expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a delta that closes the gap after a keyframe request stops retries", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    await Bun.sleep(250);
+    expect(state.requests).toHaveLength(1);
+    state.receiver.handle(encoded(11, false, [1]));
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11]);
+    await Bun.sleep(300);
+    expect(state.requests).toHaveLength(1);
   } finally {
     state.receiver.dispose();
   }
