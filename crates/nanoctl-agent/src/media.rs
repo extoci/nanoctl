@@ -68,7 +68,7 @@ const PERIODIC_IDR_INTERVAL: Duration = Duration::from_secs(20);
 // wire header is [u32 seq][u8 flags]; fragmented messages add u16 part/parts
 // and timestamped messages add u64 sent_ms. Most delta frames therefore cost
 // five header bytes instead of the original seventeen.
-const VIDEO_DC_CHUNK: usize = 48 * 1024;
+const VIDEO_DC_CHUNK: usize = 1200;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_FRAGMENTED: u8 = 2;
 const VIDEO_FLAG_TIMESTAMP: u8 = 4;
@@ -4198,9 +4198,10 @@ mod tests {
     use super::{
         EncodedFrame, EncodedFrameSlot, EncoderBackend, EncoderSettings, FrameEncoder,
         HARDWARE_BACKENDS, HardwareBackend, LatestFrame, PixelFormat, SoftwareEncoder,
-        TimingSample, TimingSamples, VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types,
-        avcc_to_annex_b, await_video_delivery, bitrate_target, delivery_failure_grace_elapsed,
-        fit_dimensions, video_data_messages, video_heartbeat_message, viewport_scaled_rate,
+        TimingSample, TimingSamples, VIDEO_DC_CHUNK, VIDEO_DELIVERY_FAILURE_GRACE,
+        annex_b_nal_types, avcc_to_annex_b, await_video_delivery, bitrate_target,
+        delivery_failure_grace_elapsed, fit_dimensions, video_data_messages,
+        video_heartbeat_message, viewport_scaled_rate,
     };
     use crate::config::{EncoderPreference, LatencyMode};
     use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
@@ -4217,11 +4218,18 @@ mod tests {
         assert_eq!(timestamped[0].len(), 23);
 
         let keyframe = video_data_messages(32, true, &vec![9; 100_000]);
-        assert_eq!(keyframe.len(), 3);
+        let expected_parts = 100_000_usize.div_ceil(VIDEO_DC_CHUNK);
+        assert_eq!(keyframe.len(), expected_parts);
         assert_eq!(keyframe[0][4], 7);
-        assert_eq!(&keyframe[0][5..9], &[0, 0, 3, 0]);
-        assert_eq!(keyframe[0].len(), 17 + 48 * 1024);
-        assert_eq!(keyframe[2].len(), 17 + (100_000 - 2 * 48 * 1024));
+        assert_eq!(
+            &keyframe[0][5..9],
+            &[0, 0, expected_parts as u8, (expected_parts >> 8) as u8]
+        );
+        assert_eq!(keyframe[0].len(), 17 + VIDEO_DC_CHUNK);
+        assert_eq!(
+            keyframe[expected_parts - 1].len(),
+            17 + (100_000 - (expected_parts - 1) * VIDEO_DC_CHUNK)
+        );
 
         let heartbeat = video_heartbeat_message(0x0102_0304);
         assert_eq!(&heartbeat[..], &[4, 3, 2, 1, 8]);
