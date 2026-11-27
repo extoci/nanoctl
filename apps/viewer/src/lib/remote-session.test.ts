@@ -1116,6 +1116,67 @@ describe("webcodecs video gating and teardown", () => {
     expect(resets).toBeGreaterThan(0);
   });
 
+  test("data-channel stats expose wire bytes, decode shape, and loss counters", () => {
+    installBrowserGlobals(() => 0);
+    let output: ((frame: unknown) => void) | null = null;
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      constructor(init: { output: (frame: unknown) => void }) {
+        output = init.output;
+      }
+      configure() {}
+      reset() {}
+      decode(chunk: { init: { timestamp: number } }) {
+        output?.({
+          timestamp: chunk.init.timestamp,
+          displayWidth: 1280,
+          displayHeight: 720,
+          close() {},
+        });
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    channel.onmessage?.({ data: message(0, true) } as MessageEvent);
+    channel.onmessage?.({ data: message(1, false) } as MessageEvent);
+    expect(handle.stats()).toMatchObject({
+      decoded: 2,
+      width: 1280,
+      height: 720,
+      codec: "h264",
+      bytes: 22,
+      packetsLost: 0,
+    });
+    expect(handle.stats().decodeTimedFrames).toBe(2);
+    handle.drop();
+  });
+
   test("keyframe requests use the reliable idr channel when present", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
