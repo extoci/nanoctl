@@ -19,7 +19,7 @@ afterEach(() => {
 const info: HostInfo = {
   hostName: "desktop",
   platform: "linux",
-  version: "3.0.0-alpha.26",
+  version: "3.0.0-alpha.27",
   displays: [],
   remoteInput: false,
   viewer: {

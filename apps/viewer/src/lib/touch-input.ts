@@ -239,7 +239,11 @@ export function attachTouchInput(video: HTMLVideoElement, gestures: TouchGesture
     if (event.type === "lostpointercapture" && !active.has(event.pointerId)) return;
     if (event.type === "pointerdown") {
       active.add(event.pointerId);
-      video.setPointerCapture(event.pointerId);
+      try {
+        video.setPointerCapture(event.pointerId);
+      } catch {
+        // Synthetic or already-ended touch pointers can reject capture.
+      }
       gestures.down(sample);
     } else if (event.type === "pointermove") gestures.move(sample);
     else if (event.type === "pointerup") {
