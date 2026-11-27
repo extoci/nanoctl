@@ -1616,6 +1616,70 @@ export class RemoteSessionController {
     }
   }
 
+  private applyDirectVideoStats(dcLoss: number | undefined): void {
+    const directStats = this.webCodecsVideo?.directDataChannel ? this.webCodecsVideo.stats() : null;
+    if (directStats?.bytes === undefined) return;
+    const base: RemoteSessionMetrics = this.metrics ?? {
+      resolution: "—",
+      fps: null,
+      bitrateKbps: null,
+      rttMs: null,
+      packetsLost: 0,
+      framesDropped: 0,
+      lossPercent: null,
+      jitterMs: null,
+      route: "unknown",
+      codec: null,
+      decoder: null,
+      decodeMs: null,
+    };
+    const directSample = {
+      id: "direct-video",
+      bytes: directStats.bytes,
+      frames: directStats.decoded,
+      timestamp: performance.now(),
+      decodeTimeMs: directStats.decodeTimeMs,
+      decodeTimedFrames: directStats.decodeTimedFrames,
+    };
+    const directRates = videoRates(directSample, this.previousDirectVideoSample);
+    const previousDirect = this.previousDirectVideoSample;
+    const decodeTimeDelta =
+      directSample.decodeTimeMs !== undefined && previousDirect?.decodeTimeMs !== undefined
+        ? directSample.decodeTimeMs - previousDirect.decodeTimeMs
+        : 0;
+    const decodeFrameDelta =
+      directSample.decodeTimedFrames !== undefined &&
+      previousDirect?.decodeTimedFrames !== undefined
+        ? directSample.decodeTimedFrames - previousDirect.decodeTimedFrames
+        : 0;
+    this.previousDirectVideoSample = directSample;
+    this.metrics = {
+      ...base,
+      resolution:
+        directStats.width && directStats.height
+          ? `${directStats.width}×${directStats.height}`
+          : base.resolution,
+      fps: directRates.fps,
+      bitrateKbps: directRates.bitrateKbps,
+      packetsLost: directStats.packetsLost ?? base.packetsLost,
+      framesDropped: directStats.dropped,
+      lossPercent: dcLoss !== undefined ? Math.round(dcLoss * 1_000) / 10 : base.lossPercent,
+      codec:
+        directStats.codec === "h264"
+          ? "H.264"
+          : directStats.codec === "hevc"
+            ? "HEVC"
+            : directStats.codec === "av1"
+              ? "AV1"
+              : base.codec,
+      decoder: "WebCodecs",
+      decodeMs:
+        decodeFrameDelta > 0 && decodeTimeDelta >= 0
+          ? Math.round((decodeTimeDelta / decodeFrameDelta) * 10) / 10
+          : null,
+    };
+  }
+
   private async collectStats(lifecycle: number): Promise<void> {
     // Receiver-measured data-channel loss is the host's only congestion
     // signal while video rides the data channel — RTP feedback describes the
@@ -1645,7 +1709,14 @@ export class RemoteSessionController {
           nominatedPairs.push(stats);
         }
       });
-      if (!inbound) return;
+      if (!inbound) {
+        // Safari can omit inbound RTP stats while the thin RTP keepalive leg is
+        // suppressed. Direct data-channel video has its own byte/frame counters
+        // and must not depend on that RTP stats object existing.
+        this.applyDirectVideoStats(dcLoss);
+        this.publishSnapshot();
+        return;
+      }
       const sample: VideoSample = {
         id: inbound.id,
         bytes: statNumber(inbound, "bytesReceived") ?? 0,
@@ -1733,57 +1804,7 @@ export class RemoteSessionController {
         decoder: statString(inbound, "decoderImplementation") ?? null,
         decodeMs: decodeMs !== null && decodeMs >= 0 ? Math.round(decodeMs * 10) / 10 : null,
       };
-      const directStats = this.webCodecsVideo?.directDataChannel
-        ? this.webCodecsVideo.stats()
-        : null;
-      if (directStats?.bytes !== undefined) {
-        const directSample = {
-          id: "direct-video",
-          bytes: directStats.bytes,
-          frames: directStats.decoded,
-          timestamp: performance.now(),
-          decodeTimeMs: directStats.decodeTimeMs,
-          decodeTimedFrames: directStats.decodeTimedFrames,
-        };
-        const directRates = videoRates(directSample, this.previousDirectVideoSample);
-        const previousDirect = this.previousDirectVideoSample;
-        const decodeTimeDelta =
-          directSample.decodeTimeMs !== undefined && previousDirect?.decodeTimeMs !== undefined
-            ? directSample.decodeTimeMs - previousDirect.decodeTimeMs
-            : 0;
-        const decodeFrameDelta =
-          directSample.decodeTimedFrames !== undefined &&
-          previousDirect?.decodeTimedFrames !== undefined
-            ? directSample.decodeTimedFrames - previousDirect.decodeTimedFrames
-            : 0;
-        this.previousDirectVideoSample = directSample;
-        this.metrics = {
-          ...this.metrics,
-          resolution:
-            directStats.width && directStats.height
-              ? `${directStats.width}×${directStats.height}`
-              : this.metrics.resolution,
-          fps: directRates.fps,
-          bitrateKbps: directRates.bitrateKbps,
-          packetsLost: directStats.packetsLost ?? this.metrics.packetsLost,
-          framesDropped: directStats.dropped,
-          lossPercent:
-            dcLoss !== undefined ? Math.round(dcLoss * 1_000) / 10 : this.metrics.lossPercent,
-          codec:
-            directStats.codec === "h264"
-              ? "H.264"
-              : directStats.codec === "hevc"
-                ? "HEVC"
-                : directStats.codec === "av1"
-                  ? "AV1"
-                  : this.metrics.codec,
-          decoder: "WebCodecs",
-          decodeMs:
-            decodeFrameDelta > 0 && decodeTimeDelta >= 0
-              ? Math.round((decodeTimeDelta / decodeFrameDelta) * 10) / 10
-              : null,
-        };
-      }
+      this.applyDirectVideoStats(dcLoss);
       this.publishSnapshot();
     } catch {
       // Stats are advisory. A browser can reject the query while the media path is healthy.

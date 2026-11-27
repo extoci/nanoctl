@@ -77,6 +77,65 @@ describe("remote session lifecycle", () => {
     await controller.stop();
   });
 
+  test("direct video stats publish even when inbound RTP stats are unavailable", async () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    (
+      controller as unknown as {
+        webCodecsVideo: {
+          directDataChannel: boolean;
+          stats: () => Record<string, unknown>;
+          takeLinkLoss: () => number;
+          drop: () => void;
+        };
+      }
+    ).webCodecsVideo = {
+      directDataChannel: true,
+      stats: () => ({
+        bytes: 12_000,
+        decoded: 30,
+        width: 1280,
+        height: 720,
+        codec: "h264",
+        packetsLost: 0,
+        dropped: 0,
+        decodeTimeMs: 30,
+        decodeTimedFrames: 30,
+      }),
+      takeLinkLoss: () => 0.02,
+      drop: () => {},
+    };
+
+    for (const callback of intervals) callback();
+    await flushSignals();
+
+    expect(controller.snapshot.metrics).toMatchObject({
+      resolution: "1280×720",
+      codec: "H.264",
+      decoder: "WebCodecs",
+      lossPercent: 2,
+      packetsLost: 0,
+      framesDropped: 0,
+    });
+    await controller.stop();
+  });
+
   test("audio is recvonly when advertised, even for view-only sessions", async () => {
     installBrowserGlobals();
     for (const enabled of [false, true]) {
