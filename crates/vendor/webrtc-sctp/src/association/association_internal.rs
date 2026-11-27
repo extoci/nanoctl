@@ -2403,6 +2403,7 @@ impl RtxTimerObserver for AssociationInternal {
                 }
 
                 log::debug!(
+                    target: "webrtc_sctp::retransmission",
                     "[{}] T3-rtx timed out: n_rtos={} cwnd={} ssthresh={}",
                     self.name,
                     n_rtos,

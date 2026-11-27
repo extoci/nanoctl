@@ -164,12 +164,20 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
                 tokio::pin!(timer);
 
                 tokio::select! {
+                    biased;
+                    _ = close_rx.recv() => break,
                     _ = timer.as_mut() => {
-                        n_rtos+=1;
+                        n_rtos += 1;
 
                         let failure = {
-                            if let Some(observer) = timeout_observer.upgrade(){
-                                let mut observer = observer.lock().await;
+                            if let Some(observer) = timeout_observer.upgrade() {
+                                // A SACK can restart the timer while it holds the
+                                // observer lock. Drop the callback from the old timer.
+                                let mut observer = tokio::select! {
+                                    biased;
+                                    _ = close_rx.recv() => break,
+                                    observer = observer.lock() => observer,
+                                };
                                 if max_retrans == 0 || n_rtos <= max_retrans {
                                     observer.on_retransmission_timeout(id, n_rtos).await;
                                     false
@@ -177,17 +185,18 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
                                     observer.on_retransmission_failure(id).await;
                                     true
                                 }
-                            }else{
+                            } else {
                                 true
                             }
                         };
                         if failure {
                             let mut close = close_tx.lock().await;
-                            *close = None;
+                            if !close_rx.is_closed() {
+                                *close = None;
+                            }
                             break;
                         }
                     }
-                    _ = close_rx.recv() => break,
                 }
             }
         });

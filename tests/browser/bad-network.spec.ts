@@ -19,6 +19,7 @@ const rssAllowanceKiB = 32 * 1024;
 const reconnects = 20;
 
 interface GateProbe {
+  timeOrigin: number;
   frames: number[];
   keyframes: number[];
   keyframeArrivals: {
@@ -130,6 +131,7 @@ async function monitorBrowser(page: Page) {
   await page.addInitScript(
     ({ delta, reference, keyframeRequest, deltaRepairHeader }) => {
       const probe: GateProbe = {
+        timeOrigin: performance.timeOrigin,
         frames: [],
         keyframes: [],
         keyframeArrivals: [],
@@ -341,6 +343,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     const after = await readNetem();
     const rssGrowthKiB = Math.max(...rss.slice(10)) - rss[9]!;
     Object.assign(evidence, {
+      browserTimeOriginMs: probe.timeOrigin,
       frames: probe.frames,
       keyframes,
       keyframeArrivals: probe.keyframeArrivals,
@@ -393,7 +396,9 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 2_000 });
     const activeReport = await request.get("/v1/debug");
     const activeLog = await activeReport.text();
-    const earlyStops = activeLog.split("\n").filter((line) => {
+    const activeLines = activeLog.split("\n");
+    evidence.sctpTimeouts = activeLines.filter((line) => line.includes("T3-rtx timed out"));
+    const earlyStops = activeLines.filter((line) => {
       return line.includes("v4 media pipeline stopped") || line.includes("reason=media-failed");
     });
     evidence.earlyStops = earlyStops;

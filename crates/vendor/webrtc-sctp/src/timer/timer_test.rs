@@ -94,10 +94,10 @@ mod test_rto_manager {
     #[tokio::test]
     async fn test_rto_manager_rto_calculation_small_rtt() -> Result<()> {
         let mut m = RtoManager::new();
-        let exp = [1800, 1500, 1275, 1106, 1000];
+        let exp = [300, 250, 212, 200, 200];
 
         for i in 0..5 {
-            m.set_new_rtt(600);
+            m.set_new_rtt(100);
             let rto = m.get_rto();
             assert_eq!(rto, exp[i], "should be equal: {i}");
         }
@@ -325,6 +325,33 @@ mod test_rtx_timer {
         assert_eq!(ncbs.load(Ordering::SeqCst), 1, "must be called once");
 
         Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_rtx_timer_restart_cancels_timeout_waiting_for_observer() {
+        let timer_id = RtxTimerId::T3RTX;
+        let ncbs = Arc::new(AtomicU32::new(0));
+        let obs = Arc::new(Mutex::new(TestTimerObserver {
+            ncbs: ncbs.clone(),
+            timer_id,
+            ..Default::default()
+        }));
+        let rt = RtxTimer::new(Arc::downgrade(&obs), timer_id, 0);
+
+        // SACK processing holds this lock while restarting the timer. The
+        // old timer expires during that work but cannot run its callback yet.
+        let guard = obs.lock().await;
+        assert!(rt.start(10).await);
+        sleep(Duration::from_millis(20)).await;
+        rt.stop().await;
+        assert!(rt.start(100).await);
+        drop(guard);
+
+        sleep(Duration::from_millis(20)).await;
+        assert_eq!(ncbs.load(Ordering::SeqCst), 0);
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(ncbs.load(Ordering::SeqCst), 1);
+        rt.stop().await;
     }
 
     #[tokio::test]
