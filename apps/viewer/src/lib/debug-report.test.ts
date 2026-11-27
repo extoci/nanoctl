@@ -132,6 +132,7 @@ test("reports v4 measurements and the host encoder separately from RTP stats", a
       route: "direct",
       jitterMs: null,
       skippedFrames: 2,
+      deliveredFrames: 3,
       skippedPercent: 40,
       decodeMs: 3,
       decodeSamples: 2,

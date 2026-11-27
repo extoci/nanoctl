@@ -19,6 +19,7 @@ import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
 import { videoRates, type VideoSample } from "./video-rates";
+import { selectedIceLink, v4DebugVideo } from "./v4-video-metrics";
 import {
   attachV4DataChannelVideo,
   attachWebCodecsVideo,
@@ -42,9 +43,11 @@ export type RemoteSessionMetrics = {
   fps: number | null;
   bitrateKbps: number | null;
   rttMs: number | null;
-  packetsLost: number;
+  packetsLost: number | null;
   framesDropped: number;
-  /** Share of packets lost since the previous stats sample. */
+  /** Indicates that lossPercent counts skipped video frames. */
+  frameLoss?: boolean;
+  /** Share of packets or video frames lost since the previous stats sample. */
   lossPercent: number | null;
   jitterMs: number | null;
   route: "direct" | "relay" | "unknown";
@@ -1607,21 +1610,41 @@ export class RemoteSessionController {
         const rates = videoRates(sample, this.previousVideoSample);
         this.previousVideoSample = sample;
         const video = this.options.video;
+        const v4 = v4DebugVideo.get(video)?.metrics.snapshot();
+        const ice = selectedIceLink(report);
+        const previous = this.previousLoss;
+        let lossPercent = null;
+        if (v4 && v4.skippedFrames !== null) {
+          if (previous?.id === sample.id) {
+            const lost = v4.skippedFrames - previous.lost;
+            const received = v4.deliveredFrames - previous.received;
+            if (lost >= 0 && received >= 0 && received + lost > 0) {
+              lossPercent = (lost * 100) / (received + lost);
+            }
+          }
+          this.previousLoss = {
+            id: sample.id,
+            lost: v4.skippedFrames,
+            received: v4.deliveredFrames,
+          };
+        }
         this.metrics = {
           resolution:
-            video.videoWidth > 0 && video.videoHeight > 0
+            v4?.resolution ??
+            (video.videoWidth > 0 && video.videoHeight > 0
               ? `${video.videoWidth}×${video.videoHeight}`
-              : "—",
+              : "—"),
           ...rates,
-          rttMs: null,
-          packetsLost: 0,
+          rttMs: ice.rttMs === null ? null : Math.round(ice.rttMs),
+          packetsLost: null,
           framesDropped: directStats.dropped,
-          lossPercent: null,
-          jitterMs: null,
-          route: "unknown",
+          frameLoss: true,
+          lossPercent,
+          jitterMs: v4?.jitterMs ?? null,
+          route: ice.route,
           codec: "H.264",
           decoder: "WebCodecs",
-          decodeMs: null,
+          decodeMs: v4?.decodeMs ?? null,
         };
         this.publishSnapshot();
         return;

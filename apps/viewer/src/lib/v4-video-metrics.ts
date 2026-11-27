@@ -48,6 +48,7 @@ export class V4VideoMetrics {
     return {
       resolution: this.resolution,
       jitterMs: this.jitterMs,
+      deliveredFrames: this.deliveredFrames,
       skippedFrames: total > 0 ? this.skippedFrames : null,
       skippedPercent: total > 0 ? (100 * this.skippedFrames) / total : null,
       decodeMs: this.decodeSamples > 0 ? this.decodeTotalMs / this.decodeSamples : null,
@@ -56,7 +57,10 @@ export class V4VideoMetrics {
   }
 }
 
-export function selectedIceLink(report: RTCStatsReport) {
+export function selectedIceLink(report: RTCStatsReport): {
+  rttMs: number | null;
+  route: "direct" | "relay" | "unknown";
+} {
   let pair: RTCIceCandidatePairStats | undefined;
   const nominated: RTCIceCandidatePairStats[] = [];
   for (const stats of report.values()) {

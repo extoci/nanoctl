@@ -7,6 +7,7 @@ import {
   type InputMessage,
 } from "@nanoctl/protocol";
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
+import { v4DebugVideo } from "./v4-video-metrics";
 import {
   attachDataChannelVideo,
   attachV4DataChannelVideo,
@@ -89,6 +90,68 @@ describe("remote session lifecycle", () => {
     await flushSignals();
     expect(controller.snapshot.metrics).toMatchObject({ route: "relay", rttMs: 42 });
     await controller.stop();
+  });
+
+  test("reports v4 video and ICE metrics without using RTP packet counters", async () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => intervals.push(callback));
+    defineGlobal("VideoDecoder", class {});
+    defineGlobal(
+      "MediaStreamTrackGenerator",
+      class {
+        track = { stop() {} };
+        writable = new WritableStream();
+      },
+    );
+    const peer = new FakePeer();
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    }) as unknown as HTMLVideoElement;
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    try {
+      peer.stats.set("transport", { type: "transport", selectedCandidatePairId: "selected" });
+      peer.stats.set("selected", {
+        type: "candidate-pair",
+        remoteCandidateId: "relay",
+        currentRoundTripTime: 0.042,
+      });
+      peer.stats.set("relay", { candidateType: "relay" });
+      peer.stats.set("inbound", { type: "inbound-rtp", kind: "video", packetsLost: 250 });
+      const metrics = v4DebugVideo.get(video)!.metrics;
+      metrics.decoded(960, 540, 2.5);
+      metrics.received(10, 20_000, 100);
+      metrics.received(11, 36_000, 132);
+      metrics.delivered(11);
+      for (const callback of intervals) callback();
+      await flushSignals();
+      expect(controller.snapshot.metrics?.lossPercent).toBeNull();
+
+      metrics.delivered(15);
+      for (const callback of intervals) callback();
+      await flushSignals();
+      expect(controller.snapshot.metrics).toMatchObject({
+        resolution: "960×540",
+        rttMs: 42,
+        route: "relay",
+        packetsLost: null,
+        frameLoss: true,
+        lossPercent: 75,
+        jitterMs: 1,
+        decodeMs: 2.5,
+      });
+    } finally {
+      await controller.stop();
+    }
   });
 
   test("audio is recvonly when advertised, even for view-only sessions", async () => {
