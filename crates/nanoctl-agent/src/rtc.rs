@@ -886,6 +886,7 @@ impl HostPeer {
                                 && let Some(limits) =
                                     crate::adaptive::ViewerLimits::parse(&message.data)
                             {
+                                tracing::info!(?limits, "viewer quality limits received");
                                 viewer_limits.send_replace(limits);
                                 return Box::pin(async {});
                             }
@@ -927,6 +928,7 @@ impl HostPeer {
                         if message.is_string
                             && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
                         {
+                            tracing::info!(?limits, "viewer quality limits received");
                             viewer_limits.send_replace(limits);
                             return Box::pin(async {});
                         }
