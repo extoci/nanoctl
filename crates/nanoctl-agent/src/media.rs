@@ -512,6 +512,35 @@ impl Drop for MmcssGuard {
     }
 }
 
+/// Keeps Windows awake while an active stream exists. Without this, a host
+/// whose display power-save fires mid-session can stop producing meaningful
+/// frames exactly when the remote user is still watching.
+#[cfg(windows)]
+struct DisplayWakeGuard;
+
+#[cfg(windows)]
+impl DisplayWakeGuard {
+    fn acquire() -> Self {
+        use windows::Win32::System::Power::{
+            ES_CONTINUOUS, ES_DISPLAY_REQUIRED, SetThreadExecutionState,
+        };
+        unsafe {
+            let _ = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+        }
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DisplayWakeGuard {
+    fn drop(&mut self) {
+        use windows::Win32::System::Power::{ES_CONTINUOUS, SetThreadExecutionState};
+        unsafe {
+            let _ = SetThreadExecutionState(ES_CONTINUOUS);
+        }
+    }
+}
+
 /// Stash of pixel buffers released by fully-dropped `CapturedFrame`s, each
 /// tagged with the emit generation it last carried.
 type RecycledFrames = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
@@ -3102,6 +3131,8 @@ pub fn spawn_video(
         let producer = tokio::task::spawn_blocking(move || -> Result<()> {
             #[cfg(windows)]
             let _mmcss = register_mmcss();
+            #[cfg(windows)]
+            let _display_wake = DisplayWakeGuard::acquire();
             let producer_slot = producer_slot;
             #[cfg(target_os = "linux")]
             producer_stats.producer_tid.store(
