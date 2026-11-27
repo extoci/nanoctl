@@ -417,7 +417,7 @@ function Viewer() {
               Jitter <b>{metrics?.jitterMs == null ? "—" : `${metrics.jitterMs.toFixed(1)} ms`}</b>
             </span>
             <span>
-              Packet loss{" "}
+              {metrics?.frameLoss ? "Skipped frames" : "Packet loss"}{" "}
               <b>{metrics?.lossPercent == null ? "—" : `${metrics.lossPercent.toFixed(1)}%`}</b>
             </span>
             <span>
