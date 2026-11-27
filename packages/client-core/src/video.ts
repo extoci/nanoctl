@@ -45,7 +45,7 @@ export class VideoStreamProcessor {
     const expected = this.nextExpectedSequence;
     return (
       this.sequencer.bufferedFrames > 0 ||
-      (expected !== undefined && this.reassembler.hasIncompleteDelta(expected))
+      (expected !== undefined && this.reassembler.hasIncompleteFrameAtOrAfter(expected))
     );
   }
 

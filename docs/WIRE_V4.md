@@ -146,12 +146,11 @@ The host can send a second copy of a video chunk on the delta lane with the same
 part index. Both copies count toward the send budget. If the delta lane is full, the host still
 sends the original reference on the reliable lane.
 
-A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when it
-receives an incomplete expected delta or sees a gap before a complete later frame. When the timer
-expires, the receiver requests a keyframe. Late deltas can still fill the gap and stop retries. If
-the reorder window fills or the decoder loses its reference, the receiver discards dependent
-deltas and waits for a fresh keyframe. The transport or session layer owns the request timers and
-rate limits.
+A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when the
+expected frame is incomplete or a fragment of a later frame arrives. When the timer expires, the
+receiver requests a keyframe. Late deltas can still fill the gap and stop retries. If the reorder
+window fills or the decoder loses its reference, the receiver discards dependent deltas and waits
+for a fresh keyframe. The transport or session layer owns the request timers and rate limits.
 
 Before the first complete reference, the viewer sends a keyframe request if it has waited 350 ms.
 It retries until a reference arrives, even if there have been no video messages.

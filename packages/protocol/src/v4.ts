@@ -569,8 +569,11 @@ export class VideoReassembler {
   private readonly pending = new Map<number, PartialAccessUnit>();
   private pendingBytes = 0;
 
-  hasIncompleteDelta(sequence: number): boolean {
-    return this.pending.get(sequence)?.keyframe === false;
+  hasIncompleteFrameAtOrAfter(sequence: number): boolean {
+    for (const pendingSequence of this.pending.keys()) {
+      if (((pendingSequence - sequence) | 0) >= 0) return true;
+    }
+    return false;
   }
 
   push(chunk: VideoChunk): ReassemblyOutcome {

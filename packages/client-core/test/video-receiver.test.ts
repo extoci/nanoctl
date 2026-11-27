@@ -148,6 +148,19 @@ test("an incomplete expected delta times out without a later frame or watermark"
   }
 });
 
+test("later fragments start recovery when the expected delta never arrives", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encodeVideoChunk({ ...chunk(12, false, [2]), parts: 2 }));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(250);
+    expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
 test("a later incomplete delta gets its own recovery deadline", async () => {
   const state = receiver();
   const fragment = (sequence: number, part: number) =>

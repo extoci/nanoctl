@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { promisify } from "node:util";
 import {
+  encodeVideoControlMessage,
   VIDEO_DELTA_CHANNEL_LABEL,
   VIDEO_REFERENCE_CHANNEL_LABEL,
 } from "../../packages/protocol/src/index";
@@ -20,6 +21,7 @@ const reconnects = 20;
 interface GateProbe {
   frames: number[];
   keyframes: number[];
+  keyframeRequests: number[];
   wireArrivals: number[];
   decodeSubmissions: number[];
   lastWireMs: number | null;
@@ -111,10 +113,11 @@ async function openScene(host: Page) {
 
 async function monitorBrowser(page: Page) {
   await page.addInitScript(
-    ({ delta, reference }) => {
+    ({ delta, reference, keyframeRequest }) => {
       const probe: GateProbe = {
         frames: [],
         keyframes: [],
+        keyframeRequests: [],
         wireArrivals: [],
         decodeSubmissions: [],
         lastWireMs: null,
@@ -129,6 +132,18 @@ async function monitorBrowser(page: Page) {
           probe.decodeSubmissions.push(performance.now());
         };
       }
+      const send = RTCDataChannel.prototype.send;
+      RTCDataChannel.prototype.send = function (data) {
+        Reflect.apply(send, this, [data]);
+        if (
+          this.label === reference &&
+          data instanceof Uint8Array &&
+          data.length === keyframeRequest.length &&
+          keyframeRequest.every((byte, index) => data[index] === byte)
+        ) {
+          probe.keyframeRequests.push(performance.now());
+        }
+      };
       const keyframesByPeer = new WeakMap<RTCPeerConnection, Set<number>>();
       const create = RTCPeerConnection.prototype.createDataChannel;
       RTCPeerConnection.prototype.createDataChannel = function (...args) {
@@ -160,7 +175,11 @@ async function monitorBrowser(page: Page) {
         return channel;
       };
     },
-    { delta: VIDEO_DELTA_CHANNEL_LABEL, reference: VIDEO_REFERENCE_CHANNEL_LABEL },
+    {
+      delta: VIDEO_DELTA_CHANNEL_LABEL,
+      reference: VIDEO_REFERENCE_CHANNEL_LABEL,
+      keyframeRequest: Array.from(encodeVideoControlMessage({ kind: "keyframeRequest" })),
+    },
   );
 }
 
@@ -268,6 +287,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     Object.assign(evidence, {
       frames: probe.frames,
       keyframes,
+      keyframeRequests: probe.keyframeRequests,
       wireArrivals: probe.wireArrivals,
       decodeSubmissions: probe.decodeSubmissions,
       sampleEnd,
