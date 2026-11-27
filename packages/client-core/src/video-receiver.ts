@@ -32,6 +32,7 @@ function messageBytes(data: unknown): Uint8Array {
  */
 const REORDER_WAIT_MS = 180;
 const DELTA_REPAIR_WAIT_MS = 70;
+const DELTA_REPAIR_RETRY_MS = 140;
 const FIRST_REFERENCE_WAIT_MS = 350;
 const FIRST_KEYFRAME_RETRY_MS = 125;
 const KEYFRAME_RETRY_MS = 250;
@@ -40,6 +41,7 @@ export class V4VideoReceiver {
   private readonly processor = new VideoStreamProcessor();
   private reorderTimer: ReturnType<typeof setTimeout> | undefined;
   private deltaRepairTimer: ReturnType<typeof setTimeout> | undefined;
+  private deltaRepairRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private reorderSequence: number | undefined;
   private firstReferenceTimer: ReturnType<typeof setTimeout> | undefined;
   private keyframeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -136,13 +138,15 @@ export class V4VideoReceiver {
     this.stopReorderTimer();
     this.reorderSequence = expected;
     if (expected !== undefined) {
-      this.deltaRepairTimer = setTimeout(() => {
+      const requestRepair = () => {
         this.sendControl({
           kind: "deltaRepair",
           streamSequence: expected,
           parts: this.processor.missingDeltaParts(expected),
         });
-      }, DELTA_REPAIR_WAIT_MS);
+      };
+      this.deltaRepairTimer = setTimeout(requestRepair, DELTA_REPAIR_WAIT_MS);
+      this.deltaRepairRetryTimer = setTimeout(requestRepair, DELTA_REPAIR_RETRY_MS);
     }
     this.reorderTimer = setTimeout(() => {
       this.stopReorderTimer();
@@ -155,8 +159,10 @@ export class V4VideoReceiver {
   private stopReorderTimer(): void {
     clearTimeout(this.reorderTimer);
     clearTimeout(this.deltaRepairTimer);
+    clearTimeout(this.deltaRepairRetryTimer);
     this.reorderTimer = undefined;
     this.deltaRepairTimer = undefined;
+    this.deltaRepairRetryTimer = undefined;
     this.reorderSequence = undefined;
   }
 

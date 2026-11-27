@@ -161,11 +161,12 @@ The viewer can submit one full reorder batch to the decoder while two decodes ar
 delta that arrives at the decoder queue limit triggers keyframe recovery.
 
 After a gap persists for 70 ms, the viewer can request the missing delta on the reference lane.
+If the gap persists at 140 ms, the viewer requests the parts that are still missing.
 Kind `0x43` carries its `u32 stream_sequence` followed by up to six distinct `u16` part indices.
 An empty list requests the whole delta. The host retains up to 16 recent deltas within a shared
-128 KiB budget. It resends at most 8 KiB per delta within 500 ms of the original send and skips a
-resend that would fill more than half of the delta lane. The 180 ms keyframe deadline still applies
-if the delta does not arrive.
+128 KiB budget. It sends at most two repairs per delta, each up to 8 KiB, within 500 ms of the
+original send. It skips a repair that would fill more than half of the delta lane. The 180 ms
+keyframe deadline still applies if the delta does not arrive.
 
 Before the first complete reference, the viewer sends a keyframe request if it has waited 350 ms.
 It retries until a reference arrives, even if there have been no video messages.

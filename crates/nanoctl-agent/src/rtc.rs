@@ -279,7 +279,7 @@ impl V4DataChannelVideo {
             (request
                 .stream_sequence
                 .wrapping_sub(previous.stream_sequence) as i32)
-                > 0
+                >= 0
         }) {
             *pending = Some(request);
         }

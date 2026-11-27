@@ -164,8 +164,8 @@ test("an incomplete expected delta times out without a later frame or watermark"
     state.receiver.handle(encodeVideoChunk({ ...chunk(11, false, [1]), parts: 2 }));
     expect(state.requests).toHaveLength(0);
     await Bun.sleep(250);
-    expect(state.repairRequests).toEqual([11]);
-    expect(state.repairParts).toEqual([[1]]);
+    expect(state.repairRequests).toEqual([11, 11]);
+    expect(state.repairParts).toEqual([[1], [1]]);
     expect(state.requests).toEqual([[4, 0x41]]);
   } finally {
     state.receiver.dispose();
@@ -179,7 +179,7 @@ test("later fragments start recovery when the expected delta never arrives", asy
     state.receiver.handle(encodeVideoChunk({ ...chunk(12, false, [2]), parts: 2 }));
     expect(state.requests).toHaveLength(0);
     await Bun.sleep(250);
-    expect(state.repairRequests).toEqual([11]);
+    expect(state.repairRequests).toEqual([11, 11]);
     expect(state.requests).toEqual([[4, 0x41]]);
   } finally {
     state.receiver.dispose();
@@ -195,6 +195,7 @@ test("a repaired delta resumes decoding without a keyframe", async () => {
     expect(state.repairRequests).toEqual([11]);
     state.receiver.handle(encoded(11, false, [1]));
     await Bun.sleep(180);
+    expect(state.repairRequests).toEqual([11]);
     expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
     expect(state.requests).toHaveLength(0);
   } finally {

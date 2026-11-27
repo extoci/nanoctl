@@ -17,6 +17,7 @@ const DELTA_REPAIR_CACHE_FRAMES: usize = 16;
 const VIDEO_REDUNDANCY_BUDGET_BYTES: usize = 8 * 1024;
 const DELTA_REPAIR_CACHE_BYTES: usize = 128 * 1024;
 const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
+const DELTA_REPAIR_ATTEMPTS: u8 = 2;
 const DATAGRAM_BURST_CHUNKS: usize = 4;
 const DATAGRAM_OVERHEAD_BYTES: usize = 80;
 
@@ -77,6 +78,7 @@ struct CachedDelta {
     sequence: u32,
     sent_at: Instant,
     wire_bytes: usize,
+    repairs_remaining: u8,
     chunks: Vec<Vec<u8>>,
 }
 
@@ -136,6 +138,7 @@ impl<S> ChunkingLaneWriter<S> {
             sequence,
             sent_at: Instant::now(),
             wire_bytes,
+            repairs_remaining: DELTA_REPAIR_ATTEMPTS,
             chunks,
         });
         self.repair_cache_bytes += wire_bytes;
@@ -201,8 +204,12 @@ where
         {
             return Ok(None);
         }
-        self.repair_cache_bytes -= delta.wire_bytes;
-        self.repair_cache.remove(slot);
+        let delta = &mut self.repair_cache[slot];
+        delta.repairs_remaining -= 1;
+        if delta.repairs_remaining == 0 {
+            self.repair_cache_bytes -= delta.wire_bytes;
+            self.repair_cache.remove(slot);
+        }
         for bytes in repair_chunks {
             self.sink.write_chunk(lane, bytes).await?;
         }
@@ -593,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_delta_is_repeated_once_within_the_repair_budget() {
+    async fn a_missing_delta_has_two_repairs_within_the_queue_budget() {
         let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
             chunks: Vec::new(),
             buffered: 0,
@@ -621,6 +628,12 @@ mod tests {
             stream_sequence: 7,
             parts: vec![],
         });
+        let retry = writer.repair_pending_delta().await.unwrap().unwrap();
+        assert_eq!(retry.wire_bytes, 1440);
+        writer.sink.repair_request = Some(DeltaRepairRequest {
+            stream_sequence: 7,
+            parts: vec![],
+        });
         assert!(writer.repair_pending_delta().await.unwrap().is_none());
 
         let mut next = access_unit(1400, false);
@@ -631,7 +644,7 @@ mod tests {
             parts: vec![],
         });
         assert!(writer.repair_pending_delta().await.unwrap().is_none());
-        assert_eq!(writer.sink.chunks.len(), 10);
+        assert_eq!(writer.sink.chunks.len(), 12);
     }
 
     #[tokio::test]
@@ -671,6 +684,13 @@ mod tests {
             })
             .collect();
         assert_eq!(parts, [(7, 4, 37), (7, 36, 37)]);
+        assert_eq!(writer.repair_cache_bytes, original.wire_bytes);
+        writer.sink.repair_request = Some(DeltaRepairRequest {
+            stream_sequence: 7,
+            parts: vec![36],
+        });
+        let retry = writer.repair_pending_delta().await.unwrap().unwrap();
+        assert_eq!(retry.wire_bytes, 1120);
         assert_eq!(writer.repair_cache_bytes, 0);
     }
 
