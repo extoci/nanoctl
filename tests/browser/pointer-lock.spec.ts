@@ -76,3 +76,63 @@ test("relative pointer-lock motion moves the Windows host cursor relatively", as
   await expect.poll(hostCursor).toEqual({ x: 500, y: 500 });
   await closePanel(page);
 });
+
+test("mouse-lock toggle makes browser pointer motion relative", async ({ page }) => {
+  test.skip(process.platform !== "win32", "Windows host input validation");
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live media input");
+  await page.addInitScript(() => {
+    const state = { sent: [] as number[][] };
+    Object.assign(window, { state });
+    const send = RTCDataChannel.prototype.send;
+    RTCDataChannel.prototype.send = function (data) {
+      if (
+        this.label === "nanoctl.pointer.v1" &&
+        typeof data !== "string" &&
+        !(data instanceof Blob)
+      ) {
+        const bytes =
+          data instanceof ArrayBuffer
+            ? new Uint8Array(data)
+            : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        state.sent.push([...bytes]);
+      }
+      return Reflect.apply(send, this, [data]);
+    };
+  });
+  await page.goto("/");
+  await openPanel(page);
+  await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  const toggle = page.getByRole("button", { name: /Mouse (absolute|locked)/ });
+  await expect(toggle).toBeVisible();
+  await toggle.click();
+  await expect
+    .poll(() => page.evaluate(() => document.pointerLockElement instanceof HTMLVideoElement))
+    .toBe(true);
+  await expect(toggle).toHaveText("Mouse locked");
+  await page.evaluate(() => {
+    (window as unknown as { state: { sent: number[][] } }).state.sent.length = 0;
+  });
+  await page.mouse.move(240, 240);
+  await page.mouse.move(285, 270);
+  await page.mouse.move(250, 310);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { state: { sent: number[][] } }).state.sent.filter(
+            (bytes) => bytes[0] === 14,
+          ).length,
+      ),
+    )
+    .toBeGreaterThan(0);
+  const absoluteMoves = await page.evaluate(
+    () =>
+      (window as unknown as { state: { sent: number[][] } }).state.sent.filter(
+        (bytes) => bytes[0] === 1,
+      ).length,
+  );
+  expect(absoluteMoves).toBe(0);
+  await page.evaluate(() => document.exitPointerLock());
+  await expect(toggle).toHaveText("Mouse absolute");
+  await closePanel(page);
+});
