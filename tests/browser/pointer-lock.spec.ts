@@ -109,6 +109,7 @@ test("mouse-lock toggle makes browser pointer motion relative", async ({ page })
     .poll(() => page.evaluate(() => document.pointerLockElement instanceof HTMLVideoElement))
     .toBe(true);
   await expect(toggle).toHaveText("Mouse locked");
+  await expect(page.getByText("Mouse locked · Ctrl+Alt+M or Esc to release")).toBeVisible();
   await page.evaluate(() => {
     (window as unknown as { state: { sent: number[][] } }).state.sent.length = 0;
   });
@@ -134,5 +135,6 @@ test("mouse-lock toggle makes browser pointer motion relative", async ({ page })
   expect(absoluteMoves).toBe(0);
   await page.evaluate(() => document.exitPointerLock());
   await expect(toggle).toHaveText("Mouse absolute");
+  await expect(page.getByText("Mouse locked · Ctrl+Alt+M or Esc to release")).toBeHidden();
   await closePanel(page);
 });

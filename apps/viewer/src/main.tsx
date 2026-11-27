@@ -434,6 +434,11 @@ function Viewer() {
             </span>
           </aside>
         )}
+        {snapshot.mouseLocked && (
+          <div className="mouse-lock-hint" role="status">
+            Mouse locked · Ctrl+Alt+M or Esc to release
+          </div>
+        )}
         {touchMode === "trackpad" && live && (
           <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
         )}
