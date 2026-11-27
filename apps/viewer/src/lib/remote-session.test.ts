@@ -512,6 +512,38 @@ describe("remote session lifecycle", () => {
     await controller.stop();
   });
 
+  test("forwards host cursor metadata from the control channel", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const shapes: unknown[] = [];
+    const positions: unknown[] = [];
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: new FakeVideo() as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+      onCursorShape: (shape) => shapes.push(shape),
+      onCursorPosition: (position) => positions.push(position),
+    });
+    await controller.start();
+    const channel = peer.channels.get("nanoctl.control.v1")!;
+    channel.onmessage?.({
+      data: '{"type":"cursorShape","width":32,"height":32,"hotspotX":4,"hotspotY":2,"pixels":"AAAA"}',
+    } as MessageEvent);
+    channel.onmessage?.({
+      data: '{"type":"cursor","x":0.25,"y":0.75,"visible":true}',
+    } as MessageEvent);
+    expect(shapes).toEqual([
+      { type: "cursorShape", width: 32, height: 32, hotspotX: 4, hotspotY: 2, pixels: "AAAA" },
+    ]);
+    expect(positions).toEqual([{ type: "cursor", x: 0.25, y: 0.75, visible: true }]);
+    await controller.stop();
+  });
+
   test("restores a valid display while input is off, but not for view-only or missing displays", async () => {
     installBrowserGlobals();
     const preferences = { inputEnabled: true, displayId: "secondary" };

@@ -210,6 +210,16 @@ video {
   transform: translate(-50%, -50%);
   pointer-events: none;
 }
+.touch-cursor.remote-cursor {
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  transform: none;
+}
 .overlay {
   position: absolute;
   inset: 0;

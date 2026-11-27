@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { AudioOutputState, ControlMessage, HostInfo } from "@nanoctl/protocol";
-import type { QualityLimits, RemoteSessionSnapshot } from "./lib/remote-session";
+import type {
+  QualityLimits,
+  RemoteCursorPosition,
+  RemoteCursorShape,
+  RemoteSessionSnapshot,
+} from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
@@ -162,6 +167,52 @@ function Viewer() {
     }
   });
   const cursorRef = useRef<HTMLSpanElement>(null);
+  const touchCursorVisibleRef = useRef(touchCursorVisible);
+  const paintCursorRef = useRef<(() => void) | null>(null);
+  const remoteCursorShapeRef = useRef<{
+    url: string;
+    width: number;
+    height: number;
+    hotspotX: number;
+    hotspotY: number;
+  } | null>(null);
+  const remoteCursorPositionRef = useRef<(RemoteCursorPosition & { at: number }) | null>(null);
+  const onRemoteCursorShape = useCallback((shape: RemoteCursorShape) => {
+    const length = shape.width * shape.height * 4;
+    let bytes: Uint8Array;
+    try {
+      bytes = Uint8Array.from(atob(shape.pixels), (char) => char.charCodeAt(0));
+    } catch {
+      return;
+    }
+    if (bytes.length !== length) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = shape.width;
+    canvas.height = shape.height;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.putImageData(
+      new ImageData(new Uint8ClampedArray(bytes), shape.width, shape.height),
+      0,
+      0,
+    );
+    remoteCursorShapeRef.current = {
+      url: canvas.toDataURL("image/png"),
+      width: shape.width,
+      height: shape.height,
+      hotspotX: shape.hotspotX,
+      hotspotY: shape.hotspotY,
+    };
+    paintCursorRef.current?.();
+  }, []);
+  const onRemoteCursorPosition = useCallback((position: RemoteCursorPosition) => {
+    remoteCursorPositionRef.current = { ...position, at: performance.now() };
+    paintCursorRef.current?.();
+  }, []);
+  useEffect(() => {
+    touchCursorVisibleRef.current = touchCursorVisible;
+    paintCursorRef.current?.();
+  }, [touchCursorVisible]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -176,10 +227,39 @@ function Viewer() {
     const paintCursor = () => {
       const geometry = inputGeometry();
       const stage = video.parentElement?.getBoundingClientRect();
-      if (!geometry || !stage || !cursorRef.current) return;
-      cursorRef.current.style.left = `${geometry.left - stage.left + cursor.x * geometry.width}px`;
-      cursorRef.current.style.top = `${geometry.top - stage.top + cursor.y * geometry.height}px`;
+      const element = cursorRef.current;
+      if (!geometry || !stage || !element) return;
+      const remotePosition = remoteCursorPositionRef.current;
+      const remoteShape = remoteCursorShapeRef.current;
+      const remoteFresh =
+        remotePosition !== null &&
+        remotePosition.visible &&
+        performance.now() - remotePosition.at < 750 &&
+        remoteShape !== null;
+      const position = remoteFresh && remotePosition ? remotePosition : cursor;
+      const show = remoteFresh || touchCursorVisibleRef.current;
+      element.style.display = show ? "block" : "none";
+      element.style.left = `${geometry.left - stage.left + position.x * geometry.width}px`;
+      element.style.top = `${geometry.top - stage.top + position.y * geometry.height}px`;
+      element.classList.toggle("remote-cursor", remoteFresh);
+      if (remoteFresh && remoteShape) {
+        const rect = inputElement.getBoundingClientRect();
+        const canvas =
+          inputElement.parentElement?.querySelector<HTMLCanvasElement>(".webcodecs-video");
+        const sourceWidth = inputElement.videoWidth || canvas?.width || rect.width;
+        const scale = sourceWidth > 0 ? geometry.width / sourceWidth : 1;
+        element.style.width = `${remoteShape.width * scale}px`;
+        element.style.height = `${remoteShape.height * scale}px`;
+        element.style.backgroundImage = `url(${remoteShape.url})`;
+        element.style.transform = `translate(${-remoteShape.hotspotX * scale}px, ${-remoteShape.hotspotY * scale}px)`;
+      } else {
+        element.style.width = "";
+        element.style.height = "";
+        element.style.backgroundImage = "";
+        element.style.transform = "";
+      }
     };
+    paintCursorRef.current = paintCursor;
     function inputGeometry() {
       const rect = inputElement.getBoundingClientRect();
       // Safari's direct-video path renders WebCodecs frames into a canvas while
@@ -212,6 +292,7 @@ function Viewer() {
     window.addEventListener("resize", paintCursor);
     paintCursor();
     return () => {
+      if (paintCursorRef.current === paintCursor) paintCursorRef.current = null;
       detach();
       resize.disconnect();
       video.removeEventListener("loadeddata", paintCursor);
@@ -251,6 +332,8 @@ function Viewer() {
         if (next.metrics) recordMetrics(next.metrics);
         setSnapshot(next);
       },
+      onCursorShape: onRemoteCursorShape,
+      onCursorPosition: onRemoteCursorPosition,
       codecChoice: () => codecChoiceRef.current,
       qualityLimits: () => qualityLimitsRef.current,
       audioEnabled: () => !["muted", "blocked"].includes(soundStateRef.current),
@@ -268,7 +351,7 @@ function Viewer() {
       session.dispose();
       transport.current = null;
     };
-  }, [updateSound]);
+  }, [updateSound, onRemoteCursorShape, onRemoteCursorPosition]);
 
   const soundEnabledRef = useRef(false);
   useEffect(() => {
@@ -474,7 +557,7 @@ function Viewer() {
             Mouse locked · Ctrl+Alt+M or Esc to release
           </div>
         )}
-        {touchMode === "trackpad" && touchCursorVisible && live && (
+        {touchMode === "trackpad" && live && (
           <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
         )}
         {!live && (

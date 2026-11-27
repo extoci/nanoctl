@@ -589,6 +589,66 @@ async fn forward_clipboard(
     }
 }
 
+#[cfg(all(feature = "media", target_os = "windows"))]
+async fn forward_cursor(
+    output: Arc<RTCDataChannel>,
+    input: Arc<std::sync::Mutex<crate::input::InputController>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let mut interval = tokio::time::interval(Duration::from_millis(33));
+    let mut shape_key: Option<usize> = None;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = interval.tick() => {
+                let Ok(sample) = crate::cursor::sample(shape_key) else {
+                    continue;
+                };
+                if let Some(shape) = sample.shape.as_ref() {
+                    let message = serde_json::json!({
+                        "type": "cursorShape",
+                        "width": shape.width,
+                        "height": shape.height,
+                        "hotspotX": shape.hotspot_x,
+                        "hotspotY": shape.hotspot_y,
+                        "pixels": STANDARD.encode(&shape.rgba),
+                    });
+                    if output.send_text(message.to_string()).await.is_ok() {
+                        shape_key = Some(sample.shape_key);
+                    }
+                }
+                let Some((origin_x, origin_y, width, height)) = input
+                    .lock()
+                    .ok()
+                    .map(|controller| controller.display_geometry())
+                else {
+                    continue;
+                };
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let x = (sample.x - origin_x) as f64 / width as f64;
+                let y = (sample.y - origin_y) as f64 / height as f64;
+                let visible = sample.visible
+                    && (0.0..=1.0).contains(&x)
+                    && (0.0..=1.0).contains(&y);
+                let message = serde_json::json!({
+                    "type": "cursor",
+                    "x": (x * 10_000.0).round() / 10_000.0,
+                    "y": (y * 10_000.0).round() / 10_000.0,
+                    "visible": visible,
+                });
+                if output.send_text(message.to_string()).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
@@ -784,6 +844,7 @@ impl HostPeer {
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
+            let input_shutdown_for_channel = input_shutdown.clone();
             let clipboard = if allow_clipboard {
                 crate::clipboard::backend()
             } else {
@@ -912,6 +973,19 @@ impl HostPeer {
                 }
                 if reliable {
                     blocked_notices.attach(&channel);
+                    #[cfg(all(feature = "media", target_os = "windows"))]
+                    if let Some(cursor_input) = input.clone() {
+                        let output = channel.clone();
+                        let shutdown = input_shutdown_for_channel.subscribe();
+                        channel.on_open(Box::new(move || {
+                            tokio::spawn(forward_cursor(
+                                output.clone(),
+                                cursor_input.clone(),
+                                shutdown.clone(),
+                            ));
+                            Box::pin(async {})
+                        }));
+                    }
                 }
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),

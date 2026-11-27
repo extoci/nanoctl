@@ -88,6 +88,17 @@ export type QualityLimits = {
 
 const controlTextEncoder = new TextEncoder();
 
+export type RemoteCursorShape = {
+  width: number;
+  height: number;
+  hotspotX: number;
+  hotspotY: number;
+  /** Base64-encoded RGBA pixels. */
+  pixels: string;
+};
+
+export type RemoteCursorPosition = { x: number; y: number; visible: boolean };
+
 export type RemoteSessionOptions = {
   sessionId: string;
   controllerEpoch: string;
@@ -118,6 +129,8 @@ export type RemoteSessionOptions = {
   }>;
   onPageRestore?: (controllerEpoch?: string) => void;
   onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
+  onCursorShape?: (shape: RemoteCursorShape) => void;
+  onCursorPosition?: (position: RemoteCursorPosition) => void;
   peerFactory?: (configuration: RTCConfiguration) => RTCPeerConnection;
 };
 
@@ -688,13 +701,40 @@ export class RemoteSessionController {
       this.controlChannel.readyState === "open";
     this.controlChannel.onmessage = (event) => {
       if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
+      let message: { type?: unknown };
       try {
-        if ((JSON.parse(event.data) as { type?: unknown }).type !== "inputBlocked") return;
+        message = JSON.parse(event.data) as { type?: unknown };
       } catch {
         return;
       }
-      this.inputBlocked += 1;
-      this.publishSnapshot();
+      if (message.type === "inputBlocked") {
+        this.inputBlocked += 1;
+        this.publishSnapshot();
+        return;
+      }
+      if (message.type === "cursorShape") {
+        const shape = message as unknown as RemoteCursorShape;
+        if (
+          shape.width > 0 &&
+          shape.height > 0 &&
+          typeof shape.pixels === "string" &&
+          shape.hotspotX >= 0 &&
+          shape.hotspotY >= 0
+        ) {
+          this.options.onCursorShape?.(shape);
+        }
+        return;
+      }
+      if (message.type === "cursor") {
+        const position = message as unknown as RemoteCursorPosition;
+        if (
+          Number.isFinite(position.x) &&
+          Number.isFinite(position.y) &&
+          typeof position.visible === "boolean"
+        ) {
+          this.options.onCursorPosition?.(position);
+        }
+      }
     };
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
