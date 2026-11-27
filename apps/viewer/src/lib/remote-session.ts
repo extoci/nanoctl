@@ -56,6 +56,7 @@ export type RemoteSessionSnapshot = {
   reconnectAttempt: number;
   iceGeneration: number;
   inputEnabled: boolean;
+  mouseLocked: boolean;
   gamepadEnabled: boolean;
   gamepadStatus: GamepadStatus;
   firstFrameReceived: boolean;
@@ -311,6 +312,7 @@ export class RemoteSessionController {
       reconnectAttempt: this.reconnectAttempt,
       iceGeneration: this.iceGeneration,
       inputEnabled: this.inputEnabled,
+      mouseLocked: document.pointerLockElement === this.options.video,
       gamepadEnabled: this.gamepadFrame !== null,
       gamepadStatus: this.gamepadStatus,
       firstFrameReceived: this.firstFrameReceived,
@@ -379,6 +381,25 @@ export class RemoteSessionController {
       this.startGamepadPolling();
     }
     this.publishSnapshot();
+  }
+
+  togglePointerLock(): void {
+    if (!this.inputEnabled || typeof this.options.video.requestPointerLock !== "function") return;
+    if (document.pointerLockElement === this.options.video) {
+      document.exitPointerLock();
+      return;
+    }
+    const request = this.options.video.requestPointerLock as (options?: {
+      unadjustedMovement?: boolean;
+    }) => Promise<void> | void;
+    try {
+      const pending = request.call(this.options.video, { unadjustedMovement: true });
+      if (pending instanceof Promise) {
+        void pending.catch(() => this.options.video.requestPointerLock());
+      }
+    } catch {
+      void this.options.video.requestPointerLock();
+    }
   }
 
   setGamepadEnabled(enabled: boolean): void {
@@ -866,6 +887,7 @@ export class RemoteSessionController {
 
   private attachInput(): void {
     const video = this.options.video;
+    document.addEventListener("pointerlockchange", this.onPointerLockChange);
     video.addEventListener("pointermove", this.onPointer);
     video.addEventListener("pointerdown", this.onPointer);
     video.addEventListener("pointerup", this.onPointer);
@@ -886,6 +908,7 @@ export class RemoteSessionController {
 
   private detachInput(): void {
     const video = this.options.video;
+    document.removeEventListener("pointerlockchange", this.onPointerLockChange);
     video.removeEventListener("pointermove", this.onPointer);
     video.removeEventListener("pointerdown", this.onPointer);
     video.removeEventListener("pointerup", this.onPointer);
@@ -904,6 +927,8 @@ export class RemoteSessionController {
     window.removeEventListener("pageshow", this.onPageShow);
   }
 
+  private readonly onPointerLockChange = (): void => this.publishSnapshot();
+
   private readonly onPointer = (event: PointerEvent): void => {
     if (event.pointerType === "touch") return;
     if (!this.inputEnabled) return;
@@ -918,10 +943,23 @@ export class RemoteSessionController {
         // Synthetic or already-ended pointers can reject capture; still deliver the click.
       }
     }
+    const locked = document.pointerLockElement === this.options.video;
+    if (locked && event.type === "pointermove") {
+      this.sendControl({
+        type: "pointer",
+        action: "move",
+        x: 0,
+        y: 0,
+        deltaX: event.movementX,
+        deltaY: event.movementY,
+      });
+      return;
+    }
     this.sendControl({
       type: "pointer",
       action: event.type === "pointermove" ? "move" : event.type === "pointerdown" ? "down" : "up",
       ...position,
+      ...(locked && { deltaX: 0, deltaY: 0 }),
       button: event.button === 1 || event.button === 2 ? event.button : 0,
     });
   };
@@ -954,6 +992,11 @@ export class RemoteSessionController {
 
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
+    if (event.type === "keydown" && event.ctrlKey && event.altKey && event.code === "KeyM") {
+      event.preventDefault();
+      this.togglePointerLock();
+      return;
+    }
     // Keys go to the host while the video or nothing in particular has focus; panel controls keep
     // theirs, and Tab from the page still moves browser focus so the controls stay reachable.
     // A key the host saw pressed is always released there, wherever focus has moved since.
@@ -1422,6 +1465,7 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
+    if (document.pointerLockElement === this.options.video) document.exitPointerLock();
     this.pressedKeys.clear();
     if (!this.inputEnabled) this.stopGamepads();
     const channel = this.controlChannel;

@@ -12,6 +12,7 @@ const DISPLAY = 10;
 const GAMEPAD_HEARTBEAT = 11;
 const GAMEPAD_SPARSE = 12;
 const KEY_EX = 13;
+const POINTER_RELATIVE = 14;
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 const textEncoder = new TextEncoder();
 
@@ -122,13 +123,26 @@ function encodeGamepadState(payload: GamepadStateInput): ArrayBuffer | null {
  */
 export function encodeBinaryInput(payload: ControlMessage | GamepadStateInput): ArrayBuffer | null {
   if (payload.type === "pointer" && payload.action === "move") {
+    const deltaX = payload.deltaX ?? 0;
+    const deltaY = payload.deltaY ?? 0;
+    if (deltaX !== 0 || deltaY !== 0) {
+      const clampI16 = (value: number) => Math.max(-32768, Math.min(32767, Math.round(value)));
+      const out = message(POINTER_RELATIVE, 5);
+      out.setInt16(1, clampI16(deltaX), true);
+      out.setInt16(3, clampI16(deltaY), true);
+      return out.buffer;
+    }
     const out = message(POINTER_MOVE, 5);
     putPosition(out, 1, payload.x, payload.y);
     return out.buffer;
   }
   if (payload.type === "pointer" && (payload.action === "down" || payload.action === "up")) {
     const out = message(POINTER_BUTTON, 6);
-    out.setUint8(1, (payload.action === "up" ? 0x80 : 0) | (payload.button ?? 0));
+    const relative = payload.deltaX !== undefined || payload.deltaY !== undefined;
+    out.setUint8(
+      1,
+      (payload.action === "up" ? 0x80 : 0) | (relative ? 0x40 : 0) | (payload.button ?? 0),
+    );
     putPosition(out, 2, payload.x, payload.y);
     return out.buffer;
   }

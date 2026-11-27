@@ -9,6 +9,13 @@ describe("encodeBinaryInput", () => {
     expect([...bytes]).toEqual([1, 0x00, 0x80, 0xff, 0xff]);
   });
 
+  test("encodes relative pointer motion as pixel deltas", () => {
+    const bytes = new Uint8Array(
+      encodeBinaryInput({ type: "pointer", action: "move", x: 0, y: 0, deltaX: -12, deltaY: 300 })!,
+    );
+    expect([...bytes]).toEqual([14, 0xf4, 0xff, 0x2c, 0x01]);
+  });
+
   test("encodes keys as extended physical-code records", () => {
     expect([
       ...new Uint8Array(

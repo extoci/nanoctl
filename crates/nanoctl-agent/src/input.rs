@@ -129,6 +129,11 @@ mod win_send {
         ))
     }
 
+    /// Relative mouse motion in desktop pixels, used by pointer-lock/game mouse mode.
+    pub fn move_rel(dx: i32, dy: i32) -> Result<()> {
+        send(&event(MOUSEEVENTF_MOVE, 0, dx, dy))
+    }
+
     /// One wheel event in raw wheel-delta units (120 = one notch).
     pub fn wheel(units: i32, horizontal: bool) -> Result<()> {
         let (flags, data) = if horizontal {
@@ -276,12 +281,13 @@ const BINARY_DISPLAY: u8 = 10;
 const BINARY_GAMEPAD_HEARTBEAT: u8 = 11;
 const BINARY_GAMEPAD_SPARSE: u8 = 12;
 const BINARY_KEY_EX: u8 = 13;
+const BINARY_POINTER_RELATIVE: u8 = 14;
 const BINARY_KEY_NAMED: u8 = 4;
 
 pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
     bytes
         .first()
-        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_KEY_EX).contains(kind))
+        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_POINTER_RELATIVE).contains(kind))
 }
 
 fn binary_named_key(id: u8) -> Option<&'static str> {
@@ -362,6 +368,24 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                 delta_y: None,
             })
         }
+        BINARY_POINTER_RELATIVE => {
+            if bytes.len() != 5 {
+                anyhow::bail!("invalid binary relative pointer length");
+            }
+            let dx = i16::from_le_bytes([bytes[1], bytes[2]]);
+            let dy = i16::from_le_bytes([bytes[3], bytes[4]]);
+            if dx == 0 && dy == 0 {
+                anyhow::bail!("empty binary relative pointer motion");
+            }
+            Ok(ControlMessage::Pointer {
+                action: PointerAction::Move,
+                x: 0.0,
+                y: 0.0,
+                button: None,
+                delta_x: Some(f64::from(dx)),
+                delta_y: Some(f64::from(dy)),
+            })
+        }
         BINARY_GAMEPAD | BINARY_GAMEPAD_SPARSE => {
             crate::gamepad::Snapshot::parse_binary(&bytes[1..], bytes[0] == BINARY_GAMEPAD_SPARSE)
                 .map(ControlMessage::Gamepad)
@@ -373,7 +397,7 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
             }
             let control = bytes[1];
             let button = control & 0x03;
-            if button > 2 || control & 0x7c != 0 {
+            if button > 2 || control & 0x3c != 0 {
                 anyhow::bail!("invalid binary pointer button flags");
             }
             let (x, y) = position(u16_at(2)?, u16_at(4)?);
@@ -386,8 +410,8 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                 x,
                 y,
                 button: Some(button),
-                delta_x: None,
-                delta_y: None,
+                delta_x: (control & 0x40 != 0).then_some(0.0),
+                delta_y: (control & 0x40 != 0).then_some(0.0),
             })
         }
         BINARY_POINTER_WHEEL => {
@@ -689,15 +713,25 @@ impl InputController {
         let x = display_pixel(x, self.width, self.origin_x);
         let y = display_pixel(y, self.height, self.origin_y);
         match action {
-            PointerAction::Move => self.move_to(x, y)?,
+            PointerAction::Move => {
+                if delta_x.is_some() || delta_y.is_some() {
+                    self.move_by(delta_x.unwrap_or(0.0), delta_y.unwrap_or(0.0))?;
+                } else {
+                    self.move_to(x, y)?;
+                }
+            }
             PointerAction::Down => {
-                self.move_to(x, y)?;
+                if delta_x.is_none() && delta_y.is_none() {
+                    self.move_to(x, y)?;
+                }
                 let button = map_button(button)?;
                 self.enigo.button(button, Direction::Press)?;
                 self.held_buttons.insert(button);
             }
             PointerAction::Up => {
-                self.move_to(x, y)?;
+                if delta_x.is_none() && delta_y.is_none() {
+                    self.move_to(x, y)?;
+                }
                 let button = map_button(button)?;
                 self.held_buttons.remove(&button);
                 self.enigo.button(button, Direction::Release)?;
@@ -721,6 +755,19 @@ impl InputController {
         #[cfg(not(target_os = "windows"))]
         {
             Ok(self.enigo.move_mouse(x, y, Coordinate::Abs)?)
+        }
+    }
+
+    fn move_by(&mut self, dx: f64, dy: f64) -> Result<()> {
+        let dx = dx.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i32;
+        let dy = dy.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i32;
+        #[cfg(target_os = "windows")]
+        {
+            win_send::move_rel(dx, dy)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(self.enigo.move_mouse(dx, dy, Coordinate::Rel)?)
         }
     }
 
@@ -1121,6 +1168,32 @@ mod tests {
     }
     use crate::rtc::MAX_CONTROL_MESSAGE_BYTES;
     use proptest::prelude::*;
+
+    #[test]
+    fn decodes_binary_relative_pointer_motion_and_buttons() {
+        let motion =
+            parse_binary_control(&[BINARY_POINTER_RELATIVE, 0xf4, 0xff, 0x2c, 0x01]).unwrap();
+        assert!(matches!(
+            motion,
+            ControlMessage::Pointer {
+                action: PointerAction::Move,
+                delta_x: Some(-12.0),
+                delta_y: Some(300.0),
+                ..
+            }
+        ));
+        let button = parse_binary_control(&[BINARY_POINTER_BUTTON, 0x40, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            button,
+            ControlMessage::Pointer {
+                action: PointerAction::Down,
+                delta_x: Some(0.0),
+                delta_y: Some(0.0),
+                ..
+            }
+        ));
+        assert!(parse_binary_control(&[BINARY_POINTER_RELATIVE, 0, 0, 0, 0]).is_err());
+    }
 
     #[test]
     fn decodes_binary_pointer_motion() {

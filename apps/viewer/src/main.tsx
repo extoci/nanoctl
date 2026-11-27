@@ -33,6 +33,7 @@ const initial: RemoteSessionSnapshot = {
   reconnectAttempt: 0,
   iceGeneration: 0,
   inputEnabled: false,
+  mouseLocked: false,
   gamepadEnabled: false,
   gamepadStatus: "waiting",
   firstFrameReceived: false,
@@ -628,11 +629,21 @@ function Viewer() {
             <button
               aria-pressed={snapshot.inputEnabled}
               disabled={!info?.remoteInput || terminal || status !== "online"}
-              title="Release input: Ctrl+Alt+Shift+Esc"
+              title="Release input: Ctrl+Alt+Shift+Esc. Toggle gaming mouse lock: Ctrl+Alt+M"
               onClick={() => transport.current?.controller?.setInputEnabled(!snapshot.inputEnabled)}
             >
               {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
             </button>
+            {!coarse && (
+              <button
+                aria-pressed={snapshot.mouseLocked}
+                disabled={!snapshot.inputEnabled || terminal || status !== "online"}
+                title="Toggle gaming mouse lock: Ctrl+Alt+M"
+                onClick={() => transport.current?.controller?.togglePointerLock()}
+              >
+                {snapshot.mouseLocked ? "Mouse locked" : "Mouse absolute"}
+              </button>
+            )}
             {showGamepad && (
               <button
                 aria-pressed={snapshot.gamepadEnabled}
