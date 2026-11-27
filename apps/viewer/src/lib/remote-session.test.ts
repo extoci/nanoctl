@@ -1233,6 +1233,64 @@ describe("webcodecs video gating and teardown", () => {
     handle.drop();
   });
 
+  test("post-key deltas arriving before the recovery keyframe are preserved", () => {
+    installBrowserGlobals(() => 0);
+    const decoded: number[] = [];
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode(chunk: { init: { timestamp: number } }) {
+        decoded.push(Math.round(chunk.init.timestamp / 16_000));
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+
+    receive(0, true);
+    for (let seq = 1; seq <= 10; seq += 1) receive(seq);
+    for (let seq = 12; seq <= 28; seq += 1) receive(seq);
+    expect(channel.sent).toContain("KF");
+
+    // The unordered delta lane can overtake the reliable IDR lane. Sequences
+    // 41 and 42 belong after the recovery IDR at sequence 40, so they must
+    // drain immediately after it instead of becoming another artificial gap.
+    receive(41);
+    receive(42);
+    receive(40, true);
+
+    expect(decoded).toEqual([...Array.from({ length: 11 }, (_, seq) => seq), 40, 41, 42]);
+    handle.drop();
+  });
+
   test("keyframe requests use the reliable idr channel when present", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
