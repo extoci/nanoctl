@@ -1368,7 +1368,7 @@ describe("webcodecs video gating and teardown", () => {
     expect(resets).toBeGreaterThan(0);
   });
 
-  test("a v4 decoder backlog requests a new reference and resumes on it", () => {
+  test("v4 decodes a full reordered batch and recovers when its decoder queue fills", () => {
     installBrowserGlobals(() => 0);
     const decoded: string[] = [];
     let pendingDecodes = 0;
@@ -1377,9 +1377,12 @@ describe("webcodecs video gating and teardown", () => {
         return pendingDecodes;
       }
       configure() {}
-      reset() {}
+      reset() {
+        pendingDecodes = 0;
+      }
       close() {}
       decode(chunk: { init: { type: string } }) {
+        pendingDecodes += 1;
         decoded.push(chunk.init.type);
       }
     }
@@ -1419,19 +1422,24 @@ describe("webcodecs video gating and teardown", () => {
         (keyframe ? reference : delta).onmessage?.({ data } as MessageEvent);
       };
       receive(0, true);
-      receive(1);
       pendingDecodes = 2;
-      receive(2);
-      pendingDecodes = 0;
-      receive(3);
-      expect(decoded).toEqual(["key", "delta"]);
+      for (let sequence = 2; sequence <= 17; sequence += 1) receive(sequence);
+      expect(decoded).toEqual(["key"]);
+      receive(1);
+      const recoveredBatch = ["key", ...Array.from({ length: 17 }, () => "delta")];
+      expect(decoded).toEqual(recoveredBatch);
+      expect(reference.sent).toHaveLength(0);
+
+      receive(18);
+      receive(19);
+      expect(decoded).toEqual(recoveredBatch);
       expect(
         reference.sent.map((data) => parseVideoControlMessage(data as unknown as Uint8Array)),
       ).toEqual([{ kind: "keyframeRequest" }]);
       expect(delta.sent).toEqual([]);
-      receive(4, true);
-      receive(5);
-      expect(decoded).toEqual(["key", "delta", "key", "delta"]);
+      receive(20, true);
+      receive(21);
+      expect(decoded).toEqual([...recoveredBatch, "key", "delta"]);
       expect(reference.sent).toHaveLength(1);
     } finally {
       handle.drop();

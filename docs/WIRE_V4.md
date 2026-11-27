@@ -157,6 +157,8 @@ expected frame is incomplete or a fragment of a later frame arrives. When the ti
 receiver requests a keyframe. Late deltas can still fill the gap and stop retries. If the reorder
 window fills or the decoder loses its reference, the receiver discards dependent deltas and waits
 for a fresh keyframe. The transport or session layer owns the request timers and rate limits.
+The viewer can submit one full reorder batch to the decoder while two decodes are pending. A
+delta that arrives at the decoder queue limit triggers keyframe recovery.
 
 After a gap persists for 70 ms, the viewer can request the missing delta on the reference lane.
 Kind `0x43` carries its `u32 stream_sequence` followed by up to six distinct `u16` part indices.

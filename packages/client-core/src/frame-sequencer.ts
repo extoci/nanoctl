@@ -12,6 +12,7 @@ export type FrameSequencerOutcome = {
 
 const MODULO_HALF = 0x80000000;
 const MAX_REORDER_BYTES = 4 * 1024 * 1024;
+export const V4_VIDEO_REORDER_CAPACITY = 16;
 
 function validSequence(sequence: number): boolean {
   return Number.isInteger(sequence) && sequence >= 0 && sequence <= 0xffffffff;
@@ -52,8 +53,12 @@ export class FrameSequencer {
   private readonly reorderBuffer: AccessUnit[] = [];
   private reorderBytes = 0;
 
-  constructor(reorderCapacity = 16) {
-    if (!Number.isInteger(reorderCapacity) || reorderCapacity < 0 || reorderCapacity > 16)
+  constructor(reorderCapacity = V4_VIDEO_REORDER_CAPACITY) {
+    if (
+      !Number.isInteger(reorderCapacity) ||
+      reorderCapacity < 0 ||
+      reorderCapacity > V4_VIDEO_REORDER_CAPACITY
+    )
       throw new Error("reorder capacity must be an integer between 0 and 16");
     this.reorderCapacity = reorderCapacity;
   }

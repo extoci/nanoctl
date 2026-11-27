@@ -38,6 +38,7 @@ interface GateProbe {
   }[];
   wireArrivals: number[];
   decodeSubmissions: number[];
+  maxDecoderQueue: number;
   lastWireMs: number | null;
   wireBytes: number;
   presentedFrames: number;
@@ -137,6 +138,7 @@ async function monitorBrowser(page: Page) {
         startupFragments: [],
         wireArrivals: [],
         decodeSubmissions: [],
+        maxDecoderQueue: 0,
         lastWireMs: null,
         wireBytes: 0,
         presentedFrames: 0,
@@ -146,6 +148,7 @@ async function monitorBrowser(page: Page) {
         const decode = VideoDecoder.prototype.decode;
         VideoDecoder.prototype.decode = function (chunk) {
           decode.call(this, chunk);
+          probe.maxDecoderQueue = Math.max(probe.maxDecoderQueue, this.decodeQueueSize);
           probe.decodeSubmissions.push(performance.now());
         };
       }
@@ -346,6 +349,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
       startupFragments: probe.startupFragments,
       wireArrivals: probe.wireArrivals,
       decodeSubmissions: probe.decodeSubmissions,
+      maxDecoderQueue: probe.maxDecoderQueue,
       sampleEnd,
       browserStart,
       firstFrameMs: firstFrame === null ? null : Math.max(0, firstFrame - attachStart),

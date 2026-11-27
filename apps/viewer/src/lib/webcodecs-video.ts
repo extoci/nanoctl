@@ -8,7 +8,7 @@
  * re-enqueued downstream), so stats and the <video> fallback keep working.
  */
 
-import { readV4IceStats, V4VideoReceiver } from "@nanoctl/client-core";
+import { readV4IceStats, V4_VIDEO_REORDER_CAPACITY, V4VideoReceiver } from "@nanoctl/client-core";
 import { v4DebugVideo, V4VideoMetrics } from "./v4-video-metrics";
 
 export interface WebCodecsVideoHandle {
@@ -378,6 +378,7 @@ interface VideoTrackGeneratorLike {
 }
 
 interface VideoSinkHooks {
+  decodeQueueLimit?: number;
   /** First decoded frame reached the screen: the session is visibly live. */
   onFirstFrame?: () => void;
   onDecodedFrame?: (width: number, height: number, decodeMs: number | undefined) => void;
@@ -392,6 +393,7 @@ function createVideoSink(
   videoCodec: DirectVideoCodec = "h264",
   hooks?: VideoSinkHooks,
 ): VideoSink {
+  const decodeQueueLimit = hooks?.decodeQueueLimit ?? 2;
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
   // buffer and the costly software canvas composite. Fall back to a 2D canvas
@@ -722,7 +724,7 @@ function createVideoSink(
         }
       }
     }
-    if (decoder.decodeQueueSize > 1 && !key) {
+    if (decoder.decodeQueueSize >= decodeQueueLimit && !key) {
       // Never decode deltas after a local drop: their reference chain is broken
       // and decoding them produces persistent smearing. Drop forward to the
       // next keyframe instead; the data-channel caller requests one.
@@ -1142,6 +1144,9 @@ export function attachV4DataChannelVideo(
         stopWatchdog();
         active?.sink.teardown();
         const sink = createVideoSink(video, undefined, joinedAt, unit.codec, {
+          // A repair can release the missing frame and the full reorder window
+          // in one callback while two ordinary decodes are still queued.
+          decodeQueueLimit: V4_VIDEO_REORDER_CAPACITY + 3,
           onFirstFrame: () => {
             if (firstFrame) return;
             firstFrame = true;
