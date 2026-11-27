@@ -723,7 +723,13 @@ mod tests {
         let mut unchanged = frame(222);
         unchanged.has_new_damage = false;
         frames_tx.send(unchanged).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pipeline.snapshot().unchanged_frames_skipped == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("unchanged frame was not processed");
         assert_eq!(units.lock().expect("collected units poisoned").len(), 1);
 
         pipeline.request_keyframe();

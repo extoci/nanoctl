@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { AudioOutputState, ControlMessage, HostInfo } from "@nanoctl/protocol";
 import type { QualityLimits, RemoteSessionSnapshot } from "./lib/remote-session";
+import { readV4VideoDebug } from "./lib/v4-video-metrics";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
@@ -257,15 +258,18 @@ function Viewer() {
 
   const copyDebugInfo = async () => {
     setDebugCopy("Collecting…");
+    const [hostReport, v4Video] = await Promise.all([
+      info?.viewer.mayControl ? fetchHostReport() : "Host report requires control permission.",
+      videoRef.current ? readV4VideoDebug(videoRef.current) : undefined,
+    ]);
     const report = await buildDebugReport({
       info,
       snapshot,
       socketStatus: status,
       socketDetail: detail,
       codecChoice,
-      hostReport: info?.viewer.mayControl
-        ? await fetchHostReport()
-        : "Host report requires control permission.",
+      hostReport,
+      v4Video,
     });
     try {
       await navigator.clipboard.writeText(report);

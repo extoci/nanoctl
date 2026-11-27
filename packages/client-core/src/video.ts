@@ -1,8 +1,14 @@
-import { VideoReassembler, parseVideoChunk, type VideoChunk } from "@nanoctl/protocol";
+import {
+  VideoReassembler,
+  parseVideoChunk,
+  type AccessUnit,
+  type VideoChunk,
+} from "@nanoctl/protocol";
 import { FrameSequencer, type FrameSequencerOutcome } from "./frame-sequencer";
 
 export type VideoInputOutcome = FrameSequencerOutcome & {
   readonly droppedIncompleteSequence?: number;
+  readonly received?: AccessUnit;
 };
 
 function emptyOutcome(): VideoInputOutcome {
@@ -42,6 +48,7 @@ export class VideoStreamProcessor {
     const sequenced = this.sequencer.push(reassembled.complete);
     return {
       ...sequenced,
+      received: reassembled.complete,
       droppedIncompleteSequence: reassembled.droppedIncompleteSequence,
     };
   }

@@ -8,7 +8,8 @@
  * re-enqueued downstream), so stats and the <video> fallback keep working.
  */
 
-import { V4VideoReceiver } from "@nanoctl/client-core";
+import { readV4IceStats, V4VideoReceiver } from "@nanoctl/client-core";
+import { v4DebugVideo, V4VideoMetrics } from "./v4-video-metrics";
 
 export interface WebCodecsVideoHandle {
   canvas: HTMLCanvasElement;
@@ -379,8 +380,10 @@ interface VideoTrackGeneratorLike {
 interface VideoSinkHooks {
   /** First decoded frame reached the screen: the session is visibly live. */
   onFirstFrame?: () => void;
+  onDecodedFrame?: (width: number, height: number, decodeMs: number | undefined) => void;
   /** Decoder failed beyond recovery; the caller should abandon this path. */
   onFatal?: () => void;
+  onBackpressure?: () => void;
 }
 
 function createVideoSink(
@@ -553,9 +556,11 @@ function createVideoSink(
           dbg.firstDecodeMs = performance.now() - joinAt;
         }
         const submit = decodeSubmit.get(frame.timestamp);
-        if (submit !== undefined) {
+        const elapsed = submit === undefined ? undefined : performance.now() - submit;
+        hooks?.onDecodedFrame?.(frame.displayWidth, frame.displayHeight, elapsed);
+        if (elapsed !== undefined) {
           decodeSubmit.delete(frame.timestamp);
-          const ms = performance.now() - submit;
+          const ms = elapsed;
           if (dbg) {
             dbg.decodeSum = ((dbg.decodeSum as number) ?? 0) + ms;
             dbg.decodeN = ((dbg.decodeN as number) ?? 0) + 1;
@@ -724,6 +729,7 @@ function createVideoSink(
       // next keyframe instead; the data-channel caller requests one.
       dropped += 1;
       resyncing = true;
+      hooks?.onBackpressure?.();
       return false;
     }
     try {
@@ -1080,8 +1086,12 @@ export function attachV4DataChannelVideo(
   onTeardown?: () => void,
   onFirstFrame?: () => void,
 ): WebCodecsVideoHandle {
+  const metrics = new V4VideoMetrics();
+  const debug = { metrics, readIceStats: () => readV4IceStats(videoDelta) };
+  v4DebugVideo.set(video, debug);
   const sink = createVideoSink(video, onTeardown, performance.now(), "h264", {
     onFirstFrame,
+    onDecodedFrame: (width, height, elapsedMs) => metrics.decoded(width, height, elapsedMs),
     onFatal: () => {
       try {
         videoDelta.close();
@@ -1090,11 +1100,16 @@ export function attachV4DataChannelVideo(
         videoReference.close();
       } catch {}
     },
+    onBackpressure: () => receiver.requestKeyframe(),
   });
   const receiver = new V4VideoReceiver({
     videoDelta,
     videoReference,
+    onReceivedAccessUnit: (unit) => {
+      metrics.received(unit.streamSequence, unit.captureTimeUs, performance.now());
+    },
     onAccessUnit: (unit) => {
+      metrics.delivered(unit.streamSequence);
       sink.feed(unit.payload, unit.keyframe, unit.captureTimeUs);
     },
     sendKeyframeRequest: (bytes) => {
@@ -1113,6 +1128,7 @@ export function attachV4DataChannelVideo(
     canvas: sink.canvas,
     drop: () => {
       receiver.dispose();
+      if (v4DebugVideo.get(video) === debug) v4DebugVideo.delete(video);
       sink.teardown(false);
     },
     stats: sink.stats,

@@ -1,5 +1,6 @@
 import type { HostInfo } from "@nanoctl/protocol";
 import type { RemoteSessionMetrics, RemoteSessionSnapshot } from "./remote-session";
+import type { V4VideoDebugSnapshot } from "./v4-video-metrics";
 import { browserDecodeSupport, type DecodeSupport } from "./video-codec";
 
 export type DebugEvent = { at: string; event: string; detail?: string };
@@ -39,6 +40,7 @@ export type DebugReportInput = {
   /** Host report from /v1/debug, or why it is unavailable. */
   hostReport: string;
   decodeSupport?: DecodeSupport;
+  v4Video?: V4VideoDebugSnapshot;
 };
 
 const METRIC_COLUMNS = [
@@ -56,6 +58,21 @@ const METRIC_COLUMNS = [
   "decoder",
 ] as const;
 
+function lastV4Encoder(report: string): string {
+  const tail = report.split("## Recent agent log\n").at(1) ?? "";
+  for (const line of tail.split("\n").reverse()) {
+    if (line.includes("hardware encode failed; switching to software"))
+      return "software-openh264 (fallback attempted)";
+    const match = /v4 platform encoder initialized.*\bbackend="?([a-z0-9-]+)"?/.exec(line);
+    if (match?.[1]) return match[1];
+  }
+  return "unavailable";
+}
+
+function displayMetric(value: number | null, unit: string): string {
+  return value === null ? "unavailable" : `${value.toFixed(2)}${unit}`;
+}
+
 function cell(value: unknown): string {
   return value == null ? "" : String(value).replaceAll("|", "/");
 }
@@ -69,7 +86,7 @@ export async function buildDebugReport(input: DebugReportInput): Promise<string>
       return `${codec}: ${result ? `supported=${result.supported} hardware=${result.powerEfficient}` : "unknown"}`;
     }),
   );
-  const { snapshot, info } = input;
+  const { snapshot, info, v4Video } = input;
   const lines = [
     "# nanoctl viewer debug info",
     "",
@@ -95,16 +112,29 @@ export async function buildDebugReport(input: DebugReportInput): Promise<string>
     `- host: ${info ? `${info.hostName} ${info.platform} v${info.version}` : "unknown"}`,
     `- host codecs: ${info?.capabilities.codecs?.join(", ") ?? "unknown"}; encoders: ${info?.capabilities.encoderBackends?.join(", ") ?? "unknown"}`,
     "",
-    "## Stats (1 s samples, newest last)",
-    "",
   ];
+  if (v4Video) {
+    lines.push(
+      "## v4 video",
+      "",
+      `- decoded resolution: ${v4Video.resolution ?? "unavailable"}`,
+      `- selected ICE pair: ${v4Video.route}; RTT: ${displayMetric(v4Video.rttMs, " ms")}`,
+      `- arrival jitter: ${displayMetric(v4Video.jitterMs, " ms")}`,
+      `- skipped stream frames: ${v4Video.skippedFrames ?? "unavailable"} (${displayMetric(v4Video.skippedPercent, "%")})`,
+      `- WebCodecs submit to output: ${displayMetric(v4Video.decodeMs, " ms")} (${v4Video.decodeSamples} samples)`,
+      `- last reported encoder backend: ${lastV4Encoder(input.hostReport)}`,
+      "",
+    );
+  }
+  lines.push("## Stats (1 s samples, newest last)", "");
+  const columns = v4Video ? (["fps", "bitrateKbps", "framesDropped"] as const) : METRIC_COLUMNS;
   if (samples.length) {
     lines.push(
-      `| time | ${METRIC_COLUMNS.join(" | ")} |`,
-      `|${" --- |".repeat(METRIC_COLUMNS.length + 1)}`,
+      `| time | ${columns.join(" | ")} |`,
+      `|${" --- |".repeat(columns.length + 1)}`,
       ...samples.map(
         (sample) =>
-          `| ${sample.at.slice(11, 19)} | ${METRIC_COLUMNS.map((key) => cell(sample[key])).join(" | ")} |`,
+          `| ${sample.at.slice(11, 19)} | ${columns.map((key) => cell(sample[key])).join(" | ")} |`,
       ),
     );
   } else {

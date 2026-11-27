@@ -4,6 +4,7 @@ import { VideoStreamProcessor } from "./video";
 export type V4VideoReceiverOptions = {
   readonly videoDelta: RTCDataChannel;
   readonly videoReference: RTCDataChannel;
+  readonly onReceivedAccessUnit?: (unit: AccessUnit) => void;
   readonly onAccessUnit: (unit: AccessUnit) => void;
   readonly sendKeyframeRequest: (bytes: Uint8Array) => void;
   readonly onError?: (error: unknown) => void;
@@ -39,15 +40,20 @@ export class V4VideoReceiver {
   handle(data: unknown): void {
     try {
       const outcome = this.processor.pushEncodedChunk(messageBytes(data));
+      if (outcome.received) this.options.onReceivedAccessUnit?.(outcome.received);
       for (const unit of outcome.emitted) {
         this.options.onAccessUnit(unit);
       }
       if (outcome.requestKeyframe) {
-        this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
+        this.requestKeyframe();
       }
     } catch (error) {
       this.options.onError?.(error);
     }
+  }
+
+  requestKeyframe(): void {
+    this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
   }
 
   dispose(): void {

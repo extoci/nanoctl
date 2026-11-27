@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
@@ -23,6 +23,8 @@ use windows::core::Interface;
 use xcap::Monitor;
 
 use crate::types::{MediaError, PixelFormat, RawFrame, VideoSource};
+
+const DUPLICATION_STARVATION: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy)]
 enum DisplaySelection {
@@ -178,6 +180,7 @@ fn capture_thread(
     }
 
     let mut last_frame: Option<CapturedFrame> = None;
+    let mut timeout_since: Option<Instant> = None;
     while let Ok(ticket) = request_rx.recv() {
         loop {
             if shutdown.load(Ordering::Acquire) {
@@ -187,8 +190,23 @@ fn capture_thread(
                 .as_mut()
                 .expect("duplication present")
                 .capture_changed(4);
+            // Some desktop transitions invalidate duplication without an error.
+            // A real idle desktop also times out, so bound the cost by rebuilding
+            // at most once per starvation interval and keep serving the cached frame.
+            let result = match result {
+                Ok(None)
+                    if timeout_since.get_or_insert_with(Instant::now).elapsed()
+                        >= DUPLICATION_STARVATION =>
+                {
+                    Err(anyhow!(
+                        "DXGI duplication returned no fresh frames for three seconds"
+                    ))
+                }
+                other => other,
+            };
             match result {
                 Ok(Some(frame)) => {
+                    timeout_since = None;
                     last_frame = Some(frame.clone());
                     if response_tx.blocking_send((ticket, Ok(frame))).is_err() {
                         return;
@@ -207,9 +225,7 @@ fn capture_thread(
                     continue;
                 }
                 Err(error) => {
-                    // Desktop duplication sessions are invalidated by mode changes, display
-                    // power events, and some secure-desktop transitions. Recreate once rather
-                    // than treating every access loss as fatal.
+                    timeout_since = None;
                     drop(duplication.take());
                     match Duplication::new(h_monitor) {
                         Ok(recreated) => {

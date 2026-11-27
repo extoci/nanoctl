@@ -1,8 +1,13 @@
+import { encodeVideoChunk, parseVideoControlMessage } from "@nanoctl/protocol";
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { parseInputMessage, type InputMessage } from "@nanoctl/protocol";
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
-import { attachDataChannelVideo, attachWebCodecsVideo } from "./webcodecs-video";
+import {
+  attachDataChannelVideo,
+  attachV4DataChannelVideo,
+  attachWebCodecsVideo,
+} from "./webcodecs-video";
 
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
@@ -1195,6 +1200,76 @@ describe("webcodecs video gating and teardown", () => {
     receive(4, true);
     expect(decoded).toEqual(["key", "delta", "key"]);
     expect(resets).toBeGreaterThan(0);
+  });
+
+  test("a v4 decoder backlog requests a new reference and resumes on it", () => {
+    installBrowserGlobals(() => 0);
+    const decoded: string[] = [];
+    let pendingDecodes = 0;
+    class Decoder {
+      get decodeQueueSize() {
+        return pendingDecodes;
+      }
+      configure() {}
+      reset() {}
+      close() {}
+      decode(chunk: { init: { type: string } }) {
+        decoded.push(chunk.init.type);
+      }
+    }
+    defineGlobal("VideoDecoder", Decoder);
+    defineGlobal(
+      "EncodedVideoChunk",
+      class {
+        constructor(public readonly init: unknown) {}
+      },
+    );
+    defineGlobal(
+      "MediaStreamTrackGenerator",
+      class {
+        track = { stop() {} };
+        writable = new WritableStream();
+      },
+    );
+    const video = Object.assign(new FakeVideo(), { ownerDocument: { createElement: () => ({}) } });
+    const delta = new FakeDataChannel();
+    const reference = new FakeDataChannel();
+    const handle = attachV4DataChannelVideo(
+      delta as unknown as RTCDataChannel,
+      reference as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+    );
+    try {
+      const receive = (sequence: number, keyframe = false) => {
+        const data = encodeVideoChunk({
+          streamSequence: sequence,
+          part: 0,
+          parts: 1,
+          keyframe,
+          codec: "h264",
+          captureTimeUs: sequence * 16_000,
+          payload: new Uint8Array([0, 0, 0, 1, keyframe ? 0x65 : 0x41, 1]),
+        });
+        (keyframe ? reference : delta).onmessage?.({ data } as MessageEvent);
+      };
+      receive(0, true);
+      receive(1);
+      pendingDecodes = 2;
+      receive(2);
+      pendingDecodes = 0;
+      receive(3);
+      expect(decoded).toEqual(["key", "delta"]);
+      expect(
+        reference.sent.map((data) => parseVideoControlMessage(data as unknown as Uint8Array)),
+      ).toEqual([{ kind: "keyframeRequest" }]);
+      expect(delta.sent).toEqual([]);
+      receive(4, true);
+      receive(5);
+      expect(decoded).toEqual(["key", "delta", "key", "delta"]);
+      expect(reference.sent).toHaveLength(1);
+    } finally {
+      handle.drop();
+    }
   });
 
   test("keyframe requests use the reliable idr channel when present", () => {

@@ -139,12 +139,13 @@ struct PartialAccessUnit {
     parts: Vec<Option<Vec<u8>>>,
 }
 
-/// Reassembles one access unit at a time. A newer sequence abandons the older
-/// incomplete unit instead of retaining unbounded partial-frame memory.
+const MAX_PENDING_ACCESS_UNITS: usize = 3;
+
+/// Reassembles a bounded set of access units across interleaved video chunks.
 #[derive(Debug, Default)]
 pub struct VideoReassembler {
-    current_sequence: Option<u32>,
-    current: Option<PartialAccessUnit>,
+    pending: std::collections::VecDeque<(u32, PartialAccessUnit)>,
+    pending_bytes: usize,
 }
 
 impl VideoReassembler {
@@ -154,56 +155,80 @@ impl VideoReassembler {
 
     pub fn push(&mut self, chunk: VideoChunk) -> Result<ReassemblyOutcome, WireError> {
         chunk.validate_for_reassembly()?;
-        let mut outcome = ReassemblyOutcome::default();
-        if self.current_sequence != Some(chunk.stream_sequence) {
-            outcome.dropped_incomplete_sequence =
-                self.current_sequence.filter(|_| self.current.is_some());
-            self.current_sequence = Some(chunk.stream_sequence);
-            self.current = Some(PartialAccessUnit {
-                part_count: chunk.parts,
-                received: 0,
-                byte_len: 0,
-                keyframe: chunk.keyframe,
-                codec: chunk.codec,
-                capture_time_us: chunk.capture_time_us,
-                parts: vec![None; usize::from(chunk.parts)],
+        let sequence = chunk.stream_sequence;
+        let existing = self.pending.iter().position(|(seq, _)| *seq == sequence);
+        if existing.is_none() && chunk.parts == 1 {
+            return Ok(ReassemblyOutcome {
+                complete: Some(AccessUnit {
+                    stream_sequence: sequence,
+                    keyframe: chunk.keyframe,
+                    codec: chunk.codec,
+                    capture_time_us: chunk.capture_time_us,
+                    payload: chunk.payload,
+                }),
+                ..Default::default()
             });
         }
 
-        let current = self.current.as_mut().expect("current frame initialized");
-        if current.part_count != chunk.parts
-            || current.keyframe != chunk.keyframe
-            || current.codec != chunk.codec
-            || current.capture_time_us != chunk.capture_time_us
-        {
-            return Err(WireError::InvalidValue(
-                "inconsistent video access-unit metadata",
-            ));
+        if let Some(index) = existing {
+            let current = &self.pending[index].1;
+            if current.part_count != chunk.parts
+                || current.keyframe != chunk.keyframe
+                || current.codec != chunk.codec
+                || current.capture_time_us != chunk.capture_time_us
+            {
+                return Err(WireError::InvalidValue(
+                    "inconsistent video access-unit metadata",
+                ));
+            }
+            if current.parts[usize::from(chunk.part)].is_some() {
+                return Ok(ReassemblyOutcome::default());
+            }
         }
-        let slot = &mut current.parts[usize::from(chunk.part)];
-        if slot.is_some() {
-            return Ok(outcome);
-        }
-        current.byte_len = current.byte_len.saturating_add(chunk.payload.len());
-        if current.byte_len > MAX_ACCESS_UNIT_BYTES {
-            self.current = None;
-            self.current_sequence = None;
-            return Err(WireError::InvalidValue(
-                "video access unit exceeds size limit",
-            ));
-        }
-        *slot = Some(chunk.payload);
-        current.received += 1;
 
+        let evict = existing.is_none() && self.pending.len() == MAX_PENDING_ACCESS_UNITS;
+        let evicted_bytes = if evict { self.pending[0].1.byte_len } else { 0 };
+        let next_bytes = self.pending_bytes - evicted_bytes + chunk.payload.len();
+        if next_bytes > MAX_ACCESS_UNIT_BYTES {
+            return Err(WireError::InvalidValue(
+                "video reassembly exceeds size limit",
+            ));
+        }
+
+        let mut outcome = ReassemblyOutcome::default();
+        let index = existing.unwrap_or_else(|| {
+            if evict {
+                outcome.dropped_incomplete_sequence = self.pending.pop_front().map(|(seq, _)| seq);
+            }
+            self.pending.push_back((
+                sequence,
+                PartialAccessUnit {
+                    part_count: chunk.parts,
+                    received: 0,
+                    byte_len: 0,
+                    keyframe: chunk.keyframe,
+                    codec: chunk.codec,
+                    capture_time_us: chunk.capture_time_us,
+                    parts: vec![None; usize::from(chunk.parts)],
+                },
+            ));
+            self.pending.len() - 1
+        });
+
+        self.pending_bytes = next_bytes;
+        let current = &mut self.pending[index].1;
+        current.byte_len += chunk.payload.len();
+        current.parts[usize::from(chunk.part)] = Some(chunk.payload);
+        current.received += 1;
         if current.received == current.part_count {
-            let current = self.current.take().expect("complete frame present");
-            self.current_sequence = None;
+            let (_, current) = self.pending.remove(index).expect("complete frame present");
+            self.pending_bytes -= current.byte_len;
             let mut payload = Vec::with_capacity(current.byte_len);
             for part in current.parts {
                 payload.extend_from_slice(&part.expect("received count implies part present"));
             }
             outcome.complete = Some(AccessUnit {
-                stream_sequence: chunk.stream_sequence,
+                stream_sequence: sequence,
                 keyframe: current.keyframe,
                 codec: current.codec,
                 capture_time_us: current.capture_time_us,
@@ -368,12 +393,19 @@ mod tests {
     }
 
     #[test]
-    fn reassembler_drops_incomplete_sequence_when_replaced() {
+    fn reassembler_keeps_interleaved_frames_and_evicts_only_when_full() {
         let mut reassembler = VideoReassembler::new();
         reassembler.push(chunk(9, 0, 2, true, b"a")).unwrap();
-        let outcome = reassembler.push(chunk(10, 0, 1, true, b"b")).unwrap();
-        assert_eq!(outcome.dropped_incomplete_sequence, Some(9));
-        assert!(outcome.complete.is_some());
+        let complete = reassembler.push(chunk(10, 0, 1, true, b"b")).unwrap();
+        assert!(complete.complete.is_some());
+        assert_eq!(complete.dropped_incomplete_sequence, None);
+        reassembler.push(chunk(11, 0, 2, true, b"c")).unwrap();
+        let late = reassembler.push(chunk(9, 1, 2, true, b"d")).unwrap();
+        assert_eq!(late.complete.unwrap().payload, b"ad");
+        reassembler.push(chunk(12, 0, 2, true, b"e")).unwrap();
+        reassembler.push(chunk(13, 0, 2, true, b"f")).unwrap();
+        let overflow = reassembler.push(chunk(14, 0, 2, true, b"g")).unwrap();
+        assert_eq!(overflow.dropped_incomplete_sequence, Some(11));
     }
 
     #[test]

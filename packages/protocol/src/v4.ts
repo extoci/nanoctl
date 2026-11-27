@@ -551,21 +551,50 @@ type PartialAccessUnit = {
   readonly parts: (Uint8Array | undefined)[];
 };
 
+const MAX_PENDING_ACCESS_UNITS = 3;
+
 export class VideoReassembler {
-  private currentSequence: number | undefined;
-  private current: PartialAccessUnit | undefined;
+  private readonly pending = new Map<number, PartialAccessUnit>();
+  private pendingBytes = 0;
 
   push(chunk: VideoChunk): ReassemblyOutcome {
     validateVideoChunk(chunk);
-    const outcome: {
-      droppedIncompleteSequence?: number;
-      complete?: AccessUnit;
-    } = {};
-    if (this.currentSequence !== chunk.streamSequence) {
-      if (this.currentSequence !== undefined && this.current !== undefined)
-        outcome.droppedIncompleteSequence = this.currentSequence;
-      this.currentSequence = chunk.streamSequence;
-      this.current = {
+    const sequence = chunk.streamSequence;
+    let current = this.pending.get(sequence);
+    if (current === undefined && chunk.parts === 1) {
+      return {
+        complete: {
+          streamSequence: sequence,
+          keyframe: chunk.keyframe,
+          codec: chunk.codec,
+          captureTimeUs: chunk.captureTimeUs,
+          payload: chunk.payload.slice(),
+        },
+      };
+    }
+    if (current) {
+      if (
+        current.partCount !== chunk.parts ||
+        current.keyframe !== chunk.keyframe ||
+        current.codec !== chunk.codec ||
+        current.captureTimeUs !== chunk.captureTimeUs
+      )
+        fail("invalidValue", "inconsistent video access-unit metadata");
+      if (current.parts[chunk.part] !== undefined) return {};
+    }
+
+    const evicted =
+      current === undefined && this.pending.size === MAX_PENDING_ACCESS_UNITS
+        ? this.pending.keys().next().value
+        : undefined;
+    const evictedBytes = evicted === undefined ? 0 : this.pending.get(evicted)!.byteLength;
+    const nextBytes = this.pendingBytes - evictedBytes + chunk.payload.length;
+    if (nextBytes > MAX_ACCESS_UNIT_BYTES)
+      fail("invalidValue", "video reassembly exceeds size limit");
+
+    if (current === undefined) {
+      if (evicted !== undefined) this.pending.delete(evicted);
+      current = {
         partCount: chunk.parts,
         received: 0,
         byteLength: 0,
@@ -574,44 +603,32 @@ export class VideoReassembler {
         captureTimeUs: chunk.captureTimeUs,
         parts: Array.from({ length: chunk.parts }),
       };
+      this.pending.set(sequence, current);
     }
-    const current = this.current;
-    if (current === undefined) fail("invalidValue", "missing current access unit");
-    if (
-      current.partCount !== chunk.parts ||
-      current.keyframe !== chunk.keyframe ||
-      current.codec !== chunk.codec ||
-      current.captureTimeUs !== chunk.captureTimeUs
-    )
-      fail("invalidValue", "inconsistent video access-unit metadata");
-    if (current.parts[chunk.part] !== undefined) return outcome;
-    current.byteLength += chunk.payload.length;
-    if (current.byteLength > MAX_ACCESS_UNIT_BYTES) {
-      this.current = undefined;
-      this.currentSequence = undefined;
-      fail("invalidValue", "video access unit exceeds size limit");
-    }
+    this.pendingBytes = nextBytes;
     current.parts[chunk.part] = chunk.payload.slice();
+    current.byteLength += chunk.payload.length;
     current.received += 1;
-    if (current.received === current.partCount) {
-      const payload = new Uint8Array(current.byteLength);
-      let offset = 0;
-      for (const part of current.parts) {
-        if (part === undefined) fail("invalidValue", "missing complete access-unit part");
-        payload.set(part, offset);
-        offset += part.length;
-      }
-      outcome.complete = {
-        streamSequence: chunk.streamSequence,
+    if (current.received !== current.partCount) return { droppedIncompleteSequence: evicted };
+
+    this.pending.delete(sequence);
+    this.pendingBytes -= current.byteLength;
+    const payload = new Uint8Array(current.byteLength);
+    let offset = 0;
+    for (const part of current.parts) {
+      if (part === undefined) fail("invalidValue", "missing complete access-unit part");
+      payload.set(part, offset);
+      offset += part.length;
+    }
+    return {
+      complete: {
+        streamSequence: sequence,
         keyframe: current.keyframe,
         codec: current.codec,
         captureTimeUs: current.captureTimeUs,
         payload,
-      };
-      this.current = undefined;
-      this.currentSequence = undefined;
-    }
-    return outcome;
+      },
+    };
   }
 }
 
