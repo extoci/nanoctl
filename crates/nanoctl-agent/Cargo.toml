@@ -1,6 +1,6 @@
 [package]
 name = "nanoctl-agent"
-version = "3.0.0-alpha.23"
+version = "3.0.0-alpha.24"
 edition = "2024"
 license = "MIT"
 description = "Headless nanoctl remote desktop agent"
