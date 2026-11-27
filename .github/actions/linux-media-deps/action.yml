@@ -38,6 +38,15 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # The media and browser packages come from Ubuntu. A failure in the runner's
+        # Microsoft feed would otherwise stop both APT refreshes.
+        if [[ ${RUNNER_ENVIRONMENT:-} == github-hosted ]]; then
+          for source in /etc/apt/sources.list.d/microsoft-prod.{list,sources}; do
+            if [[ -f $source ]]; then
+              sudo mv -- "$source" "$RUNNER_TEMP/${source##*/}.disabled"
+            fi
+          done
+        fi
         mkdir -p "$HOME/apt-archives/partial"
         sudo mount --bind "$HOME/apt-archives" /var/cache/apt/archives
         sudo apt-get update -o Acquire::Retries=10
