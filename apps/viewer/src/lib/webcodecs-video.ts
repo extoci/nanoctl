@@ -869,7 +869,8 @@ export function attachDataChannelVideo(
   // Wire format: [u32 seq][u8 flags][access-unit bytes]. Deltas ride the unordered,
   // bounded-retransmit channel; keyframes (large, loss-fatal) ride the reliable
   // `nanoctl.video-idr.v1` channel. A gap or reorder breaks the reference
-  // chain — drop deltas until the next keyframe and ask the host for one.
+  // chain — wait for the next keyframe before decoding further deltas and ask
+  // the host for one.
   let expectedSeq: number | null = null;
   let waitingForKey = true;
   let kfRequestedAt = 0;
@@ -1075,12 +1076,13 @@ export function attachDataChannelVideo(
         }
       } else if (diff > 0) {
         // Unordered delivery reorders constantly; hold ahead-of-order frames
-        // in a small reorder window instead of declaring a gap. While waiting
-        // for a key only keys are worth holding.
-        if (isKey || !waitingForKey) {
-          reordered.set(seq, { au, isKey, firstSeen: Date.now() });
-          dbg.reordered = ((dbg.reordered as number) || 0) + 1;
-        }
+        // in a small reorder window instead of declaring a gap. Deltas are
+        // worth holding even while waiting for a key: the IDR rides a separate
+        // reliable lane, so the first deltas encoded after that IDR can arrive
+        // before it. Discarding them would create a fresh gap immediately after
+        // recovery and cascade into another keyframe request.
+        reordered.set(seq, { au, isKey, firstSeen: Date.now() });
+        dbg.reordered = ((dbg.reordered as number) || 0) + 1;
         if (reordered.size > DC_REORDER_WINDOW && !waitingForKey) {
           // Nothing can drain while the missing sequence is absent, so asking
           // here rather than in deliver() is what bounds recovery time.
