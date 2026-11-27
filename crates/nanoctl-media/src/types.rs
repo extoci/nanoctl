@@ -194,6 +194,8 @@ pub enum LaneWriteStatus {
 pub struct LaneWriteReport {
     pub status: LaneWriteStatus,
     pub buffered_bytes: usize,
+    /// Video bytes accepted by the transport, including headers and repeated chunks.
+    pub wire_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

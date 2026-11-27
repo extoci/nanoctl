@@ -432,7 +432,7 @@ async fn encode_loop_inner(
                         .max_buffered_bytes
                         .max(report.buffered_bytes as u64);
                     if report.status == LaneWriteStatus::Written {
-                        snapshot.bytes_written += payload_len;
+                        snapshot.bytes_written += report.wire_bytes as u64;
                         snapshot.next_video_sequence = Some(stream_sequence.wrapping_add(1));
                     } else {
                         snapshot.access_units_dropped_before_write += 1;
@@ -521,6 +521,11 @@ mod tests {
             &mut self,
             access_unit: EncodedAccessUnit,
         ) -> Result<LaneWriteReport, MediaError> {
+            let wire_bytes = if self.status == LaneWriteStatus::Written {
+                access_unit.payload.len()
+            } else {
+                0
+            };
             self.units
                 .lock()
                 .expect("collected units poisoned")
@@ -529,6 +534,7 @@ mod tests {
             Ok(LaneWriteReport {
                 status: self.status,
                 buffered_bytes: 0,
+                wire_bytes,
             })
         }
     }

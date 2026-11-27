@@ -191,7 +191,7 @@ async fn run_pipeline(
     let sink = WebRtcVideoSink {
         lanes: lanes.clone(),
     };
-    let lane = ChunkingLaneWriter::new(sink);
+    let lane = ChunkingLaneWriter::with_repeated_deltas(sink);
     let pipeline = match MediaPipeline::start_with_keyframe_requests(
         config,
         source,
@@ -279,6 +279,7 @@ async fn run_pipeline(
         keyframes = report.snapshot.keyframes_encoded,
         max_encode_us = report.snapshot.max_encode_micros,
         written = report.snapshot.lane_writes,
+        wire_bytes = report.snapshot.bytes_written,
         dropped = report.snapshot.access_units_dropped_before_write,
         max_buffered = report.snapshot.max_buffered_bytes,
         "v4 media pipeline stopped"
@@ -319,6 +320,8 @@ fn media_settings(
             .0,
         pixels / base_pixels,
     );
+    // Reserve room for the second copy on the delta lane.
+    let kbps = kbps.div_ceil(2);
     // A constrained link needs enough bits per pixel to encode useful deltas
     // between recovery references. Keep the connection budget when scaling down.
     let (width, height) = if kbps < 1_500 {

@@ -142,6 +142,9 @@ Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCT
 It waits for the outstanding reference to drain before submitting another. The wire limits below
 still apply to received messages.
 
+The host can send a second copy of a delta chunk with the same sequence and part index. Both
+copies count toward the send budget.
+
 A keyframe resets the receiver's reference chain. If the reorder window fills before a missing
 delta arrives, the receiver discards dependent deltas and requests a keyframe once. The
 transport or session layer owns any request timers and rate limits.
