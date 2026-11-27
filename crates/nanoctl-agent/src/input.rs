@@ -287,7 +287,7 @@ const BINARY_KEY_NAMED: u8 = 4;
 pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
     bytes
         .first()
-        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_KEY_EX).contains(kind))
+        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_POINTER_RELATIVE).contains(kind))
 }
 
 fn binary_named_key(id: u8) -> Option<&'static str> {

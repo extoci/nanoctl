@@ -634,14 +634,16 @@ function Viewer() {
             >
               {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
             </button>
-            <button
-              aria-pressed={snapshot.mouseLocked}
-              disabled={!snapshot.inputEnabled || terminal || status !== "online"}
-              title="Toggle gaming mouse lock: Ctrl+Alt+M"
-              onClick={() => transport.current?.controller?.togglePointerLock()}
-            >
-              {snapshot.mouseLocked ? "Mouse locked" : "Mouse absolute"}
-            </button>
+            {!coarse && (
+              <button
+                aria-pressed={snapshot.mouseLocked}
+                disabled={!snapshot.inputEnabled || terminal || status !== "online"}
+                title="Toggle gaming mouse lock: Ctrl+Alt+M"
+                onClick={() => transport.current?.controller?.togglePointerLock()}
+              >
+                {snapshot.mouseLocked ? "Mouse locked" : "Mouse absolute"}
+              </button>
+            )}
             {showGamepad && (
               <button
                 aria-pressed={snapshot.gamepadEnabled}

@@ -384,7 +384,7 @@ export class RemoteSessionController {
   }
 
   togglePointerLock(): void {
-    if (!this.inputEnabled) return;
+    if (!this.inputEnabled || typeof this.options.video.requestPointerLock !== "function") return;
     if (document.pointerLockElement === this.options.video) {
       document.exitPointerLock();
       return;
@@ -394,7 +394,9 @@ export class RemoteSessionController {
     }) => Promise<void> | void;
     try {
       const pending = request.call(this.options.video, { unadjustedMovement: true });
-      if (pending instanceof Promise) void pending.catch(() => this.options.video.requestPointerLock());
+      if (pending instanceof Promise) {
+        void pending.catch(() => this.options.video.requestPointerLock());
+      }
     } catch {
       void this.options.video.requestPointerLock();
     }
