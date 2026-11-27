@@ -30,6 +30,7 @@ capture = [
 ]
 media = [
   "capture",
+  "dep:libloading",
   "dep:arboard",
   "dep:cpal",
   "dep:enigo",
@@ -140,6 +141,7 @@ videotoolbox = { version = "0.18.1", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+libloading = { version = "0.8", optional = true }
 anstyle-query = "1.1.5"
 cpal = { version = "0.16", optional = true }
 fast_image_resize = { version = "6.2", default-features = false, features = [
