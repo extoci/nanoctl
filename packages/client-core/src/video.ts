@@ -37,6 +37,18 @@ export class VideoStreamProcessor {
     return this.sequencer.waitingForReference;
   }
 
+  get nextExpectedSequence(): number | undefined {
+    return this.sequencer.nextExpectedSequence;
+  }
+
+  get hasFrameGap(): boolean {
+    const expected = this.nextExpectedSequence;
+    return (
+      this.sequencer.bufferedFrames > 0 ||
+      (expected !== undefined && this.reassembler.hasIncompleteDelta(expected))
+    );
+  }
+
   isBehindWatermark(next: number): boolean {
     return this.sequencer.isBehindWatermark(next);
   }

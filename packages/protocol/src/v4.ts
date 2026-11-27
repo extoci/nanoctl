@@ -569,6 +569,10 @@ export class VideoReassembler {
   private readonly pending = new Map<number, PartialAccessUnit>();
   private pendingBytes = 0;
 
+  hasIncompleteDelta(sequence: number): boolean {
+    return this.pending.get(sequence)?.keyframe === false;
+  }
+
   push(chunk: VideoChunk): ReassemblyOutcome {
     validateVideoChunk(chunk);
     const sequence = chunk.streamSequence;

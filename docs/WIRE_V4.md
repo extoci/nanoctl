@@ -145,9 +145,10 @@ still apply to received messages.
 The host can send a second copy of a delta chunk with the same sequence and part index. Both
 copies count toward the send budget.
 
-A keyframe resets the receiver's reference chain. If the reorder window fills before a missing
-delta arrives, the receiver discards dependent deltas and requests a keyframe once. The
-transport or session layer owns any request timers and rate limits.
+A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when it
+receives an incomplete expected delta or sees a gap before a complete later frame. If the timer
+expires or the reorder window fills, the receiver discards dependent deltas and requests a
+keyframe. The transport or session layer owns the request timers and rate limits.
 
 ## Size and memory limits
 

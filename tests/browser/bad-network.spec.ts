@@ -20,6 +20,8 @@ const reconnects = 20;
 interface GateProbe {
   frames: number[];
   keyframes: number[];
+  wireArrivals: number[];
+  decodeSubmissions: number[];
   lastWireMs: number | null;
   wireBytes: number;
   presentedFrames: number;
@@ -113,11 +115,20 @@ async function monitorBrowser(page: Page) {
       const probe: GateProbe = {
         frames: [],
         keyframes: [],
+        wireArrivals: [],
+        decodeSubmissions: [],
         lastWireMs: null,
         wireBytes: 0,
         presentedFrames: 0,
       };
       window.badNetworkProbe = probe;
+      if (typeof VideoDecoder === "function") {
+        const decode = VideoDecoder.prototype.decode;
+        VideoDecoder.prototype.decode = function (chunk) {
+          decode.call(this, chunk);
+          probe.decodeSubmissions.push(performance.now());
+        };
+      }
       const create = RTCPeerConnection.prototype.createDataChannel;
       RTCPeerConnection.prototype.createDataChannel = function (...args) {
         const channel = Reflect.apply(create, this, args) as RTCDataChannel;
@@ -127,6 +138,8 @@ async function monitorBrowser(page: Page) {
             const now = performance.now();
             probe.lastWireMs = now;
             probe.wireBytes += data.byteLength;
+            const lastSample = probe.wireArrivals.at(-1);
+            if (lastSample === undefined || now - lastSample >= 10) probe.wireArrivals.push(now);
             const wire = new DataView(data);
             if (
               channel.label === reference &&
@@ -247,10 +260,14 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     Object.assign(evidence, {
       frames: probe.frames,
       keyframes,
+      wireArrivals: probe.wireArrivals,
+      decodeSubmissions: probe.decodeSubmissions,
       sampleEnd,
       browserStart,
       firstFrameMs: firstFrame === null ? null : Math.max(0, firstFrame - attachStart),
       gapMs,
+      wireGapMs: longestGap(probe.wireArrivals, browserStart, sampleEnd),
+      decodeSubmitGapMs: longestGap(probe.decodeSubmissions, browserStart, sampleEnd),
       peakIdr,
       senderSilenceMs:
         probe.lastWireMs === null ? durationMs : Math.max(0, sampleEnd - probe.lastWireMs),

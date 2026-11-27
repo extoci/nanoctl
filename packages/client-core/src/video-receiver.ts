@@ -35,10 +35,10 @@ const KEYFRAME_RETRY_MS = 250;
 export class V4VideoReceiver {
   private readonly processor = new VideoStreamProcessor();
   private reorderTimer: ReturnType<typeof setTimeout> | undefined;
+  private reorderSequence: number | undefined;
   private keyframeTimer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
   private watermark: number | undefined;
-  private buffered = 0;
   private readonly linkLoss = new VideoLossWindow();
   private readonly deltaHandler = (event: MessageEvent) => this.handle(event.data);
   private readonly referenceHandler = (event: MessageEvent) => this.handle(event.data);
@@ -68,7 +68,6 @@ export class V4VideoReceiver {
         return;
       }
       const outcome = this.processor.pushEncodedChunk(bytes);
-      this.buffered = outcome.buffered;
       if (outcome.received) {
         this.linkLoss.observe(outcome.received.streamSequence);
         this.options.onReceivedAccessUnit?.(outcome.received);
@@ -91,7 +90,6 @@ export class V4VideoReceiver {
   requestKeyframe(): void {
     if (this.disposed) return;
     this.processor.requireKeyframe();
-    this.buffered = 0;
     this.stopReorderTimer();
     if (this.keyframeTimer !== undefined) return;
     this.keyframeTimer = setTimeout(() => {
@@ -108,16 +106,21 @@ export class V4VideoReceiver {
   private updateReorderTimer(): void {
     const watermarkGap =
       this.watermark !== undefined && this.processor.isBehindWatermark(this.watermark);
-    if (this.buffered === 0 && !watermarkGap) {
+    if (!this.processor.hasFrameGap && !watermarkGap) {
       this.stopReorderTimer();
-    } else {
-      this.reorderTimer ??= setTimeout(() => this.requestKeyframe(), REORDER_WAIT_MS);
+      return;
     }
+    const expected = this.processor.nextExpectedSequence;
+    if (this.reorderTimer !== undefined && this.reorderSequence === expected) return;
+    this.stopReorderTimer();
+    this.reorderSequence = expected;
+    this.reorderTimer = setTimeout(() => this.requestKeyframe(), REORDER_WAIT_MS);
   }
 
   private stopReorderTimer(): void {
     clearTimeout(this.reorderTimer);
     this.reorderTimer = undefined;
+    this.reorderSequence = undefined;
   }
 
   private stopKeyframeRetry(): void {

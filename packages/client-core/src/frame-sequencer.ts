@@ -66,6 +66,10 @@ export class FrameSequencer {
     return this.reorderBuffer.length;
   }
 
+  get nextExpectedSequence(): number | undefined {
+    return this.awaitingKeyframe ? undefined : this.expectedSequence;
+  }
+
   isBehindWatermark(next: number): boolean {
     if (this.awaitingKeyframe) return false;
     if (this.expectedSequence === undefined) return true;

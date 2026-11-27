@@ -116,6 +116,38 @@ test("a short unresolved gap requests recovery even below the frame limit", asyn
   }
 });
 
+test("an incomplete expected delta times out without a later frame or watermark", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encodeVideoChunk({ ...chunk(11, false, [1]), parts: 2 }));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(250);
+    expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a later incomplete delta gets its own recovery deadline", async () => {
+  const state = receiver();
+  const fragment = (sequence: number, part: number) =>
+    encodeVideoChunk({ ...chunk(sequence, false, [part]), part, parts: 2 });
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(fragment(11, 0));
+    await Bun.sleep(120);
+    state.receiver.handle(fragment(12, 0));
+    state.receiver.handle(fragment(11, 1));
+    await Bun.sleep(120);
+    expect(state.requests).toHaveLength(0);
+    state.receiver.handle(fragment(12, 1));
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
 test("a reliable video watermark detects a lost final delta on an idle desktop", async () => {
   const state = receiver();
   try {
