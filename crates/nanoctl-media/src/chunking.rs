@@ -20,6 +20,7 @@ const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
 const DELTA_REPAIR_ATTEMPTS: u8 = 2;
 const DELTA_REPAIR_TOTAL_BYTES: usize =
     VIDEO_REDUNDANCY_BUDGET_BYTES * DELTA_REPAIR_ATTEMPTS as usize;
+const DELTA_QUEUE_TIME_MS: u64 = 75;
 const DATAGRAM_BURST_CHUNKS: usize = 4;
 const DATAGRAM_OVERHEAD_BYTES: usize = 80;
 
@@ -83,6 +84,15 @@ struct CachedDelta {
     repairs_remaining: u8,
     repair_bytes_remaining: usize,
     chunks: Vec<Vec<u8>>,
+}
+
+fn delta_queue_budget(capacity: usize, pacing_bps: Option<NonZeroU32>) -> usize {
+    let half_capacity = capacity.div_ceil(2);
+    pacing_bps.map_or(half_capacity, |bitrate| {
+        let pacing_bytes =
+            (u64::from(bitrate.get()) * DELTA_QUEUE_TIME_MS).div_ceil(8_000) as usize;
+        half_capacity.min(pacing_bytes.max(CHUNK_PAYLOAD_BYTES + VIDEO_HEADER_BYTES))
+    })
 }
 
 pub struct ChunkingLaneWriter<S> {
@@ -164,9 +174,11 @@ where
     }
 
     async fn delta_ready(&mut self) -> bool {
-        // Leave room for the next access unit and its repeated chunks.
+        // Stop before encoding through a congested queue. The encoder then
+        // keeps its last reference and can resume with the newest capture.
         let capacity = self.sink.lane_capacity(VideoLane::Delta).await;
-        self.sink.buffered_bytes(VideoLane::Delta).await < capacity.div_ceil(2)
+        let budget = delta_queue_budget(capacity, self.sink.frame_pacing_bps());
+        self.sink.buffered_bytes(VideoLane::Delta).await < budget
     }
 
     async fn repair_pending_delta(&mut self) -> Result<Option<LaneWriteReport>, MediaError> {
@@ -389,7 +401,7 @@ mod tests {
     use nanoctl_core::video::{DeltaRepairRequest, VideoChunk, VideoCodec};
     use tokio::time::Instant;
 
-    use super::{ChunkingLaneWriter, DatagramPacer, VideoChunkSink, VideoLane};
+    use super::{ChunkingLaneWriter, DatagramPacer, VideoChunkSink, VideoLane, delta_queue_budget};
     use crate::types::{EncodedAccessUnit, LaneWriteStatus, LaneWriter, MediaError};
 
     struct MemorySink {
@@ -434,6 +446,20 @@ mod tests {
             capture_sequence: 3,
             payload: vec![0x5a; payload_len],
         }
+    }
+
+    #[test]
+    fn the_capture_budget_caps_send_ahead_without_reducing_lane_capacity() {
+        let capacity = 128 * 1024;
+        assert_eq!(
+            delta_queue_budget(capacity, NonZeroU32::new(2_400_000)),
+            22_500
+        );
+        assert_eq!(
+            delta_queue_budget(capacity, NonZeroU32::new(20_000_000)),
+            65_536
+        );
+        assert_eq!(delta_queue_budget(capacity, None), 65_536);
     }
 
     #[tokio::test]

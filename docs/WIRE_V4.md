@@ -144,6 +144,9 @@ Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCT
 The host paces chunks from keyframes and deltas larger than 8 KiB in groups of four. It uses the
 current send rate with a 2.4 Mbps minimum for these bursts. A keyframe and its copy use the same
 schedule. A large delta is sent once and kept for selective repair.
+The host skips delta captures when buffered bytes reach 75 ms of the send budget at the
+current pacing rate or half the lane capacity. It checks before encoding so the next delta
+can still use the previous frame as a reference.
 It gives the outstanding reference 350 ms to drain. If it is still pending, the next recovery
 keyframe goes on the expiring delta lane. Both copies must fit within the delta lane's byte budget.
 The reliable lane takes a new reference once the previous one drains.
