@@ -120,6 +120,7 @@ pub struct RateController {
     congestion_rate: Option<f64>,
     clean_since: Option<Instant>,
     low_fps_since: Option<Instant>,
+    last_local_backpressure_cut: Option<Instant>,
     send_kbps: Option<f64>,
     app_limited: bool,
     active_since: Option<Instant>,
@@ -154,6 +155,7 @@ impl RateController {
             congestion_rate: None,
             clean_since: None,
             low_fps_since: None,
+            last_local_backpressure_cut: None,
             send_kbps: None,
             app_limited: false,
             active_since: None,
@@ -210,6 +212,63 @@ impl RateController {
             max_fps.min(30)
         } else {
             max_fps.min(15)
+        }
+    }
+
+    fn update_fps(&mut self, at: Instant, allow_increase: bool) {
+        let target_fps = Self::tier(self.rate, self.max_fps);
+        if target_fps < self.fps {
+            let since = *self.low_fps_since.get_or_insert(at);
+            if at.duration_since(since) >= Duration::from_secs(1) {
+                self.fps = target_fps;
+                self.low_fps_since = None;
+            }
+        } else {
+            self.low_fps_since = None;
+            if allow_increase && target_fps > self.fps {
+                self.fps = Self::tier(self.rate / 1.2, self.max_fps).max(self.fps);
+            }
+        }
+    }
+
+    /// Applies an immediate multiplicative decrease for congestion observed at the
+    /// local SCTP send queue. Unlike receiver-reported frame loss this signal is
+    /// not one or more RTTs old, but it can flap during keyframe bursts, so cuts
+    /// are limited to twice per second.
+    pub fn note_local_backpressure(&mut self, at: Instant) -> Option<RateDecision> {
+        if self
+            .last_local_backpressure_cut
+            .is_some_and(|last| at.saturating_duration_since(last) < Duration::from_millis(500))
+        {
+            return None;
+        }
+        self.last_local_backpressure_cut = Some(at);
+        self.last_congestion = Some(at);
+        self.congestion_rate = Some(self.rate);
+        self.clean_since = None;
+        let previous_rate = self.rate;
+        self.rate *= 0.8;
+        self.rate = self.rate.clamp(
+            self.ceiling.min(MIN_BITRATE_KBPS) as f64,
+            self.ceiling as f64,
+        );
+        self.update_fps(at, false);
+        let decision = self.decision();
+        let changed = decision != self.reported;
+        tracing::info!(
+            reason = "local-backpressure",
+            previous_kbps = previous_rate,
+            target_kbps = decision.bitrate_kbps,
+            target_fps = decision.fps,
+            applied = changed,
+            send_kbps = self.send_kbps,
+            "video rate decision"
+        );
+        if changed {
+            self.reported = decision;
+            Some(decision)
+        } else {
+            None
         }
     }
 
@@ -426,19 +485,7 @@ impl RateController {
             self.ceiling as f64,
         );
 
-        let target_fps = Self::tier(self.rate, self.max_fps);
-        if target_fps < self.fps {
-            let since = *self.low_fps_since.get_or_insert(sample.at);
-            if sample.at.duration_since(since) >= Duration::from_secs(1) {
-                self.fps = target_fps;
-                self.low_fps_since = None;
-            }
-        } else {
-            self.low_fps_since = None;
-            if target_fps > self.fps {
-                self.fps = Self::tier(self.rate / 1.2, self.max_fps).max(self.fps);
-            }
-        }
+        self.update_fps(sample.at, true);
         let decision = self.decision();
         let delta = decision.bitrate_kbps.abs_diff(self.reported.bitrate_kbps) as f64;
         let changed = decision.fps != self.reported.fps
@@ -617,6 +664,30 @@ mod tests {
         assert_eq!(parse_link_stats(br#"{"type":"link-stats"}"#), None);
         assert_eq!(parse_link_stats(br#"{"type":"quality","loss":0.5}"#), None);
         assert_eq!(parse_link_stats(b"binary"), None);
+    }
+
+    #[test]
+    fn local_backpressure_cut_is_immediate_and_rate_limited() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        let first = controller.note_local_backpressure(now).unwrap();
+        assert_eq!(first.bitrate_kbps, 1_600);
+        assert_eq!(first.fps, 60, "fps hysteresis survives one transient cut");
+        assert!(
+            controller
+                .note_local_backpressure(now + Duration::from_millis(499))
+                .is_none()
+        );
+        let second = controller
+            .note_local_backpressure(now + Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(second.bitrate_kbps, 1_280);
+        assert_eq!(second.fps, 60);
+        let third = controller
+            .note_local_backpressure(now + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(third.bitrate_kbps, 1_024);
+        assert_eq!(third.fps, 30, "sustained low bitrate lowers fps after 1s");
     }
 
     #[test]

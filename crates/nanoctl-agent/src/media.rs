@@ -332,6 +332,7 @@ pub struct PipelineStats {
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
     pub backpressure_skips: AtomicU64,
+    pub dc_backpressure_events: AtomicU64,
     pub queue_ns: AtomicU64,
     #[cfg(target_os = "linux")]
     pub producer_tid: AtomicU32,
@@ -363,6 +364,7 @@ impl PipelineStats {
             fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
             pacer_skips = self.pacer_skips.load(Ordering::Relaxed),
             backpressure_skips = self.backpressure_skips.load(Ordering::Relaxed),
+            dc_backpressure_events = self.dc_backpressure_events.load(Ordering::Relaxed),
             queue_ns = self.queue_ns.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
@@ -3377,6 +3379,7 @@ pub fn spawn_video(
                 let mut dc_keyframes_seen = producer_video_channel
                     .keyframe_requests
                     .load(Ordering::Relaxed);
+                let mut dc_backpressure_seen = 0_u64;
                 // Explicit requests are the low-latency repair path, but a bounded
                 // periodic IDR is the last-resort safety net when a request is lost
                 // to cooldown, teardown races, or an idle-transition edge case.
@@ -3479,6 +3482,31 @@ pub fn spawn_video(
                         .send_kbps
                         .store(send_kbps as u32, Ordering::Relaxed);
                     controller.update_sender(send_kbps, pacer.idle(), now);
+                    let dc_backpressure = producer_stats
+                        .dc_backpressure_events
+                        .load(Ordering::Relaxed);
+                    if dc_backpressure != dc_backpressure_seen {
+                        dc_backpressure_seen = dc_backpressure;
+                        if let Some(decision) = controller.note_local_backpressure(now) {
+                            let (target_kbps, target_ceiling) = viewport_scaled_rate(
+                                decision.bitrate_kbps,
+                                bitrate_ceiling,
+                                viewport_bitrate_scale,
+                            );
+                            encoder.apply_bitrate_estimate(target_kbps, target_ceiling)?;
+                            fps = decision.fps;
+                            pacer.set_fps(fps);
+                            forced_keyframe |= scale.changed_limits(
+                                target_kbps,
+                                quality.max_width,
+                                quality.max_height,
+                            );
+                            producer_stats
+                                .target_kbps
+                                .store(target_kbps, Ordering::Relaxed);
+                            producer_stats.target_fps.store(fps, Ordering::Relaxed);
+                        }
+                    }
                     if link_feedback.has_changed().unwrap_or(false)
                         && let Some(mut sample) = *link_feedback.borrow_and_update()
                     {
@@ -4033,6 +4061,9 @@ pub fn spawn_video(
                                     dc_skips += 1;
                                     if !dc_backed_up {
                                         dc_backed_up = true;
+                                        writer_stats
+                                            .dc_backpressure_events
+                                            .fetch_add(1, Ordering::Relaxed);
                                         delivery_recovery.send_modify(|generation| {
                                             *generation = generation.wrapping_add(1);
                                         });
