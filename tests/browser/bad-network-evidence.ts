@@ -18,3 +18,21 @@ export function mostInOneSecond(timestamps: readonly number[]): number {
   }
   return peak;
 }
+
+export function earlyMediaExits(lines: readonly string[], sampleStartEpochMs: number): string[] {
+  const events = lines.filter(
+    (line) => line.includes("v4 media pipeline ") || line.includes("Viewer disconnected reason="),
+  );
+  const timestamp = (line: string) => Date.parse(line.split(" ", 1)[0] ?? "");
+  return events.filter((line, index) => {
+    if (line.includes("reason=media-failed")) return true;
+    if (!line.includes("v4 media pipeline stopped")) return false;
+    const next = events[index + 1];
+    const endedDuringAttach =
+      next !== undefined &&
+      next.includes("Viewer disconnected reason=viewer-ended") &&
+      timestamp(line) < sampleStartEpochMs &&
+      timestamp(next) < sampleStartEpochMs;
+    return !endedDuringAttach;
+  });
+}

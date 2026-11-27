@@ -8,7 +8,7 @@ import {
   VIDEO_DELTA_CHANNEL_LABEL,
   VIDEO_REFERENCE_CHANNEL_LABEL,
 } from "../../packages/protocol/src/index";
-import { longestGap, mostInOneSecond } from "./bad-network-evidence";
+import { earlyMediaExits, longestGap, mostInOneSecond } from "./bad-network-evidence";
 import { markerBits, readMarker, readMarkerRow } from "./latency-marker";
 
 const run = promisify(execFile);
@@ -398,9 +398,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     const activeLog = await activeReport.text();
     const activeLines = activeLog.split("\n");
     evidence.sctpTimeouts = activeLines.filter((line) => line.includes("T3-rtx timed out"));
-    const earlyStops = activeLines.filter((line) => {
-      return line.includes("v4 media pipeline stopped") || line.includes("reason=media-failed");
-    });
+    const earlyStops = earlyMediaExits(activeLines, probe.timeOrigin + browserStart);
     evidence.earlyStops = earlyStops;
     expect.soft(activeReport.ok(), "host debug report during the measured session").toBe(true);
     expect.soft(earlyStops, "host pipeline exits before the viewer disconnects").toEqual([]);
