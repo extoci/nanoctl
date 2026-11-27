@@ -552,37 +552,66 @@ static STREAMING_PRIORITY_STATE: std::sync::Mutex<(usize, Option<u32>, bool)> =
 
 /// Windows Wi-Fi scanning otherwise adds exactly the kind of jitter a game
 /// stream feels. Sunshine enables the documented media-streaming mode on each
-/// connected WLAN interface while streaming; closing the client handle after
-/// the last stream lets AutoConfig restore normal behavior.
+/// connected WLAN interface while streaming. Load wlanapi dynamically because
+/// Windows Server often does not install the Wireless LAN Service at all; a
+/// hard import would make the whole agent fail to start on wired hosts.
 #[cfg(windows)]
-static WLAN_STREAMING_STATE: std::sync::Mutex<(usize, Option<usize>)> =
-    std::sync::Mutex::new((0, None));
+type WlanOpen = unsafe extern "system" fn(
+    u32,
+    *const core::ffi::c_void,
+    *mut u32,
+    *mut windows::Win32::Foundation::HANDLE,
+) -> u32;
+#[cfg(windows)]
+type WlanClose =
+    unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, *const core::ffi::c_void) -> u32;
+#[cfg(windows)]
+type WlanEnum = unsafe extern "system" fn(
+    windows::Win32::Foundation::HANDLE,
+    *const core::ffi::c_void,
+    *mut *mut windows::Win32::NetworkManagement::WiFi::WLAN_INTERFACE_INFO_LIST,
+) -> u32;
+#[cfg(windows)]
+type WlanFree = unsafe extern "system" fn(*const core::ffi::c_void);
+#[cfg(windows)]
+type WlanSet = unsafe extern "system" fn(
+    windows::Win32::Foundation::HANDLE,
+    *const windows::core::GUID,
+    windows::Win32::NetworkManagement::WiFi::WLAN_INTF_OPCODE,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+) -> u32;
 
 #[cfg(windows)]
-struct WlanStreamingGuard;
+struct WlanStreamingGuard {
+    handle: windows::Win32::Foundation::HANDLE,
+    close: WlanClose,
+    _library: libloading::Library,
+}
 
 #[cfg(windows)]
 impl WlanStreamingGuard {
-    fn acquire() -> Self {
+    fn acquire() -> Option<Self> {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::NetworkManagement::WiFi::{
-            WLAN_INTERFACE_INFO_LIST, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle,
-            WlanSetInterface, wlan_interface_state_connected,
+            WLAN_INTERFACE_INFO_LIST, wlan_interface_state_connected,
             wlan_intf_opcode_media_streaming_mode,
         };
-        let mut state = WLAN_STREAMING_STATE.lock().unwrap();
-        state.0 += 1;
-        if state.0 != 1 {
-            return Self;
-        }
         unsafe {
+            let library = libloading::Library::new("wlanapi.dll").ok()?;
+            let open = *library.get::<WlanOpen>(b"WlanOpenHandle").ok()?;
+            let close = *library.get::<WlanClose>(b"WlanCloseHandle").ok()?;
+            let enumerate = *library.get::<WlanEnum>(b"WlanEnumInterfaces").ok()?;
+            let free = *library.get::<WlanFree>(b"WlanFreeMemory").ok()?;
+            let set = *library.get::<WlanSet>(b"WlanSetInterface").ok()?;
             let mut negotiated = 0u32;
             let mut handle = HANDLE::default();
-            if WlanOpenHandle(2, None, &mut negotiated, &mut handle) != 0 {
-                return Self;
+            if open(2, core::ptr::null(), &mut negotiated, &mut handle) != 0 {
+                return None;
             }
             let mut list = std::ptr::null_mut::<WLAN_INTERFACE_INFO_LIST>();
-            if WlanEnumInterfaces(handle, None, &mut list) == 0 && !list.is_null() {
+            if enumerate(handle, core::ptr::null(), &mut list) == 0 && !list.is_null() {
                 let count = (*list).dwNumberOfItems as usize;
                 let interfaces = std::slice::from_raw_parts((*list).InterfaceInfo.as_ptr(), count);
                 let enabled = 1i32;
@@ -590,41 +619,34 @@ impl WlanStreamingGuard {
                     if interface.isState != wlan_interface_state_connected {
                         continue;
                     }
-                    let status = WlanSetInterface(
+                    let status = set(
                         handle,
                         &interface.InterfaceGuid,
                         wlan_intf_opcode_media_streaming_mode,
                         4,
                         &enabled as *const i32 as _,
-                        None,
+                        core::ptr::null(),
                     );
                     if status != 0 {
                         tracing::warn!(status, "Windows Wi-Fi media-streaming mode failed");
                     }
                 }
-                WlanFreeMemory(list as _);
+                free(list as _);
             }
-            state.1 = Some(handle.0 as usize);
+            Some(Self {
+                handle,
+                close,
+                _library: library,
+            })
         }
-        Self
     }
 }
 
 #[cfg(windows)]
 impl Drop for WlanStreamingGuard {
     fn drop(&mut self) {
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::NetworkManagement::WiFi::WlanCloseHandle;
-        let mut state = WLAN_STREAMING_STATE.lock().unwrap();
-        if state.0 > 0 {
-            state.0 -= 1;
-        }
-        if state.0 == 0
-            && let Some(handle) = state.1.take()
-        {
-            unsafe {
-                WlanCloseHandle(HANDLE(handle as _), None);
-            }
+        unsafe {
+            (self.close)(self.handle, core::ptr::null());
         }
     }
 }
