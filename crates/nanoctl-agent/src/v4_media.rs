@@ -241,11 +241,17 @@ async fn run_pipeline(
                 let snapshot = pipeline.snapshot();
                 let elapsed = now.saturating_duration_since(last_sample).as_secs_f64();
                 let bytes = snapshot.bytes_written.saturating_sub(previous.bytes_written);
-                let dropped = snapshot.access_units_dropped_before_write > previous.access_units_dropped_before_write;
+                let backpressured = snapshot.access_units_dropped_before_write
+                    > previous.access_units_dropped_before_write
+                    || snapshot.frames_skipped_for_backpressure > previous.frames_skipped_for_backpressure;
                 if elapsed >= 0.05 {
-                    rate.update_sender(bytes as f64 * 8.0 / (1_000.0 * elapsed), bytes == 0 && !dropped, now);
+                    rate.update_sender(
+                        bytes as f64 * 8.0 / (1_000.0 * elapsed),
+                        bytes == 0 && !backpressured,
+                        now,
+                    );
                 }
-                if dropped {
+                if backpressured {
                     rate.backpressure(now);
                 }
                 if link_feedback.has_changed().unwrap_or(false)
@@ -275,6 +281,7 @@ async fn run_pipeline(
         captured = report.snapshot.frames_captured,
         taken = report.snapshot.frames_taken_for_encode,
         waiting_for_reference = report.snapshot.frames_waiting_for_reference,
+        skipped_for_backpressure = report.snapshot.frames_skipped_for_backpressure,
         encoded = report.snapshot.access_units_encoded,
         encoder_skips = report.snapshot.encoder_skips,
         keyframes = report.snapshot.keyframes_encoded,

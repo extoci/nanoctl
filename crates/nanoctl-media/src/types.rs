@@ -205,6 +205,7 @@ pub struct MediaPipelineSnapshot {
     pub frames_replaced_before_encode: u64,
     pub frames_taken_for_encode: u64,
     pub frames_waiting_for_reference: u64,
+    pub frames_skipped_for_backpressure: u64,
     pub access_units_encoded: u64,
     pub keyframes_encoded: u64,
     pub bytes_encoded: u64,
@@ -243,6 +244,11 @@ pub trait VideoEncoder: Send {
 pub trait LaneWriter: Send {
     /// Whether the transport is ready for a new reference access unit.
     async fn reference_ready(&mut self) -> bool {
+        true
+    }
+
+    /// Whether the transport has room to begin encoding another delta frame.
+    async fn delta_ready(&mut self) -> bool {
         true
     }
 

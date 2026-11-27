@@ -346,6 +346,19 @@ async fn encode_loop_inner(
             next_forced_keyframe = TokioInstant::now() + MIN_FORCED_KEYFRAME_INTERVAL;
             config = *updates.borrow();
             keyframe_requested.swap(false, Ordering::Acquire);
+        } else {
+            let ready = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown) => return Ok(()),
+                ready = lane.delta_ready() => ready,
+            };
+            if !ready {
+                // Skipping the capture keeps the encoder's previous reference usable.
+                record_metrics(metrics, |snapshot| {
+                    snapshot.frames_skipped_for_backpressure += 1;
+                });
+                continue;
+            }
         }
         last_dimensions = Some((config.width, config.height));
         force_next_keyframe = false;
@@ -456,7 +469,7 @@ async fn encode_loop_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -516,10 +529,15 @@ mod tests {
         units: Arc<Mutex<Vec<EncodedAccessUnit>>>,
         notify: Arc<Notify>,
         status: LaneWriteStatus,
+        delta_ready: Arc<AtomicBool>,
     }
 
     #[async_trait]
     impl LaneWriter for CollectLane {
+        async fn delta_ready(&mut self) -> bool {
+            self.delta_ready.load(AtomicOrdering::SeqCst)
+        }
+
         async fn write_access_unit(
             &mut self,
             access_unit: EncodedAccessUnit,
@@ -572,6 +590,7 @@ mod tests {
                 units: Arc::clone(&units),
                 notify: Arc::clone(&notify),
                 status,
+                delta_ready: Arc::new(AtomicBool::new(true)),
             },
             units,
             notify,
@@ -678,6 +697,54 @@ mod tests {
         assert_eq!(report.snapshot.frames_taken_for_encode, 3);
         assert_eq!(report.snapshot.access_units_encoded, 3);
         assert_eq!(report.snapshot.keyframes_encoded, 2);
+    }
+
+    #[tokio::test]
+    async fn delta_backpressure_preserves_sequence_and_allows_reference_repair() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let delta_ready = Arc::clone(&collecting.delta_ready);
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(TestEncoder),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        delta_ready.store(false, AtomicOrdering::SeqCst);
+        frames_tx.send(frame(222)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pipeline.snapshot().frames_skipped_for_backpressure == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("capture was not skipped during delta backpressure");
+
+        delta_ready.store(true, AtomicOrdering::SeqCst);
+        frames_tx.send(frame(333)).await.unwrap();
+        wait_for_len(&units, &notify, 2).await;
+        delta_ready.store(false, AtomicOrdering::SeqCst);
+        pipeline.request_keyframe();
+        frames_tx.send(frame(444)).await.unwrap();
+        wait_for_len(&units, &notify, 3).await;
+
+        let observed: Vec<_> = units
+            .lock()
+            .expect("collected units poisoned")
+            .iter()
+            .map(|unit| (unit.stream_sequence, unit.keyframe, unit.capture_time_us))
+            .collect();
+        assert_eq!(observed, [(1, true, 111), (2, false, 333), (3, true, 444)]);
+        let report = pipeline.stop().await;
+        assert!(report.encode_result.is_ok());
+        assert_eq!(report.snapshot.frames_skipped_for_backpressure, 1);
+        assert_eq!(report.snapshot.access_units_encoded, 3);
     }
 
     #[tokio::test]

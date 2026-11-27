@@ -72,6 +72,12 @@ where
         self.reference_can_write(buffered)
     }
 
+    async fn delta_ready(&mut self) -> bool {
+        // Leave room for the next access unit and its repeated chunks.
+        let capacity = self.sink.lane_capacity(VideoLane::Delta).await;
+        self.sink.buffered_bytes(VideoLane::Delta).await < capacity.div_ceil(2)
+    }
+
     async fn write_access_unit(
         &mut self,
         access_unit: EncodedAccessUnit,
