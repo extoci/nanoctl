@@ -486,7 +486,7 @@ where
 /// scheduler grants it low-latency timeslices - the same trick Sunshine uses
 /// for capture/encode threads on Windows. Returns a guard reverting on drop.
 #[cfg(windows)]
-fn register_mmcss() -> Option<MmcssGuard> {
+pub(crate) fn register_mmcss() -> Option<MmcssGuard> {
     use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
     let mut index = 0u32;
     let handle =
@@ -496,7 +496,12 @@ fn register_mmcss() -> Option<MmcssGuard> {
 }
 
 #[cfg(windows)]
-struct MmcssGuard(windows::Win32::Foundation::HANDLE);
+pub(crate) struct MmcssGuard(windows::Win32::Foundation::HANDLE);
+
+// The MMCSS handle is an opaque scheduler registration token. Ownership can
+// move with the callback/stream that registered it; only Drop consumes it.
+#[cfg(windows)]
+unsafe impl Send for MmcssGuard {}
 
 #[cfg(windows)]
 impl Drop for MmcssGuard {
