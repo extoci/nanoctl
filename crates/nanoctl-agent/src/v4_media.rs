@@ -274,6 +274,7 @@ async fn run_pipeline(
     tracing::info!(
         captured = report.snapshot.frames_captured,
         taken = report.snapshot.frames_taken_for_encode,
+        waiting_for_reference = report.snapshot.frames_waiting_for_reference,
         encoded = report.snapshot.access_units_encoded,
         encoder_skips = report.snapshot.encoder_skips,
         keyframes = report.snapshot.keyframes_encoded,

@@ -139,8 +139,8 @@ of the same kind when its limit is reached. Delta fragments cannot evict a pendi
 Complete single-chunk units do not evict pending fragments.
 
 Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCTP fragmentation.
-It waits for the outstanding reference to drain before submitting another. The wire limits below
-still apply to received messages.
+It gives the outstanding reference 350 ms to drain before it can submit another. Every retry must
+fit within the reference lane's byte budget. The wire limits below still apply to received messages.
 
 The host can send a second copy of a delta chunk with the same sequence and part index. Both
 copies count toward the send budget.

@@ -204,6 +204,7 @@ pub struct MediaPipelineSnapshot {
     pub frames_captured: u64,
     pub frames_replaced_before_encode: u64,
     pub frames_taken_for_encode: u64,
+    pub frames_waiting_for_reference: u64,
     pub access_units_encoded: u64,
     pub keyframes_encoded: u64,
     pub bytes_encoded: u64,

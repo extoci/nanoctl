@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nanoctl_core::video::{MAX_ACCESS_UNIT_BYTES, MAX_VIDEO_PARTS, VIDEO_HEADER_BYTES, VideoChunk};
@@ -7,6 +7,7 @@ use crate::types::{EncodedAccessUnit, LaneWriteReport, LaneWriteStatus, LaneWrit
 
 // Leave room for the video header and SCTP headers within WebRTC's 1191-byte SCTP MTU.
 const CHUNK_PAYLOAD_BYTES: usize = 1_100;
+const REFERENCE_ACK_GRACE: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoLane {
@@ -28,6 +29,7 @@ pub trait VideoChunkSink: Send {
 pub struct ChunkingLaneWriter<S> {
     sink: S,
     repeat_deltas: bool,
+    last_reference_sent: Option<Instant>,
 }
 
 impl<S> ChunkingLaneWriter<S> {
@@ -35,18 +37,28 @@ impl<S> ChunkingLaneWriter<S> {
         Self {
             sink,
             repeat_deltas: false,
+            last_reference_sent: None,
         }
     }
 
     pub fn with_repeated_deltas(sink: S) -> Self {
         Self {
-            sink,
             repeat_deltas: true,
+            ..Self::new(sink)
         }
     }
 
     pub fn into_sink(self) -> S {
         self.sink
+    }
+
+    fn reference_can_write(&self, buffered: usize) -> bool {
+        // A few control bytes can remain queued. If the previous reference still has
+        // chunks awaiting acknowledgment, allow a paced retry instead of waiting forever.
+        buffered <= VIDEO_HEADER_BYTES
+            || self
+                .last_reference_sent
+                .is_none_or(|sent| sent.elapsed() >= REFERENCE_ACK_GRACE)
     }
 }
 
@@ -56,9 +68,8 @@ where
     S: VideoChunkSink,
 {
     async fn reference_ready(&mut self) -> bool {
-        // This permits a small control message, such as an idle watermark. Every video
-        // chunk occupies more than one header's worth of bytes in a single SCTP fragment.
-        self.sink.buffered_bytes(VideoLane::Reference).await <= VIDEO_HEADER_BYTES
+        let buffered = self.sink.buffered_bytes(VideoLane::Reference).await;
+        self.reference_can_write(buffered)
     }
 
     async fn write_access_unit(
@@ -89,7 +100,7 @@ where
             .saturating_sub(buffered_before);
         if wire_bytes > available
             || parts > usize::from(MAX_VIDEO_PARTS)
-            || (lane == VideoLane::Reference && buffered_before > VIDEO_HEADER_BYTES)
+            || (lane == VideoLane::Reference && !self.reference_can_write(buffered_before))
         {
             return Ok(LaneWriteReport {
                 status: LaneWriteStatus::DroppedBeforeWrite,
@@ -127,6 +138,9 @@ where
             for bytes in repeated {
                 self.sink.write_chunk(lane, bytes).await?;
             }
+        }
+        if lane == VideoLane::Reference {
+            self.last_reference_sent = Some(Instant::now());
         }
 
         Ok(LaneWriteReport {
@@ -232,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reference_in_flight_prevents_queueing_another() {
+    async fn a_recent_reference_in_flight_prevents_queueing_another() {
         let sink = MemorySink {
             chunks: Vec::new(),
             buffered: 0,
@@ -251,6 +265,47 @@ mod tests {
             .unwrap();
         assert_eq!(next.status, LaneWriteStatus::DroppedBeforeWrite);
         assert_eq!(writer.into_sink().chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_reference_ack_allows_a_paced_retry_within_the_queue_budget() {
+        let mut writer = ChunkingLaneWriter::new(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 240,
+        });
+        assert_eq!(
+            writer
+                .write_access_unit(access_unit(100, true))
+                .await
+                .unwrap()
+                .status,
+            LaneWriteStatus::Written,
+        );
+        assert!(!writer.reference_ready().await);
+
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert!(writer.reference_ready().await);
+        assert_eq!(
+            writer
+                .write_access_unit(access_unit(100, true))
+                .await
+                .unwrap()
+                .status,
+            LaneWriteStatus::Written,
+        );
+        assert!(!writer.reference_ready().await);
+
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert_eq!(
+            writer
+                .write_access_unit(access_unit(100, true))
+                .await
+                .unwrap()
+                .status,
+            LaneWriteStatus::DroppedBeforeWrite,
+        );
+        assert_eq!(writer.into_sink().chunks.len(), 2);
     }
 
     #[tokio::test]

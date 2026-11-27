@@ -328,6 +328,9 @@ async fn encode_loop_inner(
         };
         if force_next_keyframe && !force_keyframe {
             // Keep the encoder's reference state until a replacement can be sent.
+            record_metrics(metrics, |snapshot| {
+                snapshot.frames_waiting_for_reference += 1
+            });
             continue;
         }
         if !frame.has_new_damage && !force_keyframe {
