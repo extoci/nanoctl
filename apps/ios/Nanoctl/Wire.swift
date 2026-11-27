@@ -5,6 +5,36 @@ struct HostEndpoint {
     let socket: URL
     let origin: String
 
+    /// nanoctl media is tailnet-only: the host publishes only Tailscale ICE
+    /// addresses. Physical-interface candidates on the viewer can still win
+    /// ICE priority, especially because VPN interfaces rank below Wi-Fi, but
+    /// packets sourced from those interfaces cannot make the return trip
+    /// through the tunnel. Treat MagicDNS names and Tailscale CGNAT/ULA
+    /// addresses as requiring the VPN/unknown adapter classes. Literal LAN
+    /// addresses remain direct so simulator and development loopback keep
+    /// working.
+    var usesTailnetMediaPath: Bool {
+        guard let host = base.host()?.lowercased() else { return false }
+        if isLoopbackHost(host) { return false }
+        if host.hasSuffix(".ts.net") { return true }
+        if host.hasPrefix("fd7a:115c:a1e0:") { return true }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        if octets.count == 4 {
+            return octets[0] == 100 && (64...127).contains(octets[1])
+        }
+        if host.contains(":") || host.hasSuffix(".local") || host.hasSuffix(".lan") { return false }
+        return true
+    }
+
+    var isLoopback: Bool {
+        guard let host = base.host()?.lowercased() else { return false }
+        return isLoopbackHost(host)
+    }
+
+    private func isLoopbackHost(_ host: String) -> Bool {
+        host == "localhost" || host == "::1" || host.hasPrefix("127.")
+    }
+
     init(_ address: String, allowSimulatorLoopback: Bool = false) throws {
         let text = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var parts = URLComponents(string: text.contains("://") ? text : "https://\(text)"),

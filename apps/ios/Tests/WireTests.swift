@@ -67,6 +67,17 @@ final class WireTests: XCTestCase {
         XCTAssertEqual(loopback.socket.absoluteString, "ws://127.0.0.1:7777/v1/connect")
     }
 
+    func testTailnetMediaPathDetection() throws {
+        XCTAssertTrue(try HostEndpoint("play.example.ts.net").usesTailnetMediaPath)
+        XCTAssertTrue(try HostEndpoint("100.100.100.100").usesTailnetMediaPath)
+        XCTAssertTrue(try HostEndpoint("100.64.0.1").usesTailnetMediaPath)
+        XCTAssertTrue(try HostEndpoint("malachite").usesTailnetMediaPath)
+        XCTAssertFalse(try HostEndpoint("100.63.255.255").usesTailnetMediaPath)
+        XCTAssertFalse(try HostEndpoint("192.168.1.20").usesTailnetMediaPath)
+        XCTAssertFalse(try HostEndpoint("desktop.local").usesTailnetMediaPath)
+        XCTAssertFalse(try HostEndpoint("http://127.0.0.1:7777", allowSimulatorLoopback: true).usesTailnetMediaPath)
+    }
+
     func testRejectsInsecureNonLoopbackAndAmbiguousURLs() {
         for url in ["http://127.0.0.1", "https://name:pass@host", "https://host/path", "https://host?x=1",
                     "https://host:0"] {
