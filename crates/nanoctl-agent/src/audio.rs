@@ -398,9 +398,16 @@ where
     let mut phase = 0_u64;
     let mut frame = Vec::with_capacity(SAMPLES);
     let mut failed = Some(failed);
+    let mut mmcss = None;
     Ok(device.build_input_stream(
         config,
         move |data: &[T], _| {
+            // WASAPI invokes this callback on its realtime capture thread. Register
+            // that thread with MMCSS once rather than the control thread that built
+            // the stream; the guard reverts when the stream is dropped.
+            if mmcss.is_none() {
+                mmcss = crate::media::register_mmcss();
+            }
             for input in data.chunks_exact(channels) {
                 phase += 48_000;
                 while phase >= rate {
@@ -513,6 +520,8 @@ async fn stream_inner(
     let (encoded, mut packets) = mpsc::channel(2);
     let encode_enabled = enabled.clone();
     tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let _mmcss = crate::media::register_mmcss();
         let mut output = [0; 4000];
         while let Some(frame) = pcm.blocking_recv() {
             if encoded.is_closed() {
