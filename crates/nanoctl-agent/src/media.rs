@@ -331,6 +331,7 @@ pub struct PipelineStats {
     pub encode_attempts: AtomicU64,
     pub empty_encodes: AtomicU64,
     pub pacer_skips: AtomicU64,
+    pub backpressure_skips: AtomicU64,
     pub queue_ns: AtomicU64,
     #[cfg(target_os = "linux")]
     pub producer_tid: AtomicU32,
@@ -361,6 +362,7 @@ impl PipelineStats {
             sample_writes = self.sample_writes.load(Ordering::Relaxed),
             fresh_frames = self.fresh_frames.load(Ordering::Relaxed),
             pacer_skips = self.pacer_skips.load(Ordering::Relaxed),
+            backpressure_skips = self.backpressure_skips.load(Ordering::Relaxed),
             queue_ns = self.queue_ns.load(Ordering::Relaxed),
             "video pipeline statistics"
         );
@@ -2586,6 +2588,10 @@ impl EncodedFrameSlot {
         }
     }
 
+    fn is_occupied(&self) -> bool {
+        self.frame.lock().is_ok_and(|slot| slot.is_some())
+    }
+
     fn replace(&self, frame: EncodedFrame) -> bool {
         if self.closed.load(Ordering::Acquire) {
             return false;
@@ -3426,7 +3432,12 @@ pub fn spawn_video(
                         && last_forced_idr.is_none_or(|at| {
                             now.saturating_duration_since(at) >= FORCED_IDR_COOLDOWN
                         });
-                    let wait = if keyframe_ready && last.is_some() {
+                    let wait = if producer_slot.0.is_occupied() {
+                        // A full handoff means the writer has not consumed the
+                        // previous encoded frame. Poll it lightly instead of
+                        // running the normal zero-deadline capture loop hot.
+                        Duration::from_millis(1)
+                    } else if keyframe_ready && last.is_some() {
                         Duration::ZERO
                     } else if last.is_some() {
                         pacer.next_deadline(now, fps).saturating_duration_since(now)
@@ -3589,6 +3600,16 @@ pub fn spawn_video(
                         }
                         continue;
                     };
+                    if producer_slot.0.is_occupied() {
+                        // Drop before encoding, not after. Overwriting an
+                        // unsent delta would advance the encoder reference
+                        // chain without delivering that reference to the
+                        // viewer, forcing an otherwise avoidable IDR.
+                        producer_stats
+                            .backpressure_skips
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // Forced IDRs must be rate-limited: each one costs
                     // 50-200KB on the wire, so honoring every request or
                     // recovery notice turns congestion into a keyframe storm
