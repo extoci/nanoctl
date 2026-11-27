@@ -286,6 +286,14 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
       .soft(Math.max(...queue.map(({ qlen }) => qlen)), "netem packet queue")
       .toBeLessThanOrEqual(before.options.limit);
     await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 2_000 });
+    const activeReport = await request.get("/v1/debug");
+    const activeLog = await activeReport.text();
+    const earlyStops = activeLog.split("\n").filter((line) => {
+      return line.includes("v4 media pipeline stopped") || line.includes("reason=media-failed");
+    });
+    evidence.earlyStops = earlyStops;
+    expect.soft(activeReport.ok(), "host debug report during the measured session").toBe(true);
+    expect.soft(earlyStops, "host pipeline exits before the viewer disconnects").toEqual([]);
 
     const endSession = async () => {
       await page.getByRole("button", { name: "Session options" }).click();
