@@ -31,7 +31,10 @@ tap to click, double-tap and hold to drag, two fingers to scroll or right-click,
 three fingers to middle-click, pinch to zoom. **Direct touch** (tap where you want to
 click, hold to right-click) is one tap away and remembered. Pair up to four
 controllers with iOS to forward them as independent host gamepads; each controller
-keeps a stable player slot while others join or leave. The app uses native
+keeps a stable player slot while others join or leave. The connect screen and the
+in-session Controllers panel show how iOS recognized each controller, which virtual
+host device it maps to, its player slot, and battery level/state when GameController
+publishes it. The app uses native
 controller change events instead of polling; only active-input liveness and idle
 keepalive use a timer. A DualSense or DualShock profile requests a **virtual
 DualShock 4** on a Windows host with ViGEm; other supported profiles request an
@@ -97,6 +100,32 @@ viewer alongside the summary. Native samples include decoder entry and callback,
 mailbox delivery, render start, submission and GPU completion callback. The
 summary also reports interval averages from inbound WebRTC counters (actual,
 target and minimum jitter-buffer residence, and decode time).
+
+## Repeat the bad-network Simulator harness
+
+The network probe uses the same real agent, encoder, SCTP data channels and
+VideoToolbox decoder, then applies the agent's test-only impairment at the SCTP
+send boundary. It writes `network-probe.json` in the Simulator container and the
+runner scores frame continuity, decode progress, input readiness and final state:
+
+```sh
+cargo build --release --locked --features media \
+  --manifest-path crates/nanoctl-agent/Cargo.toml
+bun apps/ios/Benchmark/network.ts \
+  apps/ios/DerivedData/Build/Products/Debug-iphonesimulator/Nanoctl.app \
+  "$SIMULATOR_ID" /tmp/nanoctl-ios-network
+```
+
+The feature flags matter: a plain `cargo build --release` produces an agent without
+RTC/media support, and the harness now fails fast instead of scoring that as an app
+regression.
+
+Scenarios are `clean` (loopback control), `lossy-wifi` (2% loss, 2% long-tail
+reorder, up to 25ms jitter, 20 Mbps), `congested` (5% loss, 10% long-tail
+reorder, up to 35ms jitter, 3 Mbps), and `service-restart` (the agent process
+stops for five seconds mid-session, then returns). Pass a scenario name as the
+fourth argument to run only one. These impairment knobs are development-only and never enable
+authentication bypass outside the loopback harness.
 
 For per-frame receive timing on this Mac-only loopback workload, start this
 capture in another terminal before the benchmark, and set

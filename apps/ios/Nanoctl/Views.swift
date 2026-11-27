@@ -68,17 +68,30 @@ struct ConnectView: View {
 
                     GlassGroup(spacing: 12) {
                         VStack(spacing: 12) {
-                            TextField("host.tailnet.ts.net", text: $address)
-                                .textContentType(.URL)
-                                .keyboardType(.URL)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .submitLabel(.go)
-                                .focused($focused)
-                                .onSubmit(connect)
-                                .padding(.horizontal, 20)
-                                .frame(height: 52)
-                                .glass(in: Capsule())
+                            HStack(spacing: 10) {
+                                TextField("host.tailnet.ts.net", text: $address)
+                                    .textContentType(.URL)
+                                    .keyboardType(.URL)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .submitLabel(.go)
+                                    .focused($focused)
+                                    .onSubmit(connect)
+                                    .padding(.horizontal, 20)
+                                    .frame(height: 52)
+                                    .glass(in: Capsule())
+                                Button {
+                                    focused = false
+                                    desktop.refreshHosts(extraSeed: address)
+                                } label: {
+                                    Image(systemName: model.discoveringHosts ? "antenna.radiowaves.left.and.right" : "magnifyingglass")
+                                        .font(.system(size: 17, weight: .semibold))
+                                        .frame(width: 52, height: 52)
+                                }
+                                .buttonStyle(.plain)
+                                .glass(in: Circle())
+                                .accessibilityLabel("Find hosts")
+                            }
                             Button(action: connect) {
                                 Text("Connect")
                                     .font(.headline)
@@ -97,6 +110,79 @@ struct ConnectView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
+                    }
+
+                    if model.discoveringHosts || !model.discoveredHosts.isEmpty || model.discoveryNotice != nil {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("On your tailnet")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if model.discoveringHosts {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else if let notice = model.discoveryNotice {
+                                    Text(notice)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            if model.discoveredHosts.isEmpty, model.discoveringHosts {
+                                HStack(spacing: 12) {
+                                    ProgressView()
+                                    Text("Looking for nanoctl hosts…")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 18)
+                                .frame(height: 54)
+                                .glass(in: Capsule(), interactive: false)
+                            } else {
+                                GlassGroup(spacing: 8) {
+                                    VStack(spacing: 8) {
+                                        ForEach(model.discoveredHosts) { host in
+                                            Button {
+                                                address = host.url
+                                                connect()
+                                            } label: {
+                                                HStack(spacing: 13) {
+                                                    Image(systemName: hostIcon(host.os))
+                                                        .font(.title3)
+                                                        .frame(width: 28)
+                                                    VStack(alignment: .leading, spacing: 3) {
+                                                        Text(host.displayName)
+                                                            .font(.subheadline.weight(.semibold))
+                                                            .lineLimit(1)
+                                                        Text(host.endpointLabel)
+                                                            .font(.caption)
+                                                            .foregroundStyle(.secondary)
+                                                            .lineLimit(1)
+                                                    }
+                                                    Spacer(minLength: 8)
+                                                    Text(host.online ? "Ready" : "Offline")
+                                                        .font(.caption2.weight(.semibold))
+                                                        .foregroundStyle(host.online ? .green : .secondary)
+                                                    Image(systemName: "play.fill")
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                .padding(.horizontal, 18)
+                                                .frame(height: 58)
+                                                .contentShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                                            }
+                                            .buttonStyle(.plain)
+                                            .glass(in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                                            .disabled(!host.online)
+                                            .opacity(host.online ? 1 : 0.55)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxWidth: 420)
                     }
 
                     if !model.recents.isEmpty {
@@ -139,6 +225,15 @@ struct ConnectView: View {
                         }
                         .frame(maxWidth: 420)
                     }
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Controllers")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.leading, 8)
+                        GamepadStatusList(statuses: model.gamepads)
+                    }
+                    .frame(maxWidth: 420)
+
                     HStack(spacing: 14) {
                         Text(BuildInfo.versionLine)
                             .font(.caption2.monospaced())
@@ -162,11 +257,21 @@ struct ConnectView: View {
         .sheet(isPresented: $showLogs) {
             DebugLogView()
         }
+        .onAppear { desktop.refreshHosts() }
     }
 
     private func connect() {
         focused = false
         desktop.connect(address)
+    }
+
+    private func hostIcon(_ os: String?) -> String {
+        switch os?.lowercased() {
+        case .some(let value) where value.contains("windows"): return "pc"
+        case .some(let value) where value.contains("mac"): return "desktopcomputer"
+        case .some(let value) where value.contains("linux"): return "server.rack"
+        default: return "display"
+        }
     }
 }
 
@@ -177,6 +282,7 @@ struct ConnectView: View {
 struct SessionView: View {
     let desktop: Desktop
     @State private var expanded = false
+    @State private var showControllers = false
     @State private var collapseTask: Task<Void, Never>?
     @Namespace private var glass
 
@@ -218,7 +324,7 @@ struct SessionView: View {
                 .glass(in: RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: false)
             }
         }
-        .overlay(alignment: .topLeading) {
+        .overlay(alignment: .bottomLeading) {
             if model.showStats, !model.stats.isEmpty {
                 Text(model.stats)
                     .font(.caption.monospaced())
@@ -237,6 +343,9 @@ struct SessionView: View {
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
         .animation(.smooth(duration: 0.3), value: expanded)
+        .sheet(isPresented: $showControllers) {
+            GamepadSheet(statuses: model.gamepads)
+        }
     }
 
     @ViewBuilder
@@ -272,6 +381,24 @@ struct SessionView: View {
                     }
                     .opacity(model.keyboardVisible ? 1 : 0.92)
                     .glassID("keyboard", in: glass)
+
+                    ChromeButton("Controllers", systemImage: "gamecontroller.fill") {
+                        showControllers = true
+                        poke()
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if !model.gamepads.isEmpty {
+                            Text("\(model.gamepads.count)")
+                                .font(.system(size: 10, weight: .bold).monospacedDigit())
+                                .foregroundStyle(.white)
+                                .frame(width: 17, height: 17)
+                                .background(.green.gradient, in: Circle())
+                                .offset(x: 2, y: -2)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .accessibilityHint("Shows controller type, player slot, host device, and battery")
+                    .glassID("controllers", in: glass)
 
                     Menu {
                         menu(model)

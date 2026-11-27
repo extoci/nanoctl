@@ -52,7 +52,9 @@ final class VTAV1CoreDecoder {
         }
         if let maxInflight, inflightCount() > maxInflight, !isKey {
             dropped += 1
-            return true
+            // A dropped delta breaks the reference chain just like packet loss.
+            // Resynchronize instead of smearing every following frame.
+            return fault()
         }
         guard let session, let format else { return false }
 

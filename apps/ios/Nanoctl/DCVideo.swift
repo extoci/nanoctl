@@ -14,16 +14,33 @@ import Foundation
 final class DCVideoReceiver {
     struct Stats {
         var msgs = 0
+        var heartbeats = 0
         var fed = 0
         var gaps = 0
         var kfRequests = 0
+        var keys = 0
         var late = 0
         var transitMs = 0.0
     }
 
-    // Match the browser viewer: four frames bounds reordering without making
-    // a single loss cost a quarter-second of buffered video at 60fps.
-    private let window = 4
+    struct Status {
+        let stats: Stats
+        let codec: VTDecoder.Codec?
+        let decoded: Int
+        let dropped: Int
+        let faulted: Bool
+        let expectedSeq: UInt32?
+        let waitingForKey: Bool
+        let reorderedCount: Int
+        let pendingCount: Int
+    }
+
+    // Match the browser viewer: unordered SCTP reorders neighboring access
+    // units under load, and a frame-count window alone becomes seconds of dead
+    // time after congestion adaptation lowers the frame rate.
+    private let window = 16
+    private let partialWindow = 16
+    private let reorderAge: CFAbsoluteTime = 0.4
     /// The codec SDP negotiation reported, used only when the stream itself
     /// carries no parameter sets to sniff. SDP can lie (the answer may merely
     /// mirror the offer's codec ordering); the bitstream does not.
@@ -43,7 +60,8 @@ final class DCVideoReceiver {
     /// should close the channels and use the RTP video track instead.
     var onPersistentFault: () -> Void = {}
 
-    private(set) var stats = Stats()
+    /// Only mutated on `queue`; read through `snapshot()` from other actors.
+    private var stats = Stats()
     // Link-quality counters drained by `takeLinkStats`.
     private var received = 0
     private var lost = 0
@@ -52,14 +70,36 @@ final class DCVideoReceiver {
     private var expectedSeq: UInt32?
     private var waitingForKey = true
     private var kfRequestedAt: CFAbsoluteTime = 0
-    private var pending: [UInt32: (isKey: Bool, parts: Int, got: [Data?], n: Int)] = [:]
-    private var reordered: [UInt32: (au: Data, isKey: Bool)] = [:]
+    private var pending: [UInt32: (isKey: Bool, parts: Int, got: [Data?], n: Int, firstSeen: CFAbsoluteTime)] = [:]
+    private var reordered: [UInt32: (au: Data, isKey: Bool, firstSeen: CFAbsoluteTime)] = [:]
+    private var newestSeq: UInt32?
+    private var maintenanceTimer: DispatchSourceTimer?
     private var consecutiveFaults = 0
     private let maxConsecutiveFaults = 3
     private let queue = DispatchQueue(label: "nanoctl.dcvideo", qos: .userInteractive)
 
     init(codec hint: VTDecoder.Codec? = nil) {
         codecHint = hint
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.expireReorderState()
+            if self.waitingForKey { self.requestKeyframeThrottled() }
+        }
+        timer.resume()
+        maintenanceTimer = timer
+    }
+
+    deinit {
+        maintenanceTimer?.cancel()
+    }
+
+    /// Starts repair immediately rather than after the first delta. On an idle
+    /// host there may otherwise be no frame that can expose the initial need
+    /// for a keyframe.
+    func begin() {
+        queue.async { self.requestKeyframeThrottled() }
     }
 
     /// Queues a binary message from either video channel.
@@ -83,22 +123,52 @@ final class DCVideoReceiver {
         return (total > 0 ? Double(lost) / Double(total) : 0, transit, received)
     }
 
-    var decodedCount: Int { decoder?.decoded ?? 0 }
-    var droppedCount: Int { decoder?.dropped ?? 0 }
-    var hasFaulted: Bool { (decoder?.faults ?? 0) > 0 }
+    func statusSnapshot() -> Status {
+        queue.sync {
+            Status(stats: stats, codec: codec, decoded: decoder?.decoded ?? 0,
+                   dropped: decoder?.dropped ?? 0, faulted: (decoder?.faults ?? 0) > 0,
+                   expectedSeq: expectedSeq, waitingForKey: waitingForKey,
+                   reorderedCount: reordered.count, pendingCount: pending.count)
+        }
+    }
+
+    private func requestKeyframeThrottled() {
+        guard CFAbsoluteTimeGetCurrent() - kfRequestedAt >= 0.4 else { return }
+        kfRequestedAt = CFAbsoluteTimeGetCurrent()
+        stats.kfRequests += 1
+        requestKeyframe()
+    }
 
     private func onDecoderFault() {
         waitingForKey = true
         reordered.removeAll()
         consecutiveFaults += 1
-        if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-            kfRequestedAt = CFAbsoluteTimeGetCurrent()
-            stats.kfRequests += 1
-            requestKeyframe()
-        }
+        requestKeyframeThrottled()
         if consecutiveFaults >= maxConsecutiveFaults {
             consecutiveFaults = 0
             onPersistentFault()
+        }
+    }
+
+    private func expireReorderState() {
+        let now = CFAbsoluteTimeGetCurrent()
+        var expired = false
+        for (seq, entry) in pending {
+            let distance = newestSeq.map { Int32(bitPattern: $0 &- seq) } ?? 0
+            if distance > partialWindow || now - entry.firstSeen >= reorderAge {
+                pending.removeValue(forKey: seq)
+                expired = true
+            }
+        }
+        for (seq, entry) in reordered where now - entry.firstSeen >= reorderAge {
+            reordered.removeValue(forKey: seq)
+            expired = true
+        }
+        if expired, !waitingForKey {
+            waitingForKey = true
+            stats.gaps += 1
+            reordered.removeAll()
+            requestKeyframeThrottled()
         }
     }
 
@@ -106,8 +176,10 @@ final class DCVideoReceiver {
         guard data.count >= 5 else { return }
         stats.msgs += 1
         let seq = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+        if newestSeq.map({ Int32(bitPattern: seq &- $0) > 0 }) ?? true { newestSeq = seq }
         let flags = data[4]
         let isKey = flags & 1 != 0
+        if isKey { stats.keys += 1 }
         var offset = 5
         var part = 0
         var parts = 1
@@ -125,6 +197,7 @@ final class DCVideoReceiver {
             offset += 8
         }
         if flags & 8 != 0 {
+            stats.heartbeats += 1
             // Heartbeats carry the next live sequence as a watermark rather
             // than consuming it. A watermark ahead of the decoder means the
             // final delta before the idle period was lost even though no newer
@@ -135,21 +208,20 @@ final class DCVideoReceiver {
             if diff > 0, !waitingForKey {
                 waitingForKey = true
                 stats.gaps += 1
-                lost += Int(diff)
                 reordered.removeAll()
-                if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-                    kfRequestedAt = CFAbsoluteTimeGetCurrent()
-                    stats.kfRequests += 1
-                    requestKeyframe()
-                }
+                requestKeyframeThrottled()
             }
             return
         }
         guard data.count > offset else { return }
+        // One throttled request is not a recovery guarantee: SCTP or the
+        // host's forced-IDR cooldown can still drop/ignore it. While repair is
+        // outstanding, live traffic and the maintenance timer both keep asking.
+        if waitingForKey { requestKeyframeThrottled() }
         var chunk = data.subdata(in: offset..<data.count)
 
         if parts > 1 {
-            var entry = pending[seq] ?? (isKey, parts, [Data?](repeating: nil, count: parts), 0)
+            var entry = pending[seq] ?? (isKey, parts, [Data?](repeating: nil, count: parts), 0, CFAbsoluteTimeGetCurrent())
             if part >= parts { return }
             if entry.got[part] == nil {
                 entry.got[part] = chunk
@@ -157,6 +229,17 @@ final class DCVideoReceiver {
             }
             if entry.n < parts {
                 pending[seq] = entry
+                // Bounded repair state: loss must never turn fragmented-frame
+                // bookkeeping into an hours-long memory leak. Thirty-two access
+                // units is far beyond the reorder window but tiny in memory.
+                if pending.count > 32 {
+                    pending.removeAll(keepingCapacity: true)
+                    if !waitingForKey {
+                        waitingForKey = true
+                        stats.gaps += 1
+                        requestKeyframeThrottled()
+                    }
+                }
                 return
             }
             pending.removeValue(forKey: seq)
@@ -181,19 +264,18 @@ final class DCVideoReceiver {
             // jumps the reorder window in every state. Older buffered deltas
             // are both undecodable and temporally stale once it exists.
             deliverNow = true
-            lost += Int(diff)
             for buffered in reordered.keys.filter({ Int32(bitPattern: $0 &- seq) < 0 }) {
                 reordered.removeValue(forKey: buffered)
             }
         } else if diff > 0 {
             if isKey || !waitingForKey {
-                reordered[seq] = (chunk, isKey)
+                reordered[seq] = (chunk, isKey, CFAbsoluteTimeGetCurrent())
             }
             if reordered.count > window, !waitingForKey {
                 waitingForKey = true
                 stats.gaps += 1
-                lost += reordered.count + Int(diff)
                 reordered.removeAll()
+                requestKeyframeThrottled()
             }
         }
 
@@ -205,13 +287,13 @@ final class DCVideoReceiver {
     }
 
     private func deliver(_ seq: UInt32, au: Data, isKey: Bool) {
+        if let expected = expectedSeq {
+            let skipped = Int32(bitPattern: seq &- expected)
+            if skipped > 0 { lost += Int(skipped) }
+        }
         expectedSeq = seq &+ 1
         if waitingForKey {
-            if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-                kfRequestedAt = CFAbsoluteTimeGetCurrent()
-                stats.kfRequests += 1
-                requestKeyframe()
-            }
+            requestKeyframeThrottled()
             guard isKey else { return }
             waitingForKey = false
         }
