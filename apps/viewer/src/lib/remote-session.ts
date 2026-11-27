@@ -742,9 +742,10 @@ export class RemoteSessionController {
         ordered: false,
         // Time-bounded retransmission repairs isolated SCTP loss for a fraction
         // of an IDR's cost. Unordered delivery means it cannot head-of-line
-        // block newer frames; after this lifetime copies would be too late for
-        // the small reorder window anyway, so SCTP stops paying for them.
-        maxPacketLifeTime: 80,
+        // block newer frames. The lifetime covers one retransmission on real
+        // WAN/Tailscale RTTs while staying well below the viewer's 400ms
+        // reorder expiry, after which copies would be too stale to matter.
+        maxPacketLifeTime: 160,
       });
       const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
       // Compressed access units must arrive as ArrayBuffer. The spec default is
