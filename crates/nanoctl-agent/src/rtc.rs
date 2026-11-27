@@ -894,6 +894,7 @@ impl HostPeer {
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
+            #[cfg(target_os = "windows")]
             let input_shutdown_for_channel = input_shutdown.clone();
             let clipboard = if allow_clipboard {
                 crate::clipboard::backend()

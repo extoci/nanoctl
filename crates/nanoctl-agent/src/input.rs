@@ -554,6 +554,7 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
 }
 
 impl InputController {
+    #[cfg(target_os = "windows")]
     pub(crate) fn display_geometry(&self) -> (i32, i32, u32, u32) {
         (self.origin_x, self.origin_y, self.width, self.height)
     }
