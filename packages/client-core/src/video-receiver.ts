@@ -58,8 +58,12 @@ export class V4VideoReceiver {
       if (bytes[1] === 0x42) {
         const message = parseVideoControlMessage(bytes);
         if (message.kind === "sequenceWatermark") {
-          this.watermark = message.nextSequence;
-          this.updateReorderTimer();
+          const next = message.nextSequence;
+          const previous = this.watermark;
+          if (previous === undefined || ((next - previous) | 0) > 0) {
+            this.watermark = next;
+            this.updateReorderTimer();
+          }
         }
         return;
       }

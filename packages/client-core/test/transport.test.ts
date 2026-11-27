@@ -19,6 +19,6 @@ test("creates canonical reliable and loss-tolerant v4 lanes", () => {
     { label: "nanoctl.control.v4", init: undefined },
     { label: "nanoctl.motion.v4", init: { ordered: false, maxRetransmits: 0 } },
     { label: "nanoctl.video-delta.v4", init: { ordered: false, maxPacketLifeTime: 150 } },
-    { label: "nanoctl.video-reference.v4", init: undefined },
+    { label: "nanoctl.video-reference.v4", init: { ordered: false } },
   ]);
 });

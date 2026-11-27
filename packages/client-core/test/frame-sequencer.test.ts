@@ -79,6 +79,17 @@ describe("FrameSequencer", () => {
     expect(sequences(duplicate)).toEqual([]);
   });
 
+  test("a late reference cannot rewind the stream, including during recovery", () => {
+    const sequencer = new FrameSequencer();
+    sequencer.push(unit(0xffffffff, true));
+    sequencer.push(unit(1, true));
+    expect(sequences(sequencer.push(unit(0, true)))).toEqual([]);
+    expect(sequences(sequencer.push(unit(2)))).toEqual([2]);
+    sequencer.requireKeyframe();
+    expect(sequences(sequencer.push(unit(1, true)))).toEqual([]);
+    expect(sequences(sequencer.push(unit(4, true)))).toEqual([4]);
+  });
+
   test("keeps newer deltas that cross-lane reordering delivered before their keyframe", () => {
     const sequencer = new FrameSequencer();
     const first = sequencer.push(unit(1, true));

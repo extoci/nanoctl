@@ -23,13 +23,14 @@ fixtures exist.
 | `nanoctl.control.v4`         | reliable, ordered        | key, text, pointer button/wheel, release, heartbeat, future session commands |
 | `nanoctl.motion.v4`          | unordered, loss-tolerant | pointer movement and gamepad latest-state snapshots                          |
 | `nanoctl.video-delta.v4`     | unordered, loss-tolerant | non-keyframe video chunks                                                    |
-| `nanoctl.video-reference.v4` | reliable, ordered        | keyframe video chunks and reference-recovery control                         |
+| `nanoctl.video-reference.v4` | reliable, unordered      | keyframe video chunks and reference-recovery control                         |
 
 Every independent input stream owns a `u32` sequence counter: reliable control is one stream, while
 pointer motion and gamepad snapshots use separate counters even though they share the motion lane. On
 loss-tolerant lanes receivers drop non-newer sequences within the same stream using wrapping sequence
-comparison. Reliable lanes keep ordering through the transport; their sequence is diagnostic and
-liveness metadata, not permission to reorder discrete input.
+comparison. The reliable control lane keeps order through the transport. Its sequence is diagnostic
+and liveness metadata, not permission to reorder discrete input. A newer complete keyframe can be
+used before an older one arrives. Receivers discard reference frames older than their decode position.
 
 ## Input messages
 
@@ -158,5 +159,6 @@ allocation even when lengths are internally consistent.
 The host sends `[0x04, 0x42, next_sequence: u32 little-endian]` on the reliable
 video reference channel when video stops advancing. It identifies the sequence
 after the last access unit accepted by the transport and does not consume a
-sequence number. A receiver gives late deltas the normal reorder grace period
-before requesting a keyframe if its expected sequence is behind the watermark.
+sequence number. Receivers retain the highest watermark using wrapping sequence comparison. A
+receiver gives late deltas the normal reorder grace period before requesting a keyframe if its
+expected sequence is behind the watermark.

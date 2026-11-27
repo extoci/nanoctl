@@ -72,7 +72,6 @@ export class FrameSequencer {
   requireKeyframe(): void {
     this.reorderBuffer.length = 0;
     this.reorderBytes = 0;
-    this.expectedSequence = undefined;
     this.awaitingKeyframe = true;
   }
 
@@ -80,6 +79,14 @@ export class FrameSequencer {
     if (!validSequence(unit.streamSequence)) throw new Error("invalid access-unit sequence");
     const outcome = emptyOutcome();
     if (unit.keyframe) {
+      if (
+        this.expectedSequence !== undefined &&
+        sequenceDistance(unit.streamSequence, this.expectedSequence) >= MODULO_HALF
+      ) {
+        outcome.duplicatesDropped = 1;
+        outcome.buffered = this.reorderBuffer.length;
+        return outcome;
+      }
       // Reference and delta frames travel on independent lanes, so a delta that
       // references this keyframe may validly arrive before the keyframe itself.
       // Discard only older generations; keep newer buffered units and drain them

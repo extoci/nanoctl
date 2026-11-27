@@ -110,6 +110,7 @@ test("a reliable video watermark detects a lost final delta on an idle desktop",
   try {
     state.receiver.handle(encoded(10, true, [0]));
     state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 11, 0, 0, 0]));
     expect(state.requests).toHaveLength(0);
     await Bun.sleep(250);
     expect(state.requests).toEqual([[4, 0x41]]);
