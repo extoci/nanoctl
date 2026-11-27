@@ -64,7 +64,7 @@ struct ActiveEncoder {
     output_buffer_size: u32,
     provides_output_samples: bool,
     needs_input: bool,
-    first_access_unit: bool,
+    sequence_header: Option<Vec<u8>>,
     shut_down: bool,
 }
 
@@ -315,12 +315,25 @@ impl FrameEncoder for WindowsEncoder {
         if self.codec != VideoCodec::Av1 {
             validate_annex_b(&bytes)?;
         }
-        if std::mem::take(&mut active.first_access_unit)
+        // Decoder configuration is not just a startup concern. Most vendor
+        // MFTs emit sequence headers only in their first access unit, while a
+        // forced IDR later contains the slice but no SPS/PPS/AV1 sequence
+        // header. If the opening frame is lost or superseded, every recovery
+        // keyframe then remains undecodable and the viewer black-screens
+        // forever. Prepend the cached configuration to every keyframe that
+        // does not already carry it; the cost is tens/hundreds of bytes on an
+        // IDR and makes each repair frame independently decodable.
+        if crate::codec::is_keyframe(self.codec, &bytes)
             && !crate::codec::has_parameter_sets(self.codec, &bytes)
-            && let Some(mut headers) = sequence_header(self.codec, &active.transform)
         {
-            headers.append(&mut bytes);
-            bytes = headers;
+            if active.sequence_header.is_none() {
+                active.sequence_header = sequence_header(self.codec, &active.transform);
+            }
+            if let Some(headers) = &active.sequence_header {
+                let mut prefixed = headers.clone();
+                prefixed.append(&mut bytes);
+                bytes = prefixed;
+            }
         }
         Ok(EncodedFrame {
             bytes,
@@ -509,7 +522,7 @@ impl WindowsEncoder {
             output_buffer_size,
             provides_output_samples,
             needs_input: false,
-            first_access_unit: true,
+            sequence_header: None,
             shut_down: false,
         };
         wait_until_input_needed(&mut active, Instant::now() + MFT_STARTUP_BUDGET)?;

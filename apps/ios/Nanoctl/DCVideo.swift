@@ -41,6 +41,7 @@ final class DCVideoReceiver {
     private let window = 16
     private let partialWindow = 16
     private let reorderAge: CFAbsoluteTime = 0.4
+    private let keyframeReorderAge: CFAbsoluteTime = 10
     /// The codec SDP negotiation reported, used only when the stream itself
     /// carries no parameter sets to sniff. SDP can lie (the answer may merely
     /// mirror the offer's codec ordering); the bitstream does not.
@@ -139,6 +140,31 @@ final class DCVideoReceiver {
         requestKeyframe()
     }
 
+    // A missing delta invalidates dependent frames until the next IDR, but
+    // those dependent frames are not independent evidence of network loss.
+    // Count only sequence holes inside the observed window; otherwise one lost
+    // frame is amplified into a sustained congestion signal while repair waits.
+    private func countMissingVideoFrames() {
+        guard let expectedSeq, let newestSeq else { return }
+        let distance = Int32(bitPattern: newestSeq &- expectedSeq)
+        guard distance > 0 else { return }
+        var missing = 0
+        var seq = expectedSeq
+        for _ in 0..<min(Int(distance), 256) {
+            if pending[seq] == nil && reordered[seq] == nil { missing += 1 }
+            seq &+= 1
+        }
+        lost += missing
+    }
+
+    private func noteReferenceChainLoss() {
+        countMissingVideoFrames()
+        waitingForKey = true
+        stats.gaps += 1
+        reordered.removeAll()
+        requestKeyframeThrottled()
+    }
+
     private func onDecoderFault() {
         waitingForKey = true
         reordered.removeAll()
@@ -154,9 +180,16 @@ final class DCVideoReceiver {
         let now = CFAbsoluteTimeGetCurrent()
         var expired = false
         for (seq, entry) in pending {
+            // IDR fragments ride the reliable lane. A large keyframe can
+            // legitimately take longer than the delta reorder window on a
+            // constrained link; expiring it turns that latency into a permanent
+            // black-screen/keyframe-request loop. Delta partials remain bounded
+            // because they are too stale to be useful after this window.
+            if entry.isKey, now - entry.firstSeen < keyframeReorderAge { continue }
             let distance = newestSeq.map { Int32(bitPattern: $0 &- seq) } ?? 0
             if distance > partialWindow || now - entry.firstSeen >= reorderAge {
                 pending.removeValue(forKey: seq)
+                if waitingForKey { lost += 1 }
                 expired = true
             }
         }
@@ -165,10 +198,7 @@ final class DCVideoReceiver {
             expired = true
         }
         if expired, !waitingForKey {
-            waitingForKey = true
-            stats.gaps += 1
-            reordered.removeAll()
-            requestKeyframeThrottled()
+            noteReferenceChainLoss()
         }
     }
 
@@ -206,10 +236,7 @@ final class DCVideoReceiver {
             guard let expected = expectedSeq else { return }
             let diff = Int32(bitPattern: seq &- expected)
             if diff > 0, !waitingForKey {
-                waitingForKey = true
-                stats.gaps += 1
-                reordered.removeAll()
-                requestKeyframeThrottled()
+                noteReferenceChainLoss()
             }
             return
         }
@@ -254,6 +281,10 @@ final class DCVideoReceiver {
 
         if expectedSeq == nil { expectedSeq = seq }
         let diff = Int32(bitPattern: seq &- expectedSeq!)
+        // Loss feedback needs a network-arrival denominator, not a decode
+        // denominator. Complete access units still count as received while the
+        // decoder waits for an IDR; only late duplicates are excluded.
+        if diff >= 0 { received += 1 }
         if diff < 0 {
             stats.late += 1
             return
@@ -268,14 +299,13 @@ final class DCVideoReceiver {
                 reordered.removeValue(forKey: buffered)
             }
         } else if diff > 0 {
-            if isKey || !waitingForKey {
-                reordered[seq] = (chunk, isKey, CFAbsoluteTimeGetCurrent())
-            }
+            // Deltas are worth holding even while waiting for a key: the IDR
+            // rides a separate reliable lane, so the first deltas encoded after
+            // it can arrive before it. Discarding them creates a fresh gap
+            // immediately after recovery and cascades into another request.
+            reordered[seq] = (chunk, isKey, CFAbsoluteTimeGetCurrent())
             if reordered.count > window, !waitingForKey {
-                waitingForKey = true
-                stats.gaps += 1
-                reordered.removeAll()
-                requestKeyframeThrottled()
+                noteReferenceChainLoss()
             }
         }
 
@@ -289,7 +319,7 @@ final class DCVideoReceiver {
     private func deliver(_ seq: UInt32, au: Data, isKey: Bool) {
         if let expected = expectedSeq {
             let skipped = Int32(bitPattern: seq &- expected)
-            if skipped > 0 { lost += Int(skipped) }
+            if skipped > 0, !waitingForKey { countMissingVideoFrames() }
         }
         expectedSeq = seq &+ 1
         if waitingForKey {
@@ -297,7 +327,6 @@ final class DCVideoReceiver {
             guard isKey else { return }
             waitingForKey = false
         }
-        received += 1
         stats.fed += 1
         guard let decoder = ensureDecoder(au) else { return }
         decoder.decode(au, isKey: isKey, seq: seq)

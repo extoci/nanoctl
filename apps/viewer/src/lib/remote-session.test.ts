@@ -1413,6 +1413,75 @@ describe("webcodecs video gating and teardown", () => {
     handle.drop();
   });
 
+  test("fragmented recovery keyframes survive delta reorder expiry", () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    const decoded: number[] = [];
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode(chunk: { init: { timestamp: number } }) {
+        decoded.push(Math.round(chunk.init.timestamp / 16_000));
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean, part = 0, parts = 1) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const fragmented = parts > 1;
+      const bytes = new Uint8Array((fragmented ? 9 : 5) + au.length);
+      bytes[0] = seq;
+      bytes[4] = (key ? 1 : 0) | (fragmented ? 2 : 0);
+      let offset = 5;
+      if (fragmented) {
+        bytes[5] = part;
+        bytes[7] = parts;
+        offset = 9;
+      }
+      bytes.set(au, offset);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false, part = 0, parts = 1) =>
+      channel.onmessage?.({ data: message(seq, key, part, parts) } as MessageEvent);
+
+    receive(0, true);
+    for (let seq = 2; seq <= 18; seq += 1) receive(seq);
+    expect(channel.sent).toContain("KF");
+    receive(30, true, 0, 2);
+    receive(31);
+    receive(32);
+    for (const callback of intervals) callback();
+
+    // A constrained reliable IDR lane may need longer than the lossy delta
+    // reorder window. The half-received keyframe must still accept its final
+    // fragment and drain the post-key deltas that overtook it.
+    receive(30, true, 1, 2);
+    expect(decoded).toEqual([0, 30, 31, 32]);
+    handle.drop();
+  });
+
   test("keyframe requests use the reliable idr channel when present", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
