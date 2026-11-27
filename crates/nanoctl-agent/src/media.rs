@@ -541,6 +541,80 @@ impl Drop for DisplayWakeGuard {
     }
 }
 
+/// Sunshine raises the streaming process while a session is active because
+/// capture, encode, and SCTP writes are all latency-sensitive. Keep a small
+/// reference count here rather than assuming exclusive ownership: concurrent
+/// media producers must not let the first stream teardown demote the process
+/// while another stream is still active.
+#[cfg(windows)]
+static STREAMING_PRIORITY_STATE: std::sync::Mutex<(usize, Option<u32>)> =
+    std::sync::Mutex::new((0, None));
+
+#[cfg(windows)]
+struct StreamingPriorityGuard;
+
+#[cfg(windows)]
+impl StreamingPriorityGuard {
+    fn acquire() -> Self {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetPriorityClass, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+            SetPriorityClass,
+        };
+        let mut state = STREAMING_PRIORITY_STATE.lock().unwrap();
+        state.0 += 1;
+        if state.0 == 1 {
+            unsafe {
+                let process = GetCurrentProcess();
+                let previous = GetPriorityClass(process);
+                if previous == 0 {
+                    tracing::warn!("Windows streaming process priority query failed");
+                } else if previous != HIGH_PRIORITY_CLASS.0 && previous != REALTIME_PRIORITY_CLASS.0
+                {
+                    match SetPriorityClass(process, HIGH_PRIORITY_CLASS) {
+                        Ok(()) => state.1 = Some(previous),
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "Windows streaming process priority boost failed"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StreamingPriorityGuard {
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetPriorityClass, HIGH_PRIORITY_CLASS, SetPriorityClass,
+        };
+        let mut state = STREAMING_PRIORITY_STATE.lock().unwrap();
+        if state.0 > 0 {
+            state.0 -= 1;
+        }
+        if state.0 != 0 {
+            return;
+        }
+        if let Some(previous) = state.1.take() {
+            unsafe {
+                let process = GetCurrentProcess();
+                if GetPriorityClass(process) == HIGH_PRIORITY_CLASS.0
+                    && let Err(error) = SetPriorityClass(
+                        process,
+                        windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(previous),
+                    )
+                {
+                    tracing::warn!(?error, "Windows streaming process priority restore failed");
+                }
+            }
+        }
+    }
+}
+
 /// Stash of pixel buffers released by fully-dropped `CapturedFrame`s, each
 /// tagged with the emit generation it last carried.
 type RecycledFrames = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
@@ -3133,6 +3207,8 @@ pub fn spawn_video(
             let _mmcss = register_mmcss();
             #[cfg(windows)]
             let _display_wake = DisplayWakeGuard::acquire();
+            #[cfg(windows)]
+            let _priority = StreamingPriorityGuard::acquire();
             let producer_slot = producer_slot;
             #[cfg(target_os = "linux")]
             producer_stats.producer_tid.store(
