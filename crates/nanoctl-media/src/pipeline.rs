@@ -326,6 +326,25 @@ async fn encode_loop_inner(
         if newly_captured {
             record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
         }
+        let repair = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            result = lane.repair_pending_delta() => result,
+        };
+        match repair {
+            Ok(Some(report)) => record_metrics(metrics, |snapshot| {
+                snapshot.delta_repairs_written += 1;
+                snapshot.bytes_written += report.wire_bytes as u64;
+                snapshot.max_buffered_bytes = snapshot
+                    .max_buffered_bytes
+                    .max(report.buffered_bytes as u64);
+            }),
+            Ok(None) => {}
+            Err(error) => {
+                record_metrics(metrics, |snapshot| snapshot.lane_write_errors += 1);
+                return Err(error);
+            }
+        }
         let mut config = *updates.borrow();
         force_next_keyframe |= last_dimensions != Some((config.width, config.height));
         let repair_pending = force_next_keyframe || keyframe_requested.load(Ordering::Acquire);

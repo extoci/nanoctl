@@ -112,6 +112,16 @@ describe("v4 video control", () => {
     expect(parseVideoControlMessage(encoded)).toEqual(message);
     expect(() => parseVideoControlMessage(new Uint8Array([4, 0x41, 0]))).toThrow(WireError);
   });
+
+  test("identifies the missing access unit in a delta repair", () => {
+    const message = { kind: "deltaRepair", streamSequence: 0x01020304 } as const;
+    const encoded = encodeVideoControlMessage(message);
+    expect(Array.from(encoded)).toEqual([4, 0x43, 4, 3, 2, 1]);
+    expect(parseVideoControlMessage(encoded)).toEqual(message);
+    expect(() => parseVideoControlMessage(new Uint8Array([4, 0x43, 4, 3, 2, 1, 0]))).toThrow(
+      WireError,
+    );
+  });
 });
 
 describe("v4 input wire", () => {

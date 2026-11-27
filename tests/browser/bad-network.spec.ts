@@ -22,6 +22,7 @@ interface GateProbe {
   frames: number[];
   keyframes: number[];
   keyframeRequests: number[];
+  deltaRepairRequests: { timestampMs: number; streamSequence: number }[];
   wireArrivals: number[];
   decodeSubmissions: number[];
   lastWireMs: number | null;
@@ -113,11 +114,12 @@ async function openScene(host: Page) {
 
 async function monitorBrowser(page: Page) {
   await page.addInitScript(
-    ({ delta, reference, keyframeRequest }) => {
+    ({ delta, reference, keyframeRequest, deltaRepairHeader }) => {
       const probe: GateProbe = {
         frames: [],
         keyframes: [],
         keyframeRequests: [],
+        deltaRepairRequests: [],
         wireArrivals: [],
         decodeSubmissions: [],
         lastWireMs: null,
@@ -135,13 +137,21 @@ async function monitorBrowser(page: Page) {
       const send = RTCDataChannel.prototype.send;
       RTCDataChannel.prototype.send = function (data) {
         Reflect.apply(send, this, [data]);
+        if (this.label !== reference || !(data instanceof Uint8Array)) return;
         if (
-          this.label === reference &&
-          data instanceof Uint8Array &&
           data.length === keyframeRequest.length &&
           keyframeRequest.every((byte, index) => data[index] === byte)
         ) {
           probe.keyframeRequests.push(performance.now());
+        } else if (
+          data.length === 6 &&
+          deltaRepairHeader.every((byte, index) => data[index] === byte)
+        ) {
+          const wire = new DataView(data.buffer, data.byteOffset, data.byteLength);
+          probe.deltaRepairRequests.push({
+            timestampMs: performance.now(),
+            streamSequence: wire.getUint32(2, true),
+          });
         }
       };
       const keyframesByPeer = new WeakMap<RTCPeerConnection, Set<number>>();
@@ -179,6 +189,9 @@ async function monitorBrowser(page: Page) {
       delta: VIDEO_DELTA_CHANNEL_LABEL,
       reference: VIDEO_REFERENCE_CHANNEL_LABEL,
       keyframeRequest: Array.from(encodeVideoControlMessage({ kind: "keyframeRequest" })),
+      deltaRepairHeader: Array.from(
+        encodeVideoControlMessage({ kind: "deltaRepair", streamSequence: 0 }).slice(0, 2),
+      ),
     },
   );
 }
@@ -288,6 +301,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
       frames: probe.frames,
       keyframes,
       keyframeRequests: probe.keyframeRequests,
+      deltaRepairRequests: probe.deltaRepairRequests,
       wireArrivals: probe.wireArrivals,
       decodeSubmissions: probe.decodeSubmissions,
       sampleEnd,

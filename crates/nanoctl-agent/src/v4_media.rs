@@ -38,6 +38,10 @@ impl WebRtcVideoSink {
 
 #[async_trait]
 impl VideoChunkSink for WebRtcVideoSink {
+    fn take_delta_repair_request(&mut self) -> Option<u32> {
+        self.lanes.pending_delta_repair.lock().unwrap().take()
+    }
+
     async fn buffered_bytes(&self, lane: VideoLane) -> usize {
         let Some(channel) = self.channel(lane) else {
             return Self::capacity(lane);
@@ -286,6 +290,7 @@ async fn run_pipeline(
         encoder_skips = report.snapshot.encoder_skips,
         keyframes = report.snapshot.keyframes_encoded,
         deltas_during_keyframe_cooldown = report.snapshot.deltas_written_during_keyframe_cooldown,
+        delta_repairs = report.snapshot.delta_repairs_written,
         max_encode_us = report.snapshot.max_encode_micros,
         written = report.snapshot.lane_writes,
         wire_bytes = report.snapshot.bytes_written,

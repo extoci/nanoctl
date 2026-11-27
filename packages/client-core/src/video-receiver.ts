@@ -2,6 +2,7 @@ import {
   encodeVideoControlMessage,
   parseVideoControlMessage,
   type AccessUnit,
+  type VideoControlMessage,
 } from "@nanoctl/protocol";
 import { VideoStreamProcessor } from "./video";
 import { VideoLossWindow } from "./video-loss";
@@ -11,7 +12,7 @@ export type V4VideoReceiverOptions = {
   readonly videoReference: RTCDataChannel;
   readonly onReceivedAccessUnit?: (unit: AccessUnit) => void;
   readonly onAccessUnit: (unit: AccessUnit) => void;
-  readonly sendKeyframeRequest: (bytes: Uint8Array) => void;
+  readonly sendVideoControl: (bytes: Uint8Array) => void;
   readonly onError?: (error: unknown) => void;
 };
 
@@ -30,6 +31,7 @@ function messageBytes(data: unknown): Uint8Array {
  * decision. Decode output is emitted only in a valid reference chain.
  */
 const REORDER_WAIT_MS = 180;
+const DELTA_REPAIR_WAIT_MS = 70;
 const FIRST_REFERENCE_WAIT_MS = 350;
 const FIRST_KEYFRAME_RETRY_MS = 125;
 const KEYFRAME_RETRY_MS = 250;
@@ -37,6 +39,7 @@ const KEYFRAME_RETRY_MS = 250;
 export class V4VideoReceiver {
   private readonly processor = new VideoStreamProcessor();
   private reorderTimer: ReturnType<typeof setTimeout> | undefined;
+  private deltaRepairTimer: ReturnType<typeof setTimeout> | undefined;
   private reorderSequence: number | undefined;
   private firstReferenceTimer: ReturnType<typeof setTimeout> | undefined;
   private keyframeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -108,8 +111,12 @@ export class V4VideoReceiver {
       this.keyframeTimer = undefined;
       this.sendKeyframeRequestWithRetry(KEYFRAME_RETRY_MS);
     }, retryAfterMs);
+    this.sendControl({ kind: "keyframeRequest" });
+  }
+
+  private sendControl(message: VideoControlMessage): void {
     try {
-      this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
+      this.options.sendVideoControl(encodeVideoControlMessage(message));
     } catch (error) {
       this.options.onError?.(error);
     }
@@ -128,6 +135,11 @@ export class V4VideoReceiver {
     if (this.reorderTimer !== undefined && this.reorderSequence === expected) return;
     this.stopReorderTimer();
     this.reorderSequence = expected;
+    if (expected !== undefined) {
+      this.deltaRepairTimer = setTimeout(() => {
+        this.sendControl({ kind: "deltaRepair", streamSequence: expected });
+      }, DELTA_REPAIR_WAIT_MS);
+    }
     this.reorderTimer = setTimeout(() => {
       this.stopReorderTimer();
       // A deadline tells us to start recovery. Late deltas may still complete
@@ -138,7 +150,9 @@ export class V4VideoReceiver {
 
   private stopReorderTimer(): void {
     clearTimeout(this.reorderTimer);
+    clearTimeout(this.deltaRepairTimer);
     this.reorderTimer = undefined;
+    this.deltaRepairTimer = undefined;
     this.reorderSequence = undefined;
   }
 

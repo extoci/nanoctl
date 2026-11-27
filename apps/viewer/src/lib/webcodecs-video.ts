@@ -1164,7 +1164,7 @@ export function attachV4DataChannelVideo(
         metrics.delivered(unit.streamSequence);
       }
     },
-    sendKeyframeRequest: (bytes) => {
+    sendVideoControl: (bytes) => {
       if (videoReference.readyState === "open") {
         const copy = new Uint8Array(new ArrayBuffer(bytes.length));
         copy.set(bytes);

@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { encodeVideoChunk, type AccessUnit, type VideoChunk } from "@nanoctl/protocol";
+import {
+  encodeVideoChunk,
+  parseVideoControlMessage,
+  type AccessUnit,
+  type VideoChunk,
+} from "@nanoctl/protocol";
 import { V4VideoReceiver } from "../src/index";
 
 function chunk(streamSequence: number, keyframe: boolean, payload: number[]): VideoChunk {
@@ -27,15 +32,20 @@ function receiver() {
   const videoReference = fakeChannel();
   const emitted: AccessUnit[] = [];
   const requests: number[][] = [];
+  const repairRequests: number[] = [];
   const errors: unknown[] = [];
   const receiver = new V4VideoReceiver({
     videoDelta,
     videoReference,
     onAccessUnit: (unit) => emitted.push(unit),
-    sendKeyframeRequest: (bytes) => requests.push(Array.from(bytes)),
+    sendVideoControl: (bytes) => {
+      const message = parseVideoControlMessage(bytes);
+      if (message.kind === "deltaRepair") repairRequests.push(message.streamSequence);
+      else requests.push(Array.from(bytes));
+    },
     onError: (error) => errors.push(error),
   });
-  return { receiver, videoDelta, videoReference, emitted, requests, errors };
+  return { receiver, videoDelta, videoReference, emitted, requests, repairRequests, errors };
 }
 
 describe("V4VideoReceiver", () => {
@@ -155,7 +165,24 @@ test("later fragments start recovery when the expected delta never arrives", asy
     state.receiver.handle(encodeVideoChunk({ ...chunk(12, false, [2]), parts: 2 }));
     expect(state.requests).toHaveLength(0);
     await Bun.sleep(250);
+    expect(state.repairRequests).toEqual([11]);
     expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a repaired delta resumes decoding without a keyframe", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encoded(12, false, [2]));
+    await Bun.sleep(120);
+    expect(state.repairRequests).toEqual([11]);
+    state.receiver.handle(encoded(11, false, [1]));
+    await Bun.sleep(180);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
+    expect(state.requests).toHaveLength(0);
   } finally {
     state.receiver.dispose();
   }

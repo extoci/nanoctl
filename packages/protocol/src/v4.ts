@@ -526,24 +526,28 @@ export function parseVideoChunk(bytes: Uint8Array): VideoChunk {
 
 export type VideoControlMessage =
   | { readonly kind: "keyframeRequest" }
-  | { readonly kind: "sequenceWatermark"; readonly nextSequence: number };
+  | { readonly kind: "sequenceWatermark"; readonly nextSequence: number }
+  | { readonly kind: "deltaRepair"; readonly streamSequence: number };
 
 export function encodeVideoControlMessage(message: VideoControlMessage): Uint8Array {
   if (message.kind === "keyframeRequest") return new Uint8Array([V4_WIRE_VERSION, 0x41]);
-  if (!validUint(message.nextSequence, 32))
-    fail("invalidValue", "invalid video sequence watermark");
+  const watermark = message.kind === "sequenceWatermark";
+  const sequence = watermark ? message.nextSequence : message.streamSequence;
+  if (!validUint(sequence, 32)) fail("invalidValue", "invalid video control sequence");
   const out = new ByteWriter();
   out.u8(V4_WIRE_VERSION);
-  out.u8(0x42);
-  out.u32(message.nextSequence);
+  out.u8(watermark ? 0x42 : 0x43);
+  out.u32(sequence);
   return out.finish();
 }
 
 export function parseVideoControlMessage(bytes: Uint8Array): VideoControlMessage {
-  const kind = versioned(bytes, 0x41, 0x42);
+  const kind = versioned(bytes, 0x41, 0x43);
   if (kind === 0x41 && bytes.length === 2) return { kind: "keyframeRequest" };
   if (kind === 0x42 && bytes.length === 6)
     return { kind: "sequenceWatermark", nextSequence: u32At(bytes, 2) };
+  if (kind === 0x43 && bytes.length === 6)
+    return { kind: "deltaRepair", streamSequence: u32At(bytes, 2) };
   fail("invalidLength", "invalid video control length");
 }
 

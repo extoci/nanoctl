@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -8,6 +9,9 @@ use crate::types::{EncodedAccessUnit, LaneWriteReport, LaneWriteStatus, LaneWrit
 // Leave room for the video header and SCTP headers within WebRTC's 1191-byte SCTP MTU.
 const CHUNK_PAYLOAD_BYTES: usize = 1_100;
 const REFERENCE_ACK_GRACE: Duration = Duration::from_millis(350);
+const DELTA_REPAIR_CACHE_FRAMES: usize = 16;
+const DELTA_REPAIR_FRAME_BYTES: usize = 8 * 1024;
+const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoLane {
@@ -21,15 +25,27 @@ pub enum VideoLane {
 /// chunk of an access unit or drops it before emitting the first byte.
 #[async_trait]
 pub trait VideoChunkSink: Send {
+    fn take_delta_repair_request(&mut self) -> Option<u32> {
+        None
+    }
+
     async fn buffered_bytes(&self, lane: VideoLane) -> usize;
     async fn lane_capacity(&self, lane: VideoLane) -> usize;
     async fn write_chunk(&mut self, lane: VideoLane, bytes: Vec<u8>) -> Result<(), MediaError>;
+}
+
+struct CachedDelta {
+    sequence: u32,
+    sent_at: Instant,
+    wire_bytes: usize,
+    chunks: Vec<Vec<u8>>,
 }
 
 pub struct ChunkingLaneWriter<S> {
     sink: S,
     repeat_chunks: bool,
     last_reference_sent: Option<Instant>,
+    repair_cache: VecDeque<CachedDelta>,
 }
 
 impl<S> ChunkingLaneWriter<S> {
@@ -38,6 +54,7 @@ impl<S> ChunkingLaneWriter<S> {
             sink,
             repeat_chunks: false,
             last_reference_sent: None,
+            repair_cache: VecDeque::new(),
         }
     }
 
@@ -76,6 +93,36 @@ where
         // Leave room for the next access unit and its repeated chunks.
         let capacity = self.sink.lane_capacity(VideoLane::Delta).await;
         self.sink.buffered_bytes(VideoLane::Delta).await < capacity.div_ceil(2)
+    }
+
+    async fn repair_pending_delta(&mut self) -> Result<Option<LaneWriteReport>, MediaError> {
+        let Some(sequence) = self.sink.take_delta_repair_request() else {
+            return Ok(None);
+        };
+        let Some(delta) = self
+            .repair_cache
+            .iter()
+            .position(|delta| delta.sequence == sequence)
+            .and_then(|slot| self.repair_cache.remove(slot))
+        else {
+            return Ok(None);
+        };
+        let lane = VideoLane::Delta;
+        let capacity = self.sink.lane_capacity(lane).await;
+        let buffered = self.sink.buffered_bytes(lane).await;
+        if delta.sent_at.elapsed() > DELTA_REPAIR_MAX_AGE
+            || delta.wire_bytes > capacity.div_ceil(2).saturating_sub(buffered)
+        {
+            return Ok(None);
+        }
+        for bytes in delta.chunks {
+            self.sink.write_chunk(lane, bytes).await?;
+        }
+        Ok(Some(LaneWriteReport {
+            status: LaneWriteStatus::Written,
+            buffered_bytes: self.sink.buffered_bytes(lane).await,
+            wire_bytes: delta.wire_bytes,
+        }))
     }
 
     async fn write_access_unit(
@@ -154,6 +201,17 @@ where
             // Give SCTP a chance to send the originals before it queues the copies,
             // including when the frame fits inside one short chunk.
             tokio::time::sleep(Duration::from_millis(8)).await;
+            if lane == VideoLane::Delta && frame_wire_bytes <= DELTA_REPAIR_FRAME_BYTES {
+                if self.repair_cache.len() == DELTA_REPAIR_CACHE_FRAMES {
+                    self.repair_cache.pop_front();
+                }
+                self.repair_cache.push_back(CachedDelta {
+                    sequence: access_unit.stream_sequence,
+                    sent_at: Instant::now(),
+                    wire_bytes: frame_wire_bytes,
+                    chunks: repeated.clone(),
+                });
+            }
             for bytes in repeated {
                 self.sink.write_chunk(VideoLane::Delta, bytes).await?;
             }
@@ -186,10 +244,15 @@ mod tests {
         chunks: Vec<(VideoLane, Vec<u8>)>,
         buffered: usize,
         capacity: usize,
+        repair_sequence: Option<u32>,
     }
 
     #[async_trait]
     impl VideoChunkSink for MemorySink {
+        fn take_delta_repair_request(&mut self) -> Option<u32> {
+            self.repair_sequence.take()
+        }
+
         async fn buffered_bytes(&self, lane: VideoLane) -> usize {
             self.buffered
                 + self
@@ -228,6 +291,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: usize::MAX,
+            repair_sequence: None,
         };
         let mut writer = ChunkingLaneWriter::new(sink);
         let report = writer
@@ -263,6 +327,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 1,
             capacity: wire_bytes,
+            repair_sequence: None,
         };
         let mut writer = ChunkingLaneWriter::new(sink);
         let report = writer
@@ -279,6 +344,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: usize::MAX,
+            repair_sequence: None,
         };
         let mut writer = ChunkingLaneWriter::new(sink);
         let first = writer
@@ -301,6 +367,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 240,
+            repair_sequence: None,
         });
         assert_eq!(
             writer
@@ -342,6 +409,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: usize::MAX,
+            repair_sequence: None,
         };
         let mut writer = ChunkingLaneWriter::new(sink);
         writer
@@ -357,6 +425,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 239,
+            repair_sequence: None,
         });
         let report = writer
             .write_access_unit(access_unit(100, false))
@@ -370,6 +439,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 240,
+            repair_sequence: None,
         });
         let report = writer
             .write_access_unit(access_unit(100, false))
@@ -383,11 +453,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_delta_is_repeated_once_within_the_repair_budget() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 16 * 1024,
+            repair_sequence: Some(7),
+        });
+        assert!(writer.repair_pending_delta().await.unwrap().is_none());
+        writer
+            .write_access_unit(access_unit(1400, false))
+            .await
+            .unwrap();
+
+        writer.sink.repair_sequence = Some(7);
+        let repair = writer.repair_pending_delta().await.unwrap().unwrap();
+        assert_eq!(repair.wire_bytes, 1440);
+        assert_eq!(writer.sink.chunks.len(), 6);
+        assert_eq!(writer.sink.chunks[..2], writer.sink.chunks[4..]);
+        writer.sink.repair_sequence = Some(7);
+        assert!(writer.repair_pending_delta().await.unwrap().is_none());
+
+        let mut next = access_unit(1400, false);
+        next.stream_sequence = 8;
+        writer.write_access_unit(next).await.unwrap();
+        writer.sink.repair_sequence = Some(8);
+        assert!(writer.repair_pending_delta().await.unwrap().is_none());
+        assert_eq!(writer.sink.chunks.len(), 10);
+    }
+
+    #[tokio::test]
     async fn a_reference_copy_uses_the_delta_lane() {
         let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 240,
+            repair_sequence: None,
         });
         let report = writer
             .write_access_unit(access_unit(100, true))
@@ -406,6 +507,7 @@ mod tests {
             chunks: Vec::new(),
             buffered: 0,
             capacity: 240,
+            repair_sequence: None,
         });
         writer
             .write_access_unit(access_unit(100, false))

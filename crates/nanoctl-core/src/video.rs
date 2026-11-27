@@ -5,6 +5,7 @@ use crate::{
 const KIND_VIDEO_CHUNK: u8 = 0x40;
 const KIND_KEYFRAME_REQUEST: u8 = 0x41;
 const KIND_SEQUENCE_WATERMARK: u8 = 0x42;
+const KIND_DELTA_REPAIR: u8 = 0x43;
 pub const MAX_VIDEO_CHUNK_BYTES: usize = 48 * 1_024;
 pub const MAX_VIDEO_PARTS: u16 = 512;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1_024 * 1_024;
@@ -40,6 +41,7 @@ impl VideoCodec {
 pub enum VideoControlMessage {
     KeyframeRequest,
     SequenceWatermark { next_sequence: u32 },
+    DeltaRepair { stream_sequence: u32 },
 }
 
 impl VideoControlMessage {
@@ -51,17 +53,25 @@ impl VideoControlMessage {
                 push_u32(&mut out, next_sequence);
                 out
             }
+            Self::DeltaRepair { stream_sequence } => {
+                let mut out = vec![WIRE_VERSION, KIND_DELTA_REPAIR];
+                push_u32(&mut out, stream_sequence);
+                out
+            }
         }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
         match (
-            versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_SEQUENCE_WATERMARK)?,
+            versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_DELTA_REPAIR)?,
             bytes.len(),
         ) {
             (KIND_KEYFRAME_REQUEST, 2) => Ok(Self::KeyframeRequest),
             (KIND_SEQUENCE_WATERMARK, 6) => Ok(Self::SequenceWatermark {
                 next_sequence: u32_at(bytes, 2)?,
+            }),
+            (KIND_DELTA_REPAIR, 6) => Ok(Self::DeltaRepair {
+                stream_sequence: u32_at(bytes, 2)?,
             }),
             _ => Err(WireError::InvalidLength),
         }
@@ -404,6 +414,19 @@ mod tests {
         assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
         assert_eq!(
             VideoControlMessage::parse(&[4, 0x42, 1]),
+            Err(WireError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn delta_repair_identifies_the_missing_access_unit() {
+        let message = VideoControlMessage::DeltaRepair {
+            stream_sequence: 0x0102_0304,
+        };
+        assert_eq!(message.encode(), [4, 0x43, 4, 3, 2, 1]);
+        assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x43, 4, 3, 2, 1, 0]),
             Err(WireError::InvalidLength)
         );
     }

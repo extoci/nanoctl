@@ -152,6 +152,12 @@ receiver requests a keyframe. Late deltas can still fill the gap and stop retrie
 window fills or the decoder loses its reference, the receiver discards dependent deltas and waits
 for a fresh keyframe. The transport or session layer owns the request timers and rate limits.
 
+After a gap persists for 70 ms, the viewer can request the missing delta on the reference lane.
+Kind `0x43` carries its `u32 stream_sequence`. The host retains up to 16 recent deltas of up to
+8 KiB each and resends a matching delta at most once within 500 ms of its original send. It skips
+the resend if it would fill more than half of the delta lane. The 180 ms keyframe deadline still
+applies if the delta does not arrive.
+
 Before the first complete reference, the viewer sends a keyframe request if it has waited 350 ms.
 It retries until a reference arrives, even if there have been no video messages.
 

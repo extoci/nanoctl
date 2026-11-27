@@ -209,6 +209,7 @@ pub struct MediaPipelineSnapshot {
     pub access_units_encoded: u64,
     pub keyframes_encoded: u64,
     pub deltas_written_during_keyframe_cooldown: u64,
+    pub delta_repairs_written: u64,
     pub bytes_encoded: u64,
     pub capture_errors: u64,
     pub encode_errors: u64,
@@ -251,6 +252,11 @@ pub trait LaneWriter: Send {
     /// Whether the transport has room to begin encoding another delta frame.
     async fn delta_ready(&mut self) -> bool {
         true
+    }
+
+    /// Retransmit a requested recent delta when the transport has room.
+    async fn repair_pending_delta(&mut self) -> Result<Option<LaneWriteReport>, MediaError> {
+        Ok(None)
     }
 
     /// Atomically accept or reject one complete access unit. A lane that cannot accept
