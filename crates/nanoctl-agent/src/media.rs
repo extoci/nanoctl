@@ -3961,13 +3961,12 @@ pub fn spawn_video(
                 }
                 frame = encoded_slot.take() => {
                     let Some((frame, dropped)) = frame else { break };
-                    // Do not blast startup or post-disconnect media into a
-                    // half-established transport. The first large IDR can arrive
-                    // while DTLS/SCTP is still handshaking; on constrained links
-                    // that burst competes with the handshake and turns a slow
-                    // attach into a repeating black-screen/reconnect failure.
-                    // Discard frames until the peer is connected, then resume on
-                    // a keyframe because the skipped deltas invalidate the chain.
+                    // RTP writes before SRTP is established are silently
+                    // discarded. Do not let those discarded frames advance the
+                    // encoder reference chain: otherwise the first packets that
+                    // do reach the viewer can be undecodable deltas. Discard
+                    // frames until the peer is connected, then resume on a
+                    // keyframe because the skipped deltas invalidate the chain.
                     let peer_connected = *connection_state.borrow_and_update()
                         == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected;
                     if !peer_connected {
