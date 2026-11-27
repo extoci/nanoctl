@@ -137,7 +137,11 @@ export class V4VideoReceiver {
     this.reorderSequence = expected;
     if (expected !== undefined) {
       this.deltaRepairTimer = setTimeout(() => {
-        this.sendControl({ kind: "deltaRepair", streamSequence: expected });
+        this.sendControl({
+          kind: "deltaRepair",
+          streamSequence: expected,
+          parts: this.processor.missingDeltaParts(expected),
+        });
       }, DELTA_REPAIR_WAIT_MS);
     }
     this.reorderTimer = setTimeout(() => {

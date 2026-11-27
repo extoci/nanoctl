@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use interceptor::registry::Registry;
 #[cfg(feature = "media")]
-use nanoctl_core::video::VideoControlMessage;
+use nanoctl_core::video::{DeltaRepairRequest, VideoControlMessage};
 #[cfg(feature = "media")]
 use nanoctl_core::{
     CONTROL_CHANNEL_LABEL, MOTION_CHANNEL_LABEL, VIDEO_DELTA_CHANNEL_LABEL,
@@ -258,7 +258,7 @@ pub(crate) struct V4DataChannelVideo {
     pub delta_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub reference_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub keyframe_requested: Arc<AtomicBool>,
-    pub pending_delta_repair: std::sync::Mutex<Option<u32>>,
+    pub pending_delta_repair: std::sync::Mutex<Option<DeltaRepairRequest>>,
     pub ready: tokio::sync::Notify,
 }
 
@@ -273,10 +273,15 @@ impl V4DataChannelVideo {
         self.keyframe_requested.store(true, Ordering::Release);
     }
 
-    fn request_delta_repair(&self, sequence: u32) {
+    fn request_delta_repair(&self, request: DeltaRepairRequest) {
         let mut pending = self.pending_delta_repair.lock().unwrap();
-        if pending.is_none_or(|previous| (sequence.wrapping_sub(previous) as i32) > 0) {
-            *pending = Some(sequence);
+        if pending.as_ref().is_none_or(|previous| {
+            (request
+                .stream_sequence
+                .wrapping_sub(previous.stream_sequence) as i32)
+                > 0
+        }) {
+            *pending = Some(request);
         }
     }
 }
@@ -932,8 +937,8 @@ impl HostPeer {
                         channel.on_message(Box::new(move |message| {
                             match VideoControlMessage::parse(message.data.as_ref()) {
                                 Ok(VideoControlMessage::KeyframeRequest) => requests.request_keyframe(),
-                                Ok(VideoControlMessage::DeltaRepair { stream_sequence }) => {
-                                    requests.request_delta_repair(stream_sequence);
+                                Ok(VideoControlMessage::DeltaRepair(request)) => {
+                                    requests.request_delta_repair(request);
                                 }
                                 _ => {}
                             }

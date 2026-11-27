@@ -53,6 +53,10 @@ export class VideoStreamProcessor {
     return this.sequencer.isBehindWatermark(next);
   }
 
+  missingDeltaParts(sequence: number): number[] | undefined {
+    return this.reassembler.missingDeltaParts(sequence);
+  }
+
   requireKeyframe(): void {
     this.sequencer.requireKeyframe();
   }

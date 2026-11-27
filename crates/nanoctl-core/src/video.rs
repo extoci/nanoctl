@@ -8,6 +8,7 @@ const KIND_SEQUENCE_WATERMARK: u8 = 0x42;
 const KIND_DELTA_REPAIR: u8 = 0x43;
 pub const MAX_VIDEO_CHUNK_BYTES: usize = 48 * 1_024;
 pub const MAX_VIDEO_PARTS: u16 = 512;
+pub const MAX_DELTA_REPAIR_PARTS: usize = 6;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1_024 * 1_024;
 pub const VIDEO_HEADER_BYTES: usize = 20;
 
@@ -37,25 +38,35 @@ impl VideoCodec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaRepairRequest {
+    pub stream_sequence: u32,
+    /// An empty list requests the whole access unit.
+    pub parts: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoControlMessage {
     KeyframeRequest,
     SequenceWatermark { next_sequence: u32 },
-    DeltaRepair { stream_sequence: u32 },
+    DeltaRepair(DeltaRepairRequest),
 }
 
 impl VideoControlMessage {
-    pub fn encode(self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::KeyframeRequest => vec![WIRE_VERSION, KIND_KEYFRAME_REQUEST],
             Self::SequenceWatermark { next_sequence } => {
                 let mut out = vec![WIRE_VERSION, KIND_SEQUENCE_WATERMARK];
-                push_u32(&mut out, next_sequence);
+                push_u32(&mut out, *next_sequence);
                 out
             }
-            Self::DeltaRepair { stream_sequence } => {
+            Self::DeltaRepair(request) => {
                 let mut out = vec![WIRE_VERSION, KIND_DELTA_REPAIR];
-                push_u32(&mut out, stream_sequence);
+                push_u32(&mut out, request.stream_sequence);
+                for part in &request.parts {
+                    push_u16(&mut out, *part);
+                }
                 out
             }
         }
@@ -70,9 +81,23 @@ impl VideoControlMessage {
             (KIND_SEQUENCE_WATERMARK, 6) => Ok(Self::SequenceWatermark {
                 next_sequence: u32_at(bytes, 2)?,
             }),
-            (KIND_DELTA_REPAIR, 6) => Ok(Self::DeltaRepair {
-                stream_sequence: u32_at(bytes, 2)?,
-            }),
+            (KIND_DELTA_REPAIR, length)
+                if (6..=6 + MAX_DELTA_REPAIR_PARTS * 2).contains(&length)
+                    && length.is_multiple_of(2) =>
+            {
+                let mut parts = Vec::with_capacity((length - 6) / 2);
+                for offset in (6..length).step_by(2) {
+                    let part = u16_at(bytes, offset)?;
+                    if part >= MAX_VIDEO_PARTS || parts.contains(&part) {
+                        return Err(WireError::InvalidValue("invalid delta repair part"));
+                    }
+                    parts.push(part);
+                }
+                Ok(Self::DeltaRepair(DeltaRepairRequest {
+                    stream_sequence: u32_at(bytes, 2)?,
+                    parts,
+                }))
+            }
             _ => Err(WireError::InvalidLength),
         }
     }
@@ -420,14 +445,29 @@ mod tests {
 
     #[test]
     fn delta_repair_identifies_the_missing_access_unit() {
-        let message = VideoControlMessage::DeltaRepair {
+        let message = VideoControlMessage::DeltaRepair(DeltaRepairRequest {
             stream_sequence: 0x0102_0304,
-        };
+            parts: vec![],
+        });
         assert_eq!(message.encode(), [4, 0x43, 4, 3, 2, 1]);
         assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
         assert_eq!(
             VideoControlMessage::parse(&[4, 0x43, 4, 3, 2, 1, 0]),
             Err(WireError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn delta_repair_can_request_distinct_missing_parts() {
+        let message = VideoControlMessage::DeltaRepair(DeltaRepairRequest {
+            stream_sequence: 2,
+            parts: vec![4, 36],
+        });
+        assert_eq!(message.encode(), [4, 0x43, 2, 0, 0, 0, 4, 0, 36, 0]);
+        assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x43, 2, 0, 0, 0, 4, 0, 4, 0]),
+            Err(WireError::InvalidValue("invalid delta repair part"))
         );
     }
 

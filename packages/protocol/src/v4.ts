@@ -527,7 +527,21 @@ export function parseVideoChunk(bytes: Uint8Array): VideoChunk {
 export type VideoControlMessage =
   | { readonly kind: "keyframeRequest" }
   | { readonly kind: "sequenceWatermark"; readonly nextSequence: number }
-  | { readonly kind: "deltaRepair"; readonly streamSequence: number };
+  | {
+      readonly kind: "deltaRepair";
+      readonly streamSequence: number;
+      readonly parts?: readonly number[];
+    };
+
+const MAX_DELTA_REPAIR_PARTS = 6;
+
+function validDeltaRepairParts(parts: readonly number[]): boolean {
+  return (
+    parts.length <= MAX_DELTA_REPAIR_PARTS &&
+    parts.every((part) => Number.isInteger(part) && part >= 0 && part < MAX_VIDEO_PARTS) &&
+    new Set(parts).size === parts.length
+  );
+}
 
 export function encodeVideoControlMessage(message: VideoControlMessage): Uint8Array {
   if (message.kind === "keyframeRequest") return new Uint8Array([V4_WIRE_VERSION, 0x41]);
@@ -538,6 +552,10 @@ export function encodeVideoControlMessage(message: VideoControlMessage): Uint8Ar
   out.u8(V4_WIRE_VERSION);
   out.u8(watermark ? 0x42 : 0x43);
   out.u32(sequence);
+  if (message.kind === "deltaRepair" && message.parts !== undefined) {
+    if (!validDeltaRepairParts(message.parts)) fail("invalidValue", "invalid delta repair parts");
+    for (const part of message.parts) out.u16(part);
+  }
   return out.finish();
 }
 
@@ -548,6 +566,17 @@ export function parseVideoControlMessage(bytes: Uint8Array): VideoControlMessage
     return { kind: "sequenceWatermark", nextSequence: u32At(bytes, 2) };
   if (kind === 0x43 && bytes.length === 6)
     return { kind: "deltaRepair", streamSequence: u32At(bytes, 2) };
+  if (
+    kind === 0x43 &&
+    bytes.length > 6 &&
+    bytes.length <= 6 + MAX_DELTA_REPAIR_PARTS * 2 &&
+    bytes.length % 2 === 0
+  ) {
+    const parts: number[] = [];
+    for (let offset = 6; offset < bytes.length; offset += 2) parts.push(u16At(bytes, offset));
+    if (!validDeltaRepairParts(parts)) fail("invalidValue", "invalid delta repair parts");
+    return { kind: "deltaRepair", streamSequence: u32At(bytes, 2), parts };
+  }
   fail("invalidLength", "invalid video control length");
 }
 
@@ -590,6 +619,20 @@ export class VideoReassembler {
       if (((pendingSequence - sequence) | 0) >= 0) return true;
     }
     return false;
+  }
+
+  missingDeltaParts(sequence: number): number[] | undefined {
+    const frame = this.pending.get(sequence);
+    if (frame === undefined || frame.keyframe) return undefined;
+    const missing: number[] = [];
+    for (
+      let index = 0;
+      index < frame.partCount && missing.length < MAX_DELTA_REPAIR_PARTS;
+      index += 1
+    ) {
+      if (frame.parts[index] === undefined) missing.push(index);
+    }
+    return missing;
   }
 
   push(chunk: VideoChunk): ReassemblyOutcome {

@@ -28,7 +28,7 @@ interface GateProbe {
     lane: "delta" | "reference";
   }[];
   keyframeRequests: number[];
-  deltaRepairRequests: { timestampMs: number; streamSequence: number }[];
+  deltaRepairRequests: { timestampMs: number; streamSequence: number; parts: number[] }[];
   startupFragments: {
     timestampMs: number;
     streamSequence: number;
@@ -159,13 +159,16 @@ async function monitorBrowser(page: Page) {
         ) {
           probe.keyframeRequests.push(performance.now());
         } else if (
-          data.length === 6 &&
+          data.length >= 6 &&
           deltaRepairHeader.every((byte, index) => data[index] === byte)
         ) {
           const wire = new DataView(data.buffer, data.byteOffset, data.byteLength);
           probe.deltaRepairRequests.push({
             timestampMs: performance.now(),
             streamSequence: wire.getUint32(2, true),
+            parts: Array.from({ length: (data.length - 6) / 2 }, (_, index) =>
+              wire.getUint16(6 + index * 2, true),
+            ),
           });
         }
       };

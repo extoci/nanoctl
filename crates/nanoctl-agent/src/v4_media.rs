@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use nanoctl_core::video::DeltaRepairRequest;
 use nanoctl_media::{
     ChunkingLaneWriter, EncoderSelection, MediaPipeline, MediaPipelineConfig, PlatformEncoder,
     VideoChunkSink, VideoLane,
@@ -42,7 +43,7 @@ impl WebRtcVideoSink {
 
 #[async_trait]
 impl VideoChunkSink for WebRtcVideoSink {
-    fn take_delta_repair_request(&mut self) -> Option<u32> {
+    fn take_delta_repair_request(&mut self) -> Option<DeltaRepairRequest> {
         self.lanes.pending_delta_repair.lock().unwrap().take()
     }
 

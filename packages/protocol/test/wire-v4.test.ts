@@ -122,6 +122,16 @@ describe("v4 video control", () => {
       WireError,
     );
   });
+
+  test("requests distinct missing fragment indices", () => {
+    const message = { kind: "deltaRepair", streamSequence: 2, parts: [4, 36] } as const;
+    const encoded = encodeVideoControlMessage(message);
+    expect(Array.from(encoded)).toEqual([4, 0x43, 2, 0, 0, 0, 4, 0, 36, 0]);
+    expect(parseVideoControlMessage(encoded)).toEqual(message);
+    expect(() => parseVideoControlMessage(Uint8Array.of(4, 0x43, 2, 0, 0, 0, 4, 0, 4, 0))).toThrow(
+      WireError,
+    );
+  });
 });
 
 describe("v4 input wire", () => {

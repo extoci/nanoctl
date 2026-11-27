@@ -33,6 +33,7 @@ function receiver() {
   const emitted: AccessUnit[] = [];
   const requests: number[][] = [];
   const repairRequests: number[] = [];
+  const repairParts: (readonly number[] | undefined)[] = [];
   const errors: unknown[] = [];
   const receiver = new V4VideoReceiver({
     videoDelta,
@@ -40,12 +41,23 @@ function receiver() {
     onAccessUnit: (unit) => emitted.push(unit),
     sendVideoControl: (bytes) => {
       const message = parseVideoControlMessage(bytes);
-      if (message.kind === "deltaRepair") repairRequests.push(message.streamSequence);
-      else requests.push(Array.from(bytes));
+      if (message.kind === "deltaRepair") {
+        repairRequests.push(message.streamSequence);
+        repairParts.push(message.parts);
+      } else requests.push(Array.from(bytes));
     },
     onError: (error) => errors.push(error),
   });
-  return { receiver, videoDelta, videoReference, emitted, requests, repairRequests, errors };
+  return {
+    receiver,
+    videoDelta,
+    videoReference,
+    emitted,
+    requests,
+    repairRequests,
+    repairParts,
+    errors,
+  };
 }
 
 describe("V4VideoReceiver", () => {
@@ -152,6 +164,8 @@ test("an incomplete expected delta times out without a later frame or watermark"
     state.receiver.handle(encodeVideoChunk({ ...chunk(11, false, [1]), parts: 2 }));
     expect(state.requests).toHaveLength(0);
     await Bun.sleep(250);
+    expect(state.repairRequests).toEqual([11]);
+    expect(state.repairParts).toEqual([[1]]);
     expect(state.requests).toEqual([[4, 0x41]]);
   } finally {
     state.receiver.dispose();
