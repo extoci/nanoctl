@@ -109,13 +109,16 @@ send boundary. It writes `network-probe.json` in the Simulator container and the
 runner scores frame continuity, decode progress, input readiness and final state:
 
 ```sh
-bun apps/ios/Benchmark/network.ts   apps/ios/DerivedData/Build/Products/Debug-iphonesimulator/Nanoctl.app   "$SIMULATOR_ID" /tmp/nanoctl-ios-network
+bun apps/ios/Benchmark/network.ts \
+  apps/ios/DerivedData/Build/Products/Debug-iphonesimulator/Nanoctl.app \
+  "$SIMULATOR_ID" /tmp/nanoctl-ios-network
 ```
 
 Scenarios are `clean` (loopback control), `lossy-wifi` (2% loss, 2% long-tail
-reorder, up to 25ms jitter, 20 Mbps), and `congested` (5% loss, 10% long-tail
-reorder, up to 35ms jitter, 3 Mbps). Pass a scenario name as the fourth argument to
-run only one. These impairment knobs are development-only and never enable
+reorder, up to 25ms jitter, 20 Mbps), `congested` (5% loss, 10% long-tail
+reorder, up to 35ms jitter, 3 Mbps), and `service-restart` (the agent process
+stops for five seconds mid-session, then returns). Pass a scenario name as the
+fourth argument to run only one. These impairment knobs are development-only and never enable
 authentication bypass outside the loopback harness.
 
 For per-frame receive timing on this Mac-only loopback workload, start this

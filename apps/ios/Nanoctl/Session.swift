@@ -499,6 +499,21 @@ final class Session {
         if connection !== current || Task.isCancelled { throw CancellationError() }
     }
 
+    private func hostEnded(_ reason: String?, _ current: Connection) {
+        switch reason {
+        case "replaced":
+            stop("Another viewer took over.")
+        case "viewer-ended":
+            stop("Session ended.")
+        default:
+            // A service restart or host-side media/transport failure is not a
+            // user intent to give up. Treat the server-sent terminal message as
+            // a recoverable drop and use the same bounded backoff as ICE loss.
+            let text = reason == "shutdown" ? "Host shut down." : "Host ended the session\(reason.map { " (\($0))" } ?? "")."
+            fail(text, current)
+        }
+    }
+
     private nonisolated static func checkHost(_ host: HostInfo) throws {
         guard host.capabilities.protocolVersion == SignalEnvelope.wireVersion else {
             throw ViewerError("This viewer requires agent protocol 2.")
@@ -567,7 +582,7 @@ final class Session {
                 if current.answered { try await peer.add(candidate) }
                 else if current.remoteCandidates.count < 256 { current.remoteCandidates.append(candidate) }
             case "end":
-                stop(signal.payload.reason ?? "Session ended.")
+                hostEnded(signal.payload.reason, current)
             default:
                 break
             }
@@ -576,7 +591,7 @@ final class Session {
             selectedAudioOutput = message.selectedId
             onChange?()
         case "end":
-            stop(message.reason == "replaced" ? "Another viewer took over." : message.reason ?? "Session ended.")
+            hostEnded(message.reason, current)
         default:
             throw ViewerError("Unexpected host message.")
         }

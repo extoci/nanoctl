@@ -19,6 +19,8 @@ type Impairment = {
 type Scenario = {
   durationMs: number;
   impairment: Impairment;
+  restartAtMs?: number;
+  restartDownMs?: number;
   minFps: number;
   maxGapMs: number;
   description: string;
@@ -44,6 +46,15 @@ const scenarios: Record<string, Scenario> = {
     minFps: 4,
     maxGapMs: 2_500,
     description: "5% loss, 10% long-tail reorder, up to 35ms jitter, 3 Mbps",
+  },
+  "service-restart": {
+    durationMs: 25_000,
+    impairment: {},
+    restartAtMs: 5_000,
+    restartDownMs: 5_000,
+    minFps: 8,
+    maxGapMs: 1_500,
+    description: "agent process stops for 5s mid-session, then returns",
   },
 };
 const selected = only ? [only] : Object.keys(scenarios);
@@ -160,15 +171,17 @@ try {
     if (impairment.jitterMs) env.NANOCTL_TEST_VIDEO_JITTER_MS = String(impairment.jitterMs);
     if (impairment.bandwidthKbps)
       env.NANOCTL_TEST_VIDEO_BANDWIDTH_KBPS = String(impairment.bandwidthKbps);
-    const agent = Bun.spawn(
-      [join(root, "crates/nanoctl-agent/target/release/nanoctl"), "--config", config, "run"],
-      {
-        cwd: root,
-        env,
-        stdout: "inherit",
-        stderr: "inherit",
-      },
-    );
+    const launchAgent = () =>
+      Bun.spawn(
+        [join(root, "crates/nanoctl-agent/target/release/nanoctl"), "--config", config, "run"],
+        {
+          cwd: root,
+          env,
+          stdout: "inherit",
+          stderr: "inherit",
+        },
+      );
+    let agent = launchAgent();
     try {
       await wait(
         async () => {
@@ -189,7 +202,18 @@ try {
         ...process.env,
         SIMCTL_CHILD_NANOCTL_NETWORK_PROBE_URL: endpoint,
       });
-      await Bun.sleep(scenario.durationMs);
+      if (scenario.restartAtMs) {
+        await Bun.sleep(scenario.restartAtMs);
+        agent.kill("SIGINT");
+        await agent.exited.catch(() => 0);
+        await Bun.sleep(scenario.restartDownMs ?? 0);
+        agent = launchAgent();
+        await Bun.sleep(
+          Math.max(0, scenario.durationMs - scenario.restartAtMs - (scenario.restartDownMs ?? 0)),
+        );
+      } else {
+        await Bun.sleep(scenario.durationMs);
+      }
       const report = await wait(
         async () => {
           if (await Bun.file(reportPath).exists())
@@ -200,22 +224,29 @@ try {
       );
       await sim("io", device, "screenshot", join(resultsPath, `${name}.png`)).catch(() => "");
 
-      const renders = report.renders.filter((at) => at >= 3);
-      const elapsed = Math.max(1, scenario.durationMs / 1000 - 3);
-      let maxGapMs = renders.length ? (renders[0] - 3) * 1000 : scenario.durationMs;
-      for (let index = 1; index < renders.length; index += 1) {
-        maxGapMs = Math.max(maxGapMs, (renders[index] - renders[index - 1]) * 1000);
-      }
       const last = report.samples.at(-1);
       const connectingAt =
         report.states.find((state) => state.state.startsWith("Connecting"))?.at ?? 0;
-      const liveAt = report.states.find((state) => state.state.startsWith("Live"))?.at;
-      const connectMs = liveAt === undefined ? undefined : (liveAt - connectingAt) * 1000;
+      const firstLiveAt = report.states.find((state) => state.state.startsWith("Live"))?.at;
+      const lastLiveAt = report.states.findLast((state) => state.state.startsWith("Live"))?.at;
+      const connectMs = firstLiveAt === undefined ? undefined : (firstLiveAt - connectingAt) * 1000;
+      const analysisStart = Math.max(3, (lastLiveAt ?? 0) + 1);
+      const renders = report.renders.filter((at) => at >= analysisStart);
+      const elapsed = Math.max(1, scenario.durationMs / 1000 - analysisStart);
+      let maxGapMs = renders.length ? (renders[0] - analysisStart) * 1000 : scenario.durationMs;
+      for (let index = 1; index < renders.length; index += 1) {
+        maxGapMs = Math.max(maxGapMs, (renders[index] - renders[index - 1]) * 1000);
+      }
+      const recoveryMs =
+        scenario.restartAtMs && lastLiveAt !== undefined
+          ? Math.max(0, lastLiveAt * 1000 - scenario.restartAtMs)
+          : undefined;
       const summary = {
         description: scenario.description,
         impairment: scenario.impairment,
         durationMs: scenario.durationMs,
         connectMs,
+        recoveryMs,
         renders: renders.length,
         fps: renders.length / elapsed,
         maxGapMs,
@@ -240,7 +271,7 @@ try {
         JSON.stringify({ summary, report }, null, 2),
       );
       console.log(
-        `${name}: connect=${connectMs?.toFixed(0) ?? "?"}ms fps=${summary.fps.toFixed(1)} max-gap=${maxGapMs.toFixed(0)}ms state=${last?.state} transport=${last?.transport}/${last?.codec} decoded=${last?.dcDecoded}`,
+        `${name}: connect=${connectMs?.toFixed(0) ?? "?"}ms recovery=${recoveryMs?.toFixed(0) ?? "-"}ms fps=${summary.fps.toFixed(1)} max-gap=${maxGapMs.toFixed(0)}ms state=${last?.state} transport=${last?.transport}/${last?.codec} decoded=${last?.dcDecoded}`,
       );
       if (summary.fps < scenario.minFps)
         failures.push(`${name}: fps ${summary.fps.toFixed(1)} < ${scenario.minFps}`);
@@ -248,6 +279,8 @@ try {
         failures.push(`${name}: max gap ${maxGapMs.toFixed(0)}ms > ${scenario.maxGapMs}ms`);
       if (!last?.inputReady) failures.push(`${name}: input channel is not ready`);
       if (!last?.state.startsWith("Live")) failures.push(`${name}: final state is ${last?.state}`);
+      if (scenario.restartAtMs && recoveryMs === undefined)
+        failures.push(`${name}: did not return to live video after the service restart`);
     } finally {
       agent.kill("SIGINT");
       await agent.exited.catch(() => 0);
