@@ -109,10 +109,16 @@ send boundary. It writes `network-probe.json` in the Simulator container and the
 runner scores frame continuity, decode progress, input readiness and final state:
 
 ```sh
+cargo build --release --locked --features media \
+  --manifest-path crates/nanoctl-agent/Cargo.toml
 bun apps/ios/Benchmark/network.ts \
   apps/ios/DerivedData/Build/Products/Debug-iphonesimulator/Nanoctl.app \
   "$SIMULATOR_ID" /tmp/nanoctl-ios-network
 ```
+
+The feature flags matter: a plain `cargo build --release` produces an agent without
+RTC/media support, and the harness now fails fast instead of scoring that as an app
+regression.
 
 Scenarios are `clean` (loopback control), `lossy-wifi` (2% loss, 2% long-tail
 reorder, up to 25ms jitter, 20 Mbps), `congested` (5% loss, 10% long-tail

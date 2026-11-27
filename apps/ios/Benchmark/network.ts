@@ -183,17 +183,22 @@ try {
       );
     let agent = launchAgent();
     try {
-      await wait(
+      const info = await wait(
         async () => {
           try {
             const response = await fetch(endpoint + "/v1/info");
-            if (response.ok) return true;
+            if (response.ok) return response.json();
           } catch {}
           return undefined;
         },
         20,
         `${name} agent`,
       );
+      if (!info.capabilities?.ready) {
+        throw new Error(
+          `${name} agent is not media/RTC-ready (${info.capabilities?.readiness ?? "unknown"}); rebuild it with cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml`,
+        );
+      }
       await runCommand(["xcrun", "simctl", "terminate", device, bundle]).catch(() => "");
       const container = await sim("get_app_container", device, bundle, "data");
       const reportPath = join(container, "Documents/network-probe.json");
