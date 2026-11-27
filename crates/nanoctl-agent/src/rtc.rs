@@ -801,6 +801,10 @@ impl HostPeer {
                 Box::pin(async {})
             })
         });
+        peer.sctp().transport().on_state_change(Box::new(|state| {
+            tracing::info!(state = %state, "dtls transport state");
+            Box::pin(async {})
+        }));
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
