@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use portable_atomic::AtomicBool;
+use tokio::time::Instant;
 
 use super::chunk_header::*;
 use super::chunk_type::*;
@@ -111,6 +112,7 @@ pub struct ChunkPayloadData {
 
     /// Partial-reliability parameters used only by sender
     pub(crate) since: SystemTime,
+    pub(crate) send_deadline: Option<Instant>,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
@@ -139,6 +141,7 @@ impl Default for ChunkPayloadData {
             acked: false,
             miss_indicator: 0,
             since: SystemTime::now(),
+            send_deadline: None,
             nsent: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
@@ -218,6 +221,7 @@ impl Chunk for ChunkPayloadData {
             acked: false,
             miss_indicator: 0,
             since: SystemTime::now(),
+            send_deadline: None,
             nsent: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),

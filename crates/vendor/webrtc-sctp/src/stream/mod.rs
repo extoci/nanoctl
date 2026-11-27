@@ -3,6 +3,7 @@ mod stream_test;
 
 use std::future::Future;
 use std::net::Shutdown;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use bytes::Bytes;
 use portable_atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::{Duration, Instant};
 
 use crate::association::AssociationState;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
@@ -311,6 +313,18 @@ impl Stream {
         let unordered =
             ppi != PayloadProtocolIdentifier::Dcep && self.unordered.load(Ordering::SeqCst);
 
+        // A whole unordered message can expire before TSN assignment without
+        // leaving an ordered sequence hole or abandoning an in-flight fragment.
+        let send_deadline = if unordered
+            && raw.len() <= self.max_payload_size as usize
+            && ReliabilityType::from(self.reliability_type.load(Ordering::SeqCst))
+                == ReliabilityType::Timed
+        {
+            NonZeroU32::new(self.reliability_value.load(Ordering::SeqCst))
+                .map(|ms| Instant::now() + Duration::from_millis(u64::from(ms.get())))
+        } else {
+            None
+        };
         let mut chunks = vec![];
 
         let head_abandoned = Arc::new(AtomicBool::new(false));
@@ -329,6 +343,7 @@ impl Stream {
                 beginning_fragment: i == 0,
                 ending_fragment: remaining - fragment_size == 0,
                 immediate_sack: false,
+                send_deadline,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number.load(Ordering::SeqCst),
                 abandoned: head_abandoned.clone(), // all fragmented chunks use the same abandoned

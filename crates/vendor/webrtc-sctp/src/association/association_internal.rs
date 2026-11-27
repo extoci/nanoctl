@@ -3,6 +3,7 @@ mod association_internal_test;
 
 use async_trait::async_trait;
 use portable_atomic::AtomicBool;
+use tokio::time::Instant;
 
 use super::*;
 use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
@@ -1888,7 +1889,7 @@ impl AssociationInternal {
             // Assign TSN
             c.tsn = self.generate_next_tsn();
 
-            c.since = SystemTime::now(); // use to calculate RTT and also for maxPacketLifeTime
+            c.since = SystemTime::now(); // RTT and lifetimes without an enqueue deadline.
             c.nsent = 1; // being sent for the first time
 
             self.check_partial_reliability_status(&c);
@@ -1938,6 +1939,16 @@ impl AssociationInternal {
                 c.user_data.len(),
                 c.stream_identifier,
             );
+
+            if self.use_forward_tsn && c.send_deadline.is_some_and(|at| Instant::now() >= at) {
+                let Some(expired) = self.pending_queue.pop(beginning_fragment, unordered) else {
+                    break;
+                };
+                if let Some(stream) = self.streams.get(&expired.stream_identifier) {
+                    stream.on_buffer_released(expired.user_data.len() as i64).await;
+                }
+                continue;
+            }
 
             if data_len == 0 {
                 sis_to_reset.push(stream_identifier);
@@ -2034,6 +2045,13 @@ impl AssociationInternal {
         //		ordered delivery and reliable transmission.
         //
         if c.payload_type == PayloadProtocolIdentifier::Dcep {
+            return;
+        }
+
+        if let Some(deadline) = c.send_deadline {
+            if Instant::now() >= deadline {
+                c.set_abandoned(true);
+            }
             return;
         }
 
