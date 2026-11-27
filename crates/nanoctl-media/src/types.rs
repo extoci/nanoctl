@@ -208,6 +208,7 @@ pub struct MediaPipelineSnapshot {
     pub frames_skipped_for_backpressure: u64,
     pub access_units_encoded: u64,
     pub keyframes_encoded: u64,
+    pub deltas_written_during_keyframe_cooldown: u64,
     pub bytes_encoded: u64,
     pub capture_errors: u64,
     pub encode_errors: u64,

@@ -308,16 +308,33 @@ async fn encode_loop_inner(
     let mut next_forced_keyframe = TokioInstant::now();
     let mut last_dimensions = None;
     let mut scaler = FrameScaler::default();
+    let mut deferred_reference = None;
 
-    while let Some(frame) = frame_slot.recv().await {
+    loop {
+        let (frame, newly_captured) = match deferred_reference.take() {
+            Some(deferred) => tokio::select! {
+                biased;
+                frame = frame_slot.recv() => (frame, true),
+                _ = time::sleep_until(next_forced_keyframe) => (Some(deferred), false),
+            },
+            None => (frame_slot.recv().await, true),
+        };
+        let Some(frame) = frame else { return Ok(()) };
         if *shutdown.borrow() {
             return Ok(());
         }
-        record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
+        if newly_captured {
+            record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
+        }
         let mut config = *updates.borrow();
         force_next_keyframe |= last_dimensions != Some((config.width, config.height));
         let repair_pending = force_next_keyframe || keyframe_requested.load(Ordering::Acquire);
-        let force_keyframe = if repair_pending {
+        let waiting_for_cooldown = repair_pending && TokioInstant::now() < next_forced_keyframe;
+        if waiting_for_cooldown {
+            // Retain one capture so even an idle source can send the delayed keyframe.
+            deferred_reference = Some(frame.clone());
+        }
+        let force_keyframe = if repair_pending && !waiting_for_cooldown {
             tokio::select! {
                 biased;
                 _ = wait_for_shutdown(shutdown) => return Ok(()),
@@ -334,15 +351,12 @@ async fn encode_loop_inner(
             continue;
         }
         if !frame.has_new_damage && !force_keyframe {
-            record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
+            if !waiting_for_cooldown {
+                record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
+            }
             continue;
         }
         if force_keyframe {
-            tokio::select! {
-                biased;
-                _ = wait_for_shutdown(shutdown) => return Ok(()),
-                _ = time::sleep_until(next_forced_keyframe) => {}
-            }
             next_forced_keyframe = TokioInstant::now() + MIN_FORCED_KEYFRAME_INTERVAL;
             config = *updates.borrow();
             keyframe_requested.swap(false, Ordering::Acquire);
@@ -416,6 +430,7 @@ async fn encode_loop_inner(
         }
 
         stream_sequence = next_sequence;
+        let sent_delta_during_cooldown = waiting_for_cooldown && !encoded.keyframe;
         let access_unit = EncodedAccessUnit {
             stream_sequence,
             keyframe: encoded.keyframe,
@@ -448,6 +463,8 @@ async fn encode_loop_inner(
                         .max_buffered_bytes
                         .max(report.buffered_bytes as u64);
                     if report.status == LaneWriteStatus::Written {
+                        snapshot.deltas_written_during_keyframe_cooldown +=
+                            u64::from(sent_delta_during_cooldown);
                         snapshot.bytes_written += report.wire_bytes as u64;
                         snapshot.next_video_sequence = Some(stream_sequence.wrapping_add(1));
                     } else {
@@ -464,7 +481,6 @@ async fn encode_loop_inner(
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -672,31 +688,38 @@ mod tests {
         wait_for_len(&units, &notify, 2).await;
         pipeline.request_keyframe();
         frames_tx.send(frame(333)).await.unwrap();
-        wait_for_len(&units, &notify, 3).await;
+        tokio::time::timeout(Duration::from_millis(250), wait_for_len(&units, &notify, 3))
+            .await
+            .expect("a usable delta must not wait for the keyframe cooldown");
+        let mut unchanged = frame(444);
+        unchanged.has_new_damage = false;
+        frames_tx.send(unchanged).await.unwrap();
+        wait_for_len(&units, &notify, 4).await;
 
-        let observed = {
-            let written = units.lock().expect("collected units poisoned");
-            (
-                written[0].stream_sequence,
-                written[0].keyframe,
-                written[0].capture_time_us,
-                written[1].stream_sequence,
-                written[1].keyframe,
-                written[1].capture_time_us,
-                written[2].stream_sequence,
-                written[2].keyframe,
-                written[2].capture_time_us,
-            )
-        };
-        assert_eq!(observed, (1, true, 111, 2, false, 222, 3, true, 333));
+        let observed: Vec<_> = units
+            .lock()
+            .expect("collected units poisoned")
+            .iter()
+            .map(|unit| (unit.stream_sequence, unit.keyframe, unit.capture_time_us))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                (1, true, 111),
+                (2, false, 222),
+                (3, false, 333),
+                (4, true, 444)
+            ]
+        );
 
         let report = pipeline.stop().await;
         assert!(report.capture_result.is_ok());
         assert!(report.encode_result.is_ok());
-        assert_eq!(report.snapshot.frames_captured, 3);
-        assert_eq!(report.snapshot.frames_taken_for_encode, 3);
-        assert_eq!(report.snapshot.access_units_encoded, 3);
+        assert_eq!(report.snapshot.frames_captured, 4);
+        assert_eq!(report.snapshot.frames_taken_for_encode, 4);
+        assert_eq!(report.snapshot.access_units_encoded, 4);
         assert_eq!(report.snapshot.keyframes_encoded, 2);
+        assert_eq!(report.snapshot.deltas_written_during_keyframe_cooldown, 1);
     }
 
     #[tokio::test]
@@ -731,7 +754,9 @@ mod tests {
         wait_for_len(&units, &notify, 2).await;
         delta_ready.store(false, AtomicOrdering::SeqCst);
         pipeline.request_keyframe();
-        frames_tx.send(frame(444)).await.unwrap();
+        let mut unchanged = frame(444);
+        unchanged.has_new_damage = false;
+        frames_tx.send(unchanged).await.unwrap();
         wait_for_len(&units, &notify, 3).await;
 
         let observed: Vec<_> = units

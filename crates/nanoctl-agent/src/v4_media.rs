@@ -285,6 +285,7 @@ async fn run_pipeline(
         encoded = report.snapshot.access_units_encoded,
         encoder_skips = report.snapshot.encoder_skips,
         keyframes = report.snapshot.keyframes_encoded,
+        deltas_during_keyframe_cooldown = report.snapshot.deltas_written_during_keyframe_cooldown,
         max_encode_us = report.snapshot.max_encode_micros,
         written = report.snapshot.lane_writes,
         wire_bytes = report.snapshot.bytes_written,
