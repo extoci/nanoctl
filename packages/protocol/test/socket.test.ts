@@ -4,7 +4,7 @@ import { assertHostInfo, parseAgentMessage } from "../src";
 const host = {
   hostName: "desktop",
   platform: "linux",
-  version: "3.0.0-alpha.26",
+  version: "3.0.0-alpha.27",
   displays: [],
   remoteInput: false,
   capabilities: { displays: [] },
