@@ -207,10 +207,15 @@ try {
         maxGapMs = Math.max(maxGapMs, (renders[index] - renders[index - 1]) * 1000);
       }
       const last = report.samples.at(-1);
+      const connectingAt =
+        report.states.find((state) => state.state.startsWith("Connecting"))?.at ?? 0;
+      const liveAt = report.states.find((state) => state.state.startsWith("Live"))?.at;
+      const connectMs = liveAt === undefined ? undefined : (liveAt - connectingAt) * 1000;
       const summary = {
         description: scenario.description,
         impairment: scenario.impairment,
         durationMs: scenario.durationMs,
+        connectMs,
         renders: renders.length,
         fps: renders.length / elapsed,
         maxGapMs,
@@ -235,7 +240,7 @@ try {
         JSON.stringify({ summary, report }, null, 2),
       );
       console.log(
-        `${name}: fps=${summary.fps.toFixed(1)} max-gap=${maxGapMs.toFixed(0)}ms state=${last?.state} transport=${last?.transport}/${last?.codec} decoded=${last?.dcDecoded}`,
+        `${name}: connect=${connectMs?.toFixed(0) ?? "?"}ms fps=${summary.fps.toFixed(1)} max-gap=${maxGapMs.toFixed(0)}ms state=${last?.state} transport=${last?.transport}/${last?.codec} decoded=${last?.dcDecoded}`,
       );
       if (summary.fps < scenario.minFps)
         failures.push(`${name}: fps ${summary.fps.toFixed(1)} < ${scenario.minFps}`);
