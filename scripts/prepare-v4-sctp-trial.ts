@@ -1,8 +1,11 @@
 import { cp, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-const directory = process.argv[2];
+const [, , directory, minimumRto] = process.argv;
 if (!directory) throw new Error("Pass a temporary directory for the SCTP trial");
+if (minimumRto !== "100" && minimumRto !== "200") {
+  throw new Error("Pass an SCTP timer trial value of 100 or 200 ms");
+}
 
 const metadata = Bun.spawnSync(
   [
@@ -40,7 +43,7 @@ const timer = resolve(copy, "src/timer/rtx_timer.rs");
 const source = await readFile(timer, "utf8");
 const baseline = "pub(crate) const RTO_MIN: u64 = 1000;";
 if (source.split(baseline).length !== 2) throw new Error("The SCTP timer definition has changed");
-await writeFile(timer, source.replace(baseline, "pub(crate) const RTO_MIN: u64 = 200;"));
+await writeFile(timer, source.replace(baseline, `pub(crate) const RTO_MIN: u64 = ${minimumRto};`));
 await writeFile(
   resolve(directory, "sctp-trial.toml"),
   `[patch.crates-io]\nwebrtc-sctp = { path = ${JSON.stringify(copy)} }\n`,
