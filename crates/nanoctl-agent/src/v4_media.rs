@@ -18,7 +18,7 @@ use crate::rtc::{HostPeer, V4DataChannelVideo};
 
 const DELTA_LANE_CAPACITY: usize = 128 * 1024;
 const REFERENCE_LANE_CAPACITY: usize = 512 * 1024;
-const MIN_KEYFRAME_PACING_BPS: u32 = 2_400_000;
+const MIN_FRAME_PACING_BPS: u32 = 2_400_000;
 
 struct WebRtcVideoSink {
     lanes: Arc<V4DataChannelVideo>,
@@ -47,12 +47,12 @@ impl VideoChunkSink for WebRtcVideoSink {
         self.lanes.pending_delta_repair.lock().unwrap().take()
     }
 
-    fn keyframe_pacing_bps(&self) -> Option<NonZeroU32> {
+    fn frame_pacing_bps(&self) -> Option<NonZeroU32> {
         let bps = self
             .send_rate_kbps
             .load(Ordering::Relaxed)
             .saturating_mul(1_000);
-        NonZeroU32::new(bps.max(MIN_KEYFRAME_PACING_BPS))
+        NonZeroU32::new(bps.max(MIN_FRAME_PACING_BPS))
     }
 
     async fn buffered_bytes(&self, lane: VideoLane) -> usize {

@@ -17,7 +17,7 @@ const DELTA_REPAIR_CACHE_FRAMES: usize = 16;
 const DELTA_REPAIR_SEND_BYTES: usize = 8 * 1024;
 const DELTA_REPAIR_CACHE_BYTES: usize = 128 * 1024;
 const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
-const KEYFRAME_BURST_CHUNKS: usize = 4;
+const DATAGRAM_BURST_CHUNKS: usize = 4;
 const DATAGRAM_OVERHEAD_BYTES: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub trait VideoChunkSink: Send {
         None
     }
 
-    fn keyframe_pacing_bps(&self) -> Option<NonZeroU32> {
+    fn frame_pacing_bps(&self) -> Option<NonZeroU32> {
         None
     }
 
@@ -45,13 +45,13 @@ pub trait VideoChunkSink: Send {
     async fn write_chunk(&mut self, lane: VideoLane, bytes: Vec<u8>) -> Result<(), MediaError>;
 }
 
-struct KeyframePacer {
+struct DatagramPacer {
     bitrate: NonZeroU32,
     chunks_in_burst: usize,
     next_burst: TokioInstant,
 }
 
-impl KeyframePacer {
+impl DatagramPacer {
     fn new(bitrate: NonZeroU32) -> Self {
         Self {
             bitrate,
@@ -61,7 +61,7 @@ impl KeyframePacer {
     }
 
     async fn before_chunk(&mut self, bytes: usize) {
-        if self.chunks_in_burst == KEYFRAME_BURST_CHUNKS {
+        if self.chunks_in_burst == DATAGRAM_BURST_CHUNKS {
             time::sleep_until(self.next_burst).await;
             self.chunks_in_burst = 0;
         }
@@ -125,10 +125,7 @@ impl<S> ChunkingLaneWriter<S> {
             .then_some(lane)
     }
 
-    fn cache_delta(&mut self, sequence: u32, wire_bytes: usize, chunks: &[Vec<u8>]) {
-        if wire_bytes > DELTA_REPAIR_CACHE_BYTES {
-            return;
-        }
+    fn cache_delta(&mut self, sequence: u32, wire_bytes: usize, chunks: Vec<Vec<u8>>) {
         while (self.repair_cache.len() >= DELTA_REPAIR_CACHE_FRAMES
             || self.repair_cache_bytes + wire_bytes > DELTA_REPAIR_CACHE_BYTES)
             && let Some(oldest) = self.repair_cache.pop_front()
@@ -139,7 +136,7 @@ impl<S> ChunkingLaneWriter<S> {
             sequence,
             sent_at: Instant::now(),
             wire_bytes,
-            chunks: chunks.to_vec(),
+            chunks,
         });
         self.repair_cache_bytes += wire_bytes;
     }
@@ -253,7 +250,9 @@ where
             )
         };
         let frame_wire_bytes = access_unit.payload.len() + parts * VIDEO_HEADER_BYTES;
-        let primary_budget = if self.repeat_chunks && lane == VideoLane::Delta {
+        let large_delta = !access_unit.keyframe && frame_wire_bytes > DELTA_REPAIR_SEND_BYTES;
+        let allow_repeat = self.repeat_chunks && !large_delta;
+        let primary_budget = if allow_repeat && lane == VideoLane::Delta {
             frame_wire_bytes * 2
         } else {
             frame_wire_bytes
@@ -273,7 +272,7 @@ where
 
         // The extra copy of a reference can expire independently. A full delta
         // queue must never prevent writing the original to the reference lane.
-        let repeat = self.repeat_chunks
+        let repeat = allow_repeat
             && (lane == VideoLane::Delta
                 || frame_wire_bytes
                     <= self
@@ -281,15 +280,18 @@ where
                         .lane_capacity(VideoLane::Delta)
                         .await
                         .saturating_sub(self.sink.buffered_bytes(VideoLane::Delta).await));
-        let mut pacer = if access_unit.keyframe {
-            self.sink.keyframe_pacing_bps().map(KeyframePacer::new)
+        let cache_delta = self.repeat_chunks
+            && !access_unit.keyframe
+            && frame_wire_bytes <= DELTA_REPAIR_CACHE_BYTES;
+        let mut pacer = if access_unit.keyframe || large_delta {
+            self.sink.frame_pacing_bps().map(DatagramPacer::new)
         } else {
             None
         };
         if lane == VideoLane::Reference {
             self.last_reference_sent = Some(Instant::now());
         }
-        let mut repeated = Vec::new();
+        let mut retained = Vec::new();
         let parts = parts as u16;
         for part in 0..parts {
             let start = usize::from(part) * CHUNK_PAYLOAD_BYTES;
@@ -306,8 +308,8 @@ where
             let bytes = chunk
                 .encode()
                 .map_err(|_| MediaError::InvalidAccessUnit("payload cannot be encoded"))?;
-            if repeat {
-                repeated.push(bytes.clone());
+            if repeat || cache_delta {
+                retained.push(bytes.clone());
             }
             if let Some(pacer) = &mut pacer {
                 pacer.before_chunk(bytes.len()).await;
@@ -318,15 +320,21 @@ where
             // Give SCTP a chance to send the originals before it queues the copies,
             // including when the frame fits inside one short chunk.
             tokio::time::sleep(Duration::from_millis(8)).await;
-            if !access_unit.keyframe {
-                self.cache_delta(access_unit.stream_sequence, frame_wire_bytes, &repeated);
+            if cache_delta {
+                self.cache_delta(
+                    access_unit.stream_sequence,
+                    frame_wire_bytes,
+                    retained.clone(),
+                );
             }
-            for bytes in repeated {
+            for bytes in retained {
                 if let Some(pacer) = &mut pacer {
                     pacer.before_chunk(bytes.len()).await;
                 }
                 self.sink.write_chunk(VideoLane::Delta, bytes).await?;
             }
+        } else if cache_delta {
+            self.cache_delta(access_unit.stream_sequence, frame_wire_bytes, retained);
         }
 
         let mut buffered_bytes = self.sink.buffered_bytes(lane).await;
@@ -350,7 +358,7 @@ mod tests {
     use nanoctl_core::video::{DeltaRepairRequest, VideoChunk, VideoCodec};
     use tokio::time::Instant;
 
-    use super::{ChunkingLaneWriter, KeyframePacer, VideoChunkSink, VideoLane};
+    use super::{ChunkingLaneWriter, DatagramPacer, VideoChunkSink, VideoLane};
     use crate::types::{EncodedAccessUnit, LaneWriteStatus, LaneWriter, MediaError};
 
     struct MemorySink {
@@ -398,9 +406,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyframe_pacer_waits_after_four_datagrams_at_the_wire_rate() {
+    async fn pacer_waits_after_four_datagrams_at_the_wire_rate() {
         let start = Instant::now();
-        let mut pacer = KeyframePacer::new(NonZeroU32::new(2_400_000).unwrap());
+        let mut pacer = DatagramPacer::new(NonZeroU32::new(2_400_000).unwrap());
         for _ in 0..4 {
             pacer.before_chunk(1120).await;
         }
@@ -623,20 +631,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_large_delta_can_repair_missing_chunks_after_rejecting_a_whole_frame_request() {
+    async fn a_large_delta_is_sent_once_and_can_repair_missing_chunks() {
         let mut writer = ChunkingLaneWriter::with_repeated_chunks(MemorySink {
             chunks: Vec::new(),
             buffered: 0,
-            capacity: 128 * 1024,
+            capacity: 64 * 1024,
             repair_request: Some(DeltaRepairRequest {
                 stream_sequence: 7,
                 parts: vec![],
             }),
         });
-        writer
+        let original = writer
             .write_access_unit(access_unit(40_700, false))
             .await
             .unwrap();
+        assert_eq!(original.status, LaneWriteStatus::Written);
+        assert_eq!(original.wire_bytes, 41_440);
+        assert_eq!(writer.sink.chunks.len(), 37);
         assert!(writer.repair_pending_delta().await.unwrap().is_none());
         // Model delivery of the original burst before the selective request arrives.
         writer.sink.chunks.clear();

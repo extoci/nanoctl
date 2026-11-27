@@ -141,8 +141,9 @@ After the receiver advances its decode position, older fragments leave the reass
 late copies of those fragments are discarded on arrival.
 
 Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCTP fragmentation.
-The host paces keyframe chunks in groups of four using the current send rate, with a 2.4 Mbps
-minimum for keyframe bursts. The original and its copy use the same schedule.
+The host paces chunks from keyframes and deltas larger than 8 KiB in groups of four. It uses the
+current send rate with a 2.4 Mbps minimum for these bursts. A keyframe and its copy use the same
+schedule. A large delta is sent once and kept for selective repair.
 It gives the outstanding reference 350 ms to drain. If it is still pending, the next recovery
 keyframe goes on the expiring delta lane. Both copies must fit within the delta lane's byte budget.
 The reliable lane takes a new reference once the previous one drains.
