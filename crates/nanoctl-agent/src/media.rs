@@ -541,14 +541,14 @@ impl Drop for DisplayWakeGuard {
     }
 }
 
-/// Sunshine raises the streaming process while a session is active because
-/// capture, encode, and SCTP writes are all latency-sensitive. Keep a small
-/// reference count here rather than assuming exclusive ownership: concurrent
-/// media producers must not let the first stream teardown demote the process
-/// while another stream is still active.
+/// Sunshine gives streaming latency-sensitive scheduling while a session is
+/// active: the compositor uses MMCSS and this process runs at high priority.
+/// Keep a small reference count here rather than assuming exclusive ownership:
+/// concurrent media producers must not let the first stream teardown demote
+/// the process while another stream is still active.
 #[cfg(windows)]
-static STREAMING_PRIORITY_STATE: std::sync::Mutex<(usize, Option<u32>)> =
-    std::sync::Mutex::new((0, None));
+static STREAMING_PRIORITY_STATE: std::sync::Mutex<(usize, Option<u32>, bool)> =
+    std::sync::Mutex::new((0, None, false));
 
 #[cfg(windows)]
 struct StreamingPriorityGuard;
@@ -563,6 +563,10 @@ impl StreamingPriorityGuard {
         let mut state = STREAMING_PRIORITY_STATE.lock().unwrap();
         state.0 += 1;
         if state.0 == 1 {
+            match unsafe { windows::Win32::Graphics::Dwm::DwmEnableMMCSS(true) } {
+                Ok(()) => state.2 = true,
+                Err(error) => tracing::warn!(?error, "Windows DWM MMCSS scheduling boost failed"),
+            }
             unsafe {
                 let process = GetCurrentProcess();
                 let previous = GetPriorityClass(process);
@@ -598,6 +602,12 @@ impl Drop for StreamingPriorityGuard {
         }
         if state.0 != 0 {
             return;
+        }
+        if state.2 {
+            state.2 = false;
+            if let Err(error) = unsafe { windows::Win32::Graphics::Dwm::DwmEnableMMCSS(false) } {
+                tracing::warn!(?error, "Windows DWM MMCSS scheduling restore failed");
+            }
         }
         if let Some(previous) = state.1.take() {
             unsafe {
