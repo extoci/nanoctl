@@ -197,6 +197,7 @@ pub struct HostPeer {
     publication_lock: Arc<tokio::sync::Mutex<()>>,
     ice_ufrag_generations: Arc<tokio::sync::RwLock<HashMap<String, u64>>>,
     terminal: Arc<AtomicBool>,
+    connection_state: tokio::sync::watch::Sender<RTCPeerConnectionState>,
     rtcp_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "media")]
     input_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -791,10 +792,15 @@ impl HostPeer {
             tracing::info!(state = %state, "ice connection state");
             Box::pin(async {})
         }));
-        peer.on_peer_connection_state_change(Box::new(|state| {
-            tracing::info!(state = %state, "peer connection state");
-            Box::pin(async {})
-        }));
+        let (connection_state, _) = tokio::sync::watch::channel(RTCPeerConnectionState::New);
+        peer.on_peer_connection_state_change({
+            let connection_state = connection_state.clone();
+            Box::new(move |state| {
+                let _ = connection_state.send(state);
+                tracing::info!(state = %state, "peer connection state");
+                Box::pin(async {})
+            })
+        });
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
@@ -1425,6 +1431,7 @@ impl HostPeer {
             publication_lock,
             ice_ufrag_generations,
             terminal,
+            connection_state,
             rtcp_task: tokio::sync::Mutex::new(Some(rtcp_task)),
             #[cfg(feature = "media")]
             input_tasks: tokio::sync::Mutex::new(input_tasks),
@@ -1635,6 +1642,11 @@ impl HostPeer {
 
     pub fn connection_failed(&self) -> bool {
         self.peer.connection_state() == RTCPeerConnectionState::Failed
+    }
+
+    #[cfg(feature = "media")]
+    pub fn connection_state(&self) -> tokio::sync::watch::Receiver<RTCPeerConnectionState> {
+        self.connection_state.subscribe()
     }
 
     /// Revoke data-channel input before asynchronous peer/media teardown begins. This closes the

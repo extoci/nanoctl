@@ -82,6 +82,9 @@ const DC_PARTIAL_REORDER_WINDOW = 16;
 // adaptation lowers the frame rate. Beyond this age a missing frame is loss
 // for interactive purposes even if fewer than sixteen newer frames arrived.
 const DC_REORDER_AGE_MS = 400;
+// Reliable IDR reassembly can legitimately take seconds on a constrained
+// link. Keep a much longer bound only as memory/stall protection.
+const DC_KEYFRAME_REORDER_AGE_MS = 10_000;
 const DC_KEYFRAME_RETRY_MS = 400;
 
 /**
@@ -956,13 +959,18 @@ export function attachDataChannelVideo(
     const now = Date.now();
     let expired = false;
     for (const [seq, entry] of pending) {
+      // IDR fragments ride the reliable lane. A large keyframe can legitimately
+      // take longer than the delta reorder window on a constrained link;
+      // expiring it turns that latency into a permanent black-screen/keyframe
+      // loop. Delta partials remain bounded because they are too stale to use.
+      if (entry.isKey && now - entry.firstSeen < DC_KEYFRAME_REORDER_AGE_MS) continue;
       const distance = newestSeq === null ? 0 : (newestSeq - seq) | 0;
       if (distance > DC_PARTIAL_REORDER_WINDOW || now - entry.firstSeen >= DC_REORDER_AGE_MS) {
         pending.delete(seq);
-        // A partial access unit that survives this long is real network loss.
-        // Do not count still-active partials when the reference chain first
-        // breaks: their remaining fragments are often merely reordered.
-        countMissingVideoFrame();
+        // A partial delta that survives this long is real network loss. Count
+        // it directly when repair is already active; otherwise the reference
+        // chain observer below counts the resulting sequence hole once.
+        if (waitingForKey) countMissingVideoFrame();
         expired = true;
       }
     }

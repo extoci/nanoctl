@@ -69,6 +69,12 @@ const PERIODIC_IDR_INTERVAL: Duration = Duration::from_secs(20);
 // and timestamped messages add u64 sent_ms. Most delta frames therefore cost
 // five header bytes instead of the original seventeen.
 const VIDEO_DC_CHUNK: usize = 1200;
+// Lossy deltas benefit from MTU-sized application messages, but reliable IDR
+// traffic does not: splitting a keyframe into dozens of chunks can keep it
+// incomplete longer than the viewer's bounded partial-frame window even on a
+// healthy link. Keep keyframe application messages large enough to reassemble
+// quickly; SCTP still fragments them on the wire as needed.
+const VIDEO_DC_KEYFRAME_CHUNK: usize = 48 * 1024;
 const VIDEO_FLAG_KEYFRAME: u8 = 1;
 const VIDEO_FLAG_FRAGMENTED: u8 = 2;
 const VIDEO_FLAG_TIMESTAMP: u8 = 4;
@@ -209,7 +215,12 @@ async fn send_video_data_message(
 }
 
 fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
-    let parts = data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
+    let chunk = if is_keyframe {
+        VIDEO_DC_KEYFRAME_CHUNK
+    } else {
+        VIDEO_DC_CHUNK
+    };
+    let parts = data.len().div_ceil(chunk).max(1) as u16;
     let timestamped = is_keyframe || seq.is_multiple_of(16);
     let sent_ms = if timestamped {
         std::time::SystemTime::now()
@@ -228,8 +239,8 @@ fn video_data_messages(seq: u32, is_keyframe: bool, data: &[u8]) -> Vec<Bytes> {
     }
     let mut messages = Vec::with_capacity(parts as usize);
     for part in 0..parts {
-        let start = part as usize * VIDEO_DC_CHUNK;
-        let end = (start + VIDEO_DC_CHUNK).min(data.len());
+        let start = part as usize * chunk;
+        let end = (start + chunk).min(data.len());
         let mut header = 5 + usize::from(timestamped) * 8;
         if parts > 1 {
             header += 4;
@@ -3297,6 +3308,9 @@ pub fn spawn_video(
     viewer_limits: tokio::sync::watch::Receiver<crate::adaptive::ViewerLimits>,
     display_selection: tokio::sync::watch::Receiver<String>,
     display_selection_feedback: tokio::sync::watch::Sender<String>,
+    connection_state: tokio::sync::watch::Receiver<
+        webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState,
+    >,
     quality: VideoQuality,
 ) -> VideoPipeline {
     let stopped = Arc::new(AtomicBool::new(false));
@@ -3808,6 +3822,9 @@ pub fn spawn_video(
             ..ReferenceRecovery::default()
         };
         let mut write_result = Ok(());
+        let mut connection_state = connection_state;
+        let mut transport_recovery_wait = false;
+        let mut transport_recovery_requested = false;
         let mut attach_poll = tokio::time::interval(Duration::from_millis(5));
         attach_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut heartbeat_poll = tokio::time::interval(Duration::from_millis(100));
@@ -3944,6 +3961,33 @@ pub fn spawn_video(
                 }
                 frame = encoded_slot.take() => {
                     let Some((frame, dropped)) = frame else { break };
+                    // Do not blast startup or post-disconnect media into a
+                    // half-established transport. The first large IDR can arrive
+                    // while DTLS/SCTP is still handshaking; on constrained links
+                    // that burst competes with the handshake and turns a slow
+                    // attach into a repeating black-screen/reconnect failure.
+                    // Discard frames until the peer is connected, then resume on
+                    // a keyframe because the skipped deltas invalidate the chain.
+                    let peer_connected = *connection_state.borrow_and_update()
+                        == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected;
+                    if !peer_connected {
+                        if !transport_recovery_requested {
+                            transport_recovery_requested = true;
+                            delivery_recovery.send_modify(|generation| {
+                                *generation = generation.wrapping_add(1);
+                            });
+                            tracing::info!("video egress waiting for peer connection");
+                        }
+                        transport_recovery_wait = true;
+                        continue;
+                    }
+                    if transport_recovery_wait {
+                        if !crate::codec::is_keyframe(quality.codec, &frame.bytes) {
+                            continue;
+                        }
+                        transport_recovery_wait = false;
+                        transport_recovery_requested = false;
+                    }
                     if !reference_recovery.admit(&frame.bytes, dropped, &delivery_recovery) {
                         continue;
                     }
@@ -4000,7 +4044,15 @@ pub fn spawn_video(
                     // post-gap deltas and asks for a keyframe on "KF".
                     // Keyframes go over the reliable channel: they are
                     // large and cannot survive partial reliability.
-                    let parts = sample.data.len().div_ceil(VIDEO_DC_CHUNK).max(1) as u16;
+                    let parts = sample
+                        .data
+                        .len()
+                        .div_ceil(if is_idr {
+                            VIDEO_DC_KEYFRAME_CHUNK
+                        } else {
+                            VIDEO_DC_CHUNK
+                        })
+                        .max(1) as u16;
                     if is_idr {
                         tracing::info!(
                             dc_skips,
@@ -4262,9 +4314,9 @@ mod tests {
     use super::{
         EncodedFrame, EncodedFrameSlot, EncoderBackend, EncoderSettings, FrameEncoder,
         HARDWARE_BACKENDS, HardwareBackend, LatestFrame, PixelFormat, SoftwareEncoder,
-        TimingSample, TimingSamples, VIDEO_DC_CHUNK, VIDEO_DELIVERY_FAILURE_GRACE,
-        annex_b_nal_types, avcc_to_annex_b, await_video_delivery, bitrate_target,
-        delivery_failure_grace_elapsed, fit_dimensions, video_data_messages,
+        TimingSample, TimingSamples, VIDEO_DC_CHUNK, VIDEO_DC_KEYFRAME_CHUNK,
+        VIDEO_DELIVERY_FAILURE_GRACE, annex_b_nal_types, avcc_to_annex_b, await_video_delivery,
+        bitrate_target, delivery_failure_grace_elapsed, fit_dimensions, video_data_messages,
         video_heartbeat_message, viewport_scaled_rate,
     };
     use crate::config::{EncoderPreference, LatencyMode};
@@ -4282,18 +4334,25 @@ mod tests {
         assert_eq!(timestamped[0].len(), 23);
 
         let keyframe = video_data_messages(32, true, &vec![9; 100_000]);
-        let expected_parts = 100_000_usize.div_ceil(VIDEO_DC_CHUNK);
+        let expected_parts = 100_000_usize.div_ceil(VIDEO_DC_KEYFRAME_CHUNK);
         assert_eq!(keyframe.len(), expected_parts);
         assert_eq!(keyframe[0][4], 7);
         assert_eq!(
             &keyframe[0][5..9],
             &[0, 0, expected_parts as u8, (expected_parts >> 8) as u8]
         );
-        assert_eq!(keyframe[0].len(), 17 + VIDEO_DC_CHUNK);
+        assert_eq!(keyframe[0].len(), 17 + VIDEO_DC_KEYFRAME_CHUNK);
         assert_eq!(
             keyframe[expected_parts - 1].len(),
-            17 + (100_000 - (expected_parts - 1) * VIDEO_DC_CHUNK)
+            17 + (100_000 - (expected_parts - 1) * VIDEO_DC_KEYFRAME_CHUNK)
         );
+
+        let fragmented_delta = video_data_messages(33, false, &vec![8; 10_000]);
+        assert_eq!(
+            fragmented_delta.len(),
+            10_000_usize.div_ceil(VIDEO_DC_CHUNK)
+        );
+        assert_eq!(fragmented_delta[0].len(), 9 + VIDEO_DC_CHUNK);
 
         let heartbeat = video_heartbeat_message(0x0102_0304);
         assert_eq!(&heartbeat[..], &[4, 3, 2, 1, 8]);
