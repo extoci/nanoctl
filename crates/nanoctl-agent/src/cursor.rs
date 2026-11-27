@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, CopyIcon, DI_NORMAL, DestroyCursor, DrawIconEx, GetCursorInfo,
-    GetIconInfo, HCURSOR, HICON, ICONINFO, IDC_ARROW, LoadCursorW,
+    GetIconInfo, GetPhysicalCursorPos, HCURSOR, HICON, ICONINFO,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,9 +47,11 @@ pub(crate) fn sample(previous_shape_key: Option<usize>) -> Result<CursorSample> 
                 captured.ok()
             })
             .flatten();
+        let mut point = info.ptScreenPos;
+        let _ = GetPhysicalCursorPos(&mut point);
         Ok(CursorSample {
-            x: info.ptScreenPos.x,
-            y: info.ptScreenPos.y,
+            x: point.x,
+            y: point.y,
             visible: (info.flags.0 & CURSOR_SHOWING.0) != 0,
             shape_key,
             shape,
@@ -172,6 +174,7 @@ fn capture_shape(hcursor: HICON) -> Result<CursorShape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 
     #[test]
     #[ignore = "requires an interactive Windows cursor"]
@@ -195,5 +198,12 @@ mod tests {
         assert!(shape.width > 0 && shape.height > 0);
         let opaque = shape.rgba.chunks_exact(4).filter(|px| px[3] != 0).count();
         assert!(opaque > 20, "only {opaque} opaque cursor pixels");
+        assert!(
+            shape
+                .rgba
+                .chunks_exact(4)
+                .any(|px| px[3] > 0 && px[3] < 255),
+            "system arrow lost its antialiased alpha channel"
+        );
     }
 }

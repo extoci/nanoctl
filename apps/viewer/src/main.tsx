@@ -231,13 +231,13 @@ function Viewer() {
       if (!geometry || !stage || !element) return;
       const remotePosition = remoteCursorPositionRef.current;
       const remoteShape = remoteCursorShapeRef.current;
-      const remoteFresh =
+      const remoteActive =
         remotePosition !== null &&
-        remotePosition.visible &&
         performance.now() - remotePosition.at < 750 &&
         remoteShape !== null;
-      const position = remoteFresh && remotePosition ? remotePosition : cursor;
-      const show = remoteFresh || touchCursorVisibleRef.current;
+      const remoteFresh = remoteActive && remotePosition.visible;
+      const position = remoteActive && remotePosition ? remotePosition : cursor;
+      const show = remoteActive ? remotePosition.visible : touchCursorVisibleRef.current;
       element.style.display = show ? "block" : "none";
       element.style.left = `${geometry.left - stage.left + position.x * geometry.width}px`;
       element.style.top = `${geometry.top - stage.top + position.y * geometry.height}px`;
@@ -815,7 +815,7 @@ function Viewer() {
                   });
                 }}
               >
-                {touchCursorVisible ? "Cursor shown" : "Cursor hidden"}
+                {touchCursorVisible ? "Cursor dot shown" : "Cursor dot hidden"}
               </button>
             )}
             <span

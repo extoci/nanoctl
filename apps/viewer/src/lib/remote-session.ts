@@ -97,7 +97,7 @@ export type RemoteCursorShape = {
   pixels: string;
 };
 
-export type RemoteCursorPosition = { x: number; y: number; visible: boolean };
+export type RemoteCursorPosition = { x: number; y: number; visible: boolean; seq?: number };
 
 export type RemoteSessionOptions = {
   sessionId: string;
@@ -168,6 +168,8 @@ export class RemoteSessionController {
     writable: WritableStream;
   } | null = null;
   private pointerChannel: RTCDataChannel | null = null;
+  private cursorChannel: RTCDataChannel | null = null;
+  private cursorSequence = 0;
   private gamepadChannel: RTCDataChannel | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private clipboardChannel: RTCDataChannel | null = null;
@@ -613,6 +615,7 @@ export class RemoteSessionController {
         this.viewportObserver?.disconnect();
         this.viewportObserver = null;
         this.pointerChannel?.close();
+        this.cursorChannel?.close();
         this.gamepadChannel?.close();
         this.controlChannel?.close();
         this.clipboardChannel?.close();
@@ -624,6 +627,7 @@ export class RemoteSessionController {
           this.options.onAudioTrackChange?.();
         }
         this.pointerChannel = null;
+        this.cursorChannel = null;
         this.gamepadChannel = null;
         this.controlChannel = null;
         peer.close();
@@ -695,23 +699,15 @@ export class RemoteSessionController {
     this.controlChannel = peer.createDataChannel("nanoctl.control.v1", {
       ordered: true,
     });
+    this.cursorChannel = peer.createDataChannel("nanoctl.cursor.v1", {
+      ordered: false,
+      maxRetransmits: 0,
+    });
     this.inputEnabled =
       this.preferences.inputEnabled &&
       this.remoteInputAllowed &&
       this.controlChannel.readyState === "open";
-    this.controlChannel.onmessage = (event) => {
-      if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
-      let message: { type?: unknown };
-      try {
-        message = JSON.parse(event.data) as { type?: unknown };
-      } catch {
-        return;
-      }
-      if (message.type === "inputBlocked") {
-        this.inputBlocked += 1;
-        this.publishSnapshot();
-        return;
-      }
+    const receiveCursorMessage = (message: { type?: unknown }) => {
       if (message.type === "cursorShape") {
         const shape = message as unknown as RemoteCursorShape;
         if (
@@ -732,9 +728,36 @@ export class RemoteSessionController {
           Number.isFinite(position.y) &&
           typeof position.visible === "boolean"
         ) {
+          const sequence =
+            typeof position.seq === "number" && Number.isFinite(position.seq)
+              ? position.seq
+              : this.cursorSequence;
+          if (sequence < this.cursorSequence) return;
+          this.cursorSequence = Math.max(this.cursorSequence, sequence);
           this.options.onCursorPosition?.(position);
         }
       }
+    };
+    this.cursorChannel.onmessage = (event) => {
+      if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
+      try {
+        receiveCursorMessage(JSON.parse(event.data) as { type?: unknown });
+      } catch {}
+    };
+    this.controlChannel.onmessage = (event) => {
+      if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
+      let message: { type?: unknown };
+      try {
+        message = JSON.parse(event.data) as { type?: unknown };
+      } catch {
+        return;
+      }
+      if (message.type === "inputBlocked") {
+        this.inputBlocked += 1;
+        this.publishSnapshot();
+        return;
+      }
+      receiveCursorMessage(message);
     };
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
