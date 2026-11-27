@@ -60,7 +60,8 @@ pub trait Tailnet: Send + Sync {
 
 pub struct CliTailnet {
     path: PathBuf,
-    cache: Mutex<HashMap<SocketAddr, (Instant, Identity)>>,
+    cache: Mutex<HashMap<IpAddr, (Instant, Identity)>>,
+    whois_flights: Mutex<HashMap<IpAddr, Arc<Mutex<()>>>>,
 }
 
 impl CliTailnet {
@@ -94,6 +95,7 @@ impl CliTailnet {
         Ok(Self {
             path,
             cache: Mutex::new(HashMap::new()),
+            whois_flights: Mutex::new(HashMap::new()),
         })
     }
 
@@ -145,7 +147,27 @@ impl Tailnet for CliTailnet {
     }
 
     async fn whois(&self, peer: SocketAddr) -> Result<Identity> {
-        if let Some((time, identity)) = self.cache.lock().await.get(&peer)
+        // Tailscale identity belongs to the node address, not the ephemeral
+        // source port. Keying the cache by SocketAddr made every reconnect a
+        // cache miss and put a tailscale CLI subprocess back in the connect path.
+        let key = peer.ip();
+        if let Some((time, identity)) = self.cache.lock().await.get(&key)
+            && time.elapsed() < Duration::from_secs(5)
+        {
+            return Ok(identity.clone());
+        }
+        let flight = {
+            let mut flights = self.whois_flights.lock().await;
+            if flights.len() >= 1024 {
+                flights.clear();
+            }
+            flights.entry(key).or_default().clone()
+        };
+        // /v1/info and /v1/connect can authenticate in parallel. Single-flight
+        // the subprocess per node so only the loser of that race waits; it then
+        // uses the winner's cached identity instead of spawning whois again.
+        let _flight = flight.lock().await;
+        if let Some((time, identity)) = self.cache.lock().await.get(&key)
             && time.elapsed() < Duration::from_secs(5)
         {
             return Ok(identity.clone());
@@ -159,7 +181,7 @@ impl Tailnet for CliTailnet {
         if cache.len() >= 1024 {
             cache.clear();
         }
-        cache.insert(peer, (Instant::now(), identity.clone()));
+        cache.insert(key, (Instant::now(), identity.clone()));
         Ok(identity)
     }
 }
@@ -433,6 +455,76 @@ mod tests {
         assert!(peer.grants.is_some());
         assert!(parse_whois(json!({})).is_err());
         assert!(parse_status(json!({"BackendState":"Stopped"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn whois_cache_reuses_node_identity_across_ephemeral_ports() {
+        let tailnet = CliTailnet {
+            path: PathBuf::from(if cfg!(windows) {
+                "missing-tailscale.exe"
+            } else {
+                "/missing/tailscale"
+            }),
+            cache: Mutex::new(HashMap::new()),
+            whois_flights: Mutex::new(HashMap::new()),
+        };
+        let ip: IpAddr = "100.64.1.2".parse().unwrap();
+        let identity = Identity {
+            login: "owner@example.com".into(),
+            ..Default::default()
+        };
+        tailnet
+            .cache
+            .lock()
+            .await
+            .insert(ip, (Instant::now(), identity));
+        for port in [40_000, 40_001] {
+            let cached = tailnet.whois(SocketAddr::new(ip, port)).await.unwrap();
+            assert_eq!(cached.login, "owner@example.com");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_whois_for_one_node_single_flights_tailscale_cli() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let directory = std::env::temp_dir().join(format!(
+            "nanoctl-whois-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let script = directory.join("tailscale");
+        let count = directory.join("count");
+        let quote = |path: &std::path::Path| {
+            format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+        };
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho x >> {}\nsleep 0.05\nprintf '%s\\n' '{{\"UserProfile\":{{\"LoginName\":\"owner@example.com\",\"DisplayName\":\"Owner\"}},\"Node\":{{\"Tags\":[]}}}}'\n",
+                quote(&count)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let tailnet = CliTailnet {
+            path: script,
+            cache: Mutex::new(HashMap::new()),
+            whois_flights: Mutex::new(HashMap::new()),
+        };
+        let ip: IpAddr = "100.64.1.2".parse().unwrap();
+        let one = tailnet.whois(SocketAddr::new(ip, 40_000));
+        let two = tailnet.whois(SocketAddr::new(ip, 40_001));
+        let (one, two) = tokio::join!(one, two);
+        assert_eq!(one.unwrap().login, "owner@example.com");
+        assert_eq!(two.unwrap().login, "owner@example.com");
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
