@@ -205,6 +205,9 @@ final class Desktop {
         let directory = try JSONDecoder().decode(HostDirectory.self, from: data)
         return ([directory.selfHost] + directory.hosts).map { host in
             var host = host
+            // A development or partially configured agent may not know its
+            // tailnet URL, but the directory seed itself is proof of reachability.
+            if host.url.isEmpty { host.url = endpoint.base.absoluteString }
             host.source = seed
             return host
         }

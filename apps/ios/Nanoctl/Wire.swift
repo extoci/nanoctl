@@ -53,12 +53,16 @@ struct DiscoveredHost: Decodable, Equatable, Identifiable {
     let dnsName: String?
     let os: String?
     let online: Bool
-    let url: String
+    var url: String
     /// Directory agent that told us about this host; populated locally, not by the wire.
     var source: String?
 
     var id: String { url }
-    var displayName: String { hostName.isEmpty ? (dnsName ?? url) : hostName }
+    var displayName: String {
+        if !hostName.isEmpty { return hostName }
+        if let dnsName, !dnsName.isEmpty { return dnsName }
+        return URL(string: url)?.host() ?? url
+    }
 
     enum CodingKeys: String, CodingKey {
         case hostName, dnsName, os, online, url

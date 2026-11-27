@@ -324,7 +324,7 @@ struct SessionView: View {
                 .glass(in: RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: false)
             }
         }
-        .overlay(alignment: .topLeading) {
+        .overlay(alignment: .bottomLeading) {
             if model.showStats, !model.stats.isEmpty {
                 Text(model.stats)
                     .font(.caption.monospaced())

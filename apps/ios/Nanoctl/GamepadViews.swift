@@ -49,7 +49,7 @@ struct GamepadStatusRow: View {
                 Text(status.recognition)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
-                Text("Host sees \(status.hostDevice) · player \(status.slot)")
+                Text("Maps to \(status.hostDevice) · player \(status.slot)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -67,7 +67,7 @@ struct GamepadStatusRow: View {
         .padding(.vertical, 12)
         .glass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(status.recognition), player \(status.slot), appears on the host as \(status.hostDevice), \(status.batteryLabel)")
+        .accessibilityLabel("\(status.recognition), player \(status.slot), maps to \(status.hostDevice), \(status.batteryLabel)")
     }
 
     private var batteryIcon: String {

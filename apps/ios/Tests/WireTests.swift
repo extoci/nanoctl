@@ -131,7 +131,7 @@ final class WireTests: XCTestCase {
     func testHostDirectoryDecodesSelfAndPeers() throws {
         let directory = try JSONDecoder().decode(HostDirectory.self, from: Data(#"""
         {
-          "self": {"hostName":"studio-mac","dnsName":"studio-mac.tail.ts.net","os":"macos","online":true,"url":"https://studio-mac:7337"},
+          "self": {"hostName":"studio-mac","dnsName":"studio-mac.tail.ts.net","url":"https://studio-mac:7337"},
           "hosts": [
             {"hostName":"gaming-pc","dnsName":"gaming-pc.tail.ts.net","os":"windows","online":true,"url":"https://gaming-pc:7337"},
             {"hostName":"offline-linux","os":"linux","online":false,"url":"https://offline-linux:7337"}
@@ -140,6 +140,8 @@ final class WireTests: XCTestCase {
         """#.utf8))
         XCTAssertEqual(directory.selfHost.displayName, "studio-mac")
         XCTAssertEqual(directory.hosts.count, 2)
+        XCTAssertTrue(directory.selfHost.online)
+        XCTAssertNil(directory.selfHost.os)
         XCTAssertEqual(directory.hosts[0].os, "windows")
         XCTAssertNil(directory.hosts[1].dnsName)
     }
