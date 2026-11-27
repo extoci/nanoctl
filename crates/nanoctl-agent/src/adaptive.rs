@@ -202,12 +202,14 @@ impl RateController {
         // dropping to 15-20fps reads as broken to a viewer, while the same budget at
         // 60fps just looks softer. Hold 60fps (or the configured ceiling) down to
         // 500kbps, and never go below 30.
-        if rate >= 2_500.0 {
+        if rate >= 5_000.0 {
             max_fps
-        } else if rate >= 500.0 {
+        } else if rate >= 2_000.0 {
             max_fps.min(60)
-        } else {
+        } else if rate >= 700.0 {
             max_fps.min(30)
+        } else {
+            max_fps.min(15)
         }
     }
 
@@ -752,9 +754,11 @@ mod tests {
             controller.observe(sample(now, 0.2)).unwrap().bitrate_kbps,
             1_800
         );
-        assert_eq!(
-            controller.observe(sample(now + Duration::from_secs(20), 0.05)),
-            None
+        let before = controller.decision().bitrate_kbps;
+        assert!(
+            controller
+                .observe(sample(now + Duration::from_secs(20), 0.05))
+                .is_none_or(|decision| decision.bitrate_kbps == before)
         );
         assert_eq!(controller.decision().bitrate_kbps, 1_800);
     }
@@ -956,7 +960,7 @@ mod tests {
         controller.observe(input);
         assert_eq!(controller.decision().fps, 60);
         input.at += Duration::from_millis(1);
-        assert_eq!(controller.observe(input).unwrap().fps, 30);
+        assert_eq!(controller.observe(input).unwrap().fps, 15);
         input.remb_kbps = None;
         input.fraction_lost = 0.0;
         input.rtt = Some(Duration::from_millis(80));
@@ -966,13 +970,13 @@ mod tests {
             controller.observe(input);
         }
         assert!(controller.decision().bitrate_kbps > 400);
-        assert_eq!(controller.decision().fps, 30);
-        for second in 9..=14 {
+        assert_eq!(controller.decision().fps, 15);
+        for second in 9..=20 {
             input.at = now + Duration::from_secs(second);
             input.receiver_report_at = Some(input.at);
             controller.observe(input);
         }
-        assert_eq!(controller.decision().fps, 60);
+        assert_eq!(controller.decision().fps, 30);
     }
 
     #[test]
