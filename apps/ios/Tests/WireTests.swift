@@ -128,6 +128,31 @@ final class WireTests: XCTestCase {
         XCTAssertNil(GamepadMessage(pads: Array(repeating: [0, 0, 0, 0, 0, 0, 0, 0], count: 5)).binary(sequence: 0))
     }
 
+    func testHostDirectoryDecodesSelfAndPeers() throws {
+        let directory = try JSONDecoder().decode(HostDirectory.self, from: Data(#"""
+        {
+          "self": {"hostName":"studio-mac","dnsName":"studio-mac.tail.ts.net","os":"macos","online":true,"url":"https://studio-mac:7337"},
+          "hosts": [
+            {"hostName":"gaming-pc","dnsName":"gaming-pc.tail.ts.net","os":"windows","online":true,"url":"https://gaming-pc:7337"},
+            {"hostName":"offline-linux","os":"linux","online":false,"url":"https://offline-linux:7337"}
+          ]
+        }
+        """#.utf8))
+        XCTAssertEqual(directory.selfHost.displayName, "studio-mac")
+        XCTAssertEqual(directory.hosts.count, 2)
+        XCTAssertEqual(directory.hosts[0].os, "windows")
+        XCTAssertNil(directory.hosts[1].dnsName)
+    }
+
+    func testGamepadStatusBatteryLabelHandlesUnknownAndCharging() {
+        XCTAssertEqual(GamepadStatus(id: 1, slot: 0, name: "Controller", recognition: "DualSense",
+                                     hostDevice: "DualShock 4", batteryPercent: 82,
+                                     batteryState: "charging").batteryLabel, "82% · charging")
+        XCTAssertEqual(GamepadStatus(id: 1, slot: 0, name: "Controller", recognition: "Xbox controller",
+                                     hostDevice: "Xbox 360", batteryPercent: nil,
+                                     batteryState: "").batteryLabel, "Battery unknown")
+    }
+
     func testMultiGamepadBinaryUsesIndependentSlotsInSortedOrder() {
         let message = GamepadMessage(pads: [
             [2, 0x2000, 9, 0, 0, 0, 0, 0],

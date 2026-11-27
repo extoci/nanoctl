@@ -110,6 +110,9 @@ final class Session {
     /// The user wants a session (connecting, live or retrying).
     private(set) var wantsConnection = false
     private var reconnectAttempts = 0
+    /// Session-local codec degradation. A persistent HEVC decode fault must not
+    /// leave the app black or permanently overwrite the user's codec preference.
+    private var forceH264 = false
 
     private(set) var track: RTCVideoTrack?
     private(set) var audioTrack: RTCAudioTrack?
@@ -150,6 +153,28 @@ final class Session {
     }
 
     #if DEBUG && targetEnvironment(simulator)
+    func diagnostics() -> SessionDiagnostics {
+        let dc = connection?.dcVideo?.statusSnapshot()
+        return SessionDiagnostics(
+            state: state,
+            transport: transport == .dataChannel ? "data-channel" : "rtp",
+            codec: dc?.codec?.rawValue ?? codec,
+            inputReady: inputReady,
+            dcMessages: dc?.stats.msgs ?? 0,
+            dcFed: dc?.stats.fed ?? 0,
+            dcDecoded: dc?.decoded ?? 0,
+            dcDropped: dc?.dropped ?? 0,
+            dcGaps: dc?.stats.gaps ?? 0,
+            dcKeyframeRequests: dc?.stats.kfRequests ?? 0,
+            dcFaulted: dc?.faulted ?? false,
+            dcKeys: dc?.stats.keys ?? 0,
+            dcExpectedSeq: dc?.expectedSeq,
+            dcWaitingForKey: dc?.waitingForKey ?? true,
+            dcReordered: dc?.reorderedCount ?? 0,
+            dcPending: dc?.pendingCount ?? 0
+        )
+    }
+
     func receiverStats() async -> ReceiverStats? {
         guard let peer = connection?.peer else { return nil }
         return await withCheckedContinuation { reply in
@@ -174,6 +199,7 @@ final class Session {
         self.endpoint = endpoint
         wantsConnection = true
         reconnectAttempts = 0
+        forceH264 = false
         connect(endpoint)
     }
 
@@ -492,7 +518,7 @@ final class Session {
             sessionLog.info("host hello: \(host.hostName) codecs=\(host.capabilities.codecs?.joined(separator: ",") ?? "?") audio=\(host.audioAvailable)")
             audioOutputs = host.capabilities.audioOutputs ?? []
             if audioOutputs.isEmpty == false { _ = selectAudioOutput(nil) }
-            try await negotiate(current, injectHevc: codecPreference.injectHevc)
+            try await negotiate(current, injectHevc: codecPreference.injectHevc && !forceH264)
         case "signal":
             guard let id = current.id, let peer = current.peer, let signal = message.envelope,
                   signal.belongs(to: id, controller: current.epoch, generation: 0) else { return }
@@ -795,9 +821,7 @@ final class Session {
         receiver.onPersistentFault = { [weak self, weak current] in
             Task { @MainActor in
                 guard let session = self, let current = current ?? session.connection else { return }
-                current.video?.close()
-                current.videoIdr?.close()
-                session.deactivateDataChannelVideo(current)
+                session.dataChannelDecoderFailed(current)
             }
         }
         receiver.onUnsupported = { [weak self, weak current] in
@@ -816,6 +840,27 @@ final class Session {
         // video channel is open; IDRs still flow so RTCP feedback survives.
         onControlOpen(current)
         onChange?()
+    }
+
+    func resetCodecFallback() {
+        forceH264 = false
+    }
+
+    /// Decoder failure is not a terminal UX state. If HEVC itself is the
+    /// suspect, retry once as H.264; otherwise reanimate the RTP leg. Either
+    /// outcome is better than a trustworthy-looking black screen.
+    private func dataChannelDecoderFailed(_ current: Connection) {
+        guard connection === current else { return }
+        if codec == "hevc", !forceH264 {
+            forceH264 = true
+            sessionLog.error("HEVC decoder persistently faulted; retrying as H.264")
+            state = "HEVC decoder failed. Retrying with H.264…"
+            if let endpoint { connect(endpoint) }
+            return
+        }
+        current.video?.close()
+        current.videoIdr?.close()
+        deactivateDataChannelVideo(current)
     }
 
     private func deactivateDataChannelVideo(_ current: Connection) {
@@ -884,7 +929,12 @@ final class Session {
         current.lastVideoFed = wire.fed
         current.lastVideoDecoded = status.decoded
         current.videoSilentSeconds = messagesDelta == 0 ? current.videoSilentSeconds + 1 : 0
-        current.decoderStallSeconds = fedDelta > 0 && decodedDelta == 0 ? current.decoderStallSeconds + 1 : 0
+        // A steady stream of wire messages with no decoded output is still a
+        // black screen: packet loss can leave the receiver waiting for repair
+        // even while the lossy delta lane itself looks lively.
+        current.decoderStallSeconds = decodedDelta == 0 && (fedDelta > 0 || messagesDelta > 20)
+            ? current.decoderStallSeconds + 1
+            : 0
         if current.videoSilentSeconds >= 8 {
             sessionLog.error("data-channel video silent for 8s; falling back to RTP")
             current.video?.close()
@@ -893,10 +943,8 @@ final class Session {
             return
         }
         if current.decoderStallSeconds >= 3 || (status.decoded == 0 && wire.msgs > 90 && status.faulted) {
-            sessionLog.error("data-channel decoder produced no frames; falling back to RTP")
-            current.video?.close()
-            current.videoIdr?.close()
-            deactivateDataChannelVideo(current)
+            sessionLog.error("data-channel decoder produced no frames; recovering video")
+            dataChannelDecoderFailed(current)
         }
     }
 

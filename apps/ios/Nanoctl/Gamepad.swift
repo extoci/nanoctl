@@ -140,7 +140,9 @@ final class Gamepad {
             var percent: Int?
             var batteryState = ""
             if let battery = controller.battery {
-                percent = Int((min(1, max(0, battery.batteryLevel)) * 100).rounded())
+                if battery.batteryState != .unknown, battery.batteryLevel >= 0 {
+                    percent = Int((min(1, battery.batteryLevel) * 100).rounded())
+                }
                 switch battery.batteryState {
                 case .charging: batteryState = "charging"
                 case .full: batteryState = "full"

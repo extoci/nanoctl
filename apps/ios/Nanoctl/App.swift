@@ -55,6 +55,7 @@ final class Desktop {
     private var discoveryTask: Task<Void, Never>?
     #if DEBUG && targetEnvironment(simulator)
     var probe: LatencyProbe?
+    var networkProbe: NetworkProbe?
     #endif
 
     init() {
@@ -224,6 +225,7 @@ final class Desktop {
 
     func setCodec(_ codec: CodecPreference) {
         guard codec != session.codecPreference else { return }
+        session.resetCodecFallback()
         session.codecPreference = codec
         if session.wantsConnection { session.restart() }
         update()
@@ -275,6 +277,11 @@ final class PhoneScene: UIResponder, UIWindowSceneDelegate {
             let probe = LatencyProbe(session: desktop.session)
             desktop.probe = probe
             desktop.stage.video.probe = probe
+            desktop.connect(address)
+        } else if let address = ProcessInfo.processInfo.environment["NANOCTL_NETWORK_PROBE_URL"] {
+            let probe = NetworkProbe(session: desktop.session)
+            desktop.networkProbe = probe
+            desktop.stage.video.networkProbe = probe
             desktop.connect(address)
         }
         #endif

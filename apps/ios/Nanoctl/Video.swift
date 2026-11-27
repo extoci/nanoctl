@@ -88,6 +88,7 @@ final class VideoView: UIView {
     private var lastPixel = -1
     #if DEBUG && targetEnvironment(simulator)
     weak var probe: LatencyProbe?
+    weak var networkProbe: NetworkProbe?
     private var displayLink: CADisplayLink?
     private var refresh: (target: CFTimeInterval, interval: CFTimeInterval)?
     #endif
@@ -202,6 +203,9 @@ final class VideoView: UIView {
             var pixelSample: (FrameMarker, Int, Int)?
             #endif
             if let buffer = entry.buffer {
+                #if DEBUG && targetEnvironment(simulator)
+                networkProbe?.recordRender()
+                #endif
                 let image = CIImage(cvPixelBuffer: buffer)
                 imageSize = image.extent.size
                 let rect = fit(imageSize, in: destination)
@@ -255,6 +259,9 @@ final class VideoView: UIView {
         var sample: (FrameMarker, Int, Int, UInt32)?
         #endif
         if let frame = entry.frame, let buffer = pixelBuffer(frame) {
+            #if DEBUG && targetEnvironment(simulator)
+            networkProbe?.recordRender()
+            #endif
             let image = CIImage(cvPixelBuffer: buffer)
             imageSize = image.extent.size
             let rect = fit(imageSize, in: destination)

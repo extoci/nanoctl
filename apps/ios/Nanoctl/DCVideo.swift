@@ -18,6 +18,7 @@ final class DCVideoReceiver {
         var fed = 0
         var gaps = 0
         var kfRequests = 0
+        var keys = 0
         var late = 0
         var transitMs = 0.0
     }
@@ -28,6 +29,10 @@ final class DCVideoReceiver {
         let decoded: Int
         let dropped: Int
         let faulted: Bool
+        let expectedSeq: UInt32?
+        let waitingForKey: Bool
+        let reorderedCount: Int
+        let pendingCount: Int
     }
 
     // Match the browser viewer: four frames bounds reordering without making
@@ -96,19 +101,24 @@ final class DCVideoReceiver {
     func statusSnapshot() -> Status {
         queue.sync {
             Status(stats: stats, codec: codec, decoded: decoder?.decoded ?? 0,
-                   dropped: decoder?.dropped ?? 0, faulted: (decoder?.faults ?? 0) > 0)
+                   dropped: decoder?.dropped ?? 0, faulted: (decoder?.faults ?? 0) > 0,
+                   expectedSeq: expectedSeq, waitingForKey: waitingForKey,
+                   reorderedCount: reordered.count, pendingCount: pending.count)
         }
+    }
+
+    private func requestKeyframeThrottled() {
+        guard CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 else { return }
+        kfRequestedAt = CFAbsoluteTimeGetCurrent()
+        stats.kfRequests += 1
+        requestKeyframe()
     }
 
     private func onDecoderFault() {
         waitingForKey = true
         reordered.removeAll()
         consecutiveFaults += 1
-        if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-            kfRequestedAt = CFAbsoluteTimeGetCurrent()
-            stats.kfRequests += 1
-            requestKeyframe()
-        }
+        requestKeyframeThrottled()
         if consecutiveFaults >= maxConsecutiveFaults {
             consecutiveFaults = 0
             onPersistentFault()
@@ -121,6 +131,7 @@ final class DCVideoReceiver {
         let seq = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
         let flags = data[4]
         let isKey = flags & 1 != 0
+        if isKey { stats.keys += 1 }
         var offset = 5
         var part = 0
         var parts = 1
@@ -151,15 +162,16 @@ final class DCVideoReceiver {
                 stats.gaps += 1
                 lost += Int(diff)
                 reordered.removeAll()
-                if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-                    kfRequestedAt = CFAbsoluteTimeGetCurrent()
-                    stats.kfRequests += 1
-                    requestKeyframe()
-                }
+                requestKeyframeThrottled()
             }
             return
         }
         guard data.count > offset else { return }
+        // KF requests themselves ride the lossy delta channel, so one
+        // throttled request is not a recovery guarantee. While repair is
+        // outstanding, every live video message is evidence that the host is
+        // still sending and a reminder that it owes us a keyframe.
+        if waitingForKey { requestKeyframeThrottled() }
         var chunk = data.subdata(in: offset..<data.count)
 
         if parts > 1 {
@@ -179,11 +191,7 @@ final class DCVideoReceiver {
                     if !waitingForKey {
                         waitingForKey = true
                         stats.gaps += 1
-                        if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-                            kfRequestedAt = CFAbsoluteTimeGetCurrent()
-                            stats.kfRequests += 1
-                            requestKeyframe()
-                        }
+                        requestKeyframeThrottled()
                     }
                 }
                 return
@@ -223,6 +231,7 @@ final class DCVideoReceiver {
                 stats.gaps += 1
                 lost += reordered.count + Int(diff)
                 reordered.removeAll()
+                requestKeyframeThrottled()
             }
         }
 
@@ -236,11 +245,7 @@ final class DCVideoReceiver {
     private func deliver(_ seq: UInt32, au: Data, isKey: Bool) {
         expectedSeq = seq &+ 1
         if waitingForKey {
-            if CFAbsoluteTimeGetCurrent() - kfRequestedAt > 0.25 {
-                kfRequestedAt = CFAbsoluteTimeGetCurrent()
-                stats.kfRequests += 1
-                requestKeyframe()
-            }
+            requestKeyframeThrottled()
             guard isKey else { return }
             waitingForKey = false
         }
