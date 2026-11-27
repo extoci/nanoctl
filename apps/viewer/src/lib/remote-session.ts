@@ -918,10 +918,23 @@ export class RemoteSessionController {
         // Synthetic or already-ended pointers can reject capture; still deliver the click.
       }
     }
+    const locked = document.pointerLockElement === this.options.video;
+    if (locked && event.type === "pointermove") {
+      this.sendControl({
+        type: "pointer",
+        action: "move",
+        x: 0,
+        y: 0,
+        deltaX: event.movementX,
+        deltaY: event.movementY,
+      });
+      return;
+    }
     this.sendControl({
       type: "pointer",
       action: event.type === "pointermove" ? "move" : event.type === "pointerdown" ? "down" : "up",
       ...position,
+      ...(locked && { deltaX: 0, deltaY: 0 }),
       button: event.button === 1 || event.button === 2 ? event.button : 0,
     });
   };
@@ -954,6 +967,24 @@ export class RemoteSessionController {
 
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
+    if (event.type === "keydown" && event.ctrlKey && event.altKey && event.code === "KeyM") {
+      event.preventDefault();
+      if (document.pointerLockElement === this.options.video) document.exitPointerLock();
+      else {
+        const request = this.options.video.requestPointerLock as (options?: {
+          unadjustedMovement?: boolean;
+        }) => Promise<void> | void;
+        try {
+          const pending = request.call(this.options.video, { unadjustedMovement: true });
+          if (pending instanceof Promise) {
+            void pending.catch(() => this.options.video.requestPointerLock());
+          }
+        } catch {
+          void this.options.video.requestPointerLock();
+        }
+      }
+      return;
+    }
     // Keys go to the host while the video or nothing in particular has focus; panel controls keep
     // theirs, and Tab from the page still moves browser focus so the controls stay reachable.
     // A key the host saw pressed is always released there, wherever focus has moved since.
@@ -1422,6 +1453,7 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
+    if (document.pointerLockElement === this.options.video) document.exitPointerLock();
     this.pressedKeys.clear();
     if (!this.inputEnabled) this.stopGamepads();
     const channel = this.controlChannel;

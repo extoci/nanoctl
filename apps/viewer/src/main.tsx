@@ -628,7 +628,7 @@ function Viewer() {
             <button
               aria-pressed={snapshot.inputEnabled}
               disabled={!info?.remoteInput || terminal || status !== "online"}
-              title="Release input: Ctrl+Alt+Shift+Esc"
+              title="Release input: Ctrl+Alt+Shift+Esc. Toggle gaming mouse lock: Ctrl+Alt+M"
               onClick={() => transport.current?.controller?.setInputEnabled(!snapshot.inputEnabled)}
             >
               {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
