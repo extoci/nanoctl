@@ -2735,6 +2735,7 @@ dependencies = [
  "hostname",
  "interceptor",
  "libc",
+ "libloading",
  "nanoctl-update",
  "objc2",
  "objc2-core-graphics",
