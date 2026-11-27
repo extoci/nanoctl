@@ -1177,6 +1177,62 @@ describe("webcodecs video gating and teardown", () => {
     handle.drop();
   });
 
+  test("keyframe recovery skips do not amplify data-channel loss feedback", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+
+    receive(0, true);
+    for (let seq = 1; seq <= 10; seq += 1) receive(seq);
+    expect(handle.takeLinkLoss?.()).toBe(0);
+
+    // Lose only sequence 11. Sequences 12-28 overflow the reorder window and
+    // sequence 40 is the recovery IDR; the 29 dependent frames skipped by that
+    // IDR must not be treated as independent network loss.
+    for (let seq = 12; seq <= 28; seq += 1) receive(seq);
+    expect(channel.sent).toContain("KF");
+    receive(40, true);
+
+    const loss = handle.takeLinkLoss?.();
+    expect(loss).toBeGreaterThan(0);
+    expect(loss).toBeLessThan(0.1);
+    handle.drop();
+  });
+
   test("keyframe requests use the reliable idr channel when present", () => {
     installBrowserGlobals(() => 0);
     class FakeVideoDecoder {
