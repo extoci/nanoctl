@@ -11,6 +11,8 @@ export type FrameSequencerOutcome = {
 };
 
 const MODULO_HALF = 0x80000000;
+const MAX_REORDER_BYTES = 4 * 1024 * 1024;
+export const V4_VIDEO_REORDER_CAPACITY = 16;
 
 function validSequence(sequence: number): boolean {
   return Number.isInteger(sequence) && sequence >= 0 && sequence <= 0xffffffff;
@@ -49,17 +51,55 @@ export class FrameSequencer {
   private expectedSequence: number | undefined;
   private awaitingKeyframe = false;
   private readonly reorderBuffer: AccessUnit[] = [];
+  private reorderBytes = 0;
 
-  constructor(reorderCapacity = 2) {
-    if (!Number.isInteger(reorderCapacity) || reorderCapacity < 0 || reorderCapacity > 8)
-      throw new Error("reorder capacity must be an integer between 0 and 8");
+  constructor(reorderCapacity = V4_VIDEO_REORDER_CAPACITY) {
+    if (
+      !Number.isInteger(reorderCapacity) ||
+      reorderCapacity < 0 ||
+      reorderCapacity > V4_VIDEO_REORDER_CAPACITY
+    )
+      throw new Error("reorder capacity must be an integer between 0 and 16");
     this.reorderCapacity = reorderCapacity;
+  }
+
+  get waitingForReference(): boolean {
+    return this.awaitingKeyframe;
+  }
+
+  get bufferedFrames(): number {
+    return this.reorderBuffer.length;
+  }
+
+  get nextExpectedSequence(): number | undefined {
+    return this.awaitingKeyframe ? undefined : this.expectedSequence;
+  }
+
+  isBehindWatermark(next: number): boolean {
+    if (this.awaitingKeyframe) return false;
+    if (this.expectedSequence === undefined) return true;
+    const distance = sequenceDistance(next, this.expectedSequence);
+    return distance > 0 && distance < MODULO_HALF;
+  }
+
+  requireKeyframe(): void {
+    this.reorderBuffer.length = 0;
+    this.reorderBytes = 0;
+    this.awaitingKeyframe = true;
   }
 
   push(unit: AccessUnit): FrameSequencerOutcome {
     if (!validSequence(unit.streamSequence)) throw new Error("invalid access-unit sequence");
     const outcome = emptyOutcome();
     if (unit.keyframe) {
+      if (
+        this.expectedSequence !== undefined &&
+        sequenceDistance(unit.streamSequence, this.expectedSequence) >= MODULO_HALF
+      ) {
+        outcome.duplicatesDropped = 1;
+        outcome.buffered = this.reorderBuffer.length;
+        return outcome;
+      }
       // Reference and delta frames travel on independent lanes, so a delta that
       // references this keyframe may validly arrive before the keyframe itself.
       // Discard only older generations; keep newer buffered units and drain them
@@ -71,6 +111,7 @@ export class FrameSequencer {
           sequenceDistance(buffered.streamSequence, unit.streamSequence) >= MODULO_HALF
         ) {
           this.reorderBuffer.splice(index, 1);
+          this.reorderBytes -= buffered?.payload.length ?? 0;
         }
       }
       this.awaitingKeyframe = false;
@@ -112,11 +153,12 @@ export class FrameSequencer {
       outcome.buffered = this.reorderBuffer.length;
       return outcome;
     }
-    if (this.reorderBuffer.length >= this.reorderCapacity) {
+    if (
+      this.reorderBuffer.length >= this.reorderCapacity ||
+      this.reorderBytes + unit.payload.length > MAX_REORDER_BYTES
+    ) {
       outcome.unreferenceableDropped += this.reorderBuffer.length + 1;
-      this.reorderBuffer.length = 0;
-      this.expectedSequence = undefined;
-      this.awaitingKeyframe = true;
+      this.requireKeyframe();
       outcome.requestKeyframe = true;
       outcome.buffered = 0;
       return outcome;
@@ -127,6 +169,7 @@ export class FrameSequencer {
     );
     if (insertAt === -1) this.reorderBuffer.push(unit);
     else this.reorderBuffer.splice(insertAt, 0, unit);
+    this.reorderBytes += unit.payload.length;
     outcome.buffered = this.reorderBuffer.length;
     return outcome;
   }
@@ -142,6 +185,7 @@ export class FrameSequencer {
       const next = this.reorderBuffer[index];
       if (next === undefined) return;
       this.reorderBuffer.splice(index, 1);
+      this.reorderBytes -= next.payload.length;
       emitted.push(next);
       this.expectedSequence = (expected + 1) >>> 0;
     }

@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Headless nanoctl remote desktop agent"
 
+[patch.crates-io]
+webrtc-sctp = { path = "../vendor/webrtc-sctp" }
+
 [features]
 default = []
 capture = [

@@ -166,9 +166,8 @@ pub struct EncodeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedBitstream {
     pub keyframe: bool,
-    /// Empty means the encoder deliberately skipped this frame for rate control. Such a frame
-    /// is not an access unit; the pipeline counts it as a visible drop and forces the next
-    /// emitted frame to be a keyframe so the reference chain remains explicit.
+    /// Empty means the encoder skipped this image and kept its previous reference state.
+    /// The pipeline counts the skip and retries any pending request for a keyframe.
     pub payload: Vec<u8>,
 }
 
@@ -195,6 +194,8 @@ pub enum LaneWriteStatus {
 pub struct LaneWriteReport {
     pub status: LaneWriteStatus,
     pub buffered_bytes: usize,
+    /// Video bytes accepted by the transport, including headers and repeated chunks.
+    pub wire_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -203,8 +204,12 @@ pub struct MediaPipelineSnapshot {
     pub frames_captured: u64,
     pub frames_replaced_before_encode: u64,
     pub frames_taken_for_encode: u64,
+    pub frames_waiting_for_reference: u64,
+    pub frames_skipped_for_backpressure: u64,
     pub access_units_encoded: u64,
     pub keyframes_encoded: u64,
+    pub deltas_written_during_keyframe_cooldown: u64,
+    pub delta_repairs_written: u64,
     pub bytes_encoded: u64,
     pub capture_errors: u64,
     pub encode_errors: u64,
@@ -215,6 +220,7 @@ pub struct MediaPipelineSnapshot {
     pub unchanged_frames_skipped: u64,
     pub bytes_written: u64,
     pub max_buffered_bytes: u64,
+    pub next_video_sequence: Option<u32>,
     pub total_encode_micros: u64,
     pub max_encode_micros: u64,
 }
@@ -238,6 +244,21 @@ pub trait VideoEncoder: Send {
 
 #[async_trait]
 pub trait LaneWriter: Send {
+    /// Whether the transport is ready for a new reference access unit.
+    async fn reference_ready(&mut self) -> bool {
+        true
+    }
+
+    /// Whether the transport has room to begin encoding another delta frame.
+    async fn delta_ready(&mut self) -> bool {
+        true
+    }
+
+    /// Retransmit a requested recent delta when the transport has room.
+    async fn repair_pending_delta(&mut self) -> Result<Option<LaneWriteReport>, MediaError> {
+        Ok(None)
+    }
+
     /// Atomically accept or reject one complete access unit. A lane that cannot accept
     /// it without queueing must return `DroppedBeforeWrite` rather than an error when
     /// the drop is recoverable. Returning `Written` means every byte was accepted.

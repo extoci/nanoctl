@@ -524,16 +524,60 @@ export function parseVideoChunk(bytes: Uint8Array): VideoChunk {
   };
 }
 
-export type VideoControlMessage = { readonly kind: "keyframeRequest" };
+export type VideoControlMessage =
+  | { readonly kind: "keyframeRequest" }
+  | { readonly kind: "sequenceWatermark"; readonly nextSequence: number }
+  | {
+      readonly kind: "deltaRepair";
+      readonly streamSequence: number;
+      readonly parts?: readonly number[];
+    };
 
-export function encodeVideoControlMessage(_message: VideoControlMessage): Uint8Array {
-  return new Uint8Array([V4_WIRE_VERSION, 0x41]);
+const MAX_DELTA_REPAIR_PARTS = 6;
+
+function validDeltaRepairParts(parts: readonly number[]): boolean {
+  return (
+    parts.length <= MAX_DELTA_REPAIR_PARTS &&
+    parts.every((part) => Number.isInteger(part) && part >= 0 && part < MAX_VIDEO_PARTS) &&
+    new Set(parts).size === parts.length
+  );
+}
+
+export function encodeVideoControlMessage(message: VideoControlMessage): Uint8Array {
+  if (message.kind === "keyframeRequest") return new Uint8Array([V4_WIRE_VERSION, 0x41]);
+  const watermark = message.kind === "sequenceWatermark";
+  const sequence = watermark ? message.nextSequence : message.streamSequence;
+  if (!validUint(sequence, 32)) fail("invalidValue", "invalid video control sequence");
+  const out = new ByteWriter();
+  out.u8(V4_WIRE_VERSION);
+  out.u8(watermark ? 0x42 : 0x43);
+  out.u32(sequence);
+  if (message.kind === "deltaRepair" && message.parts !== undefined) {
+    if (!validDeltaRepairParts(message.parts)) fail("invalidValue", "invalid delta repair parts");
+    for (const part of message.parts) out.u16(part);
+  }
+  return out.finish();
 }
 
 export function parseVideoControlMessage(bytes: Uint8Array): VideoControlMessage {
-  versioned(bytes, 0x41, 0x41);
-  if (bytes.length !== 2) fail("invalidLength", "invalid video control length");
-  return { kind: "keyframeRequest" };
+  const kind = versioned(bytes, 0x41, 0x43);
+  if (kind === 0x41 && bytes.length === 2) return { kind: "keyframeRequest" };
+  if (kind === 0x42 && bytes.length === 6)
+    return { kind: "sequenceWatermark", nextSequence: u32At(bytes, 2) };
+  if (kind === 0x43 && bytes.length === 6)
+    return { kind: "deltaRepair", streamSequence: u32At(bytes, 2) };
+  if (
+    kind === 0x43 &&
+    bytes.length > 6 &&
+    bytes.length <= 6 + MAX_DELTA_REPAIR_PARTS * 2 &&
+    bytes.length % 2 === 0
+  ) {
+    const parts: number[] = [];
+    for (let offset = 6; offset < bytes.length; offset += 2) parts.push(u16At(bytes, offset));
+    if (!validDeltaRepairParts(parts)) fail("invalidValue", "invalid delta repair parts");
+    return { kind: "deltaRepair", streamSequence: u32At(bytes, 2), parts };
+  }
+  fail("invalidLength", "invalid video control length");
 }
 
 export type ReassemblyOutcome = {
@@ -551,15 +595,52 @@ type PartialAccessUnit = {
   readonly parts: (Uint8Array | undefined)[];
 };
 
-const MAX_PENDING_ACCESS_UNITS = 3;
+const MAX_PENDING_REFERENCES = 3;
+const MAX_PENDING_DELTAS = 16;
 
 export class VideoReassembler {
   private readonly pending = new Map<number, PartialAccessUnit>();
   private pendingBytes = 0;
+  private minimumSequence: number | undefined;
+
+  /** Advance to the next useful decode sequence, including across u32 wraparound. */
+  discardBefore(sequence: number): void {
+    this.minimumSequence = sequence;
+    for (const [pendingSequence, frame] of this.pending) {
+      if (((pendingSequence - sequence) | 0) < 0) {
+        this.pending.delete(pendingSequence);
+        this.pendingBytes -= frame.byteLength;
+      }
+    }
+  }
+
+  hasIncompleteFrameAtOrAfter(sequence: number): boolean {
+    for (const pendingSequence of this.pending.keys()) {
+      if (((pendingSequence - sequence) | 0) >= 0) return true;
+    }
+    return false;
+  }
+
+  missingDeltaParts(sequence: number): number[] | undefined {
+    const frame = this.pending.get(sequence);
+    if (frame === undefined || frame.keyframe) return undefined;
+    const missing: number[] = [];
+    for (
+      let index = 0;
+      index < frame.partCount && missing.length < MAX_DELTA_REPAIR_PARTS;
+      index += 1
+    ) {
+      if (frame.parts[index] === undefined) missing.push(index);
+    }
+    return missing;
+  }
 
   push(chunk: VideoChunk): ReassemblyOutcome {
     validateVideoChunk(chunk);
     const sequence = chunk.streamSequence;
+    if (this.minimumSequence !== undefined && ((sequence - this.minimumSequence) | 0) < 0) {
+      return {};
+    }
     let current = this.pending.get(sequence);
     if (current === undefined && chunk.parts === 1) {
       return {
@@ -583,10 +664,18 @@ export class VideoReassembler {
       if (current.parts[chunk.part] !== undefined) return {};
     }
 
-    const evicted =
-      current === undefined && this.pending.size === MAX_PENDING_ACCESS_UNITS
-        ? this.pending.keys().next().value
-        : undefined;
+    let evicted: number | undefined;
+    if (current === undefined) {
+      const limit = chunk.keyframe ? MAX_PENDING_REFERENCES : MAX_PENDING_DELTAS;
+      let oldest: number | undefined;
+      let count = 0;
+      for (const [sequence, pending] of this.pending) {
+        if (pending.keyframe !== chunk.keyframe) continue;
+        oldest ??= sequence;
+        count += 1;
+      }
+      if (count === limit) evicted = oldest;
+    }
     const evictedBytes = evicted === undefined ? 0 : this.pending.get(evicted)!.byteLength;
     const nextBytes = this.pendingBytes - evictedBytes + chunk.payload.length;
     if (nextBytes > MAX_ACCESS_UNIT_BYTES)

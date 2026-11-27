@@ -758,6 +758,9 @@ export class RemoteSessionController {
         this.options.video,
         restoreRemoteVideo,
         this.onDirectVideoFrame,
+        (reason) => {
+          if (this.isCurrent(lifecycle, peer)) void this.fail(reason);
+        },
       );
     }
     if (this.options.systemAudioEnabled) peer.addTransceiver("audio", { direction: "recvonly" });

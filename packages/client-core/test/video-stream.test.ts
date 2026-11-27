@@ -59,6 +59,19 @@ describe("VideoStreamProcessor", () => {
     expect(processor.pushChunk(chunk(8, 1, 2, true, [5])).emitted[0]?.streamSequence).toBe(8);
   });
 
+  test("late fragments of older references cannot evict the current recovery frame", () => {
+    const processor = new VideoStreamProcessor();
+    processor.pushEncodedChunk(encoded(5, 0, 2, true, [5]));
+    processor.pushEncodedChunk(encoded(10, 0, 1, true, [10]));
+    processor.pushEncodedChunk(encoded(14, 0, 2, true, [14]));
+    for (const stale of [6, 7, 8]) {
+      processor.pushEncodedChunk(encoded(stale, 0, 2, true, [stale]));
+    }
+    const recovered = processor.pushEncodedChunk(encoded(14, 1, 2, true, [15]));
+    expect(recovered.emitted.map((unit) => [...unit.payload])).toEqual([[14, 15]]);
+    expect(processor.hasFrameGap).toBe(false);
+  });
+
   test("requests keyframe for first delta and malformed bytes do not mutate state", () => {
     const processor = new VideoStreamProcessor();
     expect(processor.pushChunk(chunk(3, 0, 1, false, [1])).requestKeyframe).toBe(true);

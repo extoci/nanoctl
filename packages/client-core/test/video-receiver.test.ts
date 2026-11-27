@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { encodeVideoChunk, type AccessUnit, type VideoChunk } from "@nanoctl/protocol";
+import {
+  encodeVideoChunk,
+  parseVideoControlMessage,
+  type AccessUnit,
+  type VideoChunk,
+} from "@nanoctl/protocol";
 import { V4VideoReceiver } from "../src/index";
 
 function chunk(streamSequence: number, keyframe: boolean, payload: number[]): VideoChunk {
@@ -27,15 +32,32 @@ function receiver() {
   const videoReference = fakeChannel();
   const emitted: AccessUnit[] = [];
   const requests: number[][] = [];
+  const repairRequests: number[] = [];
+  const repairParts: (readonly number[] | undefined)[] = [];
   const errors: unknown[] = [];
   const receiver = new V4VideoReceiver({
     videoDelta,
     videoReference,
     onAccessUnit: (unit) => emitted.push(unit),
-    sendKeyframeRequest: (bytes) => requests.push(Array.from(bytes)),
+    sendVideoControl: (bytes) => {
+      const message = parseVideoControlMessage(bytes);
+      if (message.kind === "deltaRepair") {
+        repairRequests.push(message.streamSequence);
+        repairParts.push(message.parts);
+      } else requests.push(Array.from(bytes));
+    },
     onError: (error) => errors.push(error),
   });
-  return { receiver, videoDelta, videoReference, emitted, requests, errors };
+  return {
+    receiver,
+    videoDelta,
+    videoReference,
+    emitted,
+    requests,
+    repairRequests,
+    repairParts,
+    errors,
+  };
 }
 
 describe("V4VideoReceiver", () => {
@@ -62,8 +84,12 @@ describe("V4VideoReceiver", () => {
 
   test("reports malformed bytes without throwing from the lane callback", () => {
     const state = receiver();
-    expect(() => state.receiver.handle(Uint8Array.from([4, 0x40]))).not.toThrow();
-    expect(state.errors.length).toBe(1);
+    try {
+      expect(() => state.receiver.handle(Uint8Array.from([4, 0x40]))).not.toThrow();
+      expect(state.errors.length).toBe(1);
+    } finally {
+      state.receiver.dispose();
+    }
   });
 
   test("dispose detaches only its own handlers", () => {
@@ -72,4 +98,170 @@ describe("V4VideoReceiver", () => {
     expect(state.videoDelta.onmessage).toBeNull();
     expect(state.videoReference.onmessage).toBeNull();
   });
+});
+
+test("requests the first keyframe even if the viewer has received no video", async () => {
+  const state = receiver();
+  try {
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(400);
+    expect(state.requests).toEqual([[4, 0x41]]);
+    state.receiver.handle(encoded(1, true, [1]));
+    await Bun.sleep(300);
+    expect(state.requests).toHaveLength(1);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([1]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("retries the first keyframe request quickly and stops on a reference", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(4, false, [4]));
+    expect(state.requests).toHaveLength(1);
+    await Bun.sleep(180);
+    expect(state.requests).toHaveLength(2);
+    state.receiver.handle(encoded(5, true, [5]));
+    const recoveredRequests = state.requests.length;
+    await Bun.sleep(300);
+    expect(state.requests).toHaveLength(recoveredRequests);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a short unresolved gap requests recovery even below the frame limit", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encoded(12, false, [2]));
+    state.receiver.handle(
+      encodeVideoChunk({
+        codec: "h264",
+        streamSequence: 13,
+        captureTimeUs: 13_000,
+        part: 0,
+        parts: 2,
+        keyframe: false,
+        payload: new Uint8Array([1]),
+      }),
+    );
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(250);
+    expect(state.requests).toEqual([[4, 0x41]]);
+    state.receiver.handle(encoded(11, false, [1]));
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("an incomplete expected delta times out without a later frame or watermark", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encodeVideoChunk({ ...chunk(11, false, [1]), parts: 2 }));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(250);
+    expect(state.repairRequests).toEqual([11, 11]);
+    expect(state.repairParts).toEqual([[1], [1]]);
+    expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("later fragments start recovery when the expected delta never arrives", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encodeVideoChunk({ ...chunk(12, false, [2]), parts: 2 }));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(250);
+    expect(state.repairRequests).toEqual([11, 11]);
+    expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a repaired delta resumes decoding without a keyframe", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(encoded(12, false, [2]));
+    await Bun.sleep(120);
+    expect(state.repairRequests).toEqual([11]);
+    state.receiver.handle(encoded(11, false, [1]));
+    await Bun.sleep(180);
+    expect(state.repairRequests).toEqual([11]);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
+    expect(state.requests).toHaveLength(0);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a later incomplete delta gets its own recovery deadline", async () => {
+  const state = receiver();
+  const fragment = (sequence: number, part: number) =>
+    encodeVideoChunk({ ...chunk(sequence, false, [part]), part, parts: 2 });
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(fragment(11, 0));
+    await Bun.sleep(120);
+    state.receiver.handle(fragment(12, 0));
+    state.receiver.handle(fragment(11, 1));
+    await Bun.sleep(120);
+    expect(state.requests).toHaveLength(0);
+    state.receiver.handle(fragment(12, 1));
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11, 12]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a reliable video watermark detects a lost final delta on an idle desktop", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 11, 0, 0, 0]));
+    expect(state.requests).toHaveLength(0);
+    await Bun.sleep(250);
+    expect(state.requests).toEqual([[4, 0x41]]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a late delta can catch up with the watermark before recovery starts", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    state.receiver.handle(encoded(11, false, [1]));
+    await Bun.sleep(250);
+    expect(state.requests).toHaveLength(0);
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11]);
+  } finally {
+    state.receiver.dispose();
+  }
+});
+
+test("a delta that closes the gap after a keyframe request stops retries", async () => {
+  const state = receiver();
+  try {
+    state.receiver.handle(encoded(10, true, [0]));
+    state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
+    await Bun.sleep(250);
+    expect(state.requests).toHaveLength(1);
+    state.receiver.handle(encoded(11, false, [1]));
+    expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11]);
+    await Bun.sleep(300);
+    expect(state.requests).toHaveLength(1);
+  } finally {
+    state.receiver.dispose();
+  }
 });

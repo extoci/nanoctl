@@ -1,12 +1,18 @@
-import { encodeVideoControlMessage, type AccessUnit } from "@nanoctl/protocol";
+import {
+  encodeVideoControlMessage,
+  parseVideoControlMessage,
+  type AccessUnit,
+  type VideoControlMessage,
+} from "@nanoctl/protocol";
 import { VideoStreamProcessor } from "./video";
+import { VideoLossWindow } from "./video-loss";
 
 export type V4VideoReceiverOptions = {
   readonly videoDelta: RTCDataChannel;
   readonly videoReference: RTCDataChannel;
   readonly onReceivedAccessUnit?: (unit: AccessUnit) => void;
   readonly onAccessUnit: (unit: AccessUnit) => void;
-  readonly sendKeyframeRequest: (bytes: Uint8Array) => void;
+  readonly sendVideoControl: (bytes: Uint8Array) => void;
   readonly onError?: (error: unknown) => void;
 };
 
@@ -24,8 +30,24 @@ function messageBytes(data: unknown): Uint8Array {
  * stream processor; lane transport reliability is deliberately not part of the reference
  * decision. Decode output is emitted only in a valid reference chain.
  */
+const REORDER_WAIT_MS = 180;
+const DELTA_REPAIR_WAIT_MS = 70;
+const DELTA_REPAIR_RETRY_MS = 140;
+const FIRST_REFERENCE_WAIT_MS = 350;
+const FIRST_KEYFRAME_RETRY_MS = 125;
+const KEYFRAME_RETRY_MS = 250;
+
 export class V4VideoReceiver {
   private readonly processor = new VideoStreamProcessor();
+  private reorderTimer: ReturnType<typeof setTimeout> | undefined;
+  private deltaRepairTimer: ReturnType<typeof setTimeout> | undefined;
+  private deltaRepairRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private reorderSequence: number | undefined;
+  private firstReferenceTimer: ReturnType<typeof setTimeout> | undefined;
+  private keyframeTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
+  private watermark: number | undefined;
+  private readonly linkLoss = new VideoLossWindow();
   private readonly deltaHandler = (event: MessageEvent) => this.handle(event.data);
   private readonly referenceHandler = (event: MessageEvent) => this.handle(event.data);
 
@@ -35,17 +57,42 @@ export class V4VideoReceiver {
     }
     options.videoDelta.onmessage = this.deltaHandler;
     options.videoReference.onmessage = this.referenceHandler;
+    this.firstReferenceTimer = setTimeout(() => this.requestKeyframe(), FIRST_REFERENCE_WAIT_MS);
   }
 
   handle(data: unknown): void {
+    if (this.disposed) return;
     try {
-      const outcome = this.processor.pushEncodedChunk(messageBytes(data));
-      if (outcome.received) this.options.onReceivedAccessUnit?.(outcome.received);
+      const bytes = messageBytes(data);
+      if (bytes[1] === 0x42) {
+        const message = parseVideoControlMessage(bytes);
+        if (message.kind === "sequenceWatermark") {
+          const next = message.nextSequence;
+          const previous = this.watermark;
+          if (previous === undefined || ((next - previous) | 0) > 0) {
+            this.watermark = next;
+            this.updateReorderTimer();
+          }
+        }
+        return;
+      }
+      const outcome = this.processor.pushEncodedChunk(bytes);
+      if (outcome.received) {
+        this.linkLoss.observe(outcome.received.streamSequence);
+        this.options.onReceivedAccessUnit?.(outcome.received);
+      }
       for (const unit of outcome.emitted) {
+        if (unit.keyframe) {
+          this.stopFirstReferenceTimer();
+          this.stopKeyframeRetry();
+        }
         this.options.onAccessUnit(unit);
+        if (this.processor.waitingForReference) return;
       }
       if (outcome.requestKeyframe) {
         this.requestKeyframe();
+      } else {
+        this.updateReorderTimer();
       }
     } catch (error) {
       this.options.onError?.(error);
@@ -53,10 +100,91 @@ export class V4VideoReceiver {
   }
 
   requestKeyframe(): void {
-    this.options.sendKeyframeRequest(encodeVideoControlMessage({ kind: "keyframeRequest" }));
+    if (this.disposed) return;
+    this.stopFirstReferenceTimer();
+    this.processor.requireKeyframe();
+    this.stopReorderTimer();
+    this.sendKeyframeRequestWithRetry();
+  }
+
+  private sendKeyframeRequestWithRetry(retryAfterMs = FIRST_KEYFRAME_RETRY_MS): void {
+    if (this.disposed || this.keyframeTimer !== undefined) return;
+    this.keyframeTimer = setTimeout(() => {
+      this.keyframeTimer = undefined;
+      this.sendKeyframeRequestWithRetry(KEYFRAME_RETRY_MS);
+    }, retryAfterMs);
+    this.sendControl({ kind: "keyframeRequest" });
+  }
+
+  private sendControl(message: VideoControlMessage): void {
+    try {
+      this.options.sendVideoControl(encodeVideoControlMessage(message));
+    } catch (error) {
+      this.options.onError?.(error);
+    }
+  }
+
+  private updateReorderTimer(): void {
+    const watermarkGap =
+      this.watermark !== undefined && this.processor.isBehindWatermark(this.watermark);
+    if (!this.processor.hasFrameGap && !watermarkGap) {
+      this.stopReorderTimer();
+      if (!this.processor.waitingForReference) this.stopKeyframeRetry();
+      return;
+    }
+    if (this.keyframeTimer !== undefined) return;
+    const expected = this.processor.nextExpectedSequence;
+    if (this.reorderTimer !== undefined && this.reorderSequence === expected) return;
+    this.stopReorderTimer();
+    this.reorderSequence = expected;
+    if (expected !== undefined) {
+      const requestRepair = () => {
+        this.sendControl({
+          kind: "deltaRepair",
+          streamSequence: expected,
+          parts: this.processor.missingDeltaParts(expected),
+        });
+      };
+      this.deltaRepairTimer = setTimeout(requestRepair, DELTA_REPAIR_WAIT_MS);
+      this.deltaRepairRetryTimer = setTimeout(requestRepair, DELTA_REPAIR_RETRY_MS);
+    }
+    this.reorderTimer = setTimeout(() => {
+      this.stopReorderTimer();
+      // A deadline tells us to start recovery. Late deltas may still complete
+      // the current chain before a new reference arrives.
+      this.sendKeyframeRequestWithRetry();
+    }, REORDER_WAIT_MS);
+  }
+
+  private stopReorderTimer(): void {
+    clearTimeout(this.reorderTimer);
+    clearTimeout(this.deltaRepairTimer);
+    clearTimeout(this.deltaRepairRetryTimer);
+    this.reorderTimer = undefined;
+    this.deltaRepairTimer = undefined;
+    this.deltaRepairRetryTimer = undefined;
+    this.reorderSequence = undefined;
+  }
+
+  private stopFirstReferenceTimer(): void {
+    clearTimeout(this.firstReferenceTimer);
+    this.firstReferenceTimer = undefined;
+  }
+
+  private stopKeyframeRetry(): void {
+    clearTimeout(this.keyframeTimer);
+    this.keyframeTimer = undefined;
+  }
+
+  takeLinkLoss(): number | undefined {
+    return this.linkLoss.take();
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.stopFirstReferenceTimer();
+    this.stopReorderTimer();
+    this.stopKeyframeRetry();
     if (this.options.videoDelta.onmessage === this.deltaHandler) {
       this.options.videoDelta.onmessage = null;
     }

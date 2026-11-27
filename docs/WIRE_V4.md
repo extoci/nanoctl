@@ -22,14 +22,15 @@ fixtures exist.
 | ---------------------------- | ------------------------ | ---------------------------------------------------------------------------- |
 | `nanoctl.control.v4`         | reliable, ordered        | key, text, pointer button/wheel, release, heartbeat, future session commands |
 | `nanoctl.motion.v4`          | unordered, loss-tolerant | pointer movement and gamepad latest-state snapshots                          |
-| `nanoctl.video-delta.v4`     | unordered, loss-tolerant | non-keyframe video chunks                                                    |
-| `nanoctl.video-reference.v4` | reliable, ordered        | keyframe video chunks and reference-recovery control                         |
+| `nanoctl.video-delta.v4`     | unordered, loss-tolerant | delta chunks and reference chunks                                            |
+| `nanoctl.video-reference.v4` | reliable, unordered      | keyframe video chunks and reference-recovery control                         |
 
 Every independent input stream owns a `u32` sequence counter: reliable control is one stream, while
 pointer motion and gamepad snapshots use separate counters even though they share the motion lane. On
 loss-tolerant lanes receivers drop non-newer sequences within the same stream using wrapping sequence
-comparison. Reliable lanes keep ordering through the transport; their sequence is diagnostic and
-liveness metadata, not permission to reorder discrete input.
+comparison. The reliable control lane keeps order through the transport. Its sequence is diagnostic
+and liveness metadata, not permission to reorder discrete input. A newer complete keyframe can be
+used before an older one arrives. Receivers discard reference frames older than their decode position.
 
 ## Input messages
 
@@ -132,14 +133,50 @@ u8[] payload         # 1..=49152 bytes; length comes from the datagram
 ```
 
 All chunks in one access unit must carry identical sequence, part count, codec, keyframe flag, and
-capture timestamp. Reassembly keeps up to three incomplete access units and at most 16 MiB of
-fragment payload across them. It ignores duplicate parts and evicts the oldest pending unit when
-a fourth fragmented unit starts. The receiver rejects chunks that would exceed the byte budget.
+capture timestamp. Reassembly keeps up to three incomplete references and sixteen incomplete deltas,
+with one shared 16 MiB payload budget. It ignores duplicate parts and evicts the oldest pending unit
+of the same kind when its limit is reached. Delta fragments cannot evict a pending reference.
 Complete single-chunk units do not evict pending fragments.
+After the receiver advances its decode position, older fragments leave the reassembly buffer and
+late copies of those fragments are discarded on arrival.
 
-A keyframe resets the receiver's reference chain. If the reorder window fills before a missing
-delta arrives, the receiver discards dependent deltas and requests a keyframe once. The
-transport or session layer owns any request timers and rate limits.
+Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCTP fragmentation.
+The host paces chunks from keyframes and deltas larger than 8 KiB in groups of four. It uses the
+current send rate with a 2.4 Mbps minimum for these bursts. A keyframe and its copy use the same
+schedule. A large delta is sent once and kept for selective repair.
+The host skips delta captures when buffered bytes reach 75 ms of the send budget at the
+current pacing rate or half the lane capacity. It checks before encoding so the next delta
+can still use the previous frame as a reference.
+It gives the outstanding reference 350 ms to drain. If it is still pending, the next recovery
+keyframe goes on the expiring delta lane. Both copies must fit within the delta lane's byte budget.
+The reliable lane takes a new reference once the previous one drains.
+
+The host can send a second copy of a video chunk on the delta lane with the same sequence and
+part index. Both copies count toward the send budget. A keyframe larger than 8 KiB sent on the
+reliable lane has no second copy. Smaller keyframes can use spare room on the delta lane.
+
+A keyframe resets the receiver's reference chain. The receiver starts its reorder timer when the
+expected frame is incomplete or a fragment of a later frame arrives. When the timer expires, the
+receiver requests a keyframe. Late deltas can still fill the gap and stop retries. If the reorder
+window fills or the decoder loses its reference, the receiver discards dependent deltas and waits
+for a fresh keyframe. The transport or session layer owns the request timers and rate limits.
+The viewer can submit one full reorder batch to the decoder while two decodes are pending. A
+delta that arrives at the decoder queue limit triggers keyframe recovery.
+
+After a gap persists for 70 ms, the viewer can request the missing delta on the reference lane.
+If the gap persists at 140 ms, the viewer requests the parts that are still missing.
+Kind `0x43` carries its `u32 stream_sequence` followed by up to six distinct `u16` part indices.
+An empty list requests the whole delta. The host retains up to 16 recent deltas within a shared
+128 KiB budget. It sends at most two repairs and 16 KiB total per delta within 500 ms of the
+original send. A whole-delta repair can use the remaining byte budget. A selective repair can use
+up to 8 KiB. The host can send a second selective repair of up to four full chunks on the reliable
+lane if it is idle. A keyframe can follow that repair without waiting for acknowledgments. Other
+repairs use the delta lane. The host paces repairs larger than 8 KiB and skips repairs that would
+fill more than half of the selected lane. The 180 ms keyframe deadline still applies if the delta
+does not arrive.
+
+Before the first complete reference, the viewer sends a keyframe request if it has waited 350 ms.
+It retries until a reference arrives, even if there have been no video messages.
 
 ## Size and memory limits
 
@@ -148,7 +185,17 @@ transport or session layer owns any request timers and rate limits.
 - Gamepads: 4 slots.
 - Text input message: 1 KiB.
 - Key code/key fields: 64 bytes each.
-- Reassembly holds at most three incomplete video access units and 16 MiB of payload in total.
+- Reassembly holds at most three incomplete references and sixteen incomplete deltas, with 16 MiB of
+  payload in total.
 
 Implementations must enforce these limits before allocation wherever possible and must cap total
 allocation even when lengths are internally consistent.
+
+### Idle video watermark
+
+The host sends `[0x04, 0x42, next_sequence: u32 little-endian]` on the reliable
+video reference channel when video stops advancing. It identifies the sequence
+after the last access unit accepted by the transport and does not consume a
+sequence number. Receivers retain the highest watermark using wrapping sequence comparison. A
+receiver gives late deltas the normal reorder grace period before requesting a keyframe if its
+expected sequence is behind the watermark.

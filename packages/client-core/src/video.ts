@@ -11,13 +11,13 @@ export type VideoInputOutcome = FrameSequencerOutcome & {
   readonly received?: AccessUnit;
 };
 
-function emptyOutcome(): VideoInputOutcome {
+function incompleteOutcome(buffered: number): VideoInputOutcome {
   return {
     emitted: [],
     requestKeyframe: false,
     duplicatesDropped: 0,
     unreferenceableDropped: 0,
-    buffered: 0,
+    buffered,
   };
 }
 
@@ -29,8 +29,36 @@ export class VideoStreamProcessor {
   private readonly reassembler = new VideoReassembler();
   private readonly sequencer: FrameSequencer;
 
-  constructor(reorderCapacity = 2) {
+  constructor(reorderCapacity?: number) {
     this.sequencer = new FrameSequencer(reorderCapacity);
+  }
+
+  get waitingForReference(): boolean {
+    return this.sequencer.waitingForReference;
+  }
+
+  get nextExpectedSequence(): number | undefined {
+    return this.sequencer.nextExpectedSequence;
+  }
+
+  get hasFrameGap(): boolean {
+    const expected = this.nextExpectedSequence;
+    return (
+      this.sequencer.bufferedFrames > 0 ||
+      (expected !== undefined && this.reassembler.hasIncompleteFrameAtOrAfter(expected))
+    );
+  }
+
+  isBehindWatermark(next: number): boolean {
+    return this.sequencer.isBehindWatermark(next);
+  }
+
+  missingDeltaParts(sequence: number): number[] | undefined {
+    return this.reassembler.missingDeltaParts(sequence);
+  }
+
+  requireKeyframe(): void {
+    this.sequencer.requireKeyframe();
   }
 
   pushEncodedChunk(bytes: Uint8Array): VideoInputOutcome {
@@ -41,11 +69,15 @@ export class VideoStreamProcessor {
     const reassembled = this.reassembler.push(chunk);
     if (reassembled.complete === undefined) {
       return {
-        ...emptyOutcome(),
+        ...incompleteOutcome(this.sequencer.bufferedFrames),
         droppedIncompleteSequence: reassembled.droppedIncompleteSequence,
       };
     }
     const sequenced = this.sequencer.push(reassembled.complete);
+    const lastEmitted = sequenced.emitted.at(-1);
+    if (lastEmitted !== undefined) {
+      this.reassembler.discardBefore((lastEmitted.streamSequence + 1) >>> 0);
+    }
     return {
       ...sequenced,
       received: reassembled.complete,

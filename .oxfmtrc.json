@@ -1,6 +1,7 @@
 {
   "ignorePatterns": [
     "apps/viewer/dist/**",
+    "crates/vendor/webrtc-sctp/**",
     "target/**",
     "playwright-report/**",
     "test-results/**",

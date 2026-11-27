@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [master, "rewrite/**"]
+    branches: [master, v4, "rewrite/**"]
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ env:
 
 jobs:
   branch-freshness:
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref_name == 'master' || github.ref_name == 'v4'))
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
@@ -51,15 +51,16 @@ jobs:
             exit 1
           fi
           echo "PR head contains ${BASE_REF}@${current_base}."
-      - name: Re-mark open PR freshness after master moves
+      - name: Re-mark open PR freshness after its base moves
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
-          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/branches/master" --jq '.commit.sha')"
-          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/branches/${BASE_REF}" --jq '.commit.sha')"
+          gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE_REF" --state open --limit 100 \
             --json headRefOid,isCrossRepository \
             --jq '.[] | select(.isCrossRepository | not) | .headRefOid' |
             while read -r head_sha; do
@@ -68,10 +69,10 @@ jobs:
                 continue
               fi
               state=failure
-              description="stale: rebase onto latest master before merging"
+              description="stale: rebase onto latest ${BASE_REF} before merging"
               if [ "$status" = ahead ] || [ "$status" = identical ]; then
                 state=success
-                description="contains latest master"
+                description="contains latest ${BASE_REF}"
               fi
               gh api "repos/${GITHUB_REPOSITORY}/statuses/${head_sha}" --method POST \
                 -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
@@ -102,12 +103,12 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('bun.lock') }}
       - run: bun run build:viewer
       - run: bun run check
-      - run: bunx playwright install --with-deps chromium
       - uses: ./.github/actions/linux-media-deps
         with:
           cache-suffix: viewer-browser-media
           extra-packages: xauth xvfb xdotool
           save-cache: ${{ github.event_name != 'pull_request' }}
+      - run: bunx playwright install --with-deps chromium
       - name: Run browser regression tests against the media runtime
         # Xvfb gives the Linux agent a real X11 desktop to capture and lets the
         # native-input regressions inject keys/pointer motion instead of skipping.
@@ -412,7 +413,25 @@ jobs:
       # vulnerable parser path nor quick-xml is present in the shipped agent runtime.
       - name: Audit Rust dependencies
         working-directory: crates/nanoctl-agent
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        run: |
+          set -euo pipefail
+          # RustSec skips path packages. Audit the vendored SCTP source as its
+          # exact upstream release so registry advisories still apply.
+          audit_lock=$(mktemp)
+          trap 'rm -f -- "$audit_lock"' EXIT
+          python3 - "$audit_lock" <<'PY'
+          from pathlib import Path
+          import sys
+
+          lock = Path("Cargo.lock").read_text()
+          package = '[[package]]\nname = "webrtc-sctp"\nversion = "0.17.3"\n'
+          if lock.count(package + "dependencies = [") != 1:
+              raise SystemExit("Update the audit entry for the vendored webrtc-sctp release")
+          registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+          checksum = 'checksum = "190e2985eddccc80353de2441c6878ef84ffe2e12beef5aba2e9d4207ffff1e5"\n'
+          Path(sys.argv[1]).write_text(lock.replace(package, package + registry + checksum, 1))
+          PY
+          cargo audit --file "$audit_lock" --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
       # Run the official CLI directly instead of the hosted Action. The Action's license/API
       # validation can fail on organization repositories because of third-party rate limits even
       # when the scanner itself reports no findings.

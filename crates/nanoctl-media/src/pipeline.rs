@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -13,7 +13,10 @@ use crate::types::{
     MediaPipelineSnapshot, RawFrame, VideoEncoder, VideoSource,
 };
 
+const MIN_FORCED_KEYFRAME_INTERVAL: Duration = Duration::from_millis(350);
+
 pub struct MediaPipeline {
+    settings: watch::Sender<MediaPipelineConfig>,
     shutdown_tx: watch::Sender<bool>,
     capture_task: Option<JoinHandle<Result<(), MediaError>>>,
     encode_task: Option<JoinHandle<Result<(), MediaError>>>,
@@ -55,12 +58,13 @@ impl MediaPipeline {
         keyframe_requested: Arc<AtomicBool>,
     ) -> Result<Self, MediaError> {
         let config = config.validate()?;
+        let (settings, updates) = watch::channel(config);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let frame_slot = Arc::new(LatestSlot::new());
         let metrics = Arc::new(Mutex::new(MediaPipelineSnapshot::default()));
 
         let capture_task = tokio::spawn(capture_loop(
-            config,
+            updates.clone(),
             source,
             Arc::clone(&frame_slot),
             shutdown_rx,
@@ -68,7 +72,7 @@ impl MediaPipeline {
             Arc::clone(&metrics),
         ));
         let encode_task = tokio::spawn(encode_loop(EncodeLoopContext {
-            config,
+            updates,
             frame_slot: Arc::clone(&frame_slot),
             encoder,
             lane,
@@ -79,6 +83,7 @@ impl MediaPipeline {
         }));
 
         Ok(Self {
+            settings,
             shutdown_tx,
             capture_task: Some(capture_task),
             encode_task: Some(encode_task),
@@ -88,8 +93,36 @@ impl MediaPipeline {
         })
     }
 
+    pub fn update_settings(&self, config: MediaPipelineConfig) -> Result<(), MediaError> {
+        let config = config.validate()?;
+        if config.codec != self.settings.borrow().codec {
+            return Err(MediaError::InvalidConfig(
+                "codec cannot change within one media pipeline",
+            ));
+        }
+        self.settings.send_if_modified(|current| {
+            if *current == config {
+                false
+            } else {
+                *current = config;
+                true
+            }
+        });
+        Ok(())
+    }
+
     pub fn request_keyframe(&self) {
         self.keyframe_requested.store(true, Ordering::Release);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.capture_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            || self
+                .encode_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
     }
 
     pub fn snapshot(&self) -> MediaPipelineSnapshot {
@@ -148,7 +181,7 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 }
 
 async fn capture_loop(
-    config: MediaPipelineConfig,
+    updates: watch::Receiver<MediaPipelineConfig>,
     mut source: Box<dyn VideoSource>,
     frame_slot: Arc<LatestSlot<RawFrame>>,
     mut shutdown: watch::Receiver<bool>,
@@ -156,7 +189,7 @@ async fn capture_loop(
     metrics: Arc<Mutex<MediaPipelineSnapshot>>,
 ) -> Result<(), MediaError> {
     let result =
-        capture_loop_inner(config, &mut source, &frame_slot, &mut shutdown, &metrics).await;
+        capture_loop_inner(&updates, &mut source, &frame_slot, &mut shutdown, &metrics).await;
     frame_slot.close();
     if result.is_err() {
         let _ = shutdown_tx.send(true);
@@ -165,13 +198,12 @@ async fn capture_loop(
 }
 
 async fn capture_loop_inner(
-    config: MediaPipelineConfig,
+    updates: &watch::Receiver<MediaPipelineConfig>,
     source: &mut Box<dyn VideoSource>,
     frame_slot: &LatestSlot<RawFrame>,
     shutdown: &mut watch::Receiver<bool>,
     metrics: &Mutex<MediaPipelineSnapshot>,
 ) -> Result<(), MediaError> {
-    let period = config.frame_interval();
     let mut next_deadline = TokioInstant::now();
     let mut first_tick = true;
     let mut capture_sequence = 0_u64;
@@ -180,6 +212,7 @@ async fn capture_loop_inner(
         if *shutdown.borrow() {
             return Ok(());
         }
+        let period = updates.borrow().frame_interval();
         let now = TokioInstant::now();
         if !first_tick {
             while next_deadline <= now {
@@ -223,7 +256,7 @@ async fn capture_loop_inner(
 }
 
 struct EncodeLoopContext {
-    config: MediaPipelineConfig,
+    updates: watch::Receiver<MediaPipelineConfig>,
     frame_slot: Arc<LatestSlot<RawFrame>>,
     encoder: Box<dyn VideoEncoder>,
     lane: Box<dyn LaneWriter>,
@@ -235,7 +268,7 @@ struct EncodeLoopContext {
 
 async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
     let EncodeLoopContext {
-        config,
+        updates,
         frame_slot,
         mut encoder,
         mut lane,
@@ -245,7 +278,7 @@ async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
         metrics,
     } = context;
     let result = encode_loop_inner(
-        config,
+        &updates,
         &frame_slot,
         &mut encoder,
         &mut lane,
@@ -262,7 +295,7 @@ async fn encode_loop(context: EncodeLoopContext) -> Result<(), MediaError> {
 }
 
 async fn encode_loop_inner(
-    config: MediaPipelineConfig,
+    updates: &watch::Receiver<MediaPipelineConfig>,
     frame_slot: &LatestSlot<RawFrame>,
     encoder: &mut Box<dyn VideoEncoder>,
     lane: &mut Box<dyn LaneWriter>,
@@ -272,24 +305,97 @@ async fn encode_loop_inner(
 ) -> Result<(), MediaError> {
     let mut stream_sequence = 0_u32;
     let mut force_next_keyframe = true;
+    let mut next_forced_keyframe = TokioInstant::now();
+    let mut last_dimensions = None;
     let mut scaler = FrameScaler::default();
+    let mut deferred_reference = None;
 
-    while let Some(frame) = frame_slot.recv().await {
+    loop {
+        let (frame, newly_captured) = match deferred_reference.take() {
+            Some(deferred) => tokio::select! {
+                biased;
+                frame = frame_slot.recv() => (frame, true),
+                _ = time::sleep_until(next_forced_keyframe) => (Some(deferred), false),
+            },
+            None => (frame_slot.recv().await, true),
+        };
+        let Some(frame) = frame else { return Ok(()) };
         if *shutdown.borrow() {
             return Ok(());
         }
-        record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
-        if !frame.has_new_damage
-            && !force_next_keyframe
-            && !keyframe_requested.load(Ordering::Acquire)
-        {
-            record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
+        if newly_captured {
+            record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
+        }
+        let repair = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            result = lane.repair_pending_delta() => result,
+        };
+        match repair {
+            Ok(Some(report)) => record_metrics(metrics, |snapshot| {
+                snapshot.delta_repairs_written += 1;
+                snapshot.bytes_written += report.wire_bytes as u64;
+                snapshot.max_buffered_bytes = snapshot
+                    .max_buffered_bytes
+                    .max(report.buffered_bytes as u64);
+            }),
+            Ok(None) => {}
+            Err(error) => {
+                record_metrics(metrics, |snapshot| snapshot.lane_write_errors += 1);
+                return Err(error);
+            }
+        }
+        let mut config = *updates.borrow();
+        force_next_keyframe |= last_dimensions != Some((config.width, config.height));
+        let repair_pending = force_next_keyframe || keyframe_requested.load(Ordering::Acquire);
+        let waiting_for_cooldown = repair_pending && TokioInstant::now() < next_forced_keyframe;
+        if waiting_for_cooldown {
+            // Retain one capture so even an idle source can send the delayed keyframe.
+            deferred_reference = Some(frame.clone());
+        }
+        let force_keyframe = if repair_pending && !waiting_for_cooldown {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown) => return Ok(()),
+                ready = lane.reference_ready() => ready,
+            }
+        } else {
+            false
+        };
+        if force_next_keyframe && !force_keyframe {
+            // Keep the encoder's reference state until a replacement can be sent.
+            record_metrics(metrics, |snapshot| {
+                snapshot.frames_waiting_for_reference += 1
+            });
             continue;
         }
-        let keyframe_was_requested = keyframe_requested.swap(false, Ordering::Acquire);
-        let force_keyframe = force_next_keyframe || keyframe_was_requested;
+        if !frame.has_new_damage && !force_keyframe {
+            if !waiting_for_cooldown {
+                record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
+            }
+            continue;
+        }
+        if force_keyframe {
+            next_forced_keyframe = TokioInstant::now() + MIN_FORCED_KEYFRAME_INTERVAL;
+            config = *updates.borrow();
+            keyframe_requested.swap(false, Ordering::Acquire);
+        } else {
+            let ready = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown) => return Ok(()),
+                ready = lane.delta_ready() => ready,
+            };
+            if !ready {
+                // Skipping the capture keeps the encoder's previous reference usable.
+                record_metrics(metrics, |snapshot| {
+                    snapshot.frames_skipped_for_backpressure += 1;
+                });
+                continue;
+            }
+        }
+        last_dimensions = Some((config.width, config.height));
         force_next_keyframe = false;
-        stream_sequence = stream_sequence.wrapping_add(1);
+        let next_sequence = stream_sequence.wrapping_add(1);
         let capture_time_us = frame.capture_time_us;
         let capture_sequence = frame.capture_sequence;
         let encode_started = Instant::now();
@@ -301,7 +407,7 @@ async fn encode_loop_inner(
             }
         };
         let request = EncodeRequest {
-            stream_sequence,
+            stream_sequence: next_sequence,
             force_keyframe,
             target_bitrate: config.target_bitrate,
             codec: config.codec,
@@ -325,15 +431,14 @@ async fn encode_loop_inner(
             }
         };
         if encoded.payload.is_empty() {
-            // Encoder rate-control skips are explicit drops, not corrupt partial access units.
-            // The next emitted frame must restart the reference chain because the skipped input
-            // still consumed a stream sequence number.
+            // A rate-control skip leaves the previous reference intact. Retry an outstanding
+            // keyframe request, but do not spend a wire sequence on an unencoded image.
             record_metrics(metrics, |snapshot| {
                 snapshot.encoder_skips += 1;
                 snapshot.total_encode_micros += encode_micros;
                 snapshot.max_encode_micros = snapshot.max_encode_micros.max(encode_micros);
             });
-            force_next_keyframe = true;
+            force_next_keyframe = force_keyframe;
             continue;
         }
         if force_keyframe && !encoded.keyframe {
@@ -343,6 +448,8 @@ async fn encode_loop_inner(
             ));
         }
 
+        stream_sequence = next_sequence;
+        let sent_delta_during_cooldown = waiting_for_cooldown && !encoded.keyframe;
         let access_unit = EncodedAccessUnit {
             stream_sequence,
             keyframe: encoded.keyframe,
@@ -360,11 +467,13 @@ async fn encode_loop_inner(
             snapshot.max_encode_micros = snapshot.max_encode_micros.max(encode_micros);
         });
 
-        // Lane writes are deliberately not cancellation-selected. A writer may emit
-        // several wire chunks for one access unit, and cancelling between chunks could
-        // publish a partial reference. Lane implementations must finish or reject one
-        // access unit in bounded time and report that atomic outcome.
-        let report = lane.write_access_unit(access_unit).await;
+        // Only cancel an in-flight access unit when the session is closing. This
+        // lets teardown proceed even if SCTP is still waiting for acknowledgments.
+        let report = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown) => return Ok(()),
+            result = lane.write_access_unit(access_unit) => result,
+        };
         match report {
             Ok(report) => {
                 record_metrics(metrics, |snapshot| {
@@ -373,7 +482,10 @@ async fn encode_loop_inner(
                         .max_buffered_bytes
                         .max(report.buffered_bytes as u64);
                     if report.status == LaneWriteStatus::Written {
-                        snapshot.bytes_written += payload_len;
+                        snapshot.deltas_written_during_keyframe_cooldown +=
+                            u64::from(sent_delta_during_cooldown);
+                        snapshot.bytes_written += report.wire_bytes as u64;
+                        snapshot.next_video_sequence = Some(stream_sequence.wrapping_add(1));
                     } else {
                         snapshot.access_units_dropped_before_write += 1;
                     }
@@ -388,12 +500,11 @@ async fn encode_loop_inner(
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -453,14 +564,24 @@ mod tests {
         units: Arc<Mutex<Vec<EncodedAccessUnit>>>,
         notify: Arc<Notify>,
         status: LaneWriteStatus,
+        delta_ready: Arc<AtomicBool>,
     }
 
     #[async_trait]
     impl LaneWriter for CollectLane {
+        async fn delta_ready(&mut self) -> bool {
+            self.delta_ready.load(AtomicOrdering::SeqCst)
+        }
+
         async fn write_access_unit(
             &mut self,
             access_unit: EncodedAccessUnit,
         ) -> Result<LaneWriteReport, MediaError> {
+            let wire_bytes = if self.status == LaneWriteStatus::Written {
+                access_unit.payload.len()
+            } else {
+                0
+            };
             self.units
                 .lock()
                 .expect("collected units poisoned")
@@ -469,6 +590,7 @@ mod tests {
             Ok(LaneWriteReport {
                 status: self.status,
                 buffered_bytes: 0,
+                wire_bytes,
             })
         }
     }
@@ -503,6 +625,7 @@ mod tests {
                 units: Arc::clone(&units),
                 notify: Arc::clone(&notify),
                 status,
+                delta_ready: Arc::new(AtomicBool::new(true)),
             },
             units,
             notify,
@@ -584,31 +707,88 @@ mod tests {
         wait_for_len(&units, &notify, 2).await;
         pipeline.request_keyframe();
         frames_tx.send(frame(333)).await.unwrap();
-        wait_for_len(&units, &notify, 3).await;
+        tokio::time::timeout(Duration::from_millis(250), wait_for_len(&units, &notify, 3))
+            .await
+            .expect("a usable delta must not wait for the keyframe cooldown");
+        let mut unchanged = frame(444);
+        unchanged.has_new_damage = false;
+        frames_tx.send(unchanged).await.unwrap();
+        wait_for_len(&units, &notify, 4).await;
 
-        let observed = {
-            let written = units.lock().expect("collected units poisoned");
-            (
-                written[0].stream_sequence,
-                written[0].keyframe,
-                written[0].capture_time_us,
-                written[1].stream_sequence,
-                written[1].keyframe,
-                written[1].capture_time_us,
-                written[2].stream_sequence,
-                written[2].keyframe,
-                written[2].capture_time_us,
-            )
-        };
-        assert_eq!(observed, (1, true, 111, 2, false, 222, 3, true, 333));
+        let observed: Vec<_> = units
+            .lock()
+            .expect("collected units poisoned")
+            .iter()
+            .map(|unit| (unit.stream_sequence, unit.keyframe, unit.capture_time_us))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                (1, true, 111),
+                (2, false, 222),
+                (3, false, 333),
+                (4, true, 444)
+            ]
+        );
 
         let report = pipeline.stop().await;
         assert!(report.capture_result.is_ok());
         assert!(report.encode_result.is_ok());
-        assert_eq!(report.snapshot.frames_captured, 3);
-        assert_eq!(report.snapshot.frames_taken_for_encode, 3);
-        assert_eq!(report.snapshot.access_units_encoded, 3);
+        assert_eq!(report.snapshot.frames_captured, 4);
+        assert_eq!(report.snapshot.frames_taken_for_encode, 4);
+        assert_eq!(report.snapshot.access_units_encoded, 4);
         assert_eq!(report.snapshot.keyframes_encoded, 2);
+        assert_eq!(report.snapshot.deltas_written_during_keyframe_cooldown, 1);
+    }
+
+    #[tokio::test]
+    async fn delta_backpressure_preserves_sequence_and_allows_reference_repair() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let delta_ready = Arc::clone(&collecting.delta_ready);
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(TestEncoder),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        delta_ready.store(false, AtomicOrdering::SeqCst);
+        frames_tx.send(frame(222)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pipeline.snapshot().frames_skipped_for_backpressure == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("capture was not skipped during delta backpressure");
+
+        delta_ready.store(true, AtomicOrdering::SeqCst);
+        frames_tx.send(frame(333)).await.unwrap();
+        wait_for_len(&units, &notify, 2).await;
+        delta_ready.store(false, AtomicOrdering::SeqCst);
+        pipeline.request_keyframe();
+        let mut unchanged = frame(444);
+        unchanged.has_new_damage = false;
+        frames_tx.send(unchanged).await.unwrap();
+        wait_for_len(&units, &notify, 3).await;
+
+        let observed: Vec<_> = units
+            .lock()
+            .expect("collected units poisoned")
+            .iter()
+            .map(|unit| (unit.stream_sequence, unit.keyframe, unit.capture_time_us))
+            .collect();
+        assert_eq!(observed, [(1, true, 111), (2, false, 333), (3, true, 444)]);
+        let report = pipeline.stop().await;
+        assert!(report.encode_result.is_ok());
+        assert_eq!(report.snapshot.frames_skipped_for_backpressure, 1);
+        assert_eq!(report.snapshot.access_units_encoded, 3);
     }
 
     #[tokio::test]
@@ -628,6 +808,12 @@ mod tests {
         frames_tx.send(frame(111)).await.unwrap();
         wait_for_len(&units, &notify, 1).await;
         frames_tx.send(frame(222)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            units.lock().unwrap().len(),
+            1,
+            "backpressure must not immediately send another IDR"
+        );
         wait_for_len(&units, &notify, 2).await;
 
         let both_keyframes = {
@@ -643,15 +829,17 @@ mod tests {
         assert_eq!(report.snapshot.keyframes_encoded, 2);
     }
 
-    struct SkipFirstEncoder {
-        attempts: Arc<AtomicUsize>,
+    struct SkippingEncoder {
+        attempts: usize,
+        skip_at: usize,
     }
 
     #[async_trait]
-    impl VideoEncoder for SkipFirstEncoder {
+    impl VideoEncoder for SkippingEncoder {
         async fn encode(&mut self, request: EncodeRequest) -> Result<EncodedBitstream, MediaError> {
-            let attempt = self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
-            if attempt == 0 {
+            let skip = self.attempts == self.skip_at;
+            self.attempts += 1;
+            if skip {
                 return Ok(EncodedBitstream {
                     keyframe: false,
                     payload: Vec::new(),
@@ -665,42 +853,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encoder_skip_is_visible_and_forces_next_keyframe() {
+    async fn encoder_skip_retries_a_requested_keyframe_and_preserves_a_delta_chain() {
+        for skip_at in [0, 1] {
+            check_encoder_skip(skip_at).await;
+        }
+    }
+
+    async fn check_encoder_skip(skip_at: usize) {
         let (frames_tx, frames_rx) = mpsc::channel(4);
         let (collecting, units, notify) = lane(LaneWriteStatus::Written);
-        let attempts = Arc::new(AtomicUsize::new(0));
         let pipeline = MediaPipeline::start(
             config(),
             Box::new(ChannelSource {
                 receiver: frames_rx,
             }),
-            Box::new(SkipFirstEncoder {
-                attempts: Arc::clone(&attempts),
+            Box::new(SkippingEncoder {
+                attempts: 0,
+                skip_at,
             }),
             Box::new(collecting),
         )
         .unwrap();
 
-        frames_tx.send(frame(111)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while attempts.load(AtomicOrdering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
+        let mut expected_frames = 0;
+        for attempt in 0..3 {
+            frames_tx
+                .send(frame(111 * (attempt as u64 + 1)))
+                .await
+                .unwrap();
+            if attempt == skip_at {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while pipeline.snapshot().encoder_skips == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                expected_frames += 1;
+                wait_for_len(&units, &notify, expected_frames).await;
             }
-        })
-        .await
-        .unwrap();
-        frames_tx.send(frame(222)).await.unwrap();
-        wait_for_len(&units, &notify, 1).await;
+        }
 
-        let first_written = {
+        let written_frames = {
             let written = units.lock().expect("collected units poisoned");
-            (written[0].stream_sequence, written[0].keyframe)
+            written
+                .iter()
+                .map(|unit| (unit.stream_sequence, unit.keyframe))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(first_written, (2, true));
+        assert_eq!(written_frames, [(1, true), (2, false)]);
 
         let report = pipeline.stop().await;
         assert_eq!(report.snapshot.encoder_skips, 1);
-        assert_eq!(report.snapshot.access_units_encoded, 1);
+        assert_eq!(report.snapshot.access_units_encoded, 2);
         assert_eq!(report.snapshot.keyframes_encoded, 1);
     }
 

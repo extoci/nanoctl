@@ -21,7 +21,8 @@ if (!process.env.NANOCTL_BROWSER_PORT) {
 }
 const baseURL = `http://127.0.0.1:${process.env.NANOCTL_BROWSER_PORT}`;
 const latency = process.env.NANOCTL_BROWSER_LATENCY === "1";
-if (process.env.NANOCTL_BROWSER_MEDIA === "1" && !latency)
+const badNetwork = process.env.NANOCTL_BROWSER_BAD_NETWORK === "1";
+if (process.env.NANOCTL_BROWSER_MEDIA === "1" && !latency && !badNetwork)
   process.env.NANOCTL_DEV_GAMEPAD_REPORTS ??= join(
     homedir(),
     ".cache",
@@ -38,7 +39,7 @@ export default defineConfig({
   // Latency assertions only check causality (a frame cannot be presented before
   // its source time), so they can fail on clock-sync flakes but never on a real
   // perf regression — retrying once in CI is safe and removes that flake class.
-  retries: process.env.CI ? (latency ? 1 : 2) : 0,
+  retries: process.env.CI && !badNetwork ? (latency ? 1 : 2) : 0,
   reporter: process.env.CI ? "github" : "list",
   use: {
     baseURL,

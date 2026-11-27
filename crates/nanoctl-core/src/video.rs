@@ -4,8 +4,11 @@ use crate::{
 
 const KIND_VIDEO_CHUNK: u8 = 0x40;
 const KIND_KEYFRAME_REQUEST: u8 = 0x41;
+const KIND_SEQUENCE_WATERMARK: u8 = 0x42;
+const KIND_DELTA_REPAIR: u8 = 0x43;
 pub const MAX_VIDEO_CHUNK_BYTES: usize = 48 * 1_024;
 pub const MAX_VIDEO_PARTS: u16 = 512;
+pub const MAX_DELTA_REPAIR_PARTS: usize = 6;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 16 * 1_024 * 1_024;
 pub const VIDEO_HEADER_BYTES: usize = 20;
 
@@ -35,22 +38,68 @@ impl VideoCodec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaRepairRequest {
+    pub stream_sequence: u32,
+    /// An empty list requests the whole access unit.
+    pub parts: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoControlMessage {
     KeyframeRequest,
+    SequenceWatermark { next_sequence: u32 },
+    DeltaRepair(DeltaRepairRequest),
 }
 
 impl VideoControlMessage {
-    pub fn encode(self) -> Vec<u8> {
-        vec![WIRE_VERSION, KIND_KEYFRAME_REQUEST]
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::KeyframeRequest => vec![WIRE_VERSION, KIND_KEYFRAME_REQUEST],
+            Self::SequenceWatermark { next_sequence } => {
+                let mut out = vec![WIRE_VERSION, KIND_SEQUENCE_WATERMARK];
+                push_u32(&mut out, *next_sequence);
+                out
+            }
+            Self::DeltaRepair(request) => {
+                let mut out = vec![WIRE_VERSION, KIND_DELTA_REPAIR];
+                push_u32(&mut out, request.stream_sequence);
+                for part in &request.parts {
+                    push_u16(&mut out, *part);
+                }
+                out
+            }
+        }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_KEYFRAME_REQUEST)?;
-        if bytes.len() != 2 {
-            return Err(WireError::InvalidLength);
+        match (
+            versioned(bytes, KIND_KEYFRAME_REQUEST..=KIND_DELTA_REPAIR)?,
+            bytes.len(),
+        ) {
+            (KIND_KEYFRAME_REQUEST, 2) => Ok(Self::KeyframeRequest),
+            (KIND_SEQUENCE_WATERMARK, 6) => Ok(Self::SequenceWatermark {
+                next_sequence: u32_at(bytes, 2)?,
+            }),
+            (KIND_DELTA_REPAIR, length)
+                if (6..=6 + MAX_DELTA_REPAIR_PARTS * 2).contains(&length)
+                    && length.is_multiple_of(2) =>
+            {
+                let mut parts = Vec::with_capacity((length - 6) / 2);
+                for offset in (6..length).step_by(2) {
+                    let part = u16_at(bytes, offset)?;
+                    if part >= MAX_VIDEO_PARTS || parts.contains(&part) {
+                        return Err(WireError::InvalidValue("invalid delta repair part"));
+                    }
+                    parts.push(part);
+                }
+                Ok(Self::DeltaRepair(DeltaRepairRequest {
+                    stream_sequence: u32_at(bytes, 2)?,
+                    parts,
+                }))
+            }
+            _ => Err(WireError::InvalidLength),
         }
-        Ok(Self::KeyframeRequest)
     }
 }
 
@@ -139,7 +188,8 @@ struct PartialAccessUnit {
     parts: Vec<Option<Vec<u8>>>,
 }
 
-const MAX_PENDING_ACCESS_UNITS: usize = 3;
+const MAX_PENDING_REFERENCES: usize = 3;
+const MAX_PENDING_DELTAS: usize = 16;
 
 /// Reassembles a bounded set of access units across interleaved video chunks.
 #[derive(Debug, Default)]
@@ -186,8 +236,25 @@ impl VideoReassembler {
             }
         }
 
-        let evict = existing.is_none() && self.pending.len() == MAX_PENDING_ACCESS_UNITS;
-        let evicted_bytes = if evict { self.pending[0].1.byte_len } else { 0 };
+        let eviction = if existing.is_none() {
+            let limit = if chunk.keyframe {
+                MAX_PENDING_REFERENCES
+            } else {
+                MAX_PENDING_DELTAS
+            };
+            let mut oldest = None;
+            let mut count = 0;
+            for (index, (_, pending)) in self.pending.iter().enumerate() {
+                if pending.keyframe == chunk.keyframe {
+                    oldest.get_or_insert(index);
+                    count += 1;
+                }
+            }
+            if count == limit { oldest } else { None }
+        } else {
+            None
+        };
+        let evicted_bytes = eviction.map_or(0, |index| self.pending[index].1.byte_len);
         let next_bytes = self.pending_bytes - evicted_bytes + chunk.payload.len();
         if next_bytes > MAX_ACCESS_UNIT_BYTES {
             return Err(WireError::InvalidValue(
@@ -197,8 +264,9 @@ impl VideoReassembler {
 
         let mut outcome = ReassemblyOutcome::default();
         let index = existing.unwrap_or_else(|| {
-            if evict {
-                outcome.dropped_incomplete_sequence = self.pending.pop_front().map(|(seq, _)| seq);
+            if let Some(index) = eviction {
+                outcome.dropped_incomplete_sequence =
+                    self.pending.remove(index).map(|(seq, _)| seq);
             }
             self.pending.push_back((
                 sequence,
@@ -363,6 +431,47 @@ mod tests {
     }
 
     #[test]
+    fn sequence_watermark_has_a_little_endian_next_sequence() {
+        let message = VideoControlMessage::SequenceWatermark {
+            next_sequence: 0x0102_0304,
+        };
+        assert_eq!(message.encode(), [4, 0x42, 4, 3, 2, 1]);
+        assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x42, 1]),
+            Err(WireError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn delta_repair_identifies_the_missing_access_unit() {
+        let message = VideoControlMessage::DeltaRepair(DeltaRepairRequest {
+            stream_sequence: 0x0102_0304,
+            parts: vec![],
+        });
+        assert_eq!(message.encode(), [4, 0x43, 4, 3, 2, 1]);
+        assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x43, 4, 3, 2, 1, 0]),
+            Err(WireError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn delta_repair_can_request_distinct_missing_parts() {
+        let message = VideoControlMessage::DeltaRepair(DeltaRepairRequest {
+            stream_sequence: 2,
+            parts: vec![4, 36],
+        });
+        assert_eq!(message.encode(), [4, 0x43, 2, 0, 0, 0, 4, 0, 36, 0]);
+        assert_eq!(VideoControlMessage::parse(&message.encode()), Ok(message));
+        assert_eq!(
+            VideoControlMessage::parse(&[4, 0x43, 2, 0, 0, 0, 4, 0, 4, 0]),
+            Err(WireError::InvalidValue("invalid delta repair part"))
+        );
+    }
+
+    #[test]
     fn reassembler_accepts_out_of_order_parts() {
         let mut reassembler = VideoReassembler::new();
         assert!(
@@ -406,6 +515,22 @@ mod tests {
         reassembler.push(chunk(13, 0, 2, true, b"f")).unwrap();
         let overflow = reassembler.push(chunk(14, 0, 2, true, b"g")).unwrap();
         assert_eq!(overflow.dropped_incomplete_sequence, Some(11));
+    }
+
+    #[test]
+    fn reassembler_does_not_evict_a_reference_to_hold_deltas() {
+        let mut reassembler = VideoReassembler::new();
+        reassembler.push(chunk(7, 0, 2, true, b"a")).unwrap();
+        for sequence in 8..24 {
+            let outcome = reassembler
+                .push(chunk(sequence, 0, 2, false, b"b"))
+                .unwrap();
+            assert_eq!(outcome.dropped_incomplete_sequence, None);
+        }
+        let overflow = reassembler.push(chunk(24, 0, 2, false, b"b")).unwrap();
+        assert_eq!(overflow.dropped_incomplete_sequence, Some(8));
+        let reference = reassembler.push(chunk(7, 1, 2, true, b"c")).unwrap();
+        assert_eq!(reference.complete.unwrap().payload, b"ac");
     }
 
     #[test]

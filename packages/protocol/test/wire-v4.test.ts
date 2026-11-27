@@ -112,6 +112,26 @@ describe("v4 video control", () => {
     expect(parseVideoControlMessage(encoded)).toEqual(message);
     expect(() => parseVideoControlMessage(new Uint8Array([4, 0x41, 0]))).toThrow(WireError);
   });
+
+  test("identifies the missing access unit in a delta repair", () => {
+    const message = { kind: "deltaRepair", streamSequence: 0x01020304 } as const;
+    const encoded = encodeVideoControlMessage(message);
+    expect(Array.from(encoded)).toEqual([4, 0x43, 4, 3, 2, 1]);
+    expect(parseVideoControlMessage(encoded)).toEqual(message);
+    expect(() => parseVideoControlMessage(new Uint8Array([4, 0x43, 4, 3, 2, 1, 0]))).toThrow(
+      WireError,
+    );
+  });
+
+  test("requests distinct missing fragment indices", () => {
+    const message = { kind: "deltaRepair", streamSequence: 2, parts: [4, 36] } as const;
+    const encoded = encodeVideoControlMessage(message);
+    expect(Array.from(encoded)).toEqual([4, 0x43, 2, 0, 0, 0, 4, 0, 36, 0]);
+    expect(parseVideoControlMessage(encoded)).toEqual(message);
+    expect(() => parseVideoControlMessage(Uint8Array.of(4, 0x43, 2, 0, 0, 0, 4, 0, 4, 0))).toThrow(
+      WireError,
+    );
+  });
 });
 
 describe("v4 input wire", () => {
@@ -174,6 +194,20 @@ function chunk(
 }
 
 describe("v4 video reassembly and reference validation", () => {
+  test("delta fragments cannot evict an incomplete reference", () => {
+    const reassembler = new VideoReassembler();
+    reassembler.push(chunk(7, 0, 2, true, [1]));
+    for (let sequence = 8; sequence < 24; sequence += 1) {
+      expect(
+        reassembler.push(chunk(sequence, 0, 2, false, [2])).droppedIncompleteSequence,
+      ).toBeUndefined();
+    }
+    expect(reassembler.push(chunk(24, 0, 2, false, [2])).droppedIncompleteSequence).toBe(8);
+    expect(Array.from(reassembler.push(chunk(7, 1, 2, true, [3])).complete!.payload)).toEqual([
+      1, 3,
+    ]);
+  });
+
   test("reassembles out-of-order parts across sequences", () => {
     const reassembler = new VideoReassembler();
     expect(reassembler.push(chunk(7, 1, 2, true, [2])).complete).toBeUndefined();

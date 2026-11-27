@@ -13,7 +13,7 @@ test("a missing frame requests recovery once and no dependent frame is emitted b
     const base = trial < 64 ? 0xffffffff - trial : next();
     const missing = 1 + (next() % 12);
     const future = 6 + (next() % 8);
-    const processor = new VideoStreamProcessor();
+    const processor = new VideoStreamProcessor(2);
     const emitted: number[] = [];
     let requests = 0;
     const feed = (index: number, keyframe = false) => {

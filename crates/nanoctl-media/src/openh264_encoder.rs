@@ -46,39 +46,58 @@ impl OpenH264Encoder {
         Ok(())
     }
 
-    fn apply_bitrate(&mut self, target_bps: u32) -> Result<(), MediaError> {
-        let mut maximum = SBitrateInfo {
+    fn active_bitrate(&mut self) -> Result<i32, MediaError> {
+        let mut current = SBitrateInfo {
             iLayer: SPATIAL_LAYER_0,
-            iBitrate: target_bps.saturating_mul(2).min(i32::MAX as u32) as i32,
+            iBitrate: 0,
         };
-        // SAFETY: the initialized encoder consumes this matching option structure synchronously.
+        // SAFETY: the initialized encoder writes to this matching option structure synchronously.
         let result = unsafe {
-            self.encoder.raw_api().set_option(
-                ENCODER_OPTION_MAX_BITRATE,
-                std::ptr::from_mut(&mut maximum).cast(),
+            self.encoder.raw_api().get_option(
+                ENCODER_OPTION_BITRATE,
+                std::ptr::from_mut(&mut current).cast(),
             )
         };
         if result != 0 {
             return Err(MediaError::Encode(format!(
-                "OpenH264 maximum bitrate update failed: {result}"
+                "OpenH264 active bitrate query failed: {result}"
             )));
         }
-        let mut bitrate = SBitrateInfo {
+        Ok(current.iBitrate)
+    }
+
+    fn apply_bitrate(&mut self, target_bps: u32) -> Result<(), MediaError> {
+        let target = SBitrateInfo {
             iLayer: SPATIAL_LAYER_ALL,
             iBitrate: target_bps.min(i32::MAX as u32) as i32,
         };
-        // SAFETY: the initialized encoder consumes this correctly typed bitrate structure
-        // synchronously without changing dimensions or buffer ownership.
-        let result = unsafe {
-            self.encoder.raw_api().set_option(
-                ENCODER_OPTION_BITRATE,
-                std::ptr::from_mut(&mut bitrate).cast(),
-            )
+        let maximum = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_0,
+            iBitrate: target_bps.saturating_mul(2).min(i32::MAX as u32) as i32,
         };
-        if result != 0 {
-            return Err(MediaError::Encode(format!(
-                "OpenH264 bitrate update failed: {result}"
-            )));
+        // OpenH264 checks target <= maximum after each setter. A resize can also reset
+        // the backend to its constructor bitrate, so read the active target first.
+        let lowering = target.iBitrate < self.active_bitrate()?;
+        let target = (ENCODER_OPTION_BITRATE, target, "target");
+        let maximum = (ENCODER_OPTION_MAX_BITRATE, maximum, "maximum");
+        let updates = if lowering {
+            [target, maximum]
+        } else {
+            [maximum, target]
+        };
+        for (option, mut bitrate, name) in updates {
+            // SAFETY: the initialized encoder consumes a matching, live option structure.
+            let result = unsafe {
+                self.encoder
+                    .raw_api()
+                    .set_option(option, std::ptr::from_mut(&mut bitrate).cast())
+            };
+            if result != 0 {
+                return Err(MediaError::Encode(format!(
+                    "OpenH264 {name} bitrate update to {} failed: {result}",
+                    bitrate.iBitrate
+                )));
+            }
         }
         self.bitrate_bps = target_bps;
         Ok(())
@@ -264,6 +283,25 @@ mod tests {
         let _ = encoder.encode(request(2, false, 128, 64)).await.unwrap();
         let forced = encoder.encode(request(3, true, 128, 64)).await.unwrap();
         assert!(forced.keyframe);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn applies_sharp_bitrate_cuts_and_restores_them_after_resize() {
+        let mut encoder = OpenH264Encoder::new(2_000_000, 60).unwrap();
+        encoder.encode(request(1, true, 128, 64)).await.unwrap();
+
+        let mut lower = request(2, false, 128, 64);
+        lower.target_bitrate = 200_000;
+        encoder.encode(lower).await.unwrap();
+        assert_eq!(encoder.active_bitrate().unwrap(), 200_000);
+
+        let mut resized = request(3, true, 160, 90);
+        resized.target_bitrate = 200_000;
+        assert!(encoder.encode(resized).await.unwrap().keyframe);
+        assert_eq!(encoder.active_bitrate().unwrap(), 200_000);
+
+        encoder.encode(request(4, false, 160, 90)).await.unwrap();
+        assert_eq!(encoder.active_bitrate().unwrap(), 2_000_000);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -11,7 +11,7 @@ interface VideoFaults {
   dropped: number;
   reorder: boolean;
   reordered: number;
-  requests: number;
+  recoveryRequests: number;
   control?: RTCDataChannel;
 }
 
@@ -29,7 +29,7 @@ async function installVideoFaults(page: Page) {
         dropped: 0,
         reorder: false,
         reordered: 0,
-        requests: 0,
+        recoveryRequests: 0,
       };
       window.videoFaults = faults;
       const create = RTCPeerConnection.prototype.createDataChannel;
@@ -39,9 +39,11 @@ async function installVideoFaults(page: Page) {
         if (channel.label === reference) {
           const send = channel.send;
           channel.send = function (data: unknown) {
-            if (ArrayBuffer.isView(data) && data.byteLength === 2) {
+            if (ArrayBuffer.isView(data) && data.byteLength >= 2) {
               const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-              if (bytes[0] === 4 && bytes[1] === 0x41) faults.requests += 1;
+              const keyframe = bytes[1] === 0x41 && bytes.length === 2;
+              const deltaRepair = bytes[1] === 0x43 && bytes.length >= 6;
+              if (bytes[0] === 4 && (keyframe || deltaRepair)) faults.recoveryRequests += 1;
             }
             Reflect.apply(send, this, [data]);
           };
@@ -116,8 +118,9 @@ test("v4 input reaches the host during video loss and the viewer recovers after 
     await expect.poll(() => page.evaluate(() => window.videoFaults.reordered)).toBe(1);
     await expect.poll(presented).toBeGreaterThan(beforeReorder + 3);
 
-    await page.evaluate(() => {
+    const beforeLoss = await page.evaluate(() => {
       window.videoFaults.drop = true;
+      return window.videoFaults.recoveryRequests;
     });
     await expect
       .poll(() => page.evaluate(() => window.videoFaults.dropped))
@@ -136,13 +139,12 @@ test("v4 input reaches the host during video loss and the viewer recovers after 
       .toBeGreaterThan(beforeInput);
 
     const beforeRecovery = await presented();
-    const requests = await page.evaluate(() => {
+    await page.evaluate(() => {
       window.videoFaults.drop = false;
-      return window.videoFaults.requests;
     });
     await expect
-      .poll(() => page.evaluate(() => window.videoFaults.requests), { timeout: 2_000 })
-      .toBeGreaterThan(requests);
+      .poll(() => page.evaluate(() => window.videoFaults.recoveryRequests), { timeout: 2_000 })
+      .toBeGreaterThan(beforeLoss);
     await expect.poll(presented, { timeout: 2_000 }).toBeGreaterThan(beforeRecovery + 3);
     await expect(page.getByTestId("connection-state")).toHaveText("Live");
   } finally {

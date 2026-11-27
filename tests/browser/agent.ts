@@ -32,21 +32,24 @@ const env = {
   XDG_CONFIG_HOME: directory,
   ...(process.platform === "linux" && !process.env.CC ? { CC: "gcc" } : {}),
 };
+const prebuilt = process.env.NANOCTL_BROWSER_AGENT_BIN;
 const start = () =>
   spawn(
-    "cargo",
-    [
-      "run",
-      "--features",
-      latency || process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
-      ...(latency ? ["--release", "--locked"] : []),
-      "--manifest-path",
-      "crates/nanoctl-agent/Cargo.toml",
-      "--",
-      "--config",
-      config,
-      "run",
-    ],
+    prebuilt ?? "cargo",
+    prebuilt
+      ? ["--config", config, "run"]
+      : [
+          "run",
+          "--features",
+          latency || process.env.NANOCTL_BROWSER_MEDIA === "1" ? "media" : "rtc",
+          ...(latency ? ["--release", "--locked"] : []),
+          "--manifest-path",
+          "crates/nanoctl-agent/Cargo.toml",
+          "--",
+          "--config",
+          config,
+          "run",
+        ],
     { env, stdio: "inherit" },
   );
 const pidFile = process.env.NANOCTL_BROWSER_AGENT_PID_FILE;

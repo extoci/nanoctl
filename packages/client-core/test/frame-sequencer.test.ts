@@ -79,6 +79,17 @@ describe("FrameSequencer", () => {
     expect(sequences(duplicate)).toEqual([]);
   });
 
+  test("a late reference cannot rewind the stream, including during recovery", () => {
+    const sequencer = new FrameSequencer();
+    sequencer.push(unit(0xffffffff, true));
+    sequencer.push(unit(1, true));
+    expect(sequences(sequencer.push(unit(0, true)))).toEqual([]);
+    expect(sequences(sequencer.push(unit(2)))).toEqual([2]);
+    sequencer.requireKeyframe();
+    expect(sequences(sequencer.push(unit(1, true)))).toEqual([]);
+    expect(sequences(sequencer.push(unit(4, true)))).toEqual([4]);
+  });
+
   test("keeps newer deltas that cross-lane reordering delivered before their keyframe", () => {
     const sequencer = new FrameSequencer();
     const first = sequencer.push(unit(1, true));
@@ -96,4 +107,15 @@ describe("FrameSequencer", () => {
     expect(sequences(sequencer.push(unit(0)))).toEqual([0]);
     expect(sequences(sequencer.push(unit(1)))).toEqual([1]);
   });
+});
+
+test("the default reorder window accepts sixteen later frames before the missing one arrives", () => {
+  const sequencer = new FrameSequencer();
+  sequencer.push(unit(0, true));
+  for (let sequence = 2; sequence <= 17; sequence += 1) {
+    expect(sequencer.push(unit(sequence)).requestKeyframe).toBe(false);
+  }
+  expect(sequencer.push(unit(1)).emitted.map((frame) => frame.streamSequence)).toEqual(
+    Array.from({ length: 17 }, (_, index) => index + 1),
+  );
 });

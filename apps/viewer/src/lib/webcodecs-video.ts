@@ -8,7 +8,7 @@
  * re-enqueued downstream), so stats and the <video> fallback keep working.
  */
 
-import { readV4IceStats, V4VideoReceiver } from "@nanoctl/client-core";
+import { readV4IceStats, V4_VIDEO_REORDER_CAPACITY, V4VideoReceiver } from "@nanoctl/client-core";
 import { v4DebugVideo, V4VideoMetrics } from "./v4-video-metrics";
 
 export interface WebCodecsVideoHandle {
@@ -17,7 +17,7 @@ export interface WebCodecsVideoHandle {
   stats(): { decoded: number; dropped: number; bytes: number };
   /** Rolling data-channel loss fraction since the previous call, when the
    * handle tracks sequence numbers (data-channel video). */
-  takeLinkLoss?(): number;
+  takeLinkLoss?(): number | undefined;
 }
 
 interface EncodedVideoFrameLike {
@@ -378,12 +378,12 @@ interface VideoTrackGeneratorLike {
 }
 
 interface VideoSinkHooks {
+  decodeQueueLimit?: number;
   /** First decoded frame reached the screen: the session is visibly live. */
   onFirstFrame?: () => void;
   onDecodedFrame?: (width: number, height: number, decodeMs: number | undefined) => void;
   /** Decoder failed beyond recovery; the caller should abandon this path. */
   onFatal?: () => void;
-  onBackpressure?: () => void;
 }
 
 function createVideoSink(
@@ -393,6 +393,7 @@ function createVideoSink(
   videoCodec: DirectVideoCodec = "h264",
   hooks?: VideoSinkHooks,
 ): VideoSink {
+  const decodeQueueLimit = hooks?.decodeQueueLimit ?? 2;
   // Prefer VideoTrackGenerator: it presents decoded frames through the same
   // composited video layer as a media stream track, avoiding both the jitter
   // buffer and the costly software canvas composite. Fall back to a 2D canvas
@@ -723,13 +724,12 @@ function createVideoSink(
         }
       }
     }
-    if (decoder.decodeQueueSize > 1 && !key) {
+    if (decoder.decodeQueueSize >= decodeQueueLimit && !key) {
       // Never decode deltas after a local drop: their reference chain is broken
       // and decoding them produces persistent smearing. Drop forward to the
       // next keyframe instead; the data-channel caller requests one.
       dropped += 1;
       resyncing = true;
-      hooks?.onBackpressure?.();
       return false;
     }
     try {
@@ -1085,23 +1085,50 @@ export function attachV4DataChannelVideo(
   video: HTMLVideoElement,
   onTeardown?: () => void,
   onFirstFrame?: () => void,
+  onFailure?: (reason: string) => void,
 ): WebCodecsVideoHandle {
+  const joinedAt = performance.now();
+  const placeholder = video.ownerDocument.createElement("canvas");
   const metrics = new V4VideoMetrics();
   const debug = { metrics, readIceStats: () => readV4IceStats(videoDelta) };
   v4DebugVideo.set(video, debug);
-  const sink = createVideoSink(video, onTeardown, performance.now(), "h264", {
-    onFirstFrame,
-    onDecodedFrame: (width, height, elapsedMs) => metrics.decoded(width, height, elapsedMs),
-    onFatal: () => {
+  let active: { codec: DirectVideoCodec; sink: VideoSink } | undefined;
+  let watchdog: number | undefined;
+  let firstFrame = false;
+  let closed = false;
+
+  const stopWatchdog = () => {
+    window.clearTimeout(watchdog);
+    watchdog = undefined;
+  };
+  const onOpen = () => {
+    if (
+      !closed &&
+      !active &&
+      videoDelta.readyState === "open" &&
+      videoReference.readyState === "open"
+    ) {
+      watchdog ??= window.setTimeout(() => finish("v4 video did not start"), 3_000);
+    }
+  };
+  const finish = (reason?: string) => {
+    if (closed) return;
+    closed = true;
+    stopWatchdog();
+    videoDelta.removeEventListener("open", onOpen);
+    videoReference.removeEventListener("open", onOpen);
+    receiver.dispose();
+    if (v4DebugVideo.get(video) === debug) v4DebugVideo.delete(video);
+    active?.sink.teardown(false);
+    if (reason === undefined) return;
+    for (const channel of [videoDelta, videoReference]) {
       try {
-        videoDelta.close();
+        channel.close();
       } catch {}
-      try {
-        videoReference.close();
-      } catch {}
-    },
-    onBackpressure: () => receiver.requestKeyframe(),
-  });
+    }
+    onTeardown?.();
+    onFailure?.(reason);
+  };
   const receiver = new V4VideoReceiver({
     videoDelta,
     videoReference,
@@ -1109,10 +1136,40 @@ export function attachV4DataChannelVideo(
       metrics.received(unit.streamSequence, unit.captureTimeUs, performance.now());
     },
     onAccessUnit: (unit) => {
-      metrics.delivered(unit.streamSequence);
-      sink.feed(unit.payload, unit.keyframe, unit.captureTimeUs);
+      if (!active || active.codec !== unit.codec) {
+        if (!unit.keyframe) {
+          receiver.requestKeyframe();
+          return;
+        }
+        stopWatchdog();
+        active?.sink.teardown();
+        const sink = createVideoSink(video, undefined, joinedAt, unit.codec, {
+          // A repair can release the missing frame and the full reorder window
+          // in one callback while two ordinary decodes are still queued.
+          decodeQueueLimit: V4_VIDEO_REORDER_CAPACITY + 3,
+          onFirstFrame: () => {
+            if (firstFrame) return;
+            firstFrame = true;
+            onFirstFrame?.();
+          },
+          onDecodedFrame: (width, height, elapsedMs) => {
+            stopWatchdog();
+            metrics.decoded(width, height, elapsedMs);
+          },
+          onFatal: () => finish("v4 video decoder failed"),
+        });
+        active = { codec: unit.codec, sink };
+      }
+      // Arm only when there is encoded video to decode. An idle screen does
+      // not start or extend the timer.
+      watchdog ??= window.setTimeout(() => finish("v4 video decoder stalled"), 4_000);
+      if (!active.sink.feed(unit.payload, unit.keyframe, unit.captureTimeUs)) {
+        receiver.requestKeyframe();
+      } else {
+        metrics.delivered(unit.streamSequence);
+      }
     },
-    sendKeyframeRequest: (bytes) => {
+    sendVideoControl: (bytes) => {
       if (videoReference.readyState === "open") {
         const copy = new Uint8Array(new ArrayBuffer(bytes.length));
         copy.set(bytes);
@@ -1121,16 +1178,18 @@ export function attachV4DataChannelVideo(
     },
     onError: (error) => console.warn("v4 video lane error", error),
   });
-  const onClosed = () => sink.teardown(true);
+  const onClosed = () => finish("v4 video channel closed");
   videoDelta.onclose = onClosed;
   videoReference.onclose = onClosed;
+  videoDelta.addEventListener("open", onOpen);
+  videoReference.addEventListener("open", onOpen);
+  onOpen();
   return {
-    canvas: sink.canvas,
-    drop: () => {
-      receiver.dispose();
-      if (v4DebugVideo.get(video) === debug) v4DebugVideo.delete(video);
-      sink.teardown(false);
+    get canvas() {
+      return active?.sink.canvas ?? placeholder;
     },
-    stats: sink.stats,
+    drop: () => finish(),
+    stats: () => active?.sink.stats() ?? { decoded: 0, dropped: 0, bytes: 0 },
+    takeLinkLoss: () => receiver.takeLinkLoss(),
   };
 }

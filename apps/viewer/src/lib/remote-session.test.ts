@@ -1,7 +1,11 @@
-import { encodeVideoChunk, parseVideoControlMessage } from "@nanoctl/protocol";
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { parseInputMessage, type InputMessage } from "@nanoctl/protocol";
+import {
+  encodeVideoChunk,
+  parseInputMessage,
+  parseVideoControlMessage,
+  type InputMessage,
+} from "@nanoctl/protocol";
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
 import { v4DebugVideo } from "./v4-video-metrics";
 import {
@@ -1070,8 +1074,10 @@ class FakeMediaStream {
   }
 }
 
-class FakeDataChannel {
-  constructor(private readonly record: (message: unknown) => void = () => {}) {}
+class FakeDataChannel extends EventTarget {
+  constructor(private readonly record: (message: unknown) => void = () => {}) {
+    super();
+  }
   sent: unknown[] = [];
   readyState: RTCDataChannelState = "open";
   bufferedAmount = 0;
@@ -1193,10 +1199,107 @@ describe("webcodecs video gating and teardown", () => {
       );
       expect(peer.channelConfigs.get("nanoctl.video-delta.v4")).toMatchObject({
         ordered: false,
-        maxRetransmits: 0,
+        maxPacketLifeTime: 150,
       });
       expect(peer.channelConfigs.has("nanoctl.video-reference.v4")).toBe(true);
       await controller.stop("done", false);
+    }
+  });
+
+  test("v4 fails an open video connection that never receives a first reference", () => {
+    installBrowserGlobals(() => 0);
+    const failures: string[] = [];
+    let timeout: (() => void) | undefined;
+    window.setTimeout = ((fn: () => void) => {
+      timeout = fn;
+      return 1;
+    }) as typeof window.setTimeout;
+    const video = Object.assign(new FakeVideo(), { ownerDocument: { createElement: () => ({}) } });
+    const delta = new FakeDataChannel();
+    const reference = new FakeDataChannel();
+    reference.readyState = "connecting";
+    const handle = attachV4DataChannelVideo(
+      delta as unknown as RTCDataChannel,
+      reference as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+      undefined,
+      undefined,
+      (reason) => failures.push(reason),
+    );
+    try {
+      expect(timeout).toBeUndefined();
+      reference.readyState = "open";
+      reference.dispatchEvent(new Event("open"));
+      expect(timeout).toBeDefined();
+      timeout?.();
+      expect(failures).toEqual(["v4 video did not start"]);
+      expect([reference.readyState, delta.readyState]).toEqual(["closed", "closed"]);
+    } finally {
+      handle.drop();
+    }
+  });
+
+  test("v4 uses the wire codec and detects a decoder that accepts video without producing output", () => {
+    installBrowserGlobals(() => 0);
+    const configurations: string[] = [];
+    const faults: string[] = [];
+    const scheduled = new Map<number, () => void>();
+    let timerId = 0;
+    window.setTimeout = ((fn: () => void) => {
+      scheduled.set(++timerId, fn);
+      return timerId;
+    }) as typeof window.setTimeout;
+    window.clearTimeout = (id) => {
+      if (typeof id === "number") scheduled.delete(id);
+    };
+    defineGlobal(
+      "VideoDecoder",
+      class {
+        decodeQueueSize = 0;
+        configure(config: VideoDecoderConfig) {
+          configurations.push(config.codec);
+        }
+        decode() {}
+        close() {}
+      },
+    );
+    defineGlobal("EncodedVideoChunk", class {});
+    defineGlobal(
+      "MediaStreamTrackGenerator",
+      class {
+        track = { stop() {} };
+        writable = new WritableStream();
+      },
+    );
+    const video = Object.assign(new FakeVideo(), { ownerDocument: { createElement: () => ({}) } });
+    const delta = new FakeDataChannel();
+    const reference = new FakeDataChannel();
+    const handle = attachV4DataChannelVideo(
+      delta as unknown as RTCDataChannel,
+      reference as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+      undefined,
+      undefined,
+      (reason) => faults.push(reason),
+    );
+    try {
+      reference.onmessage?.({
+        data: encodeVideoChunk({
+          streamSequence: 1,
+          part: 0,
+          parts: 1,
+          keyframe: true,
+          codec: "hevc",
+          captureTimeUs: 1,
+          payload: new Uint8Array([0, 0, 0, 1, 0x26, 1]),
+        }),
+      } as MessageEvent);
+      expect(configurations[0]).toMatch(/^(hev1|hvc1)\./);
+      expect(scheduled.size).toBe(1);
+      for (const timeout of scheduled.values()) timeout();
+      expect(faults).toEqual(["v4 video decoder stalled"]);
+    } finally {
+      handle.drop();
     }
   });
 
@@ -1265,7 +1368,7 @@ describe("webcodecs video gating and teardown", () => {
     expect(resets).toBeGreaterThan(0);
   });
 
-  test("a v4 decoder backlog requests a new reference and resumes on it", () => {
+  test("v4 decodes a full reordered batch and recovers when its decoder queue fills", () => {
     installBrowserGlobals(() => 0);
     const decoded: string[] = [];
     let pendingDecodes = 0;
@@ -1274,9 +1377,12 @@ describe("webcodecs video gating and teardown", () => {
         return pendingDecodes;
       }
       configure() {}
-      reset() {}
+      reset() {
+        pendingDecodes = 0;
+      }
       close() {}
       decode(chunk: { init: { type: string } }) {
+        pendingDecodes += 1;
         decoded.push(chunk.init.type);
       }
     }
@@ -1316,19 +1422,24 @@ describe("webcodecs video gating and teardown", () => {
         (keyframe ? reference : delta).onmessage?.({ data } as MessageEvent);
       };
       receive(0, true);
-      receive(1);
       pendingDecodes = 2;
-      receive(2);
-      pendingDecodes = 0;
-      receive(3);
-      expect(decoded).toEqual(["key", "delta"]);
+      for (let sequence = 2; sequence <= 17; sequence += 1) receive(sequence);
+      expect(decoded).toEqual(["key"]);
+      receive(1);
+      const recoveredBatch = ["key", ...Array.from({ length: 17 }, () => "delta")];
+      expect(decoded).toEqual(recoveredBatch);
+      expect(reference.sent).toHaveLength(0);
+
+      receive(18);
+      receive(19);
+      expect(decoded).toEqual(recoveredBatch);
       expect(
         reference.sent.map((data) => parseVideoControlMessage(data as unknown as Uint8Array)),
       ).toEqual([{ kind: "keyframeRequest" }]);
       expect(delta.sent).toEqual([]);
-      receive(4, true);
-      receive(5);
-      expect(decoded).toEqual(["key", "delta", "key", "delta"]);
+      receive(20, true);
+      receive(21);
+      expect(decoded).toEqual([...recoveredBatch, "key", "delta"]);
       expect(reference.sent).toHaveLength(1);
     } finally {
       handle.drop();
