@@ -7,7 +7,7 @@ use tokio::time::Duration;
 use crate::association::RtxTimerId;
 
 pub(crate) const RTO_INITIAL: u64 = 3000; // msec
-pub(crate) const RTO_MIN: u64 = 1000; // msec
+pub(crate) const RTO_MIN: u64 = 200; // msec
 pub(crate) const RTO_MAX: u64 = 60000; // msec
 pub(crate) const RTO_ALPHA: u64 = 1;
 pub(crate) const RTO_BETA: u64 = 2;

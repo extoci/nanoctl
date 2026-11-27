@@ -413,7 +413,25 @@ jobs:
       # vulnerable parser path nor quick-xml is present in the shipped agent runtime.
       - name: Audit Rust dependencies
         working-directory: crates/nanoctl-agent
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        run: |
+          set -euo pipefail
+          # RustSec skips path packages. Audit the vendored SCTP source as its
+          # exact upstream release so registry advisories still apply.
+          audit_lock=$(mktemp)
+          trap 'rm -f -- "$audit_lock"' EXIT
+          python3 - "$audit_lock" <<'PY'
+          from pathlib import Path
+          import sys
+
+          lock = Path("Cargo.lock").read_text()
+          package = '[[package]]\nname = "webrtc-sctp"\nversion = "0.17.3"\n'
+          if lock.count(package + "dependencies = [") != 1:
+              raise SystemExit("Update the audit entry for the vendored webrtc-sctp release")
+          registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+          checksum = 'checksum = "190e2985eddccc80353de2441c6878ef84ffe2e12beef5aba2e9d4207ffff1e5"\n'
+          Path(sys.argv[1]).write_text(lock.replace(package, package + registry + checksum, 1))
+          PY
+          cargo audit --file "$audit_lock" --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
       # Run the official CLI directly instead of the hosted Action. The Action's license/API
       # validation can fail on organization repositories because of third-party rate limits even
       # when the scanner itself reports no findings.

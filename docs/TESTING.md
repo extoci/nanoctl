@@ -145,7 +145,6 @@ cycles under the same profile. The gate also checks peak and sustained
 keyframe rates, host RSS growth, and queue limits. The run writes the profile,
 observed counters, and timestamps to `test-results/*/bad-network.json`.
 
-The draft v4 network trial also runs the gate with host SCTP minimum
-retransmission timeouts of 200 ms and 100 ms. Each trial patches a temporary copy
-of the locked dependency and uploads its own artifact. The stock build runs
-the full gate with the dependency's 1,000 ms minimum.
+The v4 release build uses a 200 ms minimum SCTP retransmission timeout. The
+network trial branch runs the full gate on three independent CI runners using
+the same locked build. Each run uploads its own evidence.
