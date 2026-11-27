@@ -28,11 +28,11 @@ final class DCVideoTests: XCTestCase {
         // arbitrary bytes are enough here because this test exercises sequence
         // repair before codec detection, not VideoToolbox decoding.
         receiver.receive(message(0, keyframe: true, payload: [0, 0, 0, 1, 0x67]))
-        for seq in UInt32(2)...UInt32(6) {
+        for seq in UInt32(2)...UInt32(18) {
             receiver.receive(message(seq, payload: [0, 0, 0, 1, 0x41]))
         }
         Thread.sleep(forTimeInterval: 0.3)
-        receiver.receive(message(7, payload: [0, 0, 0, 1, 0x41]))
+        receiver.receive(message(19, payload: [0, 0, 0, 1, 0x41]))
         wait(for: [requested], timeout: 1)
         let status = receiver.statusSnapshot()
         XCTAssertGreaterThanOrEqual(status.stats.gaps, 1)

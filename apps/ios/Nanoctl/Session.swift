@@ -812,8 +812,11 @@ final class Session {
               let idr = current.videoIdr, idr.readyState == .open,
               current.dcVideo == nil else { return }
         let receiver = DCVideoReceiver(codec: codec.flatMap(VTDecoder.Codec.init(rawValue:)))
-        receiver.requestKeyframe = { [weak video] in
-            video?.sendData(RTCDataBuffer(data: Data("KF".utf8), isBinary: false))
+        receiver.requestKeyframe = { [weak idr] in
+            // The delta lane is deliberately lossy exactly when recovery is
+            // needed. Match the browser viewer: repair requests ride the
+            // reliable IDR lane; the host accepts them on either channel.
+            idr?.sendData(RTCDataBuffer(data: Data("KF".utf8), isBinary: false))
         }
         receiver.onBuffer = { [weak self] buffer in
             self?.pixelMailbox.put(buffer)
@@ -834,6 +837,7 @@ final class Session {
             }
         }
         current.dcVideo = receiver
+        receiver.begin()
         transport = .dataChannel
         sessionLog.info("data-channel video active: codec=\(receiver.codec?.rawValue ?? "pending")")
         // The agent suppresses delta-frame RTP writes automatically while the
