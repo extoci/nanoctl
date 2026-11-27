@@ -15,6 +15,10 @@ On a T3 timeout, expire timed DATA before building retransmissions. Advance
 FORWARD TSN in the same timeout so expired video does not use the reduced
 congestion window. See [RFC 3758 section 4.1](https://www.rfc-editor.org/rfc/rfc3758.html#section-4.1).
 
+Request immediate SACKs on timeout retransmissions and new sends under the
+one-packet congestion window. The sender can resume after one RTT when the peer
+honors the request. See [RFC 7053 section 4.2](https://www.rfc-editor.org/rfc/rfc7053.html#section-4.2).
+
 Update the audit entry in `.github/workflows/ci.yml` when changing the upstream
 version. Before removing the patch, verify the timer setting, cancellation
 behavior, and the v4 bad-network gate with the new dependency.

@@ -261,14 +261,47 @@ async fn t3_timeout_forwards_expired_data_and_retransmits_live_data() {
     let resent: Vec<_> = chunks
         .iter()
         .filter_map(|chunk| chunk.as_any().downcast_ref::<ChunkPayloadData>())
-        .map(|chunk| chunk.tsn)
+        .map(|chunk| (chunk.tsn, chunk.immediate_sack))
         .collect();
-    assert_eq!(resent, [11, 12]);
+    assert_eq!(resent, [(11, false), (12, true)]);
     let forward = chunks
         .iter()
         .find_map(|chunk| chunk.as_any().downcast_ref::<ChunkForwardTsn>())
         .expect("The timeout should forward the expired TSN immediately");
     assert_eq!(forward.new_cumulative_tsn, 10);
+}
+
+#[tokio::test]
+async fn new_data_requests_an_immediate_ack_with_a_single_packet_window() {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        mtu: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.rwnd = 65_535;
+    let chunk = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        payload_type: PayloadProtocolIdentifier::Binary,
+        user_data: Bytes::from_static(b"data"),
+        ..Default::default()
+    };
+
+    a.cwnd = a.mtu;
+    a.pending_queue.push(chunk.clone()).await;
+    let (single_packet, _) = a.pop_pending_data_chunks_to_send().await;
+    assert_eq!(single_packet.len(), 1);
+    assert!(single_packet[0].immediate_sack);
+
+    a.cwnd = 2 * a.mtu;
+    a.pending_queue.push(chunk).await;
+    let (unblocked, _) = a.pop_pending_data_chunks_to_send().await;
+    assert_eq!(unblocked.len(), 1);
+    assert!(!unblocked[0].immediate_sack);
 }
 
 #[tokio::test]

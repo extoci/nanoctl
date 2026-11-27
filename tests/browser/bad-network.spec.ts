@@ -461,17 +461,15 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
           readReconnectCounters(),
           request.get("/v1/debug", { timeout: 2_000 }).then((report) => report.text()),
         ]);
+        const hostLines = host.status === "fulfilled" ? host.value.split("\n") : undefined;
         evidence.failedReconnect = {
           cycle,
           before: beforeReconnect,
           after: counters.status === "fulfilled" ? counters.value : undefined,
-          mediaEvents:
-            host.status === "fulfilled"
-              ? host.value
-                  .split("\n")
-                  .filter((line) => line.includes("v4") || line.includes("Viewer disconnected"))
-                  .slice(-15)
-              : undefined,
+          mediaEvents: hostLines
+            ?.filter((line) => line.includes("v4") || line.includes("Viewer disconnected"))
+            .slice(-15),
+          sctpTimeouts: hostLines?.filter((line) => line.includes("T3-rtx timed out")).slice(-25),
         };
         throw error;
       }

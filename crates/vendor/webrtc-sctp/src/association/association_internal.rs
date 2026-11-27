@@ -1984,6 +1984,11 @@ impl AssociationInternal {
             }
         }
 
+        if let Some(last) = chunks.last_mut().filter(|_| self.cwnd <= self.mtu) {
+            // With a one-packet window, the sender cannot send a second
+            // packet to trigger an ACK under the normal delayed-ACK policy.
+            last.immediate_sack = true;
+        }
         (chunks, sis_to_reset)
     }
 
@@ -2117,6 +2122,10 @@ impl AssociationInternal {
             i += 1;
         }
 
+        // T3 recovery waits for this batch's SACK before sending more data.
+        if let Some(last) = chunks.last_mut() {
+            last.immediate_sack = true;
+        }
         self.bundle_data_chunks_into_packets(chunks)
     }
 
@@ -2413,9 +2422,10 @@ impl RtxTimerObserver for AssociationInternal {
 
                 log::debug!(
                     target: "webrtc_sctp::retransmission",
-                    "[{}] T3-rtx timed out: n_rtos={} cwnd={} ssthresh={} newly_abandoned={}",
+                    "[{}] T3-rtx timed out: n_rtos={} rto_ms={} cwnd={} ssthresh={} newly_abandoned={}",
                     self.name,
                     n_rtos,
+                    self.rto_mgr.get_rto(),
                     self.cwnd,
                     self.ssthresh,
                     newly_abandoned
