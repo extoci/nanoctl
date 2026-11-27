@@ -23,6 +23,10 @@ mod win_send {
     use anyhow::Result;
 
     const INPUT_MOUSE: u32 = 0;
+    const INPUT_KEYBOARD: u32 = 1;
+    const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const KEYEVENTF_SCANCODE: u32 = 0x0008;
     const MOUSEEVENTF_MOVE: u32 = 0x0001;
     const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
     const MOUSEEVENTF_WHEEL: u32 = 0x0800;
@@ -52,16 +56,43 @@ mod win_send {
         mouse: MouseInput,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KeybdInput {
+        vk: u16,
+        scan: u16,
+        flags: u32,
+        time: u32,
+        extra_info: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KeyboardInput {
+        kind: u32,
+        padding: u32,
+        keyboard: KeybdInput,
+        tail: usize,
+    }
+
+    const _: () = assert!(std::mem::size_of::<KeyboardInput>() == std::mem::size_of::<Input>());
+
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+        fn SendInput(count: u32, inputs: *const std::ffi::c_void, size: i32) -> u32;
         fn GetSystemMetrics(index: i32) -> i32;
     }
 
-    fn send(input: Input) -> Result<()> {
-        let sent = unsafe { SendInput(1, &input, std::mem::size_of::<Input>() as i32) };
+    fn send<T>(input: &T) -> Result<()> {
+        let sent = unsafe {
+            SendInput(
+                1,
+                input as *const T as *const std::ffi::c_void,
+                std::mem::size_of::<T>() as i32,
+            )
+        };
         if sent != 1 {
-            return Err(enigo::InputError::Simulate("SendInput rejected the mouse event").into());
+            return Err(enigo::InputError::Simulate("SendInput rejected the input event").into());
         }
         Ok(())
     }
@@ -90,7 +121,7 @@ mod win_send {
         anyhow::ensure!(vw > 1 && vh > 1, "virtual screen metrics unavailable");
         let nx = virtual_normalized(x - vx, vw);
         let ny = virtual_normalized(y - vy, vh);
-        send(event(
+        send(&event(
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             0,
             nx,
@@ -106,7 +137,36 @@ mod win_send {
             // Positive mouseData scrolls up; viewer deltas are down-positive.
             (MOUSEEVENTF_WHEEL, -units)
         };
-        send(event(flags, data, 0, 0))
+        send(&event(flags, data, 0, 0))
+    }
+
+    /// Scan-set-1 extended-key marker used internally before SendInput.
+    pub const EXTENDED_SCAN: u16 = 0xe000;
+
+    /// Raw scan-code key input. `scan` uses `EXTENDED_SCAN` as a marker for
+    /// E0-prefixed keys; SendInput receives only the low byte plus the flag.
+    pub fn key(scan: u16, press: bool) -> Result<()> {
+        let extended = scan & EXTENDED_SCAN != 0;
+        let scan = scan & 0xff;
+        let mut flags = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !press {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        send(&KeyboardInput {
+            kind: INPUT_KEYBOARD,
+            padding: 0,
+            keyboard: KeybdInput {
+                vk: 0,
+                scan,
+                flags,
+                time: 0,
+                extra_info: 0,
+            },
+            tail: 0,
+        })
     }
 
     fn virtual_normalized(offset: i32, extent: i32) -> i32 {
@@ -121,14 +181,21 @@ pub enum InputLane {
     PointerMotion,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum InjectedKey {
+    Mapped(Key),
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    ScanCode(u16),
+}
+
 pub struct InputController {
     enigo: Enigo,
     origin_x: i32,
     origin_y: i32,
     width: u32,
     height: u32,
-    held_keys: HashSet<Key>,
-    repeat_keys: HashMap<Key, Instant>,
+    held_keys: HashSet<InjectedKey>,
+    repeat_keys: HashMap<InjectedKey, Instant>,
     held_buttons: HashSet<Button>,
     last_physical_input: Instant,
     gamepads: crate::gamepad::Gamepads,
@@ -208,12 +275,13 @@ const BINARY_AUDIO: u8 = 9;
 const BINARY_DISPLAY: u8 = 10;
 const BINARY_GAMEPAD_HEARTBEAT: u8 = 11;
 const BINARY_GAMEPAD_SPARSE: u8 = 12;
+const BINARY_KEY_EX: u8 = 13;
 const BINARY_KEY_NAMED: u8 = 4;
 
 pub(crate) fn is_binary_input_message(bytes: &[u8]) -> bool {
     bytes
         .first()
-        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_GAMEPAD_SPARSE).contains(kind))
+        .is_some_and(|kind| (BINARY_POINTER_MOVE..=BINARY_KEY_EX).contains(kind))
 }
 
 fn binary_named_key(id: u8) -> Option<&'static str> {
@@ -364,6 +432,36 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
                     .to_owned();
                 (String::new(), key)
             };
+            Ok(ControlMessage::Key {
+                action: if flags & 1 != 0 {
+                    KeyAction::Up
+                } else {
+                    KeyAction::Down
+                },
+                code,
+                key,
+                repeat: flags & 2 != 0,
+            })
+        }
+        BINARY_KEY_EX => {
+            if bytes.len() < 4 {
+                anyhow::bail!("truncated extended binary key input");
+            }
+            let flags = bytes[1];
+            if flags & !3 != 0 {
+                anyhow::bail!("invalid extended binary key flags");
+            }
+            let code_len = usize::from(bytes[2]);
+            let key_len = usize::from(bytes[3]);
+            if bytes.len() != 4 + code_len + key_len || key_len == 0 {
+                anyhow::bail!("invalid extended binary key length");
+            }
+            let code = std::str::from_utf8(&bytes[4..4 + code_len])
+                .context("extended binary key code is not UTF-8")?
+                .to_owned();
+            let key = std::str::from_utf8(&bytes[4 + code_len..])
+                .context("extended binary key value is not UTF-8")?
+                .to_owned();
             Ok(ControlMessage::Key {
                 action: if flags & 1 != 0 {
                     KeyAction::Up
@@ -656,7 +754,7 @@ impl InputController {
         if code.len() > 64 || value.len() > 32 {
             anyhow::bail!("key identifier is too long");
         }
-        let Some(key) = map_key(code, value) else {
+        let Some(key) = injected_key(code, value) else {
             return Ok(());
         };
         match action {
@@ -664,9 +762,9 @@ impl InputController {
             // held. A repeat datagram is only a clock tick and is ignored.
             KeyAction::Down if repeat => {}
             KeyAction::Down if !self.held_keys.contains(&key) => {
-                self.enigo.key(key, Direction::Press)?;
+                inject_key(&mut self.enigo, key, Direction::Press)?;
                 self.held_keys.insert(key);
-                if repeatable_key(key) {
+                if repeatable_injected_key(key) {
                     self.repeat_keys
                         .insert(key, Instant::now() + KEY_REPEAT_DELAY);
                 }
@@ -674,7 +772,7 @@ impl InputController {
             KeyAction::Up => {
                 self.held_keys.remove(&key);
                 self.repeat_keys.remove(&key);
-                self.enigo.key(key, Direction::Release)?;
+                inject_key(&mut self.enigo, key, Direction::Release)?;
             }
             KeyAction::Down => {}
         }
@@ -687,7 +785,7 @@ impl InputController {
     pub(crate) fn pump_key_repeats(&mut self, now: Instant) {
         for (key, due) in &mut self.repeat_keys {
             if key_repeat_due(due, now) {
-                let _ = self.enigo.key(*key, Direction::Press);
+                let _ = inject_key(&mut self.enigo, *key, Direction::Press);
             }
         }
     }
@@ -695,7 +793,7 @@ impl InputController {
     pub fn release_all(&mut self) {
         self.repeat_keys.clear();
         for key in self.held_keys.drain() {
-            let _ = self.enigo.key(key, Direction::Release);
+            let _ = inject_key(&mut self.enigo, key, Direction::Release);
         }
         for button in self.held_buttons.drain() {
             let _ = self.enigo.button(button, Direction::Release);
@@ -798,6 +896,162 @@ fn repeatable_key(key: Key) -> bool {
         key,
         Key::Shift | Key::Control | Key::Alt | Key::Meta | Key::CapsLock
     )
+}
+
+#[cfg(target_os = "windows")]
+fn scan_key(scan: u16, direction: Direction) -> Result<()> {
+    match direction {
+        Direction::Press => win_send::key(scan, true)?,
+        Direction::Release => win_send::key(scan, false)?,
+        Direction::Click => {
+            win_send::key(scan, true)?;
+            win_send::key(scan, false)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn scan_key(_scan: u16, _direction: Direction) -> Result<()> {
+    unreachable!("scan-code keys are only selected on Windows")
+}
+
+fn inject_key(enigo: &mut Enigo, key: InjectedKey, direction: Direction) -> Result<()> {
+    match key {
+        InjectedKey::Mapped(key) => enigo.key(key, direction)?,
+        InjectedKey::ScanCode(scan) => scan_key(scan, direction)?,
+    }
+    Ok(())
+}
+
+fn injected_key(code: &str, value: &str) -> Option<InjectedKey> {
+    #[cfg(target_os = "windows")]
+    if let Some(scan) = windows_scan_code(code) {
+        return Some(InjectedKey::ScanCode(scan));
+    }
+    map_key(code, value).map(InjectedKey::Mapped)
+}
+
+fn repeatable_injected_key(key: InjectedKey) -> bool {
+    match key {
+        InjectedKey::Mapped(key) => repeatable_key(key),
+        InjectedKey::ScanCode(scan) => !matches!(
+            scan,
+            0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0xe01d | 0xe038 | 0xe05b | 0xe05c
+        ),
+    }
+}
+
+/// Browser `KeyboardEvent.code` positions as Windows scan-set-1 codes. Raw
+/// scan input keeps game controls positional (WASD stays WASD) instead of
+/// depending on whichever character the host layout assigns. E0-prefixed keys
+/// carry the internal `0xe000` marker and are emitted with the extended flag.
+#[cfg(any(target_os = "windows", test))]
+fn windows_scan_code(code: &str) -> Option<u16> {
+    Some(match code {
+        "Escape" => 0x01,
+        "Digit1" => 0x02,
+        "Digit2" => 0x03,
+        "Digit3" => 0x04,
+        "Digit4" => 0x05,
+        "Digit5" => 0x06,
+        "Digit6" => 0x07,
+        "Digit7" => 0x08,
+        "Digit8" => 0x09,
+        "Digit9" => 0x0a,
+        "Digit0" => 0x0b,
+        "Minus" => 0x0c,
+        "Equal" => 0x0d,
+        "Backspace" => 0x0e,
+        "Tab" => 0x0f,
+        "KeyQ" => 0x10,
+        "KeyW" => 0x11,
+        "KeyE" => 0x12,
+        "KeyR" => 0x13,
+        "KeyT" => 0x14,
+        "KeyY" => 0x15,
+        "KeyU" => 0x16,
+        "KeyI" => 0x17,
+        "KeyO" => 0x18,
+        "KeyP" => 0x19,
+        "BracketLeft" => 0x1a,
+        "BracketRight" => 0x1b,
+        "Enter" => 0x1c,
+        "NumpadEnter" => 0xe01c,
+        "ControlLeft" => 0x1d,
+        "ControlRight" => 0xe01d,
+        "KeyA" => 0x1e,
+        "KeyS" => 0x1f,
+        "KeyD" => 0x20,
+        "KeyF" => 0x21,
+        "KeyG" => 0x22,
+        "KeyH" => 0x23,
+        "KeyJ" => 0x24,
+        "KeyK" => 0x25,
+        "KeyL" => 0x26,
+        "Semicolon" => 0x27,
+        "Quote" => 0x28,
+        "Backquote" => 0x29,
+        "ShiftLeft" => 0x2a,
+        "Backslash" => 0x2b,
+        "KeyZ" => 0x2c,
+        "KeyX" => 0x2d,
+        "KeyC" => 0x2e,
+        "KeyV" => 0x2f,
+        "KeyB" => 0x30,
+        "KeyN" => 0x31,
+        "KeyM" => 0x32,
+        "Comma" => 0x33,
+        "Period" => 0x34,
+        "Slash" => 0x35,
+        "ShiftRight" => 0x36,
+        "NumpadMultiply" => 0x37,
+        "AltLeft" => 0x38,
+        "AltRight" => 0xe038,
+        "Space" => 0x39,
+        "CapsLock" => 0x3a,
+        "F1" => 0x3b,
+        "F2" => 0x3c,
+        "F3" => 0x3d,
+        "F4" => 0x3e,
+        "F5" => 0x3f,
+        "F6" => 0x40,
+        "F7" => 0x41,
+        "F8" => 0x42,
+        "F9" => 0x43,
+        "F10" => 0x44,
+        "NumLock" => 0x45,
+        "Numpad7" => 0x47,
+        "Numpad8" => 0x48,
+        "Numpad9" => 0x49,
+        "NumpadSubtract" => 0x4a,
+        "Numpad4" => 0x4b,
+        "Numpad5" => 0x4c,
+        "Numpad6" => 0x4d,
+        "NumpadAdd" => 0x4e,
+        "Numpad1" => 0x4f,
+        "Numpad2" => 0x50,
+        "Numpad3" => 0x51,
+        "Numpad0" => 0x52,
+        "NumpadDecimal" => 0x53,
+        "NumpadDivide" => 0xe035,
+        "IntlBackslash" => 0x56,
+        "F11" => 0x57,
+        "F12" => 0x58,
+        "MetaLeft" => 0xe05b,
+        "MetaRight" => 0xe05c,
+        "Home" => 0xe047,
+        "End" => 0xe04f,
+        "PageUp" => 0xe049,
+        "PageDown" => 0xe051,
+        "Insert" => 0xe052,
+        "Delete" => 0xe053,
+        "ArrowUp" => 0xe048,
+        "ArrowDown" => 0xe050,
+        "ArrowLeft" => 0xe04b,
+        "ArrowRight" => 0xe04d,
+        _ => return None,
+    })
 }
 
 fn map_key(code: &str, value: &str) -> Option<Key> {
@@ -909,6 +1163,52 @@ mod tests {
             } if code == "ShiftLeft"
         ));
         assert!(parse_binary_control(&[BINARY_KEY, BINARY_KEY_NAMED, 99]).is_err());
+    }
+
+    #[test]
+    fn decodes_extended_binary_keys_with_physical_codes() {
+        let bytes = [BINARY_KEY_EX, 2, 4, 1, b'K', b'e', b'y', b'A', b'a'];
+        let message = parse_binary_control(&bytes).unwrap();
+        assert!(matches!(
+            message,
+            ControlMessage::Key {
+                action: KeyAction::Down,
+                code,
+                key,
+                repeat: true,
+            } if code == "KeyA" && key == "a"
+        ));
+        assert!(parse_binary_control(&[BINARY_KEY_EX, 4, 4, 1]).is_err());
+        assert!(parse_binary_control(&[BINARY_KEY_EX, 0, 4, 0, b'K']).is_err());
+    }
+
+    #[test]
+    fn maps_browser_codes_to_nonextended_windows_scan_codes() {
+        assert_eq!(windows_scan_code("KeyW"), Some(0x11));
+        assert_eq!(windows_scan_code("Digit1"), Some(0x02));
+        assert_eq!(windows_scan_code("Space"), Some(0x39));
+        assert_eq!(windows_scan_code("IntlBackslash"), Some(0x56));
+        assert_eq!(windows_scan_code("ArrowLeft"), Some(0xe04b));
+        assert_eq!(windows_scan_code("NumpadEnter"), Some(0xe01c));
+        assert_eq!(windows_scan_code("ControlRight"), Some(0xe01d));
+        assert_eq!(windows_scan_code("PrintScreen"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_injects_positional_keys_as_scan_codes() {
+        assert!(matches!(
+            injected_key("KeyW", "w"),
+            Some(InjectedKey::ScanCode(0x11))
+        ));
+        assert!(matches!(
+            injected_key("ArrowLeft", "ArrowLeft"),
+            Some(InjectedKey::ScanCode(0xe04b))
+        ));
+        assert!(matches!(
+            injected_key("UnknownKey", "é"),
+            Some(InjectedKey::Mapped(Key::Unicode('é')))
+        ));
     }
 
     #[test]

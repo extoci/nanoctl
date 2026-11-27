@@ -9,7 +9,7 @@ describe("encodeBinaryInput", () => {
     expect([...bytes]).toEqual([1, 0x00, 0x80, 0xff, 0xff]);
   });
 
-  test("encodes keys as named ids or UTF-8 without code strings", () => {
+  test("encodes keys as extended physical-code records", () => {
     expect([
       ...new Uint8Array(
         encodeBinaryInput({
@@ -21,7 +21,7 @@ describe("encodeBinaryInput", () => {
           repeat: false,
         })!,
       ),
-    ]).toEqual([5, 0, 97]);
+    ]).toEqual([13, 0, 4, 1, 75, 101, 121, 65, 97]);
     expect([
       ...new Uint8Array(
         encodeBinaryInput({
@@ -33,7 +33,7 @@ describe("encodeBinaryInput", () => {
           repeat: true,
         })!,
       ),
-    ]).toEqual([5, 7, 30]);
+    ]).toEqual([13, 3, 9, 5, 83, 104, 105, 102, 116, 76, 101, 102, 116, 83, 104, 105, 102, 116]);
   });
 
   test("encodes discrete input without legacy framing", () => {
