@@ -232,11 +232,17 @@ test("Safari canvas fallback still delivers trackpad pointer movement", async ({
   await page.goto("/");
   await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
   await expect(page.locator(".webcodecs-video")).toBeVisible();
-  expect(await page.locator("video").evaluate((video) => (video as HTMLVideoElement).videoWidth)).toBe(
-    0,
-  );
+  expect(
+    await page.locator("video").evaluate((video) => (video as HTMLVideoElement).videoWidth),
+  ).toBe(0);
   await expect
-    .poll(() => page.evaluate(() => (window as unknown as { state: { pointer: RTCDataChannel | null } }).state.pointer?.readyState))
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { state: { pointer: RTCDataChannel | null } }).state.pointer
+            ?.readyState,
+      ),
+    )
     .toBe("open");
   const box = (await page.locator("video").boundingBox())!;
   const x = box.x + box.width / 2;
@@ -262,7 +268,9 @@ test("Safari canvas fallback still delivers trackpad pointer movement", async ({
     { x, y },
   );
   await expect
-    .poll(() => page.evaluate(() => (window as unknown as { state: { moves: number } }).state.moves))
+    .poll(() =>
+      page.evaluate(() => (window as unknown as { state: { moves: number } }).state.moves),
+    )
     .toBeGreaterThan(0);
 });
 

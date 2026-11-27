@@ -104,12 +104,17 @@ test("absolute pointer motion moves the Windows host cursor", async ({ page }) =
       "import ctypes; print(f'{ctypes.windll.user32.GetSystemMetrics(0)},{ctypes.windll.user32.GetSystemMetrics(1)}')",
     ],
     { encoding: "utf8" },
-  ).trim().split(",").map(Number);
+  )
+    .trim()
+    .split(",")
+    .map(Number);
   await expect
     .poll(() => {
       const cursor = hostCursor();
-      return Math.abs(cursor.x - target.x * (size[0]! - 1)) <= 8 &&
-        Math.abs(cursor.y - target.y * (size[1]! - 1)) <= 8;
+      return (
+        Math.abs(cursor.x - target.x * (size[0]! - 1)) <= 8 &&
+        Math.abs(cursor.y - target.y * (size[1]! - 1)) <= 8
+      );
     })
     .toBe(true);
 });

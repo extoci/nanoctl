@@ -186,7 +186,8 @@ function Viewer() {
       // the hidden video element has no track dimensions. Using zero as the
       // source size made touch geometry null, so taps still clicked at the
       // previous cursor position but trackpad movement never reached the host.
-      const canvas = inputElement.parentElement?.querySelector<HTMLCanvasElement>(".webcodecs-video");
+      const canvas =
+        inputElement.parentElement?.querySelector<HTMLCanvasElement>(".webcodecs-video");
       const width = inputElement.videoWidth || canvas?.width || rect.width;
       const height = inputElement.videoHeight || canvas?.height || rect.height;
       return videoGeometry(rect, width, height);
