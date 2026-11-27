@@ -916,6 +916,40 @@ export function attachDataChannelVideo(
   >();
   const reordered = new Map<number, { au: Uint8Array; isKey: boolean; firstSeen: number }>();
   let newestSeq: number | null = null;
+  // A missing delta invalidates every dependent delta until the next IDR, but
+  // those dependent frames are not independent evidence of network loss. When
+  // the reference chain breaks, estimate only the sequence holes (including
+  // incomplete fragmented access units) inside the observed reorder window.
+  // Otherwise one lost frame is amplified into a ~100% loss report while the
+  // viewer waits for a keyframe, which keeps the host pinned at the bitrate
+  // floor long after the actual network recovers.
+  const countMissingVideoFrames = () => {
+    if (expectedSeq === null || newestSeq === null) return;
+    const distance = (newestSeq - expectedSeq) | 0;
+    if (distance <= 0) return;
+    let missing = 0;
+    let seq = expectedSeq;
+    // The window constants keep real reorder within tens of frames. The bound
+    // only prevents a malformed sequence jump from making this loop unbounded.
+    for (let i = 0; i < distance && i < 256; i += 1) {
+      if (!pending.has(seq) && !reordered.has(seq)) missing += 1;
+      seq = (seq + 1) >>> 0;
+    }
+    dcLost += missing;
+    dcLostTotal += missing;
+  };
+  const countMissingVideoFrame = () => {
+    dcLost += 1;
+    dcLostTotal += 1;
+  };
+  const noteReferenceChainLoss = () => {
+    countMissingVideoFrames();
+    waitingForKey = true;
+    dbg.waitingForKey = true;
+    dbg.gaps = (dbg.gaps as number) + 1;
+    reordered.clear();
+    requestKeyframe();
+  };
   const expireReorderState = () => {
     if (recoveryStopped) return;
     const now = Date.now();
@@ -924,6 +958,10 @@ export function attachDataChannelVideo(
       const distance = newestSeq === null ? 0 : (newestSeq - seq) | 0;
       if (distance > DC_PARTIAL_REORDER_WINDOW || now - entry.firstSeen >= DC_REORDER_AGE_MS) {
         pending.delete(seq);
+        // A partial access unit that survives this long is real network loss.
+        // Do not count still-active partials when the reference chain first
+        // breaks: their remaining fragments are often merely reordered.
+        countMissingVideoFrame();
         expired = true;
       }
     }
@@ -934,11 +972,7 @@ export function attachDataChannelVideo(
       }
     }
     if (expired && !waitingForKey) {
-      waitingForKey = true;
-      dbg.waitingForKey = true;
-      dbg.gaps = (dbg.gaps as number) + 1;
-      reordered.clear();
-      requestKeyframe();
+      noteReferenceChainLoss();
     }
   };
   const reorderExpiry = window.setInterval(expireReorderState, 100);
@@ -986,11 +1020,7 @@ export function attachDataChannelVideo(
         if (expectedSeq === null) return;
         const heartbeatDiff = (seq - expectedSeq) | 0;
         if (heartbeatDiff > 0 && !waitingForKey) {
-          waitingForKey = true;
-          dbg.waitingForKey = true;
-          dbg.gaps = (dbg.gaps as number) + 1;
-          reordered.clear();
-          requestKeyframe();
+          noteReferenceChainLoss();
         }
         return;
       }
@@ -1026,6 +1056,10 @@ export function attachDataChannelVideo(
         expectedSeq = seq;
       }
       const diff = (seq - expectedSeq) | 0;
+      // Loss feedback needs a network-arrival denominator, not a decode
+      // denominator. Complete access units still count as received while the
+      // decoder waits for an IDR; only late duplicates are excluded.
+      if (diff >= 0) dcReceived += 1;
       if (diff < 0) {
         dbg.late = ((dbg.late as number) || 0) + 1;
         return; // Already delivered (or already declared lost).
@@ -1048,24 +1082,16 @@ export function attachDataChannelVideo(
           dbg.reordered = ((dbg.reordered as number) || 0) + 1;
         }
         if (reordered.size > DC_REORDER_WINDOW && !waitingForKey) {
-          waitingForKey = true;
-          dbg.gaps = (dbg.gaps as number) + 1;
-          reordered.clear();
           // Nothing can drain while the missing sequence is absent, so asking
           // here rather than in deliver() is what bounds recovery time.
-          requestKeyframe();
+          noteReferenceChainLoss();
         }
       }
       // Drain the reorder window in sequence.
       const deliver = (s: number, a: Uint8Array, k: boolean) => {
-        if (expectedSeq !== null) {
-          const skipped = (s - expectedSeq) | 0;
-          if (skipped > 0) {
-            dcLost += skipped;
-            dcLostTotal += skipped;
-          }
+        if (expectedSeq !== null && ((s - expectedSeq) | 0) > 0 && !waitingForKey) {
+          countMissingVideoFrames();
         }
-        dcReceived += 1;
         expectedSeq = (s + 1) >>> 0;
         if (waitingForKey) {
           requestKeyframe();
@@ -1078,11 +1104,7 @@ export function attachDataChannelVideo(
         dbg.fed = (dbg.fed as number) + 1;
         const accepted = sink.feed(a, k, s * 16_000);
         if (!accepted && !k && !waitingForKey) {
-          waitingForKey = true;
-          dbg.waitingForKey = true;
-          dbg.gaps = (dbg.gaps as number) + 1;
-          reordered.clear();
-          requestKeyframe();
+          noteReferenceChainLoss();
         }
       };
       if (deliverNow) {
