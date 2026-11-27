@@ -7,6 +7,8 @@ mod clipboard;
 #[cfg(feature = "rtc")]
 mod codec;
 mod config;
+#[cfg(all(feature = "media", target_os = "windows"))]
+mod cursor;
 mod diagnostics;
 #[cfg(feature = "media")]
 mod gamepad;

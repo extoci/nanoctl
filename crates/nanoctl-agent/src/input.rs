@@ -554,6 +554,10 @@ fn parse_binary_control(bytes: &[u8]) -> Result<ControlMessage> {
 }
 
 impl InputController {
+    pub(crate) fn display_geometry(&self) -> (i32, i32, u32, u32) {
+        (self.origin_x, self.origin_y, self.width, self.height)
+    }
+
     pub fn new() -> Result<Self> {
         let monitors = Monitor::all().context("cannot enumerate displays for input")?;
         let monitor = monitors

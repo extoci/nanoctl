@@ -12,6 +12,8 @@ import {
   type RemoteSessionSnapshot,
   type QualityLimits,
   type RemoteSessionOptions,
+  type RemoteCursorShape,
+  type RemoteCursorPosition,
 } from "./remote-session";
 
 export type SocketStatus =
@@ -45,6 +47,8 @@ export class SocketSession {
       onAudioOutputs?: (state: AudioOutputState) => void;
       onInfo: (info: HostInfo) => void;
       onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
+      onCursorShape?: (shape: RemoteCursorShape) => void;
+      onCursorPosition?: (position: RemoteCursorPosition) => void;
       onStatus: (status: SocketStatus, detail?: string) => void;
       createController?: (options: RemoteSessionOptions) => RemoteSessionController;
       codecChoice?: () => CodecChoice;
@@ -204,6 +208,8 @@ export class SocketSession {
                 if (snapshot.phase === "connected") this.attempt = 0;
                 this.options.onSnapshot(snapshot);
               },
+              onCursorShape: this.options.onCursorShape,
+              onCursorPosition: this.options.onCursorPosition,
             });
             this.controller = controller;
             void controller.start().catch(() => {

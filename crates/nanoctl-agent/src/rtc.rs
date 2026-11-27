@@ -589,6 +589,113 @@ async fn forward_clipboard(
     }
 }
 
+#[cfg(all(feature = "media", target_os = "windows"))]
+async fn forward_cursor(
+    output: Arc<RTCDataChannel>,
+    mut pointer: tokio::sync::watch::Receiver<Option<Arc<RTCDataChannel>>>,
+    input: Arc<std::sync::Mutex<crate::input::InputController>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    while output.ready_state()
+        == webrtc::data_channel::data_channel_state::RTCDataChannelState::Connecting
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if output.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+        return;
+    }
+    let motion_output = loop {
+        let current = { pointer.borrow().as_ref().cloned() };
+        if let Some(channel) = current {
+            while channel.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Connecting
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if channel.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            {
+                break channel;
+            }
+            return;
+        }
+        if pointer.changed().await.is_err() {
+            return;
+        }
+    };
+    tracing::debug!("cursor metadata forwarder started");
+    let mut interval = tokio::time::interval(Duration::from_millis(33));
+    let mut shape_key: Option<usize> = None;
+    let mut sequence = 0_u32;
+    let mut tick = 0_u32;
+    let mut last_sent: Option<(i32, i32, bool)> = None;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = interval.tick() => {
+                let sample = match crate::cursor::sample(shape_key) {
+                    Ok(sample) => sample,
+                    Err(error) => {
+                        tracing::debug!(%error, "cursor sample failed");
+                        continue;
+                    }
+                };
+                if let Some(shape) = sample.shape.as_ref() {
+                    let message = serde_json::json!({
+                        "type": "cursorShape",
+                        "width": shape.width,
+                        "height": shape.height,
+                        "hotspotX": shape.hotspot_x,
+                        "hotspotY": shape.hotspot_y,
+                        "pixels": STANDARD.encode(&shape.rgba),
+                    });
+                    if output.send_text(message.to_string()).await.is_ok() {
+                        shape_key = Some(sample.shape_key);
+                    }
+                }
+                let Some((origin_x, origin_y, width, height)) = input
+                    .lock()
+                    .ok()
+                    .map(|controller| controller.display_geometry())
+                else {
+                    continue;
+                };
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let x = (sample.x - origin_x) as f64 / width as f64;
+                let y = (sample.y - origin_y) as f64 / height as f64;
+                let visible = sample.visible
+                    && (0.0..=1.0).contains(&x)
+                    && (0.0..=1.0).contains(&y);
+                tick = tick.wrapping_add(1);
+                let position = (sample.x, sample.y, visible);
+                if last_sent == Some(position) && !tick.is_multiple_of(15) {
+                    continue;
+                }
+                last_sent = Some(position);
+                sequence = sequence.wrapping_add(1);
+                let message = serde_json::json!({
+                    "type": "cursor",
+                    "seq": sequence,
+                    "x": (x * 10_000.0).round() / 10_000.0,
+                    "y": (y * 10_000.0).round() / 10_000.0,
+                    "visible": visible,
+                });
+                if motion_output.buffered_amount().await <= 32 * 1024
+                    && let Err(error) = motion_output.send_text(message.to_string()).await
+                {
+                    tracing::debug!(%error, "cursor position send failed");
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
@@ -760,6 +867,9 @@ impl HostPeer {
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
             let (pointer_sender, pointer_receiver) = motion_channel();
+            #[cfg(target_os = "windows")]
+            let (cursor_pointer_sender, cursor_pointer_receiver) =
+                tokio::sync::watch::channel(None::<Arc<RTCDataChannel>>);
             let blocked_notices = InputBlockedNotices::default();
             if let Some(input) = &input {
                 input_tasks.push(spawn_input_worker(
@@ -784,6 +894,7 @@ impl HostPeer {
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
+            let input_shutdown_for_channel = input_shutdown.clone();
             let clipboard = if allow_clipboard {
                 crate::clipboard::backend()
             } else {
@@ -910,8 +1021,21 @@ impl HostPeer {
                     }
                     return Box::pin(async {});
                 }
+                #[cfg(all(feature = "media", target_os = "windows"))]
+                if channel.label() == "nanoctl.cursor.v1" {
+                    cursor_pointer_sender.send_replace(Some(channel.clone()));
+                }
                 if reliable {
                     blocked_notices.attach(&channel);
+                    #[cfg(all(feature = "media", target_os = "windows"))]
+                    if let Some(cursor_input) = input.clone() {
+                        tokio::spawn(forward_cursor(
+                            channel.clone(),
+                            cursor_pointer_receiver.clone(),
+                            cursor_input,
+                            input_shutdown_for_channel.subscribe(),
+                        ));
+                    }
                 }
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
