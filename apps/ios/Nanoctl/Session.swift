@@ -260,6 +260,26 @@ final class Session {
         }
     }
 
+    private func applyNetworkAdapterPolicy(_ endpoint: HostEndpoint) {
+        let options = RTCPeerConnectionFactoryOptions()
+        options.ignoreLoopbackNetworkAdapter = !endpoint.isLoopback
+        if endpoint.usesTailnetMediaPath {
+            // Tailscale is a utun/VPN adapter on iOS. WebRTC otherwise gathers
+            // every Wi-Fi/cellular interface and lets their higher network
+            // priority win even though the host only publishes tailnet
+            // candidates; those pairs can transmit into the tunnel but never
+            // complete the return path. Keep VPN and unknown adapters while
+            // dropping the physical classes that cannot carry this media.
+            options.ignoreWiFiNetworkAdapter = true
+            options.ignoreCellularNetworkAdapter = true
+            options.ignoreEthernetNetworkAdapter = true
+            sessionLog.info("ice adapter policy: tailnet interfaces only")
+        } else {
+            sessionLog.info("ice adapter policy: direct interfaces")
+        }
+        factory.setOptions(options)
+    }
+
     /// Reconnects to the last host, e.g. after a codec change or returning
     /// from the background.
     func restart() {
@@ -684,6 +704,7 @@ final class Session {
                 self.deactivateDataChannelVideo(current)
             }
         }
+        if let endpoint { applyNetworkAdapterPolicy(endpoint) }
         let configuration = RTCConfiguration()
         configuration.sdpSemantics = .unifiedPlan
         configuration.iceServers = []
