@@ -1045,7 +1045,7 @@ describe("webcodecs video gating and teardown", () => {
       );
       expect(peer.channelConfigs.get("nanoctl.video.v1")).toMatchObject({
         ordered: false,
-        maxPacketLifeTime: 80,
+        maxPacketLifeTime: 160,
       });
       await controller.stop("done", false);
     }
