@@ -1099,10 +1099,22 @@ export function attachV4DataChannelVideo(
     window.clearTimeout(watchdog);
     watchdog = undefined;
   };
+  const onOpen = () => {
+    if (
+      !closed &&
+      !active &&
+      videoDelta.readyState === "open" &&
+      videoReference.readyState === "open"
+    ) {
+      watchdog ??= window.setTimeout(() => finish("v4 video did not start"), 3_000);
+    }
+  };
   const finish = (reason?: string) => {
     if (closed) return;
     closed = true;
     stopWatchdog();
+    videoDelta.removeEventListener("open", onOpen);
+    videoReference.removeEventListener("open", onOpen);
     receiver.dispose();
     if (v4DebugVideo.get(video) === debug) v4DebugVideo.delete(video);
     active?.sink.teardown(false);
@@ -1164,6 +1176,9 @@ export function attachV4DataChannelVideo(
   const onClosed = () => finish("v4 video channel closed");
   videoDelta.onclose = onClosed;
   videoReference.onclose = onClosed;
+  videoDelta.addEventListener("open", onOpen);
+  videoReference.addEventListener("open", onOpen);
+  onOpen();
   return {
     get canvas() {
       return active?.sink.canvas ?? placeholder;

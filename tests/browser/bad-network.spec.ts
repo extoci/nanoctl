@@ -356,12 +356,42 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
       .soft(maxBuffered, "host media lane buffer watermark")
       .toBeLessThanOrEqual(referenceBufferBytes);
 
+    const readReconnectCounters = () =>
+      page.evaluate(() => {
+        const probe = window.badNetworkProbe;
+        return {
+          wireBytes: probe.wireBytes,
+          keyframes: probe.keyframes.length,
+          decodeSubmissions: probe.decodeSubmissions.length,
+        };
+      });
     for (let cycle = 1; cycle <= reconnects; cycle += 1) {
+      const beforeReconnect = await readReconnectCounters();
       await page.getByRole("button", { name: "Reconnect", exact: true }).click();
-      await expect(page.getByTestId("connection-state"), `impaired reattach ${cycle}`).toHaveText(
-        "Live",
-        { timeout: 8_000 },
-      );
+      try {
+        await expect(page.getByTestId("connection-state"), `impaired reattach ${cycle}`).toHaveText(
+          "Live",
+          { timeout: 8_000 },
+        );
+      } catch (error) {
+        const [counters, host] = await Promise.allSettled([
+          readReconnectCounters(),
+          request.get("/v1/debug", { timeout: 2_000 }).then((report) => report.text()),
+        ]);
+        evidence.failedReconnect = {
+          cycle,
+          before: beforeReconnect,
+          after: counters.status === "fulfilled" ? counters.value : undefined,
+          mediaEvents:
+            host.status === "fulfilled"
+              ? host.value
+                  .split("\n")
+                  .filter((line) => line.includes("v4") || line.includes("Viewer disconnected"))
+                  .slice(-15)
+              : undefined,
+        };
+        throw error;
+      }
       await endSession();
       evidence.reconnectsCompleted = cycle;
     }

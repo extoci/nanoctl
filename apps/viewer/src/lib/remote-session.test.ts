@@ -1074,8 +1074,10 @@ class FakeMediaStream {
   }
 }
 
-class FakeDataChannel {
-  constructor(private readonly record: (message: unknown) => void = () => {}) {}
+class FakeDataChannel extends EventTarget {
+  constructor(private readonly record: (message: unknown) => void = () => {}) {
+    super();
+  }
   sent: unknown[] = [];
   readyState: RTCDataChannelState = "open";
   bufferedAmount = 0;
@@ -1201,6 +1203,39 @@ describe("webcodecs video gating and teardown", () => {
       });
       expect(peer.channelConfigs.has("nanoctl.video-reference.v4")).toBe(true);
       await controller.stop("done", false);
+    }
+  });
+
+  test("v4 fails an open video connection that never receives a first reference", () => {
+    installBrowserGlobals(() => 0);
+    const failures: string[] = [];
+    let timeout: (() => void) | undefined;
+    window.setTimeout = ((fn: () => void) => {
+      timeout = fn;
+      return 1;
+    }) as typeof window.setTimeout;
+    const video = Object.assign(new FakeVideo(), { ownerDocument: { createElement: () => ({}) } });
+    const delta = new FakeDataChannel();
+    const reference = new FakeDataChannel();
+    reference.readyState = "connecting";
+    const handle = attachV4DataChannelVideo(
+      delta as unknown as RTCDataChannel,
+      reference as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+      undefined,
+      undefined,
+      (reason) => failures.push(reason),
+    );
+    try {
+      expect(timeout).toBeUndefined();
+      reference.readyState = "open";
+      reference.dispatchEvent(new Event("open"));
+      expect(timeout).toBeDefined();
+      timeout?.();
+      expect(failures).toEqual(["v4 video did not start"]);
+      expect([reference.readyState, delta.readyState]).toEqual(["closed", "closed"]);
+    } finally {
+      handle.drop();
     }
   });
 
