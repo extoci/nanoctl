@@ -3994,6 +3994,12 @@ pub fn spawn_video(
                     if let Some(channel) = target {
                         if !skip_live_delta {
                             let au_len = sample.data.len();
+                            let wire_len = messages.iter().map(|msg| msg.len()).sum::<usize>();
+                            // Local backpressure is access-unit atomic. Sending only the
+                            // parts that fit before the queue fills wastes constrained
+                            // bandwidth on a frame the decoder can never complete.
+                            let delta_has_budget = is_idr
+                                || channel.buffered_amount().await + wire_len <= 64 * 1024;
                             for msg in &messages {
                                 if is_idr {
                                     // Pace IDR parts: bursting ~150KB into the
@@ -4014,7 +4020,7 @@ pub fn spawn_video(
                                             break;
                                         }
                                     }
-                                } else if channel.buffered_amount().await <= 64 * 1024 {
+                                } else if delta_has_budget {
                                     match send_video_data_message(channel, msg, false, &mut dc_impairment).await {
                                         Ok(_) => dc_backed_up = false,
                                         Err(error) => {
