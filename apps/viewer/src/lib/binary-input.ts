@@ -4,7 +4,6 @@ const POINTER_MOVE = 1;
 const GAMEPAD = 2;
 const POINTER_BUTTON = 3;
 const POINTER_WHEEL = 4;
-const KEY = 5;
 const TEXT = 6;
 const RELEASE = 7;
 const PING = 8;
@@ -12,50 +11,9 @@ const AUDIO = 9;
 const DISPLAY = 10;
 const GAMEPAD_HEARTBEAT = 11;
 const GAMEPAD_SPARSE = 12;
-const KEY_NAMED = 4;
+const KEY_EX = 13;
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 const textEncoder = new TextEncoder();
-
-const NAMED_KEYS: Record<string, number> = {
-  Backspace: 1,
-  Delete: 2,
-  Enter: 3,
-  NumpadEnter: 3,
-  Escape: 4,
-  Tab: 5,
-  Space: 6,
-  ArrowUp: 7,
-  ArrowDown: 8,
-  ArrowLeft: 9,
-  ArrowRight: 10,
-  Home: 11,
-  End: 12,
-  PageUp: 13,
-  PageDown: 14,
-  F1: 15,
-  F2: 16,
-  F3: 17,
-  F4: 18,
-  F5: 19,
-  F6: 20,
-  F7: 21,
-  F8: 22,
-  F9: 23,
-  F10: 24,
-  F11: 25,
-  F12: 26,
-  CapsLock: 27,
-  PrintScreen: 28,
-  Insert: 29,
-  ShiftLeft: 30,
-  ShiftRight: 30,
-  ControlLeft: 31,
-  ControlRight: 31,
-  AltLeft: 32,
-  AltRight: 32,
-  MetaLeft: 33,
-  MetaRight: 33,
-};
 
 function message(kind: number, length: number): DataView<ArrayBuffer> {
   const out = new DataView(new ArrayBuffer(length));
@@ -193,18 +151,18 @@ export function encodeBinaryInput(payload: ControlMessage | GamepadStateInput): 
   }
   if (payload.type === "key") {
     const flags = (payload.action === "up" ? 1 : 0) | (payload.repeat ? 2 : 0);
-    const named = NAMED_KEYS[payload.code];
-    if (named) {
-      const out = message(KEY, 3);
-      out.setUint8(1, flags | KEY_NAMED);
-      out.setUint8(2, named);
-      return out.buffer;
-    }
+    const code = utf8(payload.code, 64) ?? new Uint8Array();
     const key = utf8(payload.key, 32);
-    if (!key?.length) return null;
-    const out = message(KEY, 2 + key.length);
+    if (!key?.length || code.length > 255 || key.length > 255) return null;
+    // KeyEx carries the browser's physical `code` alongside the layout-dependent
+    // `key`. Windows hosts use the physical position for game-compatible scan
+    // codes; other hosts can still fall back to the character value.
+    const out = message(KEY_EX, 4 + code.length + key.length);
     out.setUint8(1, flags);
-    new Uint8Array(out.buffer, 2, key.length).set(key);
+    out.setUint8(2, code.length);
+    out.setUint8(3, key.length);
+    new Uint8Array(out.buffer, 4, code.length).set(code);
+    new Uint8Array(out.buffer, 4 + code.length, key.length).set(key);
     return out.buffer;
   }
   if (payload.type === "text") {
