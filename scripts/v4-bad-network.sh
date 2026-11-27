@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ${1:-} == --with-display ]]; then
+  shift
+  # Manage the authority file as the test user and preserve Playwright's exit status.
+  display_dir=$(mktemp -d)
+  trap 'rm -rf -- "$display_dir"' EXIT
+  xvfb-run -a -f "$display_dir/Xauthority" -s "-screen 0 1280x720x24 -nolisten tcp" "$@"
+  exit
+fi
+
 # The agent binary must already include the built viewer. Prepare the executable
 # outside the namespace so Cargo and browser installation can reach the network.
 if [[ ${1:-} != --inside ]]; then
@@ -43,7 +52,7 @@ cd "$(dirname "$0")/.."
 # sudo can restore a system-only PATH. The Playwright web server also launches Bun.
 args=(env "PATH=$(dirname "$bun"):$PATH" NANOCTL_BROWSER_MEDIA=1 NANOCTL_BROWSER_BAD_NETWORK=1
   "NANOCTL_BROWSER_AGENT_BIN=$agent"
-  xvfb-run -a -s "-screen 0 1280x720x24 -nolisten tcp"
+  bash "$(realpath "$0")" --with-display
   "$node" node_modules/@playwright/test/cli.js test
   -c tests/browser/playwright.config.ts bad-network.spec.ts --project chromium)
 if [[ -n ${SUDO_USER:-} ]]; then
