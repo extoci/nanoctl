@@ -4021,13 +4021,13 @@ pub fn spawn_video(
                         video_data_channel.needs_keyframe.load(Ordering::Acquire) && !is_idr;
                     if let Some(channel) = target {
                         if !skip_live_delta {
-                            let au_len = sample.data.len();
                             let wire_len = messages.iter().map(|msg| msg.len()).sum::<usize>();
                             // Local backpressure is access-unit atomic. Sending only the
                             // parts that fit before the queue fills wastes constrained
                             // bandwidth on a frame the decoder can never complete.
                             let delta_has_budget = is_idr
                                 || channel.buffered_amount().await + wire_len <= 64 * 1024;
+                            let mut sent_wire_len = 0_u64;
                             for msg in &messages {
                                 if is_idr {
                                     // Pace IDR parts: bursting ~150KB into the
@@ -4041,7 +4041,10 @@ pub fn spawn_video(
                                         tokio::time::sleep(Duration::from_millis(1)).await;
                                     }
                                     match send_video_data_message(channel, msg, true, &mut dc_impairment).await {
-                                        Ok(_) => dc_backed_up = false,
+                                        Ok(sent) => {
+                                            dc_backed_up = false;
+                                            sent_wire_len += u64::from(sent) * msg.len() as u64;
+                                        }
                                         Err(error) => {
                                             tracing::warn!(%error, "video data channel send failed");
                                             dc_backed_up = true;
@@ -4050,7 +4053,10 @@ pub fn spawn_video(
                                     }
                                 } else if delta_has_budget {
                                     match send_video_data_message(channel, msg, false, &mut dc_impairment).await {
-                                        Ok(_) => dc_backed_up = false,
+                                        Ok(sent) => {
+                                            dc_backed_up = false;
+                                            sent_wire_len += u64::from(sent) * msg.len() as u64;
+                                        }
                                         Err(error) => {
                                             tracing::warn!(%error, "video data channel send failed");
                                             dc_backed_up = true;
@@ -4078,8 +4084,8 @@ pub fn spawn_video(
                                 // Count the data-channel egress too: the rate
                                 // controller measures real wire bytes, not
                                 // just the RTP share.
-                                writer_stats.bytes_sent.fetch_add(au_len as u64, Ordering::Relaxed);
-                                writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), au_len));
+                                writer_stats.bytes_sent.fetch_add(sent_wire_len, Ordering::Relaxed);
+                                writer_stats.send_window.lock().unwrap().writes.push_back((Instant::now(), sent_wire_len as usize));
                                 last_dc_activity = Some(Instant::now());
                             }
                         }
