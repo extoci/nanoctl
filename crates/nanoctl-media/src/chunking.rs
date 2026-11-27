@@ -1,9 +1,10 @@
 use async_trait::async_trait;
-use nanoctl_core::video::{
-    MAX_ACCESS_UNIT_BYTES, MAX_VIDEO_CHUNK_BYTES, MAX_VIDEO_PARTS, VIDEO_HEADER_BYTES, VideoChunk,
-};
+use nanoctl_core::video::{MAX_ACCESS_UNIT_BYTES, MAX_VIDEO_PARTS, VIDEO_HEADER_BYTES, VideoChunk};
 
 use crate::types::{EncodedAccessUnit, LaneWriteReport, LaneWriteStatus, LaneWriter, MediaError};
+
+// Leave room for the video header and SCTP headers within WebRTC's 1191-byte SCTP MTU.
+const CHUNK_PAYLOAD_BYTES: usize = 1_100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoLane {
@@ -11,8 +12,8 @@ pub enum VideoLane {
     Delta,
 }
 
-/// Byte sink owned by the transport layer. Implementations must expose the same
-/// monotonic buffered-byte accounting as the underlying lane. Capacity is a hard
+/// Byte sink owned by the transport layer. Report the bytes still queued or
+/// awaiting acknowledgment on the underlying lane. Capacity is a hard
 /// backpressure budget, not an estimate: the writer either preflights and emits every
 /// chunk of an access unit or drops it before emitting the first byte.
 #[async_trait]
@@ -41,6 +42,12 @@ impl<S> LaneWriter for ChunkingLaneWriter<S>
 where
     S: VideoChunkSink,
 {
+    async fn reference_ready(&mut self) -> bool {
+        // This permits a small control message, such as an idle watermark. Every video
+        // chunk occupies more than one header's worth of bytes in a single SCTP fragment.
+        self.sink.buffered_bytes(VideoLane::Reference).await <= VIDEO_HEADER_BYTES
+    }
+
     async fn write_access_unit(
         &mut self,
         access_unit: EncodedAccessUnit,
@@ -51,12 +58,7 @@ where
         if access_unit.payload.len() > MAX_ACCESS_UNIT_BYTES {
             return Err(MediaError::InvalidAccessUnit("payload exceeds maximum"));
         }
-        let parts = access_unit.payload.len().div_ceil(MAX_VIDEO_CHUNK_BYTES);
-        if parts > usize::from(MAX_VIDEO_PARTS) {
-            return Err(MediaError::InvalidAccessUnit(
-                "payload requires too many chunks",
-            ));
-        }
+        let parts = access_unit.payload.len().div_ceil(CHUNK_PAYLOAD_BYTES);
 
         let lane = if access_unit.keyframe {
             VideoLane::Reference
@@ -70,7 +72,10 @@ where
             .lane_capacity(lane)
             .await
             .saturating_sub(buffered_before);
-        if wire_bytes > available {
+        if wire_bytes > available
+            || parts > usize::from(MAX_VIDEO_PARTS)
+            || (lane == VideoLane::Reference && buffered_before > VIDEO_HEADER_BYTES)
+        {
             return Ok(LaneWriteReport {
                 status: LaneWriteStatus::DroppedBeforeWrite,
                 buffered_bytes: buffered_before,
@@ -79,8 +84,8 @@ where
 
         let parts = parts as u16;
         for part in 0..parts {
-            let start = usize::from(part) * MAX_VIDEO_CHUNK_BYTES;
-            let end = (start + MAX_VIDEO_CHUNK_BYTES).min(access_unit.payload.len());
+            let start = usize::from(part) * CHUNK_PAYLOAD_BYTES;
+            let end = (start + CHUNK_PAYLOAD_BYTES).min(access_unit.payload.len());
             let chunk = VideoChunk {
                 stream_sequence: access_unit.stream_sequence,
                 part,
@@ -106,7 +111,7 @@ where
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use nanoctl_core::video::{MAX_VIDEO_CHUNK_BYTES, VideoChunk, VideoCodec};
+    use nanoctl_core::video::{VideoChunk, VideoCodec};
 
     use super::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
     use crate::types::{EncodedAccessUnit, LaneWriteStatus, LaneWriter, MediaError};
@@ -147,6 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn access_units_are_chunked_and_reference_units_use_reference_lane() {
+        let payload_bytes = 1_100;
         let sink = MemorySink {
             chunks: Vec::new(),
             buffered: 0,
@@ -154,7 +160,7 @@ mod tests {
         };
         let mut writer = ChunkingLaneWriter::new(sink);
         let report = writer
-            .write_access_unit(access_unit(MAX_VIDEO_CHUNK_BYTES * 2 + 1, true))
+            .write_access_unit(access_unit(payload_bytes * 2 + 1, true))
             .await
             .unwrap();
         assert_eq!(report.status, LaneWriteStatus::Written);
@@ -170,7 +176,7 @@ mod tests {
         assert_eq!(first.stream_sequence, 7);
         assert_eq!(first.part, 0);
         assert_eq!(first.parts, 3);
-        assert_eq!(first.payload.len(), MAX_VIDEO_CHUNK_BYTES);
+        assert_eq!(first.payload.len(), payload_bytes);
         assert!(first.keyframe);
         assert_eq!(first.capture_time_us, 1234);
         let last = VideoChunk::parse(&sink.chunks[2].1).unwrap();
@@ -194,6 +200,28 @@ mod tests {
             .unwrap();
         assert_eq!(report.status, LaneWriteStatus::DroppedBeforeWrite);
         assert!(writer.into_sink().chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reference_in_flight_prevents_queueing_another() {
+        let sink = MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: usize::MAX,
+        };
+        let mut writer = ChunkingLaneWriter::new(sink);
+        let first = writer
+            .write_access_unit(access_unit(100, true))
+            .await
+            .unwrap();
+        assert_eq!(first.status, LaneWriteStatus::Written);
+        assert!(!writer.reference_ready().await);
+        let next = writer
+            .write_access_unit(access_unit(100, true))
+            .await
+            .unwrap();
+        assert_eq!(next.status, LaneWriteStatus::DroppedBeforeWrite);
+        assert_eq!(writer.into_sink().chunks.len(), 1);
     }
 
     #[tokio::test]

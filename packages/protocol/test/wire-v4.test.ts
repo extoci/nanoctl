@@ -174,6 +174,20 @@ function chunk(
 }
 
 describe("v4 video reassembly and reference validation", () => {
+  test("delta fragments cannot evict an incomplete reference", () => {
+    const reassembler = new VideoReassembler();
+    reassembler.push(chunk(7, 0, 2, true, [1]));
+    for (let sequence = 8; sequence < 24; sequence += 1) {
+      expect(
+        reassembler.push(chunk(sequence, 0, 2, false, [2])).droppedIncompleteSequence,
+      ).toBeUndefined();
+    }
+    expect(reassembler.push(chunk(24, 0, 2, false, [2])).droppedIncompleteSequence).toBe(8);
+    expect(Array.from(reassembler.push(chunk(7, 1, 2, true, [3])).complete!.payload)).toEqual([
+      1, 3,
+    ]);
+  });
+
   test("reassembles out-of-order parts across sequences", () => {
     const reassembler = new VideoReassembler();
     expect(reassembler.push(chunk(7, 1, 2, true, [2])).complete).toBeUndefined();

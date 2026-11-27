@@ -95,6 +95,17 @@ test("a short unresolved gap requests recovery even below the frame limit", asyn
   try {
     state.receiver.handle(encoded(10, true, [0]));
     state.receiver.handle(encoded(12, false, [2]));
+    state.receiver.handle(
+      encodeVideoChunk({
+        codec: "h264",
+        streamSequence: 13,
+        captureTimeUs: 13_000,
+        part: 0,
+        parts: 2,
+        keyframe: false,
+        payload: new Uint8Array([1]),
+      }),
+    );
     expect(state.requests).toHaveLength(0);
     await Bun.sleep(250);
     expect(state.requests).toEqual([[4, 0x41]]);

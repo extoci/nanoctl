@@ -562,7 +562,8 @@ type PartialAccessUnit = {
   readonly parts: (Uint8Array | undefined)[];
 };
 
-const MAX_PENDING_ACCESS_UNITS = 3;
+const MAX_PENDING_REFERENCES = 3;
+const MAX_PENDING_DELTAS = 16;
 
 export class VideoReassembler {
   private readonly pending = new Map<number, PartialAccessUnit>();
@@ -594,10 +595,18 @@ export class VideoReassembler {
       if (current.parts[chunk.part] !== undefined) return {};
     }
 
-    const evicted =
-      current === undefined && this.pending.size === MAX_PENDING_ACCESS_UNITS
-        ? this.pending.keys().next().value
-        : undefined;
+    let evicted: number | undefined;
+    if (current === undefined) {
+      const limit = chunk.keyframe ? MAX_PENDING_REFERENCES : MAX_PENDING_DELTAS;
+      let oldest: number | undefined;
+      let count = 0;
+      for (const [sequence, pending] of this.pending) {
+        if (pending.keyframe !== chunk.keyframe) continue;
+        oldest ??= sequence;
+        count += 1;
+      }
+      if (count === limit) evicted = oldest;
+    }
     const evictedBytes = evicted === undefined ? 0 : this.pending.get(evicted)!.byteLength;
     const nextBytes = this.pendingBytes - evictedBytes + chunk.payload.length;
     if (nextBytes > MAX_ACCESS_UNIT_BYTES)

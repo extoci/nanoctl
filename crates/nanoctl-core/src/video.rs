@@ -153,7 +153,8 @@ struct PartialAccessUnit {
     parts: Vec<Option<Vec<u8>>>,
 }
 
-const MAX_PENDING_ACCESS_UNITS: usize = 3;
+const MAX_PENDING_REFERENCES: usize = 3;
+const MAX_PENDING_DELTAS: usize = 16;
 
 /// Reassembles a bounded set of access units across interleaved video chunks.
 #[derive(Debug, Default)]
@@ -200,8 +201,25 @@ impl VideoReassembler {
             }
         }
 
-        let evict = existing.is_none() && self.pending.len() == MAX_PENDING_ACCESS_UNITS;
-        let evicted_bytes = if evict { self.pending[0].1.byte_len } else { 0 };
+        let eviction = if existing.is_none() {
+            let limit = if chunk.keyframe {
+                MAX_PENDING_REFERENCES
+            } else {
+                MAX_PENDING_DELTAS
+            };
+            let mut oldest = None;
+            let mut count = 0;
+            for (index, (_, pending)) in self.pending.iter().enumerate() {
+                if pending.keyframe == chunk.keyframe {
+                    oldest.get_or_insert(index);
+                    count += 1;
+                }
+            }
+            if count == limit { oldest } else { None }
+        } else {
+            None
+        };
+        let evicted_bytes = eviction.map_or(0, |index| self.pending[index].1.byte_len);
         let next_bytes = self.pending_bytes - evicted_bytes + chunk.payload.len();
         if next_bytes > MAX_ACCESS_UNIT_BYTES {
             return Err(WireError::InvalidValue(
@@ -211,8 +229,9 @@ impl VideoReassembler {
 
         let mut outcome = ReassemblyOutcome::default();
         let index = existing.unwrap_or_else(|| {
-            if evict {
-                outcome.dropped_incomplete_sequence = self.pending.pop_front().map(|(seq, _)| seq);
+            if let Some(index) = eviction {
+                outcome.dropped_incomplete_sequence =
+                    self.pending.remove(index).map(|(seq, _)| seq);
             }
             self.pending.push_back((
                 sequence,
@@ -433,6 +452,22 @@ mod tests {
         reassembler.push(chunk(13, 0, 2, true, b"f")).unwrap();
         let overflow = reassembler.push(chunk(14, 0, 2, true, b"g")).unwrap();
         assert_eq!(overflow.dropped_incomplete_sequence, Some(11));
+    }
+
+    #[test]
+    fn reassembler_does_not_evict_a_reference_to_hold_deltas() {
+        let mut reassembler = VideoReassembler::new();
+        reassembler.push(chunk(7, 0, 2, true, b"a")).unwrap();
+        for sequence in 8..24 {
+            let outcome = reassembler
+                .push(chunk(sequence, 0, 2, false, b"b"))
+                .unwrap();
+            assert_eq!(outcome.dropped_incomplete_sequence, None);
+        }
+        let overflow = reassembler.push(chunk(24, 0, 2, false, b"b")).unwrap();
+        assert_eq!(overflow.dropped_incomplete_sequence, Some(8));
+        let reference = reassembler.push(chunk(7, 1, 2, true, b"c")).unwrap();
+        assert_eq!(reference.complete.unwrap().payload, b"ac");
     }
 
     #[test]

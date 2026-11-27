@@ -316,15 +316,24 @@ async fn encode_loop_inner(
         record_metrics(metrics, |snapshot| snapshot.frames_taken_for_encode += 1);
         let mut config = *updates.borrow();
         force_next_keyframe |= last_dimensions != Some((config.width, config.height));
-        if !frame.has_new_damage
-            && !force_next_keyframe
-            && !keyframe_requested.load(Ordering::Acquire)
-        {
+        let repair_pending = force_next_keyframe || keyframe_requested.load(Ordering::Acquire);
+        let force_keyframe = if repair_pending {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown) => return Ok(()),
+                ready = lane.reference_ready() => ready,
+            }
+        } else {
+            false
+        };
+        if force_next_keyframe && !force_keyframe {
+            // Keep the encoder's reference state until a replacement can be sent.
+            continue;
+        }
+        if !frame.has_new_damage && !force_keyframe {
             record_metrics(metrics, |snapshot| snapshot.unchanged_frames_skipped += 1);
             continue;
         }
-        let keyframe_was_requested = keyframe_requested.swap(false, Ordering::Acquire);
-        let force_keyframe = force_next_keyframe || keyframe_was_requested;
         if force_keyframe {
             tokio::select! {
                 biased;

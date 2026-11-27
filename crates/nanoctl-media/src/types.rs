@@ -238,6 +238,11 @@ pub trait VideoEncoder: Send {
 
 #[async_trait]
 pub trait LaneWriter: Send {
+    /// Whether the transport is ready for a new reference access unit.
+    async fn reference_ready(&mut self) -> bool {
+        true
+    }
+
     /// Atomically accept or reject one complete access unit. A lane that cannot accept
     /// it without queueing must return `DroppedBeforeWrite` rather than an error when
     /// the drop is recoverable. Returning `Written` means every byte was accepted.

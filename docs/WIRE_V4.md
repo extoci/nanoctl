@@ -133,10 +133,14 @@ u8[] payload         # 1..=49152 bytes; length comes from the datagram
 ```
 
 All chunks in one access unit must carry identical sequence, part count, codec, keyframe flag, and
-capture timestamp. Reassembly keeps up to three incomplete access units and at most 16 MiB of
-fragment payload across them. It ignores duplicate parts and evicts the oldest pending unit when
-a fourth fragmented unit starts. The receiver rejects chunks that would exceed the byte budget.
+capture timestamp. Reassembly keeps up to three incomplete references and sixteen incomplete deltas,
+with one shared 16 MiB payload budget. It ignores duplicate parts and evicts the oldest pending unit
+of the same kind when its limit is reached. Delta fragments cannot evict a pending reference.
 Complete single-chunk units do not evict pending fragments.
+
+Over SCTP, the host sends up to 1,100 payload bytes in each message to avoid SCTP fragmentation.
+It waits for the outstanding reference to drain before submitting another. The wire limits below
+still apply to received messages.
 
 A keyframe resets the receiver's reference chain. If the reorder window fills before a missing
 delta arrives, the receiver discards dependent deltas and requests a keyframe once. The
@@ -149,7 +153,8 @@ transport or session layer owns any request timers and rate limits.
 - Gamepads: 4 slots.
 - Text input message: 1 KiB.
 - Key code/key fields: 64 bytes each.
-- Reassembly holds at most three incomplete video access units and 16 MiB of payload in total.
+- Reassembly holds at most three incomplete references and sixteen incomplete deltas, with 16 MiB of
+  payload in total.
 
 Implementations must enforce these limits before allocation wherever possible and must cap total
 allocation even when lengths are internally consistent.

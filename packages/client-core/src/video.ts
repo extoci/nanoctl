@@ -11,13 +11,13 @@ export type VideoInputOutcome = FrameSequencerOutcome & {
   readonly received?: AccessUnit;
 };
 
-function emptyOutcome(): VideoInputOutcome {
+function incompleteOutcome(buffered: number): VideoInputOutcome {
   return {
     emitted: [],
     requestKeyframe: false,
     duplicatesDropped: 0,
     unreferenceableDropped: 0,
-    buffered: 0,
+    buffered,
   };
 }
 
@@ -53,7 +53,7 @@ export class VideoStreamProcessor {
     const reassembled = this.reassembler.push(chunk);
     if (reassembled.complete === undefined) {
       return {
-        ...emptyOutcome(),
+        ...incompleteOutcome(this.sequencer.bufferedFrames),
         droppedIncompleteSequence: reassembled.droppedIncompleteSequence,
       };
     }
