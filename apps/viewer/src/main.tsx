@@ -8,6 +8,7 @@ import { SoftKeyboard } from "./soft-keyboard";
 import { SoundPlayback, type SoundState } from "./lib/sound";
 import {
   CODEC_CHOICES,
+  browserDecodeSupport,
   loadCodecChoice,
   saveCodecChoice,
   type CodecChoice,
@@ -73,6 +74,7 @@ function Viewer() {
     }
   });
   const codecChoiceRef = useRef(codecChoice);
+  const [av1DecodeSupported, setAv1DecodeSupported] = useState<boolean | null>(null);
   const [qualityLimits, setQualityLimitsState] = useState<QualityLimits>(() => {
     try {
       return JSON.parse(localStorage.getItem("quality-limits") ?? "{}") as QualityLimits;
@@ -89,6 +91,24 @@ function Viewer() {
     } catch {}
     transport.current?.controller?.setQualityLimits(next);
   };
+  useEffect(() => {
+    let active = true;
+    void browserDecodeSupport("av1").then(({ supported }) => {
+      if (!active) return;
+      setAv1DecodeSupported(supported);
+      if (!supported && codecChoiceRef.current === "av1") {
+        codecChoiceRef.current = "auto";
+        setCodecChoiceState("auto");
+        try {
+          saveCodecChoice("auto");
+        } catch {}
+        transport.current?.connect();
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
   const setCodecChoice = (next: CodecChoice) => {
     codecChoiceRef.current = next;
     setCodecChoiceState(next);
@@ -134,11 +154,19 @@ function Viewer() {
       return "trackpad";
     }
   });
+  const [touchCursorVisible, setTouchCursorVisible] = useState(() => {
+    try {
+      return localStorage.getItem("touch-cursor") !== "hidden";
+    } catch {
+      return true;
+    }
+  });
   const cursorRef = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    const inputElement = video;
     try {
       localStorage.setItem("touch-mode", touchMode);
     } catch {
@@ -146,20 +174,26 @@ function Viewer() {
     }
     let cursor = { x: 0.5, y: 0.5 };
     const paintCursor = () => {
-      const geometry = videoGeometry(
-        video.getBoundingClientRect(),
-        video.videoWidth,
-        video.videoHeight,
-      );
+      const geometry = inputGeometry();
       const stage = video.parentElement?.getBoundingClientRect();
       if (!geometry || !stage || !cursorRef.current) return;
       cursorRef.current.style.left = `${geometry.left - stage.left + cursor.x * geometry.width}px`;
       cursorRef.current.style.top = `${geometry.top - stage.top + cursor.y * geometry.height}px`;
     };
+    function inputGeometry() {
+      const rect = inputElement.getBoundingClientRect();
+      // Safari's direct-video path renders WebCodecs frames into a canvas while
+      // the hidden video element has no track dimensions. Using zero as the
+      // source size made touch geometry null, so taps still clicked at the
+      // previous cursor position but trackpad movement never reached the host.
+      const canvas = inputElement.parentElement?.querySelector<HTMLCanvasElement>(".webcodecs-video");
+      const width = inputElement.videoWidth || canvas?.width || rect.width;
+      const height = inputElement.videoHeight || canvas?.height || rect.height;
+      return videoGeometry(rect, width, height);
+    }
     const gestures = new TouchGestures({
       mode: touchMode,
-      geometry: () =>
-        videoGeometry(video.getBoundingClientRect(), video.videoWidth, video.videoHeight),
+      geometry: inputGeometry,
       send: (message) => transport.current?.controller?.sendControl(message),
       onCursor: (position) => {
         cursor = position;
@@ -439,7 +473,7 @@ function Viewer() {
             Mouse locked · Ctrl+Alt+M or Esc to release
           </div>
         )}
-        {touchMode === "trackpad" && live && (
+        {touchMode === "trackpad" && touchCursorVisible && live && (
           <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
         )}
         {!live && (
@@ -592,7 +626,12 @@ function Viewer() {
                   <button
                     key={choice.value}
                     aria-pressed={choice.value === codecChoice}
-                    disabled={terminal}
+                    disabled={terminal || (choice.value === "av1" && av1DecodeSupported === false)}
+                    title={
+                      choice.value === "av1" && av1DecodeSupported === false
+                        ? "Safari/WebRTC on this device does not support AV1; use HEVC/H.264 here or the native app for AV1."
+                        : undefined
+                    }
                     onClick={() => {
                       if (choice.value !== codecChoice) setCodecChoice(choice.value);
                     }}
@@ -601,6 +640,12 @@ function Viewer() {
                   </button>
                 ))}
               </div>
+              {av1DecodeSupported === false && info.capabilities.codecs.includes("av1") && (
+                <p className="panel-hint">
+                  AV1 is unavailable in Safari/WebRTC on this device. Use HEVC/H.264 here or the
+                  native app for AV1.
+                </p>
+              )}
             </>
           )}
           <h2>Frame rate</h2>
@@ -670,6 +715,23 @@ function Viewer() {
                 onClick={() => setTouchMode(touchMode === "trackpad" ? "direct" : "trackpad")}
               >
                 {touchMode === "trackpad" ? "Trackpad" : "Direct"}
+              </button>
+            )}
+            {coarse && touchMode === "trackpad" && (
+              <button
+                aria-pressed={!touchCursorVisible}
+                onClick={() => {
+                  setTouchCursorVisible((visible) => {
+                    try {
+                      localStorage.setItem("touch-cursor", visible ? "hidden" : "shown");
+                    } catch {
+                      /* Storage may be unavailable. */
+                    }
+                    return !visible;
+                  });
+                }}
+              >
+                {touchCursorVisible ? "Cursor shown" : "Cursor hidden"}
               </button>
             )}
             <span

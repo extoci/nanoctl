@@ -77,6 +77,43 @@ test("relative pointer-lock motion moves the Windows host cursor relatively", as
   await closePanel(page);
 });
 
+test("absolute pointer motion moves the Windows host cursor", async ({ page }) => {
+  test.skip(process.platform !== "win32", "Windows host input validation");
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live media input");
+  await page.goto("/");
+  await openPanel(page);
+  await expect(page.getByTestId("connection-state")).toHaveText("Live");
+  await closePanel(page);
+  const geometry = await page.evaluate(() => {
+    const video = document.querySelector("video")!;
+    const rect = video.getBoundingClientRect();
+    const scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
+    const w = video.videoWidth * scale;
+    const h = video.videoHeight * scale;
+    return { left: rect.left + (rect.width - w) / 2, top: rect.top + (rect.height - h) / 2, w, h };
+  });
+  const target = { x: 0.67, y: 0.42 };
+  await page.mouse.move(
+    geometry.left + target.x * geometry.w,
+    geometry.top + target.y * geometry.h,
+  );
+  const size = execFileSync(
+    "python",
+    [
+      "-c",
+      "import ctypes; print(f'{ctypes.windll.user32.GetSystemMetrics(0)},{ctypes.windll.user32.GetSystemMetrics(1)}')",
+    ],
+    { encoding: "utf8" },
+  ).trim().split(",").map(Number);
+  await expect
+    .poll(() => {
+      const cursor = hostCursor();
+      return Math.abs(cursor.x - target.x * (size[0]! - 1)) <= 8 &&
+        Math.abs(cursor.y - target.y * (size[1]! - 1)) <= 8;
+    })
+    .toBe(true);
+});
+
 test("mouse-lock toggle makes browser pointer motion relative", async ({ page }) => {
   test.skip(process.platform !== "win32", "Windows host input validation");
   test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live media input");
