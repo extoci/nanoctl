@@ -11,6 +11,10 @@ It also cancels an old timeout callback when a SACK restarts the timer while
 holding the association lock. The bad-network gate records T3 timeout events
 with browser frame timestamps so transport stalls can be correlated.
 
+On a T3 timeout, expire timed DATA before building retransmissions. Advance
+FORWARD TSN in the same timeout so expired video does not use the reduced
+congestion window. See [RFC 3758 section 4.1](https://www.rfc-editor.org/rfc/rfc3758.html#section-4.1).
+
 Update the audit entry in `.github/workflows/ci.yml` when changing the upstream
 version. Before removing the patch, verify the timer setting, cancellation
 behavior, and the v4 bad-network gate with the new dependency.

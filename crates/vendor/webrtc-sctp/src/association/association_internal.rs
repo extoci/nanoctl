@@ -2375,7 +2375,16 @@ impl RtxTimerObserver for AssociationInternal {
                 //  A5) Any time the T3-rtx timer expires, on any destination, the sender
                 //  SHOULD try to advance the "Advanced.Peer.Ack.Point" by following
                 //  the procedures outlined in C2 - C5.
+                let mut newly_abandoned = 0;
                 if self.use_forward_tsn {
+                    // RFC 3758 sec 4.1 (TR4): expire timed DATA before it spends
+                    // any of the reduced congestion window on retransmission.
+                    for chunk in self.inflight_queue.chunks() {
+                        if !chunk.acked && !chunk.abandoned() {
+                            self.check_partial_reliability_status(chunk);
+                            newly_abandoned += usize::from(chunk.abandoned());
+                        }
+                    }
                     // RFC 3758 Sec 3.5 C2
                     let mut i = self.advanced_peer_tsn_ack_point + 1;
                     while let Some(c) = self.inflight_queue.get(i) {
@@ -2404,11 +2413,12 @@ impl RtxTimerObserver for AssociationInternal {
 
                 log::debug!(
                     target: "webrtc_sctp::retransmission",
-                    "[{}] T3-rtx timed out: n_rtos={} cwnd={} ssthresh={}",
+                    "[{}] T3-rtx timed out: n_rtos={} cwnd={} ssthresh={} newly_abandoned={}",
                     self.name,
                     n_rtos,
                     self.cwnd,
-                    self.ssthresh
+                    self.ssthresh,
+                    newly_abandoned
                 );
 
                 self.inflight_queue.mark_all_to_retrasmit();

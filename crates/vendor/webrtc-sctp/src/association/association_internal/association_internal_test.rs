@@ -214,6 +214,64 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
 }
 
 #[tokio::test]
+async fn t3_timeout_forwards_expired_data_and_retransmits_live_data() {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        mtu: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    a.use_forward_tsn = true;
+    a.rwnd = 65_535;
+    a.cumulative_tsn_ack_point = 9;
+    a.advanced_peer_tsn_ack_point = 9;
+    a.create_stream(1, false)
+        .unwrap()
+        .set_reliability_params(true, ReliabilityType::Timed, 60_000);
+    a.create_stream(2, false).unwrap();
+
+    let now = SystemTime::now();
+    let expired = now - std::time::Duration::from_secs(120);
+    for (tsn, stream_identifier, since) in [(10, 1, expired), (11, 1, now), (12, 2, expired)] {
+        let mut chunk = ChunkPayloadData {
+            tsn,
+            stream_identifier,
+            since,
+            nsent: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            unordered: true,
+            retransmit: true,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            user_data: Bytes::from_static(b"data"),
+            ..Default::default()
+        };
+        chunk.set_all_inflight();
+        a.inflight_queue.push_no_check(chunk);
+    }
+
+    a.on_retransmission_timeout(RtxTimerId::T3RTX, 1).await;
+    let (packets, open) = a.gather_outbound().await;
+    assert!(open);
+    let chunks: Vec<_> = packets.iter().flat_map(|packet| &packet.chunks).collect();
+    let resent: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| chunk.as_any().downcast_ref::<ChunkPayloadData>())
+        .map(|chunk| chunk.tsn)
+        .collect();
+    assert_eq!(resent, [11, 12]);
+    let forward = chunks
+        .iter()
+        .find_map(|chunk| chunk.as_any().downcast_ref::<ChunkForwardTsn>())
+        .expect("The timeout should forward the expired TSN immediately");
+    assert_eq!(forward.new_cumulative_tsn, 10);
+}
+
+#[tokio::test]
 async fn test_handle_forward_tsn_forward_3unreceived_chunks() -> Result<()> {
     let mut a = create_association_internal(Config {
         net_conn: Arc::new(DumbConn {}),

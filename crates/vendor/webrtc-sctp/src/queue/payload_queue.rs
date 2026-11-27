@@ -96,6 +96,10 @@ impl PayloadQueue {
         self.chunk_map.get_mut(&tsn)
     }
 
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &ChunkPayloadData> {
+        self.chunk_map.values()
+    }
+
     /// popDuplicates returns an array of TSN values that were found duplicate.
     pub(crate) fn pop_duplicates(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.dup_tsn)
@@ -162,10 +166,7 @@ impl PayloadQueue {
 
     pub(crate) fn mark_all_to_retrasmit(&mut self) {
         for c in self.chunk_map.values_mut() {
-            if c.acked || c.abandoned() {
-                continue;
-            }
-            c.retransmit = true;
+            c.retransmit = !c.acked && !c.abandoned();
         }
     }
 
