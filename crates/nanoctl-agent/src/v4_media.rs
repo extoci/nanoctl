@@ -1,4 +1,6 @@
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -15,9 +17,11 @@ use crate::rtc::{HostPeer, V4DataChannelVideo};
 
 const DELTA_LANE_CAPACITY: usize = 128 * 1024;
 const REFERENCE_LANE_CAPACITY: usize = 512 * 1024;
+const MIN_KEYFRAME_PACING_BPS: u32 = 2_400_000;
 
 struct WebRtcVideoSink {
     lanes: Arc<V4DataChannelVideo>,
+    send_rate_kbps: Arc<AtomicU32>,
 }
 
 impl WebRtcVideoSink {
@@ -40,6 +44,14 @@ impl WebRtcVideoSink {
 impl VideoChunkSink for WebRtcVideoSink {
     fn take_delta_repair_request(&mut self) -> Option<u32> {
         self.lanes.pending_delta_repair.lock().unwrap().take()
+    }
+
+    fn keyframe_pacing_bps(&self) -> Option<NonZeroU32> {
+        let bps = self
+            .send_rate_kbps
+            .load(Ordering::Relaxed)
+            .saturating_mul(1_000);
+        NonZeroU32::new(bps.max(MIN_KEYFRAME_PACING_BPS))
     }
 
     async fn buffered_bytes(&self, lane: VideoLane) -> usize {
@@ -192,8 +204,10 @@ async fn run_pipeline(
             return;
         }
     };
+    let send_rate_kbps = Arc::new(AtomicU32::new(rate.decision().bitrate_kbps));
     let sink = WebRtcVideoSink {
         lanes: lanes.clone(),
+        send_rate_kbps: send_rate_kbps.clone(),
     };
     let lane = ChunkingLaneWriter::with_repeated_chunks(sink);
     let pipeline = match MediaPipeline::start_with_keyframe_requests(
@@ -269,6 +283,7 @@ async fn run_pipeline(
                     tracing::warn!(%error, "could not update v4 media settings");
                     break;
                 }
+                send_rate_kbps.store(rate.decision().bitrate_kbps, Ordering::Relaxed);
                 previous = snapshot;
                 last_sample = now;
             }

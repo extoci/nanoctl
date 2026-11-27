@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nanoctl_core::video::{MAX_ACCESS_UNIT_BYTES, MAX_VIDEO_PARTS, VIDEO_HEADER_BYTES, VideoChunk};
+use tokio::time::{self, Instant as TokioInstant};
 
 use crate::types::{EncodedAccessUnit, LaneWriteReport, LaneWriteStatus, LaneWriter, MediaError};
 
@@ -12,6 +14,8 @@ const REFERENCE_ACK_GRACE: Duration = Duration::from_millis(350);
 const DELTA_REPAIR_CACHE_FRAMES: usize = 16;
 const DELTA_REPAIR_FRAME_BYTES: usize = 8 * 1024;
 const DELTA_REPAIR_MAX_AGE: Duration = Duration::from_millis(500);
+const KEYFRAME_BURST_CHUNKS: usize = 4;
+const DATAGRAM_OVERHEAD_BYTES: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoLane {
@@ -29,9 +33,41 @@ pub trait VideoChunkSink: Send {
         None
     }
 
+    fn keyframe_pacing_bps(&self) -> Option<NonZeroU32> {
+        None
+    }
+
     async fn buffered_bytes(&self, lane: VideoLane) -> usize;
     async fn lane_capacity(&self, lane: VideoLane) -> usize;
     async fn write_chunk(&mut self, lane: VideoLane, bytes: Vec<u8>) -> Result<(), MediaError>;
+}
+
+struct KeyframePacer {
+    bitrate: NonZeroU32,
+    chunks_in_burst: usize,
+    next_burst: TokioInstant,
+}
+
+impl KeyframePacer {
+    fn new(bitrate: NonZeroU32) -> Self {
+        Self {
+            bitrate,
+            chunks_in_burst: 0,
+            next_burst: TokioInstant::now(),
+        }
+    }
+
+    async fn before_chunk(&mut self, bytes: usize) {
+        if self.chunks_in_burst == KEYFRAME_BURST_CHUNKS {
+            time::sleep_until(self.next_burst).await;
+            self.chunks_in_burst = 0;
+        }
+        let bits = (bytes + DATAGRAM_OVERHEAD_BYTES) as u64 * 8;
+        let spacing =
+            Duration::from_nanos((bits * 1_000_000_000).div_ceil(self.bitrate.get().into()));
+        self.next_burst = self.next_burst.max(TokioInstant::now()) + spacing;
+        self.chunks_in_burst += 1;
+    }
 }
 
 struct CachedDelta {
@@ -200,6 +236,14 @@ where
                         .lane_capacity(VideoLane::Delta)
                         .await
                         .saturating_sub(self.sink.buffered_bytes(VideoLane::Delta).await));
+        let mut pacer = if access_unit.keyframe {
+            self.sink.keyframe_pacing_bps().map(KeyframePacer::new)
+        } else {
+            None
+        };
+        if lane == VideoLane::Reference {
+            self.last_reference_sent = Some(Instant::now());
+        }
         let mut repeated = Vec::new();
         let parts = parts as u16;
         for part in 0..parts {
@@ -220,6 +264,9 @@ where
             if repeat {
                 repeated.push(bytes.clone());
             }
+            if let Some(pacer) = &mut pacer {
+                pacer.before_chunk(bytes.len()).await;
+            }
             self.sink.write_chunk(lane, bytes).await?;
         }
         if repeat {
@@ -238,11 +285,11 @@ where
                 });
             }
             for bytes in repeated {
+                if let Some(pacer) = &mut pacer {
+                    pacer.before_chunk(bytes.len()).await;
+                }
                 self.sink.write_chunk(VideoLane::Delta, bytes).await?;
             }
-        }
-        if lane == VideoLane::Reference {
-            self.last_reference_sent = Some(Instant::now());
         }
 
         let mut buffered_bytes = self.sink.buffered_bytes(lane).await;
@@ -259,10 +306,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+    use std::time::Duration;
+
     use async_trait::async_trait;
     use nanoctl_core::video::{VideoChunk, VideoCodec};
+    use tokio::time::Instant;
 
-    use super::{ChunkingLaneWriter, VideoChunkSink, VideoLane};
+    use super::{ChunkingLaneWriter, KeyframePacer, VideoChunkSink, VideoLane};
     use crate::types::{EncodedAccessUnit, LaneWriteStatus, LaneWriter, MediaError};
 
     struct MemorySink {
@@ -307,6 +358,21 @@ mod tests {
             capture_sequence: 3,
             payload: vec![0x5a; payload_len],
         }
+    }
+
+    #[tokio::test]
+    async fn keyframe_pacer_waits_after_four_datagrams_at_the_wire_rate() {
+        let start = Instant::now();
+        let mut pacer = KeyframePacer::new(NonZeroU32::new(2_400_000).unwrap());
+        for _ in 0..4 {
+            pacer.before_chunk(1120).await;
+        }
+        let deadline = pacer.next_burst;
+        assert!(deadline >= start + Duration::from_millis(16));
+
+        pacer.before_chunk(1120).await;
+        assert!(Instant::now() >= deadline);
+        assert_eq!(pacer.chunks_in_burst, 1);
     }
 
     #[tokio::test]
