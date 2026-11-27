@@ -96,7 +96,7 @@ test("a short unresolved gap requests recovery even below the frame limit", asyn
     state.receiver.handle(encoded(10, true, [0]));
     state.receiver.handle(encoded(12, false, [2]));
     expect(state.requests).toHaveLength(0);
-    await Bun.sleep(150);
+    await Bun.sleep(250);
     expect(state.requests).toEqual([[4, 0x41]]);
     state.receiver.handle(encoded(11, false, [1]));
     expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10]);
@@ -111,7 +111,7 @@ test("a reliable video watermark detects a lost final delta on an idle desktop",
     state.receiver.handle(encoded(10, true, [0]));
     state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
     expect(state.requests).toHaveLength(0);
-    await Bun.sleep(150);
+    await Bun.sleep(250);
     expect(state.requests).toEqual([[4, 0x41]]);
   } finally {
     state.receiver.dispose();
@@ -124,7 +124,7 @@ test("a late delta can catch up with the watermark before recovery starts", asyn
     state.receiver.handle(encoded(10, true, [0]));
     state.receiver.handle(Uint8Array.from([4, 0x42, 12, 0, 0, 0]));
     state.receiver.handle(encoded(11, false, [1]));
-    await Bun.sleep(150);
+    await Bun.sleep(250);
     expect(state.requests).toHaveLength(0);
     expect(state.emitted.map((unit) => unit.streamSequence)).toEqual([10, 11]);
   } finally {

@@ -1134,7 +1134,7 @@ describe("webcodecs video gating and teardown", () => {
       );
       expect(peer.channelConfigs.get("nanoctl.video-delta.v4")).toMatchObject({
         ordered: false,
-        maxRetransmits: 0,
+        maxPacketLifeTime: 150,
       });
       expect(peer.channelConfigs.has("nanoctl.video-reference.v4")).toBe(true);
       await controller.stop("done", false);
