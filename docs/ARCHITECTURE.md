@@ -29,6 +29,12 @@ WireGuard transport, NAT traversal and, when needed, DERP relay.
 - The media pipeline captures the interactive desktop, bounds its newest-frame queue,
   encodes the negotiated codec (AV1, HEVC or H.264) and sends RTP. Input requires config, platform capability and viewer permission.
 
+## Desktop shell
+
+`crates/nanoctl-planck` is the native Windows desktop shell, branded nanoctl and internally codenamed `planck`. This GPUI application discovers agents and launches their existing secure embedded viewer; it does not duplicate the streaming media pipeline yet.
+
+Labs is a typed experiment registry owned by the desktop shell. Experiments are off by default, platform-gated, locally persisted, and independent from agent configuration. The initial `windows.tailnet-discovery` experiment expands host discovery from the local device to online Tailscale peers.
+
 ## Viewer
 
 `apps/viewer` is a static React SPA built with Bun into hashed assets in `dist`.

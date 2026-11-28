@@ -141,6 +141,10 @@ jobs:
             nanoctl-windows-x64.exe.sha256
             nanoctl-windows-arm64.exe
             nanoctl-windows-arm64.exe.sha256
+            nanoctl-desktop-windows-x64.exe
+            nanoctl-desktop-windows-x64.exe.sha256
+            nanoctl-desktop-windows-arm64.exe
+            nanoctl-desktop-windows-arm64.exe.sha256
           )
           for file in "${expected[@]}"; do
             test -f "dist/$file" || {

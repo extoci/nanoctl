@@ -73,6 +73,14 @@ recognized PlayStation controllers and Xbox 360 for other controllers.
 Gamepad forwarding requires permission to control the desktop and only sends input from a
 focused viewer. It does not replace Tailscale or require a native iOS helper.
 
+## Windows desktop
+
+nanoctl includes a native Windows desktop shell built with GPUI. It discovers nanoctl hosts, opens their secure embedded viewer, and exposes opt-in experimental features through Labs. See [Windows desktop](docs/DESKTOP.md).
+
+```powershell
+bun run build:desktop
+```
+
 ## Develop
 
 ```sh

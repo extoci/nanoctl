@@ -68,6 +68,8 @@ jobs:
           [ "$(jq -r .version packages/protocol/package.json)" = "$v" ]
           grep -qF "version = \"$v\"" crates/nanoctl-agent/Cargo.toml
           grep -qF "version = \"$v\"" crates/nanoctl-agent/Cargo.lock
+          grep -qF "version = \"$v\"" crates/nanoctl-planck/Cargo.toml
+          grep -qF "version = \"$v\"" crates/nanoctl-planck/Cargo.lock
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.14
@@ -80,6 +82,32 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
+
+  desktop:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: desktop-windows
+          workspaces: crates/nanoctl-planck
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Exclude build outputs from Defender
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath $env:CARGO_HOME
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-planck\target"
+          Add-MpPreference -ExclusionProcess cargo.exe
+          Add-MpPreference -ExclusionProcess rustc.exe
+          Add-MpPreference -ExclusionProcess link.exe
+      - run: cargo fmt --manifest-path crates/nanoctl-planck/Cargo.toml -- --check
+      - run: cargo test --locked --manifest-path crates/nanoctl-planck/Cargo.toml
+      - run: cargo clippy --all-targets --locked --manifest-path crates/nanoctl-planck/Cargo.toml -- -D warnings
 
   agent:
     needs: viewer-dist
@@ -454,6 +482,7 @@ jobs:
         run: |
           Add-MpPreference -ExclusionPath $env:CARGO_HOME
           Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-agent\target"
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-planck\target"
           Add-MpPreference -ExclusionProcess cargo.exe
           Add-MpPreference -ExclusionProcess rustc.exe
           Add-MpPreference -ExclusionProcess link.exe
@@ -463,6 +492,9 @@ jobs:
           cache-suffix: media
           save-cache: ${{ github.event_name != 'pull_request' }}
       - run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Build Windows desktop app
+        if: matrix.platform == 'windows'
+        run: cargo build --release --locked --manifest-path crates/nanoctl-planck/Cargo.toml
       - name: Stage Unix release asset
         if: matrix.platform != 'windows'
         shell: bash
@@ -485,10 +517,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Release binary smoke test failed." }
           $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $asset" | Set-Content -NoNewline "$asset.sha256"
+          $desktopAsset = "nanoctl-desktop-${{ matrix.platform }}-${{ matrix.architecture }}.exe"
+          Copy-Item "crates/nanoctl-planck/target/release/nanoctl-desktop.exe" $desktopAsset
+          & ".\$desktopAsset" --version
+          if ($LASTEXITCODE -ne 0) { throw "Desktop binary smoke test failed." }
+          $desktopHash = (Get-FileHash -LiteralPath $desktopAsset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$desktopHash  $desktopAsset" | Set-Content -NoNewline "$desktopAsset.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nanoctl-release-${{ matrix.platform }}-${{ matrix.architecture }}
-          path: nanoctl-${{ matrix.platform }}-${{ matrix.architecture }}*
+          path: |
+            nanoctl-${{ matrix.platform }}-${{ matrix.architecture }}*
+            nanoctl-desktop-${{ matrix.platform }}-${{ matrix.architecture }}*
           if-no-files-found: error
           retention-days: 30
 
@@ -504,9 +544,12 @@ jobs:
           tool: cargo-audit
       # xcb uses quick-xml only in its build script against crate-owned protocol XML. Neither
       # vulnerable parser path nor quick-xml is present in the shipped agent runtime.
-      - name: Audit Rust dependencies
+      - name: Audit agent dependencies
         working-directory: crates/nanoctl-agent
         run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+      - name: Audit desktop dependencies
+        working-directory: crates/nanoctl-planck
+        run: cargo audit
       # Run the official CLI directly instead of the hosted Action. The Action's license/API
       # validation can fail on organization repositories because of third-party rate limits even
       # when the scanner itself reports no findings.

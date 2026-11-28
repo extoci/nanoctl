@@ -2,7 +2,8 @@
 
 nanoctl is a small, self-hosted remote desktop for devices on your Tailscale network.
 The host agent serves the controller itself; opening its URL is the complete browser
-workflow. See [ADR 0004](adr/0004-tailnet-native.md).
+workflow. A native Windows desktop shell provides a polished entry point and Labs without
+replacing that streaming workflow yet. See [ADR 0004](adr/0004-tailnet-native.md).
 
 ## Experience
 
@@ -15,6 +16,11 @@ workflow. See [ADR 0004](adr/0004-tailnet-native.md).
   show a dash until sampled; a static desktop can have sparse frames and very low traffic.
 - Socket loss gets bounded reconnect. Another viewer taking over gets a clear message
   and explicit Reconnect action. Only one session is active per host.
+
+## Labs
+
+Desktop experiments are opt-in, independently toggleable and platform-specific. They stay off
+by default so alpha users can track current builds without inheriting unfinished behavior.
 
 ## Boundaries
 
