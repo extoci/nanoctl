@@ -157,6 +157,17 @@ final class TouchGesturesTests: XCTestCase {
         XCTAssertEqual(g.zoom, Zoom())
     }
 
+    func testContactCallbackTracksFirstAndLastFinger() {
+        let g = setup()
+        var states: [Bool] = []
+        g.onContact = { states.append($0) }
+        g.down(sample(1))
+        g.down(sample(2, 200))
+        g.up(sample(2, 200, 100, 100))
+        g.up(sample(1, 100, 100, 110))
+        XCTAssertEqual(states, [true, false])
+    }
+
     func testUnknownInputAndMissingGeometryAreHarmless() {
         let g = setup(.direct, area: nil)
         g.up(sample(1))

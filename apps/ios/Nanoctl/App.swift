@@ -87,6 +87,7 @@ final class Desktop {
     var hasVideo: Bool { session.track != nil || session.transport == .dataChannel }
 
     func update() {
+        let previousProgress = model.connectProgress
         if track !== session.track {
             track?.remove(mailbox)
             mailbox.renderFrame(nil)
@@ -120,6 +121,12 @@ final class Desktop {
         model.maxFps = session.maxFps
         model.maxBitrateKbps = session.maxBitrateKbps
         model.displayMaxFps = session.displayMaxFps
+
+        if previousProgress.stage != .live, model.connectProgress.stage == .live {
+            NanoHaptics.notify(.success)
+        } else if previousProgress.failure == nil, model.connectProgress.failure != nil {
+            NanoHaptics.notify(.warning)
+        }
     }
 
     func connect(_ input: String) {
@@ -135,6 +142,7 @@ final class Desktop {
             UserDefaults.standard.set(model.recents, forKey: "recentHosts")
             session.start(endpoint)
         } catch {
+            NanoHaptics.notify(.warning)
             show(error.localizedDescription)
         }
     }

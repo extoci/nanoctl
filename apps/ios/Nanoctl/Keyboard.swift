@@ -269,14 +269,18 @@ private final class KeyboardAccessoryView: UIView {
 
     init(forwarder: KeyboardForwarder) {
         self.forwarder = forwarder
-        super.init(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 46))
+        super.init(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 50))
         autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        backgroundColor = UIColor.black.withAlphaComponent(0.82)
+        backgroundColor = UIColor.black.withAlphaComponent(0.78)
+        let separator = UIView(frame: CGRect(x: 0, y: 0, width: bounds.width, height: 1 / UIScreen.main.scale))
+        separator.backgroundColor = UIColor.white.withAlphaComponent(0.09)
+        separator.autoresizingMask = [.flexibleWidth]
+        addSubview(separator)
         scroll.showsHorizontalScrollIndicator = false
         stack.axis = .horizontal
-        stack.spacing = 7
+        stack.spacing = 8
         stack.alignment = .center
-        stack.layoutMargins = UIEdgeInsets(top: 5, left: 8, bottom: 5, right: 8)
+        stack.layoutMargins = UIEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
         stack.isLayoutMarginsRelativeArrangement = true
         scroll.addSubview(stack)
         addSubview(scroll)
@@ -298,7 +302,7 @@ private final class KeyboardAccessoryView: UIView {
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: CGSize { CGSize(width: UIView.noIntrinsicMetric, height: 46) }
+    override var intrinsicContentSize: CGSize { CGSize(width: UIView.noIntrinsicMetric, height: 50) }
 
     private static var items: [Item] {
         func key(_ name: String) -> RemoteKey? { RemoteKey.special(name) }
@@ -325,11 +329,15 @@ private final class KeyboardAccessoryView: UIView {
 
     private func addButton(_ item: Item) {
         var configuration = UIButton.Configuration.plain()
-        configuration.title = item.title
+        var attributes = AttributeContainer()
+        attributes.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        configuration.attributedTitle = AttributedString(item.title, attributes: attributes)
         configuration.baseForegroundColor = .white
-        configuration.background.backgroundColor = UIColor.white.withAlphaComponent(0.13)
-        configuration.background.cornerRadius = 8
-        configuration.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
+        configuration.background.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+        configuration.background.strokeColor = UIColor.white.withAlphaComponent(0.08)
+        configuration.background.strokeWidth = 1
+        configuration.background.cornerRadius = 15
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 7, leading: 12, bottom: 7, trailing: 12)
         let button = UIButton(configuration: configuration)
         button.addTarget(self, action: #selector(tapped(_:)), for: .touchUpInside)
         button.tag = item.modifier ? 1 : 0
@@ -340,6 +348,7 @@ private final class KeyboardAccessoryView: UIView {
 
     @objc private func tapped(_ button: UIButton) {
         guard let key = buttons[ObjectIdentifier(button)] else { return }
+        NanoHaptics.selection()
         if button.tag == 1 { _ = forwarder.toggleSticky(key) }
         else { _ = forwarder.tap(key) }
         refresh()
@@ -349,8 +358,8 @@ private final class KeyboardAccessoryView: UIView {
         for (id, button) in modifierButtons {
             guard let key = buttons[id] else { continue }
             button.configuration?.background.backgroundColor = forwarder.isSticky(key)
-                ? UIColor.systemBlue.withAlphaComponent(0.8)
-                : UIColor.white.withAlphaComponent(0.13)
+                ? UIColor(red: 0.34, green: 0.68, blue: 1.0, alpha: 0.86)
+                : UIColor.white.withAlphaComponent(0.12)
         }
     }
 }

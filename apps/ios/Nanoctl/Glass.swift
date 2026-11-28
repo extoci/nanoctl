@@ -10,9 +10,11 @@ extension View {
             glassEffect(interactive ? .regular.tint(tint).interactive() : .regular.tint(tint), in: shape)
         } else {
             background(.ultraThinMaterial, in: shape)
+                .overlay { shape.stroke(Color.white.opacity(0.11), lineWidth: 1) }
         }
         #else
         background(.ultraThinMaterial, in: shape)
+            .overlay { shape.stroke(Color.white.opacity(0.11), lineWidth: 1) }
         #endif
     }
 
