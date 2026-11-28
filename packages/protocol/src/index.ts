@@ -242,11 +242,27 @@ export type HostInfo = {
     readonly identity: {
       readonly login: string;
       readonly displayName: string;
+      readonly machineName?: string;
       readonly tags: readonly string[];
     };
     readonly mayControl: boolean;
   };
 };
+
+/** One connected viewer endpoint. `clientId` is browser-generated and is a replacement hint,
+ * never an authorization credential; Tailscale identity remains the trust boundary. */
+export type SessionClient = {
+  readonly sessionId: string;
+  readonly clientId: string;
+  readonly login: string;
+  readonly displayName: string;
+  readonly machineName: string;
+  readonly mayControl: boolean;
+};
+
+export type ClientPresenceMessage =
+  | { readonly type: "client-connected"; readonly client: SessionClient }
+  | { readonly type: "client-disconnected"; readonly client: SessionClient };
 
 type AgentCommonMessage =
   | { readonly type: "signal"; readonly envelope: SignalEnvelope }
@@ -259,7 +275,8 @@ export type AgentClientMessage =
 export type AgentServerMessage =
   | { readonly type: "hello"; readonly sessionId: string; readonly host: HostInfo }
   | AgentCommonMessage
-  | AudioOutputState;
+  | AudioOutputState
+  | ClientPresenceMessage;
 
 export function assertHostInfo(value: unknown): asserts value is HostInfo {
   if (
@@ -280,6 +297,8 @@ export function assertHostInfo(value: unknown): asserts value is HostInfo {
     !isRecord(value.viewer.identity) ||
     typeof value.viewer.identity.login !== "string" ||
     typeof value.viewer.identity.displayName !== "string" ||
+    (value.viewer.identity.machineName !== undefined &&
+      typeof value.viewer.identity.machineName !== "string") ||
     !Array.isArray(value.viewer.identity.tags) ||
     !value.viewer.identity.tags.every((tag) => typeof tag === "string")
   ) {
@@ -314,8 +333,26 @@ export function parseAgentMessage(value: unknown): AgentServerMessage {
       }
       return { type: "audio-outputs", outputs, selectedId };
     }
+    case "client-connected":
+    case "client-disconnected":
+      assertSessionClient(value.client);
+      return { type: value.type, client: value.client };
     default:
       throw new Error("unknown agent message");
+  }
+}
+
+function assertSessionClient(value: unknown): asserts value is SessionClient {
+  if (
+    !isRecord(value) ||
+    !isBoundedString(value.sessionId, 1, 128) ||
+    !isBoundedString(value.clientId, 1, 128) ||
+    typeof value.login !== "string" ||
+    typeof value.displayName !== "string" ||
+    typeof value.machineName !== "string" ||
+    typeof value.mayControl !== "boolean"
+  ) {
+    throw new Error("invalid client presence");
   }
 }
 

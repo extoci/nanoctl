@@ -84,10 +84,12 @@ function fixture(protocol = "http:", response = Response.json(info)) {
     signals: unknown[];
   }[] = [];
   const hosts: HostInfo[] = [];
+  const presence: unknown[] = [];
   const session = new SocketSession({
     video: {} as HTMLVideoElement,
     onInfo: (host) => hosts.push(host),
     onSnapshot() {},
+    onClientPresence: (message) => presence.push(message),
     onStatus: (status, detail) => {
       statuses.push(status);
       if (detail) details.push(detail);
@@ -108,7 +110,7 @@ function fixture(protocol = "http:", response = Response.json(info)) {
   });
   sessions.push(session);
   session.connect();
-  return { session, controllers, hosts, statuses, details };
+  return { session, controllers, hosts, statuses, details, presence };
 }
 async function socket() {
   for (let i = 0; i < 20 && !FakeSocket.instances.length; i++)
@@ -170,6 +172,41 @@ test("hello creates a view-only controller with no ICE servers and streams host 
     envelope: JSON.stringify(envelope),
   });
   expect(JSON.parse(ws.sent[0]!)).toEqual({ type: "signal", envelope });
+});
+
+test("connect includes a stable client replacement hint", async () => {
+  const state = fixture();
+  const first = await socket();
+  const client = first.url.searchParams.get("client");
+  expect(client).toBeTruthy();
+  first.receive({ type: "hello", sessionId: "one", host: info });
+  first.onclose!();
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  const second = await socket();
+  expect(second.url.searchParams.get("client")).toBe(client);
+  state.session.dispose();
+});
+
+test("client presence events ignore this endpoint and forward other clients", async () => {
+  const state = fixture();
+  const ws = await socket();
+  ws.receive({ type: "hello", sessionId: "own", host: info });
+  const client = {
+    sessionId: "other",
+    clientId: "browser-2",
+    login: "friend@example.com",
+    displayName: "Friend",
+    machineName: "friend-laptop",
+    mayControl: true,
+  };
+  ws.receive({ type: "client-connected", client: { ...client, sessionId: "own" } });
+  expect(state.presence).toEqual([]);
+  ws.receive({ type: "client-connected", client });
+  ws.receive({ type: "client-disconnected", client });
+  expect(state.presence).toEqual([
+    { type: "client-connected", client },
+    { type: "client-disconnected", client },
+  ]);
 });
 
 test("a dropped socket stops the old peer and reconnects with a fresh session and epoch", async () => {

@@ -377,6 +377,10 @@ kbd {
   bottom: 16px;
   left: 16px;
 }
+
+.client-notice {
+  bottom: 56px;
+}
 .soft-keyboard-field {
   position: fixed;
   top: 50%;
