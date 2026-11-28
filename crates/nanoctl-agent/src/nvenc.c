@@ -156,6 +156,10 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, 
         h264->disableSPSPPS = 0;
         h264->entropyCodingMode = h264_high ? NV_ENC_H264_ENTROPY_CODING_MODE_CABAC
                                             : NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+        /* Ultra-low-latency presets commonly use one reference. Four past
+         * references do not reorder frames or add output latency, but materially
+         * reduce repeated desktop/game motion residuals. */
+        h264->maxNumRefFrames = 4;
     } else if (codec == NANO_CODEC_HEVC) {
         h->config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
         NV_ENC_CONFIG_HEVC *hevc = &h->config.encodeCodecConfig.hevcConfig;

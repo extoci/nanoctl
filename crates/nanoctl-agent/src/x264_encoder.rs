@@ -147,8 +147,10 @@ impl Drop for Active {
 }
 
 /// Content-driven encoder parameter negotiation. Tier 0 (baseline/hex/subme2)
-/// is the measured worst-case-safe configuration; tiers 1-3 spend encode
-/// headroom on CABAC/8x8, UMH, and finally a slower preset for fewer bits.
+/// is the measured worst-case-safe configuration; tiers 1-4 spend encode
+/// headroom on CABAC/8x8, UMH, a slower preset, and finally fewer slice
+/// boundaries, a longer reference window and deeper subpixel refinement
+/// for fewer bits.
 /// The policy only promotes after a sustained easy window and demotes fast
 /// under stress — defaults must never regress the hard scene.
 struct AdaptPolicy {
@@ -163,11 +165,14 @@ struct AdaptPolicy {
 }
 
 impl AdaptPolicy {
-    const MAX_TIER: u8 = 3;
+    const MAX_TIER: u8 = 4;
     /// Frames of sustained ease before each promotion step — cheap tier 1
-    /// (CABAC/8x8) engages fast, the slower-preset tier 3 stays careful.
-    /// ~1s/1.5s/2.5s at 60fps.
-    const EASE_FRAMES: [u32; 3] = [60, 90, 150];
+    /// (CABAC/8x8) engages fast, while the slower/single-slice top tiers stay
+    /// careful. ~1s/1.5s/2.5s/4s at 60fps.
+    const EASE_FRAMES: [u32; 4] = [60, 90, 150, 240];
+    /// Frames needed for the first clearly trivial stream to skip the ladder.
+    /// Later tier-0 stays use the normal conservative ease window.
+    const INITIAL_TRIVIAL_EASE_FRAMES: u32 = 30;
     /// Consecutive stressed frames before a demotion (~0.33s at 60fps).
     const STRESS_FRAMES: u32 = 20;
     /// Minimum frames between any two tier switches.
@@ -182,9 +187,18 @@ impl AdaptPolicy {
         au_bytes: usize,
         budget_ns: f64,
         cap_bytes: f64,
+        keyframe: bool,
     ) -> Option<u8> {
         let encode = encode_ns as f64;
         let bytes = au_bytes as f64;
+        self.cooldown = self.cooldown.saturating_add(1);
+        if keyframe {
+            // Intra frames are one-off repair/re-open events, not evidence of
+            // delta cost. Counting their bytes or encode time in either EWMA
+            // makes every efficient-tier re-open look like stress and can
+            // immediately undo the tier it just enabled.
+            return None;
+        }
         if self.encode_ewma_ns == 0.0 {
             self.encode_ewma_ns = encode;
             self.bytes_ewma = bytes;
@@ -192,7 +206,6 @@ impl AdaptPolicy {
             self.encode_ewma_ns += (encode - self.encode_ewma_ns) * Self::EWMA_ALPHA;
             self.bytes_ewma += (bytes - self.bytes_ewma) * Self::EWMA_ALPHA;
         }
-        self.cooldown = self.cooldown.saturating_add(1);
         // Hard overload: drop straight to the safe tier.
         if self.tier > 0 && self.encode_ewma_ns > 0.85 * budget_ns {
             return Some(0);
@@ -214,16 +227,29 @@ impl AdaptPolicy {
         }
         self.stress_frames = 0;
         self.ease_frames = self.ease_frames.saturating_add(1);
+        // Startup is the expensive path: every extra second in tier0 re-encodes
+        // trivial scrolling content without CABAC/UMH/long references. Thirty
+        // clean deltas are enough evidence when both encode time and produced
+        // bytes are far below budget; after any switch, the conservative ladder
+        // below prevents oscillation.
+        if self.tier == 0
+            && self.switches == 0
+            && self.ease_frames >= Self::INITIAL_TRIVIAL_EASE_FRAMES
+            && self.encode_ewma_ns < 0.12 * budget_ns
+            && (self.bytes_ewma < 0.20 * cap_bytes || self.network_constrained)
+        {
+            return Some(Self::MAX_TIER);
+        }
         if self.tier < Self::MAX_TIER
             && self.ease_frames >= Self::EASE_FRAMES[self.tier as usize]
             && self.cooldown >= Self::SWITCH_COOLDOWN
             && self.encode_ewma_ns < 0.30 * budget_ns
             && (self.bytes_ewma < 0.50 * cap_bytes || self.network_constrained)
         {
-            // Trivially easy content skips intermediate tiers entirely —
-            // one re-open/IDR instead of one per rung.
+            // Trivially easy content jumps straight to the most efficient tier —
+            // one re-open/IDR, and no seconds spent with short references.
             if self.encode_ewma_ns < 0.12 * budget_ns && self.bytes_ewma < 0.20 * cap_bytes {
-                return Some((self.tier + 2).min(Self::MAX_TIER));
+                return Some(Self::MAX_TIER);
             }
             return Some(self.tier + 1);
         }
@@ -394,7 +420,8 @@ impl X264Encoder {
             .min((i64::MAX - 1) as u128) as i64)
             .max(self.last_pts + 1);
         let encode_started = Instant::now();
-        let bytes = self.active.encode(yuv, pts, self.force_keyframe)?;
+        let keyframe = self.force_keyframe;
+        let bytes = self.active.encode(yuv, pts, keyframe)?;
         let encode_ns = encode_started.elapsed().as_nanos() as u64;
         self.last_pts = pts;
         self.force_keyframe = false;
@@ -402,9 +429,9 @@ impl X264Encoder {
             let fps = f64::from(self.max_fps.max(1));
             let budget_ns = 1_000_000_000.0 / fps;
             let cap_bytes = f64::from(self.bitrate_kbps) * 125.0 / fps;
-            if let Some(target) = self
-                .adapt
-                .observe(encode_ns, bytes.len(), budget_ns, cap_bytes)
+            if let Some(target) =
+                self.adapt
+                    .observe(encode_ns, bytes.len(), budget_ns, cap_bytes, keyframe)
             {
                 match self.active.adapt(target) {
                     // 0 = re-opened with new params; 1 = already at the masked target.
@@ -580,6 +607,8 @@ struct Parameters {
     rc_method: c_int,
     me: c_int,
     subme: c_int,
+    refs: c_int,
+    trellis: c_int,
 }
 
 #[cfg(test)]
@@ -734,7 +763,16 @@ mod tests {
         assert_eq!(encoder.active.parameters().me, ME_UMH);
         assert_eq!(encoder.active.adapt(3), 0);
         let p = encoder.active.parameters();
-        assert_eq!((p.cabac, p.me, p.subme), (1, ME_UMH, 6));
+        assert_eq!(
+            (p.cabac, p.me, p.subme, p.threads, p.refs, p.trellis),
+            (1, ME_UMH, 6, 2, 4, 0)
+        );
+        assert_eq!(encoder.active.adapt(4), 0);
+        let p = encoder.active.parameters();
+        assert_eq!(
+            (p.cabac, p.me, p.subme, p.threads, p.refs, p.trellis),
+            (1, ME_UMH, 9, 1, 4, 0)
+        );
         assert_eq!(encoder.active.adapt(0), 0);
         let p = encoder.active.parameters();
         assert_eq!((p.cabac, p.transform8x8, p.me), (0, 0, ME_HEX));
@@ -763,30 +801,79 @@ mod tests {
         let cap = 4_000.0 * 125.0 / 60.0;
         // Moderately easy frames climb one rung at a time.
         for _ in 0..AdaptPolicy::EASE_FRAMES[0] - 1 {
-            assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), None);
+            assert_eq!(policy.observe(4_500_000, 2_500, budget, cap, false), None);
         }
-        assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), Some(1));
+        assert_eq!(
+            policy.observe(4_500_000, 2_500, budget, cap, false),
+            Some(1)
+        );
         policy.committed(1);
-        // Trivially easy frames skip intermediate tiers (one re-open).
+
+        // A fresh trivial stream skips the ladder after thirty clean deltas.
+        let mut startup = AdaptPolicy {
+            tier: 0,
+            encode_ewma_ns: 0.0,
+            bytes_ewma: 0.0,
+            ease_frames: 0,
+            stress_frames: 0,
+            cooldown: 0,
+            switches: 0,
+            network_constrained: false,
+        };
+        for _ in 0..AdaptPolicy::INITIAL_TRIVIAL_EASE_FRAMES - 1 {
+            assert_eq!(startup.observe(1_000_000, 500, budget, cap, false), None);
+        }
+        assert_eq!(
+            startup.observe(1_000_000, 500, budget, cap, false),
+            Some(AdaptPolicy::MAX_TIER)
+        );
+        // Trivially easy frames jump straight to the most efficient tier.
         for _ in 0..AdaptPolicy::EASE_FRAMES[1] + AdaptPolicy::SWITCH_COOLDOWN {
-            policy.observe(1_000_000, 500, budget, cap);
+            policy.observe(1_000_000, 500, budget, cap, false);
         }
-        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(3));
-        policy.committed(3);
-        // Hard overload drops straight to tier 0.
+        assert_eq!(
+            policy.observe(1_000_000, 500, budget, cap, false),
+            Some(AdaptPolicy::MAX_TIER)
+        );
+        policy.committed(AdaptPolicy::MAX_TIER);
+        // Expensive keyframes do not count as content cost; sustained slow
+        // deltas still drop straight to tier 0 through the hard-overload EWMA.
+        assert_eq!(policy.observe(15_000_000, 500, budget, cap, true), None);
         for _ in 0..40 {
-            policy.observe(15_000_000, 500, budget, cap);
+            policy.observe(15_000_000, 500, budget, cap, false);
         }
-        assert_eq!(policy.observe(15_000_000, 500, budget, cap), Some(0));
+        assert_eq!(policy.observe(15_000_000, 500, budget, cap, false), Some(0));
         policy.committed(0);
+
+        // Large, slow keyframes are repair events and must not poison either
+        // stress EWMA; the next delta is the first content-cost signal.
+        let mut repair = AdaptPolicy {
+            tier: AdaptPolicy::MAX_TIER,
+            encode_ewma_ns: 1_000_000.0,
+            bytes_ewma: 500.0,
+            ease_frames: 10,
+            stress_frames: 0,
+            cooldown: 0,
+            switches: 1,
+            network_constrained: false,
+        };
+        for _ in 0..20 {
+            assert_eq!(
+                repair.observe(15_000_000, (cap * 2.0) as usize, budget, cap, true),
+                None
+            );
+        }
+        assert_eq!((repair.ease_frames, repair.stress_frames), (10, 0));
+        assert_eq!(repair.encode_ewma_ns, 1_000_000.0);
+        assert_eq!(repair.bytes_ewma, 500.0);
         // Bitrate pressure alone demotes one tier at a time (the bytes EWMA
         // needs ~30 frames to cross the cap, then 20 stressed frames).
         policy.tier = 2;
         for _ in 0..80 {
-            policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap);
+            policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap, false);
         }
         assert_eq!(
-            policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap),
+            policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap, false),
             Some(1)
         );
     }
@@ -809,12 +896,12 @@ mod tests {
         // nor block promotion when the CPU has headroom.
         for _ in 0..AdaptPolicy::EASE_FRAMES[0] + AdaptPolicy::SWITCH_COOLDOWN - 1 {
             assert_ne!(
-                policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap),
+                policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap, false),
                 Some(0)
             );
         }
         assert_eq!(
-            policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap),
+            policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap, false),
             Some(2)
         );
 
@@ -824,7 +911,8 @@ mod tests {
         policy.network_constrained = false;
         let mut demoted = None;
         for _ in 0..120 {
-            if let Some(tier) = policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap) {
+            if let Some(tier) = policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap, false)
+            {
                 demoted = Some(tier);
                 break;
             }

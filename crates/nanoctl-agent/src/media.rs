@@ -3520,9 +3520,11 @@ pub fn spawn_video(
                     .keyframe_requests
                     .load(Ordering::Relaxed);
                 let mut dc_backpressure_seen = 0_u64;
-                // Explicit requests are the low-latency repair path, but a bounded
-                // periodic IDR is the last-resort safety net when a request is lost
-                // to cooldown, teardown races, or an idle-transition edge case.
+                // Explicit requests are the low-latency repair path. A bounded
+                // periodic IDR remains the last-resort safety net only for
+                // transports without the reliable IDR lane; when that lane is
+                // attached, every repair keyframe is already loss-proof and
+                // periodic intra refreshes are pure bandwidth overhead.
                 let mut last_idr_at = Instant::now();
                 let mut viewer_dimensions = startup_dimensions;
                 producer_stats
@@ -3563,7 +3565,9 @@ pub fn spawn_video(
                         dc_keyframes_seen = dc_keyframes;
                         forced_keyframe = true;
                     }
-                    if last_idr_at.elapsed() >= PERIODIC_IDR_INTERVAL {
+                    let reliable_idr_missing =
+                        producer_video_channel.idr_channel.lock().unwrap().is_none();
+                    if reliable_idr_missing && last_idr_at.elapsed() >= PERIODIC_IDR_INTERVAL {
                         forced_keyframe = true;
                     }
                     let now = Instant::now();
@@ -3613,7 +3617,9 @@ pub fn spawn_video(
                         dc_keyframes_seen = dc_keyframes;
                         forced_keyframe = true;
                     }
-                    if last_idr_at.elapsed() >= PERIODIC_IDR_INTERVAL {
+                    let reliable_idr_missing =
+                        producer_video_channel.idr_channel.lock().unwrap().is_none();
+                    if reliable_idr_missing && last_idr_at.elapsed() >= PERIODIC_IDR_INTERVAL {
                         forced_keyframe = true;
                     }
                     let now = Instant::now();
