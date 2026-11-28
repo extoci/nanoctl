@@ -323,12 +323,18 @@ where
         } else {
             frame_wire_bytes
         };
-        let available = self
-            .sink
-            .lane_capacity(lane)
-            .await
-            .saturating_sub(buffered_before);
-        if primary_budget > available || parts > usize::from(MAX_VIDEO_PARTS) {
+        let capacity = self.sink.lane_capacity(lane).await;
+        let pacing_bps = self.sink.frame_pacing_bps();
+        // A single large delta can exceed the send-ahead window even when the
+        // queue was empty at encode time. Do not put repairs or a new reference
+        // behind that delta. Recovery keyframes can still use their lane budget.
+        let exceeds_delta_window = !access_unit.keyframe
+            && pacing_bps.is_some()
+            && frame_wire_bytes > delta_queue_budget(capacity, pacing_bps);
+        if exceeds_delta_window
+            || primary_budget > capacity.saturating_sub(buffered_before)
+            || parts > usize::from(MAX_VIDEO_PARTS)
+        {
             return Ok(LaneWriteReport {
                 status: LaneWriteStatus::DroppedBeforeWrite,
                 buffered_bytes: buffered_before,
@@ -350,7 +356,7 @@ where
             && !access_unit.keyframe
             && frame_wire_bytes <= DELTA_REPAIR_CACHE_BYTES;
         let mut pacer = if access_unit.keyframe || large_frame {
-            self.sink.frame_pacing_bps().map(DatagramPacer::new)
+            pacing_bps.map(DatagramPacer::new)
         } else {
             None
         };
@@ -461,6 +467,27 @@ mod tests {
         }
     }
 
+    struct PacedSink(MemorySink);
+
+    #[async_trait]
+    impl VideoChunkSink for PacedSink {
+        fn frame_pacing_bps(&self) -> Option<NonZeroU32> {
+            NonZeroU32::new(2_400_000)
+        }
+
+        async fn buffered_bytes(&self, lane: VideoLane) -> usize {
+            self.0.buffered_bytes(lane).await
+        }
+
+        async fn lane_capacity(&self, lane: VideoLane) -> usize {
+            self.0.lane_capacity(lane).await
+        }
+
+        async fn write_chunk(&mut self, lane: VideoLane, bytes: Vec<u8>) -> Result<(), MediaError> {
+            self.0.write_chunk(lane, bytes).await
+        }
+    }
+
     fn access_unit(payload_len: usize, keyframe: bool) -> EncodedAccessUnit {
         EncodedAccessUnit {
             stream_sequence: 7,
@@ -484,6 +511,30 @@ mod tests {
             65_536
         );
         assert_eq!(delta_queue_budget(capacity, None), 65_536);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_delta_leaves_the_queue_free_for_recovery() {
+        let mut writer = ChunkingLaneWriter::with_repeated_chunks(PacedSink(MemorySink {
+            chunks: Vec::new(),
+            buffered: 0,
+            capacity: 128 * 1024,
+            repair_request: None,
+        }));
+        assert!(writer.delta_ready().await);
+        let delta = writer
+            .write_access_unit(access_unit(40_000, false))
+            .await
+            .unwrap();
+        assert_eq!(delta.status, LaneWriteStatus::DroppedBeforeWrite);
+        assert!(writer.sink.0.chunks.is_empty());
+
+        let reference = writer
+            .write_access_unit(access_unit(40_000, true))
+            .await
+            .unwrap();
+        assert_eq!(reference.status, LaneWriteStatus::Written);
+        assert_eq!(writer.sink.buffered_bytes(VideoLane::Delta).await, 0);
     }
 
     #[tokio::test]
