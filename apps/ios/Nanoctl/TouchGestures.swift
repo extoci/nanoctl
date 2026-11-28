@@ -41,6 +41,8 @@ final class TouchGestures {
     typealias Schedule = (_ milliseconds: Double, _ fire: @escaping @MainActor () -> Void) -> () -> Void
 
     var mode: TouchMode
+    var pointerSensitivity: Double
+    var scrollSpeed: Double
     var geometry: () -> CGRect?
     var send: (PointerEvent) -> Void
     var onCursor: ((CGPoint) -> Void)?
@@ -68,8 +70,11 @@ final class TouchGestures {
     private var scroll = CGPoint.zero
 
     init(mode: TouchMode, geometry: @escaping () -> CGRect?, send: @escaping (PointerEvent) -> Void,
+         pointerSensitivity: Double = 1, scrollSpeed: Double = 1,
          schedule: @escaping Schedule = TouchGestures.dispatchSchedule) {
         self.mode = mode
+        self.pointerSensitivity = pointerSensitivity
+        self.scrollSpeed = scrollSpeed
         self.geometry = geometry
         self.send = send
         self.schedule = schedule
@@ -139,8 +144,9 @@ final class TouchGestures {
                 guard let area = geometry(), area.width > 0, area.height > 0 else { return }
                 let speed = distance(previous, sample) / max(1, sample.t - previous.t)
                 let gain = 1 + min(0.5, speed / 4)
-                cursor = CGPoint(x: clamp(cursor.x + (sample.x - previous.x) / area.width * gain),
-                                 y: clamp(cursor.y + (sample.y - previous.y) / area.height * gain))
+                let sensitivity = CGFloat(pointerSensitivity)
+                cursor = CGPoint(x: clamp(cursor.x + (sample.x - previous.x) / area.width * gain * sensitivity),
+                                 y: clamp(cursor.y + (sample.y - previous.y) / area.height * gain * sensitivity))
                 onCursor?(cursor)
                 emit("move")
             }
@@ -164,8 +170,9 @@ final class TouchGestures {
                 : Zoom(scale: scale, offsetX: pair.zoom.offsetX + dx, offsetY: pair.zoom.offsetY + dy)
             onZoom?(zoom)
         } else {
-            scroll.x -= dx * 5
-            scroll.y -= dy * 5
+            let speed = CGFloat(scrollSpeed)
+            scroll.x -= dx * 5 * speed
+            scroll.y -= dy * 5 * speed
             let deltaX = (scroll.x / 100).rounded(.towardZero) * 100
             let deltaY = (scroll.y / 100).rounded(.towardZero) * 100
             if deltaX != 0 || deltaY != 0 {

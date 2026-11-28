@@ -438,6 +438,27 @@ struct SessionView: View {
         }
         .disabled(model.external)
 
+        Menu {
+            Picker("Trackpad speed", selection: Binding(get: { model.pointerSensitivity }, set: {
+                desktop.setPointerSensitivity($0)
+            })) {
+                ForEach([0.5, 0.75, 1.0, 1.25, 1.5], id: \.self) { value in
+                    Text("\(Int(value * 100))%").tag(value)
+                }
+            }
+            .pickerStyle(.menu)
+            Picker("Scroll speed", selection: Binding(get: { model.scrollSpeed }, set: {
+                desktop.setScrollSpeed($0)
+            })) {
+                ForEach([0.5, 0.75, 1.0, 1.25, 1.5], id: \.self) { value in
+                    Text("\(Int(value * 100))%").tag(value)
+                }
+            }
+            .pickerStyle(.menu)
+        } label: {
+            Label("Input feel", systemImage: "hand.draw")
+        }
+
         Section {
             if model.audioAvailable {
                 Toggle(isOn: Binding(get: { model.audioEnabled }, set: {

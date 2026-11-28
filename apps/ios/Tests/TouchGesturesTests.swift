@@ -11,11 +11,13 @@ final class TouchGesturesTests: XCTestCase {
         TouchSample(id: id, x: x, y: y, t: t)
     }
 
-    private func setup(_ mode: TouchMode = .trackpad, area: CGRect? = CGRect(x: 0, y: 0, width: 1000, height: 500)) -> TouchGestures {
+    private func setup(_ mode: TouchMode = .trackpad, area: CGRect? = CGRect(x: 0, y: 0, width: 1000, height: 500),
+                       pointerSensitivity: Double = 1, scrollSpeed: Double = 1) -> TouchGestures {
         events = []
         zooms = []
         timer = nil
         let gestures = TouchGestures(mode: mode, geometry: { area }, send: { [unowned self] in events.append($0) },
+                                     pointerSensitivity: pointerSensitivity, scrollSpeed: scrollSpeed,
                                      schedule: { [unowned self] _, fire in
                                          timer = { MainActor.assumeIsolated { fire() } }
                                          return { [unowned self] in timer = nil }
@@ -56,6 +58,32 @@ final class TouchGesturesTests: XCTestCase {
         fast.move(sample(1, 200, 100, 10))
         XCTAssertEqual(slow.cursor.x, 0.6025, accuracy: 0.001)
         XCTAssertEqual(fast.cursor.x, 0.65, accuracy: 0.001)
+    }
+
+    func testPointerSensitivityScalesTrackpadMovement() {
+        let gentle = setup(pointerSensitivity: 0.5)
+        gentle.down(sample(1))
+        gentle.move(sample(1, 200, 100, 1000))
+        let quick = setup(pointerSensitivity: 1.5)
+        quick.down(sample(1))
+        quick.move(sample(1, 200, 100, 1000))
+        XCTAssertGreaterThan(quick.cursor.x - 0.5, (gentle.cursor.x - 0.5) * 2)
+    }
+
+    func testScrollSpeedChangesWheelEmissionRate() {
+        let slow = setup(scrollSpeed: 0.25)
+        slow.down(sample(1))
+        slow.down(sample(2, 200))
+        slow.move(sample(1, 100, 140, 100))
+        slow.move(sample(2, 200, 140, 100))
+        XCTAssertFalse(events.contains { $0.action == "wheel" })
+
+        let fast = setup(scrollSpeed: 2)
+        fast.down(sample(1))
+        fast.down(sample(2, 200))
+        fast.move(sample(1, 100, 140, 100))
+        fast.move(sample(2, 200, 140, 100))
+        XCTAssertTrue(events.contains { $0.action == "wheel" && abs($0.deltaY) >= 200 })
     }
 
     func testDoubleTapAndHoldDragsAndCancelReleases() {
