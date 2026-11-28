@@ -147,8 +147,9 @@ impl Drop for Active {
 }
 
 /// Content-driven encoder parameter negotiation. Tier 0 (baseline/hex/subme2)
-/// is the measured worst-case-safe configuration; tiers 1-3 spend encode
-/// headroom on CABAC/8x8, UMH, and finally a slower preset for fewer bits.
+/// is the measured worst-case-safe configuration; tiers 1-4 spend encode
+/// headroom on CABAC/8x8, UMH, a slower preset, and finally fewer slice
+/// boundaries plus a longer reference window for fewer bits.
 /// The policy only promotes after a sustained easy window and demotes fast
 /// under stress — defaults must never regress the hard scene.
 struct AdaptPolicy {
@@ -163,11 +164,11 @@ struct AdaptPolicy {
 }
 
 impl AdaptPolicy {
-    const MAX_TIER: u8 = 3;
+    const MAX_TIER: u8 = 4;
     /// Frames of sustained ease before each promotion step — cheap tier 1
-    /// (CABAC/8x8) engages fast, the slower-preset tier 3 stays careful.
-    /// ~1s/1.5s/2.5s at 60fps.
-    const EASE_FRAMES: [u32; 3] = [60, 90, 150];
+    /// (CABAC/8x8) engages fast, while the slower/single-slice top tiers stay
+    /// careful. ~1s/1.5s/2.5s/4s at 60fps.
+    const EASE_FRAMES: [u32; 4] = [60, 90, 150, 240];
     /// Consecutive stressed frames before a demotion (~0.33s at 60fps).
     const STRESS_FRAMES: u32 = 20;
     /// Minimum frames between any two tier switches.
@@ -580,6 +581,7 @@ struct Parameters {
     rc_method: c_int,
     me: c_int,
     subme: c_int,
+    refs: c_int,
 }
 
 #[cfg(test)]
@@ -734,7 +736,16 @@ mod tests {
         assert_eq!(encoder.active.parameters().me, ME_UMH);
         assert_eq!(encoder.active.adapt(3), 0);
         let p = encoder.active.parameters();
-        assert_eq!((p.cabac, p.me, p.subme), (1, ME_UMH, 6));
+        assert_eq!(
+            (p.cabac, p.me, p.subme, p.threads, p.refs),
+            (1, ME_UMH, 6, 2, 4)
+        );
+        assert_eq!(encoder.active.adapt(4), 0);
+        let p = encoder.active.parameters();
+        assert_eq!(
+            (p.cabac, p.me, p.subme, p.threads, p.refs),
+            (1, ME_UMH, 6, 1, 4)
+        );
         assert_eq!(encoder.active.adapt(0), 0);
         let p = encoder.active.parameters();
         assert_eq!((p.cabac, p.transform8x8, p.me), (0, 0, ME_HEX));
