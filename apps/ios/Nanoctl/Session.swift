@@ -528,6 +528,8 @@ final class Session {
         message["outputId"] = outputId ?? NSNull()
         guard let data = try? JSONSerialization.data(withJSONObject: message) else { return false }
         socket.send(.string(String(decoding: data, as: UTF8.self))) { _ in }
+        selectedAudioOutput = outputId
+        onChange?()
         return true
     }
 

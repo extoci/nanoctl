@@ -447,6 +447,24 @@ struct SessionView: View {
                     Label("Sound", systemImage: "speaker.wave.2")
                 }
             }
+            if !model.audioOutputs.isEmpty {
+                Menu {
+                    Picker("Host output", selection: Binding(get: { model.selectedAudioOutput ?? "" }, set: { output in
+                        if !desktop.session.selectAudioOutput(output.isEmpty ? nil : output) {
+                            desktop.show("Could not change the host audio output")
+                        }
+                    })) {
+                        Text("System default").tag("")
+                        ForEach(model.audioOutputs) { output in
+                            Text(output.isDefault == true ? "\(output.name) (default)" : output.name)
+                                .tag(output.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                } label: {
+                    Label("Host output", systemImage: "hifispeaker")
+                }
+            }
             if model.clipboard {
                 Button("Paste to host", systemImage: "doc.on.clipboard") {
                     if !desktop.session.sendClipboard() { desktop.show("Clipboard is empty") }
