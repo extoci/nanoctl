@@ -86,6 +86,8 @@ pub struct RawFrame {
     /// substituted for this value because doing so hides queueing delay from measurements.
     pub capture_time_us: u64,
     pub capture_sequence: u64,
+    /// Changes when capture moves to another source, even if dimensions stay the same.
+    pub source_generation: u64,
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
@@ -107,6 +109,7 @@ impl RawFrame {
         Self {
             capture_time_us,
             capture_sequence: 0,
+            source_generation: 0,
             width,
             height,
             format,
@@ -127,6 +130,7 @@ impl RawFrame {
         Self {
             capture_time_us,
             capture_sequence: 0,
+            source_generation: 0,
             width,
             height,
             format,
@@ -145,6 +149,7 @@ impl RawFrame {
         Self {
             capture_time_us,
             capture_sequence: 0,
+            source_generation: 0,
             width,
             height,
             format,

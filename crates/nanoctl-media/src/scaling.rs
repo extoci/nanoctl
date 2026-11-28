@@ -132,7 +132,6 @@ impl FrameScaler {
                 }
             });
 
-        let capture_sequence = frame.capture_sequence;
         let mut scaled = RawFrame::new(
             frame.capture_time_us,
             target_width,
@@ -140,7 +139,8 @@ impl FrameScaler {
             frame.format,
             pixels,
         );
-        scaled.capture_sequence = capture_sequence;
+        scaled.capture_sequence = frame.capture_sequence;
+        scaled.source_generation = frame.source_generation;
         scaled.has_new_damage = frame.has_new_damage;
         Ok(scaled)
     }

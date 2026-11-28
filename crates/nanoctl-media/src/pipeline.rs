@@ -307,6 +307,7 @@ async fn encode_loop_inner(
     let mut force_next_keyframe = true;
     let mut next_forced_keyframe = TokioInstant::now();
     let mut last_dimensions = None;
+    let mut last_source_generation = None;
     let mut scaler = FrameScaler::default();
     let mut deferred_reference = None;
 
@@ -346,7 +347,8 @@ async fn encode_loop_inner(
             }
         }
         let mut config = *updates.borrow();
-        force_next_keyframe |= last_dimensions != Some((config.width, config.height));
+        force_next_keyframe |= last_dimensions != Some((config.width, config.height))
+            || last_source_generation != Some(frame.source_generation);
         let repair_pending = force_next_keyframe || keyframe_requested.load(Ordering::Acquire);
         let waiting_for_cooldown = repair_pending && TokioInstant::now() < next_forced_keyframe;
         if waiting_for_cooldown {
@@ -394,6 +396,7 @@ async fn encode_loop_inner(
             }
         }
         last_dimensions = Some((config.width, config.height));
+        last_source_generation = Some(frame.source_generation);
         force_next_keyframe = false;
         let next_sequence = stream_sequence.wrapping_add(1);
         let capture_time_us = frame.capture_time_us;
@@ -739,6 +742,37 @@ mod tests {
         assert_eq!(report.snapshot.access_units_encoded, 4);
         assert_eq!(report.snapshot.keyframes_encoded, 2);
         assert_eq!(report.snapshot.deltas_written_during_keyframe_cooldown, 1);
+    }
+
+    #[tokio::test]
+    async fn switching_to_an_unchanged_display_requires_a_new_reference() {
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (collecting, units, notify) = lane(LaneWriteStatus::Written);
+        let pipeline = MediaPipeline::start(
+            config(),
+            Box::new(ChannelSource {
+                receiver: frames_rx,
+            }),
+            Box::new(TestEncoder),
+            Box::new(collecting),
+        )
+        .unwrap();
+
+        frames_tx.send(frame(111)).await.unwrap();
+        wait_for_len(&units, &notify, 1).await;
+        let mut switched = frame(222);
+        switched.source_generation = 1;
+        switched.has_new_damage = false;
+        frames_tx.send(switched).await.unwrap();
+        wait_for_len(&units, &notify, 2).await;
+
+        let report = pipeline.stop().await;
+        assert!(report.encode_result.is_ok());
+        let written = units.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[1].stream_sequence, 2);
+        assert_eq!(written[1].capture_time_us, 222);
+        assert!(written[1].keyframe);
     }
 
     #[tokio::test]

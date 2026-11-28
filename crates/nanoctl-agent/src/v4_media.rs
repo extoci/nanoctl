@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use nanoctl_core::video::DeltaRepairRequest;
 use nanoctl_media::{
-    ChunkingLaneWriter, EncoderSelection, MediaPipeline, MediaPipelineConfig, PlatformEncoder,
-    VideoChunkSink, VideoLane,
+    ChunkingLaneWriter, EncoderSelection, MediaError, MediaPipeline, MediaPipelineConfig,
+    PlatformEncoder, RawFrame, VideoChunkSink, VideoLane, VideoSource, XcapCaptureSource,
 };
+use tokio::sync::watch;
 use webrtc::data_channel::RTCDataChannel;
 
 use crate::adaptive::{LinkSample, RateController, ViewerLimits};
@@ -19,6 +20,111 @@ use crate::rtc::{HostPeer, V4DataChannelVideo};
 const DELTA_LANE_CAPACITY: usize = 128 * 1024;
 const REFERENCE_LANE_CAPACITY: usize = 512 * 1024;
 const MIN_FRAME_PACING_BPS: u32 = 2_400_000;
+
+struct DisplayCapture {
+    selection: watch::Receiver<String>,
+    feedback: watch::Sender<String>,
+    display_id: Option<u32>,
+    source: Box<dyn VideoSource>,
+    started: Instant,
+    source_offset_us: u64,
+    generation: u64,
+}
+
+impl DisplayCapture {
+    fn start(
+        mut selection: watch::Receiver<String>,
+        feedback: watch::Sender<String>,
+    ) -> Result<Self, MediaError> {
+        let displays = xcap::Monitor::all().unwrap_or_default();
+        let display_id = displays
+            .iter()
+            .find(|monitor| monitor.is_primary().unwrap_or(false))
+            .or_else(|| displays.first())
+            .and_then(|monitor| monitor.id().ok());
+        let started = Instant::now();
+        let source = open_display(display_id)?;
+        selection.mark_changed();
+        Ok(Self {
+            selection,
+            feedback,
+            display_id,
+            source,
+            started,
+            source_offset_us: elapsed_us(started),
+            generation: 0,
+        })
+    }
+
+    async fn update_selection(&mut self) {
+        if !self.selection.has_changed().unwrap_or(false) {
+            return;
+        }
+        let request = self.selection.borrow_and_update().clone();
+        let Ok(display_id) = request.parse::<u32>() else {
+            return;
+        };
+        if self.display_id == Some(display_id) {
+            return;
+        }
+        let result = tokio::task::spawn_blocking(move || open_display(Some(display_id)))
+            .await
+            .map_err(|error| MediaError::TaskJoin(error.to_string()))
+            .and_then(|result| result);
+        if *self.selection.borrow() != request {
+            return;
+        }
+        match result {
+            Ok(source) => {
+                self.source = source;
+                self.display_id = Some(display_id);
+                self.source_offset_us = elapsed_us(self.started);
+                self.generation = self.generation.wrapping_add(1);
+                tracing::info!(display_id, "v4 capture switched displays");
+            }
+            Err(error) => {
+                tracing::warn!(%error, display_id, "v4 display switch failed");
+                if let Some(current_id) = self.display_id {
+                    self.feedback.send_replace(current_id.to_string());
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl VideoSource for DisplayCapture {
+    async fn next_frame(&mut self) -> Result<Option<RawFrame>, MediaError> {
+        self.update_selection().await;
+        let mut frame = self.source.next_frame().await?;
+        if let Some(frame) = frame.as_mut() {
+            frame.capture_time_us = self.source_offset_us.saturating_add(frame.capture_time_us);
+            frame.source_generation = self.generation;
+        }
+        Ok(frame)
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros() as u64
+}
+
+fn open_display(display_id: Option<u32>) -> Result<Box<dyn VideoSource>, MediaError> {
+    #[cfg(target_os = "windows")]
+    {
+        use nanoctl_media::DxgiCaptureSource;
+        match display_id.map_or_else(DxgiCaptureSource::primary, DxgiCaptureSource::display) {
+            Ok(source) => {
+                tracing::info!(?display_id, "v4 media using DXGI capture");
+                return Ok(Box::new(source));
+            }
+            Err(error) => tracing::warn!(%error, ?display_id, "DXGI unavailable; using xcap"),
+        }
+    }
+    display_id
+        .map_or_else(XcapCaptureSource::primary, XcapCaptureSource::display)
+        .map(|source| Box::new(source) as Box<dyn VideoSource>)
+}
 
 struct WebRtcVideoSink {
     lanes: Arc<V4DataChannelVideo>,
@@ -94,6 +200,8 @@ impl V4MediaRuntime {
         let lanes = peer.v4_video_data_channel();
         let viewer_limits = peer.viewer_limits();
         let link_feedback = peer.link_feedback();
+        let display_selection = peer.display_selection();
+        let display_feedback = peer.display_selection_feedback_sender();
         let pipeline_config = MediaPipelineConfig {
             width: config.quality.max_width,
             height: config.quality.max_height,
@@ -115,6 +223,7 @@ impl V4MediaRuntime {
                 encoder_selection,
                 viewer_limits,
                 link_feedback,
+                (display_selection, display_feedback),
                 shutdown_rx,
             )
             .await;
@@ -141,6 +250,7 @@ async fn run_pipeline(
     encoder_selection: EncoderSelection,
     mut viewer_limits: tokio::sync::watch::Receiver<ViewerLimits>,
     mut link_feedback: tokio::sync::watch::Receiver<Option<LinkSample>>,
+    (display_selection, display_feedback): (watch::Receiver<String>, watch::Sender<String>),
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     while !lanes.lanes_ready() {
@@ -159,33 +269,13 @@ async fn run_pipeline(
         return;
     }
 
-    #[cfg(target_os = "windows")]
-    let source: Box<dyn nanoctl_media::VideoSource> =
-        match nanoctl_media::DxgiCaptureSource::primary() {
-            Ok(source) => {
-                tracing::info!("v4 media using DXGI capture");
-                Box::new(source)
-            }
-            Err(error) => {
-                tracing::warn!(%error, "DXGI capture unavailable; falling back to xcap");
-                match nanoctl_media::XcapCaptureSource::primary() {
-                    Ok(source) => Box::new(source),
-                    Err(error) => {
-                        tracing::warn!(%error, "v4 capture source failed to start");
-                        return;
-                    }
-                }
-            }
-        };
-    #[cfg(not(target_os = "windows"))]
-    let source: Box<dyn nanoctl_media::VideoSource> =
-        match nanoctl_media::XcapCaptureSource::primary() {
-            Ok(source) => Box::new(source),
-            Err(error) => {
-                tracing::warn!(%error, "v4 capture source failed to start");
-                return;
-            }
-        };
+    let source = match DisplayCapture::start(display_selection, display_feedback) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(%error, "v4 capture source failed to start");
+            return;
+        }
+    };
 
     let mut limits = *viewer_limits.borrow_and_update();
     let ceiling_kbps = (configured.target_bitrate / 1_000).max(1);
@@ -213,7 +303,7 @@ async fn run_pipeline(
     let lane = ChunkingLaneWriter::with_repeated_chunks(sink);
     let pipeline = match MediaPipeline::start_with_keyframe_requests(
         config,
-        source,
+        Box::new(source),
         Box::new(encoder),
         Box::new(lane),
         lanes.keyframe_requested.clone(),
