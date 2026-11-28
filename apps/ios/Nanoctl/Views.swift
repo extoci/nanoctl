@@ -328,9 +328,10 @@ struct SessionView: View {
             if model.showStats, !model.stats.isEmpty {
                 Text(model.stats)
                     .font(.caption.monospaced())
+                    .multilineTextAlignment(.leading)
                     .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .glass(in: Capsule(), interactive: false)
+                    .padding(.vertical, 8)
+                    .glass(in: RoundedRectangle(cornerRadius: 14, style: .continuous), interactive: false)
                     .padding(12)
                     .allowsHitTesting(false)
             }
