@@ -485,6 +485,18 @@ struct SessionView: View {
 
         Section {
             Menu {
+                Picker("Preset", selection: Binding(
+                    get: { StreamPreset.infer(maxFps: model.maxFps, maxBitrateKbps: model.maxBitrateKbps) },
+                    set: { preset in
+                        guard let caps = preset.caps else { return }
+                        desktop.session.maxFps = caps.maxFps
+                        desktop.session.maxBitrateKbps = caps.maxBitrateKbps
+                        desktop.update()
+                    }
+                )) {
+                    ForEach(StreamPreset.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.menu)
                 Picker("Frame rate", selection: Binding(get: { model.maxFps }, set: {
                     desktop.session.maxFps = $0
                     desktop.update()

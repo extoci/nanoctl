@@ -6,6 +6,45 @@ struct HostStreamSettings: Codable, Equatable {
     var maxBitrateKbps: Int?
 }
 
+enum StreamPreset: String, CaseIterable {
+    case performance
+    case balanced
+    case quality
+    case custom
+
+    var label: String {
+        switch self {
+        case .performance: return "Performance"
+        case .balanced: return "Balanced"
+        case .quality: return "Quality"
+        case .custom: return "Custom"
+        }
+    }
+
+    /// Nil means the host maximum. Performance buys fluidity first, balanced
+    /// saves bandwidth without dropping below 60fps, and quality removes both
+    /// viewer-imposed ceilings.
+    var caps: (maxFps: Int?, maxBitrateKbps: Int?)? {
+        switch self {
+        case .performance: return (nil, 20_000)
+        case .balanced: return (60, 10_000)
+        case .quality: return (nil, nil)
+        case .custom: return nil
+        }
+    }
+
+    static func infer(maxFps: Int?, maxBitrateKbps: Int?) -> StreamPreset {
+        for preset in [StreamPreset.performance, .balanced, .quality] {
+            if let caps = preset.caps,
+               caps.maxFps == maxFps,
+               caps.maxBitrateKbps == maxBitrateKbps {
+                return preset
+            }
+        }
+        return .custom
+    }
+}
+
 /// Per-host stream preferences. Hosts differ too much for one global cap to
 /// be the right answer: a desktop on the same tailnet can use high bitrate
 /// while a remote or thermally constrained machine needs a lower ceiling.
