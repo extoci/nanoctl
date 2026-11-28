@@ -41,7 +41,8 @@ const scenarios: Record<string, Scenario> = {
     impairment: {},
     minFps: 7,
     maxGapMs: 700,
-    description: "clean loopback AV1 IVF fixture through the real RTP path plus a VideoToolbox bitstream proof",
+    description:
+      "clean loopback AV1 IVF fixture through the real RTP path plus a VideoToolbox bitstream proof",
     codec: "av1",
     av1Fixture: true,
     minScreenshotLuma: 25,
@@ -262,7 +263,16 @@ try {
       await runCommand(["xcrun", "simctl", "terminate", device, bundle]).catch(() => "");
       await sim("uninstall", device, bundle).catch(() => "");
       await sim("install", device, resolve(app));
-      await sim("spawn", device, "defaults", "write", bundle, "codec", "-string", scenario.codec ?? "h264");
+      await sim(
+        "spawn",
+        device,
+        "defaults",
+        "write",
+        bundle,
+        "codec",
+        "-string",
+        scenario.codec ?? "h264",
+      );
       const container = await sim("get_app_container", device, bundle, "data");
       const reportPath = join(container, "Documents/network-probe.json");
       await rm(reportPath, { force: true });
@@ -308,7 +318,9 @@ try {
         ]);
         const luma = Number(stats.match(/lavfi\.signalstats\.YAVG=([0-9.]+)/)?.[1] ?? 0);
         if (luma < scenario.minScreenshotLuma) {
-          failures.push(`${name}: screenshot luma ${luma.toFixed(1)} < ${scenario.minScreenshotLuma}`);
+          failures.push(
+            `${name}: screenshot luma ${luma.toFixed(1)} < ${scenario.minScreenshotLuma}`,
+          );
         }
       }
 

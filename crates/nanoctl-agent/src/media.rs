@@ -3481,15 +3481,15 @@ pub fn spawn_video(
                     startup_limits.resolve(quality.max_bitrate_kbps, quality.max_fps);
                 let mut controller = controller;
                 let startup = controller.set_limits(startup_ceiling, startup_fps_limit);
-                if quality.codec == VideoCodec::Av1 {
-                    if let Some(fixture) = av1_fixture_from_env()? {
-                        return produce_av1_fixture(
-                            &producer_slot.0,
-                            &producer_stopped,
-                            &producer_stats,
-                            fixture,
-                        );
-                    }
+                if quality.codec == VideoCodec::Av1
+                    && let Some(fixture) = av1_fixture_from_env()?
+                {
+                    return produce_av1_fixture(
+                        &producer_slot.0,
+                        &producer_stopped,
+                        &producer_stats,
+                        fixture,
+                    );
                 }
                 let mut encoder = CaptureEncoder::primary(
                     startup.bitrate_kbps,
