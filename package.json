@@ -12,6 +12,8 @@
   "scripts": {
     "build": "bun run build:agent",
     "build:viewer": "bun --filter @nanoctl/viewer build",
+    "build:desktop": "bun run scripts/cargo.ts build --release --manifest-path crates/nanoctl-planck/Cargo.toml",
+    "test:desktop": "bun run scripts/cargo.ts test --locked --manifest-path crates/nanoctl-planck/Cargo.toml",
     "build:agent": "bun run build:viewer && bun run scripts/cargo.ts build --release --features media",
     "check": "bun run fmt:check && bun run lint && bun run typecheck && bun run test && bun run test:agent",
     "fmt": "oxfmt --write .",

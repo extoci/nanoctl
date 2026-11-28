@@ -965,6 +965,7 @@ pub struct CaptureEncoder {
     latest_frame: Arc<LatestFrame>,
     display_id: String,
     encoder: EncoderBackend,
+    strict_dxgi_capture: bool,
     /// In-process decode-and-compare probe used by `media-smoke` to report PSNR.
     psnr: Option<PsnrProbe>,
     #[cfg(target_os = "windows")]
@@ -1470,6 +1471,7 @@ impl CaptureEncoder {
         encoder_preference: EncoderPreference,
         codec: VideoCodec,
         h264_high: bool,
+        strict_dxgi_capture: bool,
         stats: Arc<PipelineStats>,
     ) -> Result<Self> {
         let monitors = Monitor::all().context("screen capture is unavailable")?;
@@ -1502,13 +1504,15 @@ impl CaptureEncoder {
             .id()
             .context("cannot read primary display identifier")?
             .to_string();
-        let (recorder, latest_frame, forwarder) = start_capture(&monitor, stats)?;
+        let (recorder, latest_frame, forwarder) =
+            start_capture(&monitor, stats, strict_dxgi_capture)?;
         Ok(Self {
             recorder,
             forwarder,
             latest_frame,
             display_id,
             encoder,
+            strict_dxgi_capture,
             psnr: None,
             #[cfg(target_os = "windows")]
             resizer: resize::RgbaResizer::default(),
@@ -1530,8 +1534,11 @@ impl CaptureEncoder {
         // Start the replacement while the current recorder is still valid. If the new display
         // cannot be opened, the caller keeps the current stream instead of losing video merely
         // because a display-selection request was invalid or temporarily unavailable.
-        let (recorder, latest_frame, forwarder) =
-            start_capture(&monitor, self.latest_frame.stats.clone())?;
+        let (recorder, latest_frame, forwarder) = start_capture(
+            &monitor,
+            self.latest_frame.stats.clone(),
+            self.strict_dxgi_capture,
+        )?;
         self.latest_frame.stopped.store(true, Ordering::Release);
         if let Some(old_recorder) = self.recorder.take() {
             old_recorder.stop();
@@ -2301,11 +2308,21 @@ type StartedCapture = (
     Option<std::thread::JoinHandle<()>>,
 );
 
-fn start_capture(monitor: &Monitor, stats: Arc<PipelineStats>) -> Result<StartedCapture> {
+fn start_capture(
+    monitor: &Monitor,
+    stats: Arc<PipelineStats>,
+    strict_dxgi_capture: bool,
+) -> Result<StartedCapture> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = strict_dxgi_capture;
     #[cfg(target_os = "windows")]
     if !std::env::var("NANOCTL_DXGI_CAPTURE").is_ok_and(|v| v == "0" || v == "false") {
         match media_dxgi::start(monitor, stats.clone()) {
             Ok((latest, thread)) => return Ok((None, latest, Some(thread))),
+            Err(error) if strict_dxgi_capture => {
+                return Err(error)
+                    .context("DXGI duplication is required by the strict capture experiment");
+            }
             Err(error) => {
                 tracing::debug!(%error, "DXGI duplication unavailable; retaining continuous capture")
             }
@@ -3051,6 +3068,7 @@ pub fn run_smoke(
         quality.encoder,
         VideoCodec::H264,
         false,
+        false,
         Arc::default(),
     )?;
     if measure_psnr {
@@ -3243,6 +3261,7 @@ pub struct VideoQuality {
     pub encoder_preference: EncoderPreference,
     pub codec: VideoCodec,
     pub h264_high: bool,
+    pub strict_dxgi_capture: bool,
 }
 
 /// Owns both halves of the capture pipeline so shutdown can wait for the blocking worker to
@@ -3500,6 +3519,7 @@ pub fn spawn_video(
                     quality.encoder_preference,
                     quality.codec,
                     quality.h264_high,
+                    quality.strict_dxgi_capture,
                     producer_stats.clone(),
                 )?;
                 let mut bitrate_ceiling = startup_ceiling;
@@ -4976,6 +4996,7 @@ mod tests {
                 (64, 64),
             )
             .unwrap(),
+            strict_dxgi_capture: false,
             psnr: None,
             #[cfg(target_os = "windows")]
             resizer: super::resize::RgbaResizer::default(),

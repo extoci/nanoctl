@@ -1,19 +1,18 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
 if (args.length === 0) throw new Error("usage: bun scripts/cargo.ts <cargo arguments>");
 const separator = args.indexOf("--");
+const manifestArgs = args.includes("--manifest-path")
+  ? []
+  : ["--manifest-path", "crates/nanoctl-agent/Cargo.toml"];
 const cargoArgs =
   separator === -1
-    ? [...args, "--manifest-path", "crates/nanoctl-agent/Cargo.toml"]
-    : [
-        ...args.slice(0, separator),
-        "--manifest-path",
-        "crates/nanoctl-agent/Cargo.toml",
-        ...args.slice(separator),
-      ];
+    ? [...args, ...manifestArgs]
+    : [...args.slice(0, separator), ...manifestArgs, ...args.slice(separator)];
 
 const cargoHome = process.env.CARGO_HOME;
 const cargoFromHome = cargoHome
@@ -22,7 +21,7 @@ const cargoFromHome = cargoHome
 const cargo = cargoFromHome && existsSync(cargoFromHome) ? cargoFromHome : "cargo";
 
 const subprocess = spawn(cargo, cargoArgs, {
-  cwd: new URL("..", import.meta.url).pathname,
+  cwd: fileURLToPath(new URL("..", import.meta.url)),
   // Bun 1.3 on Windows cannot launch Rust's rustup proxy executables directly even when the
   // absolute path exists. Route that platform through ComSpec; other platforms stay direct.
   shell: process.platform === "win32",
