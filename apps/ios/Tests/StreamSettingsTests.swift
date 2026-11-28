@@ -37,6 +37,12 @@ final class StreamSettingsTests: XCTestCase {
         XCTAssertNil(store.settings(for: "https://other.example.ts.net:7337"))
     }
 
+    func testFrameRateOptionsIncludeDisplayMaximumOnce() {
+        XCTAssertEqual(streamFrameRateOptions(displayMaximum: 120), [120, 60, 30])
+        XCTAssertEqual(streamFrameRateOptions(displayMaximum: 90), [90, 60, 30])
+        XCTAssertEqual(streamFrameRateOptions(displayMaximum: 60), [60, 30])
+    }
+
     func testInfersOnlyExactPresetCaps() {
         XCTAssertEqual(StreamPreset.infer(maxFps: nil, maxBitrateKbps: 20_000), .performance)
         XCTAssertEqual(StreamPreset.infer(maxFps: 60, maxBitrateKbps: 10_000), .balanced)

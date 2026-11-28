@@ -163,6 +163,12 @@ final class Session {
     var onClipboard: ((String) -> Void)?
 
     var host: HostInfo? { connection?.host }
+    var displayMaxFps: Int {
+        let maximums = UIApplication.shared.connectedScenes.compactMap {
+            ($0 as? UIWindowScene)?.screen.maximumFramesPerSecond
+        }
+        return max(60, maximums.max() ?? 60)
+    }
     var gamepadAllowed: Bool { connection?.host?.capabilities.gamepad == true }
     var inputReady: Bool {
         connection?.host?.canControl == true && connection?.control?.readyState == .open
@@ -959,7 +965,7 @@ final class Session {
         _ = sendControlBytesFree([9, audioEnabled ? 1 : 0])
         if !current.sentDisplayQualityCap {
             current.sentDisplayQualityCap = true
-            _ = setQuality(maxFps: UIScreen.main.maximumFramesPerSecond, maxBitrateKbps: nil)
+            _ = setQuality(maxFps: displayMaxFps, maxBitrateKbps: nil)
         }
         guard statsTask == nil else { return }
         if maxFps != nil || maxBitrateKbps != nil { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) }

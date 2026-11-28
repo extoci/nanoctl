@@ -32,6 +32,7 @@ final class ViewerModel {
     var codec = CodecPreference.auto
     var maxFps: Int?
     var maxBitrateKbps: Int?
+    var displayMaxFps = 60
     var showStats = UserDefaults.standard.bool(forKey: "showStats") {
         didSet { UserDefaults.standard.set(showStats, forKey: "showStats") }
     }
@@ -109,6 +110,7 @@ final class Desktop {
         model.codec = session.codecPreference
         model.maxFps = session.maxFps
         model.maxBitrateKbps = session.maxBitrateKbps
+        model.displayMaxFps = session.displayMaxFps
     }
 
     func connect(_ input: String) {

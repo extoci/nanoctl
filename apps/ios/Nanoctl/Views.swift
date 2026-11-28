@@ -501,8 +501,10 @@ struct SessionView: View {
                     desktop.session.maxFps = $0
                     desktop.update()
                 })) {
-                    Text("Host maximum").tag(Int?.none)
-                    ForEach([60, 30], id: \.self) { Text("\($0) fps").tag(Int?.some($0)) }
+                    Text("Display maximum").tag(Int?.none)
+                    ForEach(streamFrameRateOptions(displayMaximum: model.displayMaxFps), id: \.self) {
+                        Text("\($0) fps").tag(Int?.some($0))
+                    }
                 }
                 .pickerStyle(.menu)
                 Picker("Bitrate", selection: Binding(get: { model.maxBitrateKbps }, set: {

@@ -6,6 +6,13 @@ struct HostStreamSettings: Codable, Equatable {
     var maxBitrateKbps: Int?
 }
 
+/// Frame-rate choices worth exposing for a display. Sixty and thirty remain
+/// useful even on ProMotion hardware; the display maximum is added exactly
+/// once so a 120Hz device gets an explicit 120fps choice.
+func streamFrameRateOptions(displayMaximum: Int) -> [Int] {
+    Array(Set([30, 60, displayMaximum])).sorted(by: >)
+}
+
 enum StreamPreset: String, CaseIterable {
     case performance
     case balanced
