@@ -2,6 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use super::*;
+use crate::chunk::chunk_selective_ack::GapAckBlock;
 
 type Result<T> = std::result::Result<T, util::Error>;
 
@@ -269,6 +270,54 @@ async fn t3_timeout_forwards_expired_data_and_retransmits_live_data() {
         .find_map(|chunk| chunk.as_any().downcast_ref::<ChunkForwardTsn>())
         .expect("The timeout should forward the expired TSN immediately");
     assert_eq!(forward.new_cumulative_tsn, 10);
+}
+
+#[tokio::test]
+async fn sack_ignores_abandoned_data_and_takes_one_rtt_sample_per_flight() {
+    let mut association = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        mtu: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    association.use_forward_tsn = true;
+    association.cumulative_tsn_ack_point = 9;
+    association.advanced_peer_tsn_ack_point = 10;
+    association.min_tsn2measure_rtt = 10;
+    association.my_next_tsn = 14;
+    let now = SystemTime::now();
+    let expired = now - std::time::Duration::from_secs(10);
+    let recent = now - std::time::Duration::from_millis(40);
+    for (tsn, since) in [(10, expired), (11, recent), (12, recent), (13, expired)] {
+        let mut chunk = ChunkPayloadData {
+            tsn,
+            since,
+            nsent: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"data"),
+            ..Default::default()
+        };
+        if tsn == 10 {
+            chunk.set_abandoned(true);
+        }
+        chunk.set_all_inflight();
+        association.inflight_queue.push_no_check(chunk);
+    }
+
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 10,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end: 3 }],
+        ..Default::default()
+    };
+    let (acked, _) = association.process_selective_ack(&sack).await.unwrap();
+    assert_eq!(acked.values().sum::<i64>(), 12);
+    assert_eq!(association.min_tsn2measure_rtt, 14);
+    assert!(association.rto_mgr.srtt >= 40);
+    assert!(association.rto_mgr.get_rto() < 1_000);
 }
 
 #[tokio::test]

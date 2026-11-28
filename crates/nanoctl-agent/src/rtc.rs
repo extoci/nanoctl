@@ -281,6 +281,12 @@ impl V4DataChannelVideo {
                 .wrapping_sub(previous.stream_sequence) as i32)
                 >= 0
         }) {
+            tracing::debug!(
+                target: "nanoctl::rtc::delta_repair",
+                stream_sequence = request.stream_sequence,
+                parts = ?request.parts,
+                "v4 delta repair requested"
+            );
             *pending = Some(request);
         }
     }

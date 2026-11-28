@@ -51,7 +51,7 @@ tc -s -d qdisc show dev lo
 cd "$(dirname "$0")/.."
 # sudo can restore a system-only PATH. The Playwright web server also launches Bun.
 args=(env "PATH=$(dirname "$bun"):$PATH" NANOCTL_BROWSER_MEDIA=1 NANOCTL_BROWSER_BAD_NETWORK=1
-  "RUST_LOG=${RUST_LOG:-nanoctl=info,webrtc_sctp::retransmission=debug}"
+  "RUST_LOG=${RUST_LOG:-nanoctl=info,nanoctl::rtc::delta_repair=debug,nanoctl_media::delta_repair=debug,webrtc_sctp::retransmission=debug}"
   "NANOCTL_BROWSER_AGENT_BIN=$agent"
   bash "$(realpath "$0")" --with-display
   "$node" node_modules/@playwright/test/cli.js test

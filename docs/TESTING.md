@@ -143,7 +143,8 @@ TCP and stays outside the fault profile. The viewer must present new desktop
 content for 60 seconds with gaps no longer than 500 ms, then pass 20 reattach
 cycles under the same profile. The gate also checks peak and sustained
 keyframe rates, host RSS growth, and queue limits. The run writes the profile,
-observed counters, and timestamps to `test-results/*/bad-network.json`.
+observed counters, and timestamps to `test-results/*/bad-network.json`. The host
+records recent delta repair requests and whether they were queued or skipped.
 
 The v4 release build uses a 200 ms minimum SCTP retransmission timeout. The
 network trial branch runs the full gate on three independent CI runners using
