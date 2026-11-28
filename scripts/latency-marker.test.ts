@@ -16,7 +16,14 @@ test("marker rejects blank frames and ambiguous or corrupt bits", () => {
 
 test("latency distribution uses nearest-rank percentiles", () => {
   const samples = Array.from({ length: 100 }, (_, i) => 100 - i);
-  expect(summarize(samples)).toEqual({ count: 100, p50: 50, p95: 95, p99: 99, max: 100 });
+  expect(summarize(samples)).toEqual({
+    count: 100,
+    mean: 50.5,
+    p50: 50,
+    p95: 95,
+    p99: 99,
+    max: 100,
+  });
   expect(() => summarize([])).toThrow("No latency samples");
 });
 

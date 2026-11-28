@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctl-planck"
-version = "3.0.0-alpha.5"
+version = "3.0.0-alpha.28"
 dependencies = [
  "anyhow",
  "directories",

@@ -64,7 +64,7 @@ struct ActiveEncoder {
     output_buffer_size: u32,
     provides_output_samples: bool,
     needs_input: bool,
-    first_access_unit: bool,
+    sequence_header: Option<Vec<u8>>,
     shut_down: bool,
 }
 
@@ -179,7 +179,6 @@ pub struct WindowsEncoder {
     reconfigure: bool,
     force_keyframe: bool,
     timestamp: i64,
-    nv12: Vec<u8>,
 }
 
 impl Drop for WindowsEncoder {
@@ -214,7 +213,6 @@ impl WindowsEncoder {
             reconfigure: false,
             force_keyframe: false,
             timestamp: 0,
-            nv12: Vec::new(),
         };
         // `doctor` calls this constructor. Configure a real encoder rather than treating an
         // enumeration result as proof that its media types and buffers work.
@@ -256,6 +254,14 @@ impl FrameEncoder for WindowsEncoder {
     }
 
     fn encode(&mut self, image: &crate::media::RgbaFrame<'_>) -> Result<EncodedFrame> {
+        self.encode_format(image, crate::media::PixelFormat::Rgba)
+    }
+
+    fn encode_format(
+        &mut self,
+        image: &crate::media::RgbaFrame<'_>,
+        format: crate::media::PixelFormat,
+    ) -> Result<EncodedFrame> {
         let width = image.width();
         let height = image.height();
         let dimensions_changed = self
@@ -278,9 +284,16 @@ impl FrameEncoder for WindowsEncoder {
             }
             self.force_keyframe = false;
         }
-        crate::nv12::rgba_to_nv12(image.as_raw(), width, height, &mut self.nv12)?;
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .context("NV12 frame dimensions overflow")?;
+        let nv12_len = pixels
+            .checked_add(pixels / 2)
+            .context("NV12 frame size overflows")?;
         let duration = 10_000_000_i64 / i64::from(self.max_fps);
-        let sample = create_input_sample(&self.nv12, self.timestamp, duration)?;
+        let sample = create_input_sample(nv12_len, self.timestamp, duration, |output| {
+            crate::nv12::pixels_to_nv12_slice(image.as_raw(), width, height, format, output)
+        })?;
         self.timestamp = self.timestamp.saturating_add(duration);
         let active = self
             .active
@@ -302,12 +315,25 @@ impl FrameEncoder for WindowsEncoder {
         if self.codec != VideoCodec::Av1 {
             validate_annex_b(&bytes)?;
         }
-        if std::mem::take(&mut active.first_access_unit)
+        // Decoder configuration is not just a startup concern. Most vendor
+        // MFTs emit sequence headers only in their first access unit, while a
+        // forced IDR later contains the slice but no SPS/PPS/AV1 sequence
+        // header. If the opening frame is lost or superseded, every recovery
+        // keyframe then remains undecodable and the viewer black-screens
+        // forever. Prepend the cached configuration to every keyframe that
+        // does not already carry it; the cost is tens/hundreds of bytes on an
+        // IDR and makes each repair frame independently decodable.
+        if crate::codec::is_keyframe(self.codec, &bytes)
             && !crate::codec::has_parameter_sets(self.codec, &bytes)
-            && let Some(mut headers) = sequence_header(self.codec, &active.transform)
         {
-            headers.append(&mut bytes);
-            bytes = headers;
+            if active.sequence_header.is_none() {
+                active.sequence_header = sequence_header(self.codec, &active.transform);
+            }
+            if let Some(headers) = &active.sequence_header {
+                let mut prefixed = headers.clone();
+                prefixed.append(&mut bytes);
+                bytes = prefixed;
+            }
         }
         Ok(EncodedFrame {
             bytes,
@@ -400,13 +426,10 @@ impl WindowsEncoder {
             unsafe {
                 let _ = codec.SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
                 let _ = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &ui4_variant(0));
-                // A 30s GOP, not 2s: unrepairable IDRs already force a
-                // keyframe through the RTCP loss path, so periodic IDRs are
-                // pure overhead. Vendor MFTs default to ~2s; best-effort.
-                let _ = codec.SetValue(
-                    &CODECAPI_AVEncMPVGOPSize,
-                    &ui4_variant(u32::from(self.max_fps).saturating_mul(30)),
-                );
+                // Unrepairable IDRs already force a keyframe through the
+                // RTCP loss path, so periodic IDRs are pure overhead. Vendor
+                // MFTs default to ~2s; best-effort.
+                let _ = codec.SetValue(&CODECAPI_AVEncMPVGOPSize, &ui4_variant(u32::MAX));
                 // Peak-constrained VBR lets easy frames undershoot the
                 // target instead of padding to it; MeanBitRate stays the
                 // average cap. Vendor MFTs without the property keep CBR.
@@ -499,7 +522,7 @@ impl WindowsEncoder {
             output_buffer_size,
             provides_output_samples,
             needs_input: false,
-            first_access_unit: true,
+            sequence_header: None,
             shut_down: false,
         };
         wait_until_input_needed(&mut active, Instant::now() + MFT_STARTUP_BUDGET)?;
@@ -614,8 +637,13 @@ fn create_video_type(
     Ok(media_type)
 }
 
-fn create_input_sample(bytes: &[u8], timestamp: i64, duration: i64) -> Result<IMFSample> {
-    let length = u32::try_from(bytes.len()).context("NV12 frame is too large")?;
+fn create_input_sample(
+    byte_len: usize,
+    timestamp: i64,
+    duration: i64,
+    fill: impl FnOnce(&mut [u8]) -> Result<()>,
+) -> Result<IMFSample> {
+    let length = u32::try_from(byte_len).context("NV12 frame is too large")?;
     // SAFETY: the locked buffer is valid for `length` bytes and is always unlocked before return.
     unsafe {
         let buffer =
@@ -624,10 +652,11 @@ fn create_input_sample(bytes: &[u8], timestamp: i64, duration: i64) -> Result<IM
         buffer
             .Lock(&mut destination, None, None)
             .context("cannot lock an NV12 media buffer")?;
-        ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
-        if let Err(error) = buffer.Unlock() {
-            return Err(error).context("cannot unlock an NV12 media buffer");
-        }
+        let output = slice::from_raw_parts_mut(destination, byte_len);
+        let fill_result = fill(output);
+        let unlock_result = buffer.Unlock();
+        fill_result?;
+        unlock_result.context("cannot unlock an NV12 media buffer")?;
         buffer
             .SetCurrentLength(length)
             .context("cannot set NV12 media buffer length")?;

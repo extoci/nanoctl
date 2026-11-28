@@ -14,7 +14,7 @@ Types and validators live in `packages/protocol`.
   {
     "hostName": "desktop",
     "platform": "linux",
-    "version": "3.0.0-alpha.5",
+    "version": "3.0.0-alpha.28",
     "displays": [
       {
         "id": "59",
@@ -36,12 +36,17 @@ Types and validators live in `packages/protocol`.
       "readiness": "ready",
       "input": true,
       "remoteInput": true,
+      "binaryInput": true,
       "clipboard": true,
       "systemAudio": true,
       "displays": []
     },
     "viewer": {
-      "identity": { "login": "owner@example.com", "displayName": "Owner", "tags": [] },
+      "identity": {
+        "login": "owner@example.com",
+        "displayName": "Owner",
+        "tags": []
+      },
       "mayControl": true
     }
   }
@@ -97,14 +102,30 @@ underlying encrypted transport through DERP. Reliable control carries discrete c
 the lossy pointer lane avoids accumulating stale motion. View-only sessions never enable
 host input or clipboard access. System audio is available to view-only sessions too.
 
+A `quality` control message may include optional positive `maxWidth`/`maxHeight`
+physical-pixel caps in addition to rate caps. They describe the viewer's rendered video
+viewport. Hosts clamp them to configured encode dimensions, fit the source aspect ratio
+inside them, scale the bitrate ceiling by the measured 0.8 power of the viewport/source pixel
+ratio, and force a keyframe when they change. Omitted dimensions preserve the configured
+encode size, so older iOS and web viewers remain compatible.
+
 ### Video over data channel
 
-A viewer may also create `nanoctl.video.v1` (unordered, `maxRetransmits: 0`) and
-`nanoctl.video-idr.v1` (reliable, ordered) to receive Annex-B access units directly,
-bypassing the RTP jitter buffer. Each message is
-`[u32 seq][u8 flags (bit0 = keyframe)][u16 part][u16 parts][u64 sent_ms][payload chunk]`
-with all integers little-endian; `parts` splits large access units into ~48 KiB chunks.
-Deltas ride the unreliable channel and keyframes the reliable one. A sequence gap breaks
+A viewer may also create `nanoctl.video.v1` (unordered, `maxPacketLifeTime: 80`) and
+`nanoctl.video-idr.v1` (reliable, ordered) to receive compressed access units directly,
+bypassing the RTP jitter buffer. H.264 and HEVC payloads use Annex-B; AV1 payloads use
+low-overhead OBU temporal units (the formats WebCodecs consumes). Each message is
+`[u32 seq][u8 flags][optional u16 part][optional u16 parts][optional u64 sent_ms][payload chunk]`
+with all integers little-endian. Flags bit0 marks a keyframe, bit1 marks fragmentation (the
+part fields are present), bit2 marks a sender timestamp, and bit3 marks an idle heartbeat.
+Unfragmented delta frames normally cost only five header bytes; keyframes and every sixteenth
+delta carry `sent_ms` for transit telemetry. `parts` splits large access units into ~48 KiB chunks.
+A heartbeat is exactly the five-byte header: its sequence field is the host's next live
+sequence watermark rather than a frame sequence, so it does not advance the expected sequence.
+While the desktop is unchanged the agent sends these heartbeats instead of re-encoding and
+transmitting identical frames; if the watermark is ahead of the decoder, the final delta before
+the idle period was lost.
+Deltas ride the unordered bounded-retransmit channel and keyframes the reliable one. A sequence gap breaks
 the reference chain: the viewer drops post-gap deltas and sends the text `KF` on the
 video channel until a keyframe arrives. While `nanoctl.video.v1` is open the agent
 suppresses delta-frame writes on the RTP track automatically — a viewer decoding the
@@ -146,20 +167,34 @@ pending text otherwise. It reads local text on paste and focus/visibility regain
 echoes. Clipboard permissions and a secure browser context are required; denied browser APIs
 are silently ignored. A remote paste shortcut sends local clipboard text before its key event.
 
+### Compact input
+
+Input uses compact binary wire v3 when `capabilities.binaryInput` is true. SCTP datagrams already preserve message boundaries, so byte zero is the kind; there is no magic or version framing. Integers are little-endian except wheel deltas, which use the exact significant big-endian bytes of each IEEE-754 f64 with trailing zero bytes omitted; a packed nibble byte stores the two 0–8 byte lengths. Malformed binary messages are invalid input.
+
+Kinds: `1` pointer motion with normalized unsigned u16 `x`/`y` (5 bytes); `2` full gamepad snapshot — u8 sequence, 4-bit slot mask, then 13 bytes per masked slot in ascending order: u16 buttons, u8 triggers, four i16 axes, and DualShock flags (bit 0 present, bits 1/2/3 left-trigger/right-trigger/touchpad); `3` pointer button down/up (6 bytes); `4` wheel input with exact compact f64 deltas (6–22 bytes); `5` keyboard input — flags byte (bit0 up, bit1 repeat, bit2 named-key form), followed by either a named-key id or the UTF-8 `key` bytes; `6` text input with a u16 byte length; `7` release-all (1 byte); `8` optional keepalive probe (1 byte — current clients do not send periodic application probes because SCTP and media traffic already keep the association alive); `9` audio enablement (2 bytes); `10` display selection with a u8 identifier length. Kind `11` is a one-byte gamepad heartbeat: it proves the viewer is alive without replacing controller state. Kind `12` is a sparse gamepad snapshot with the same sequence and slot-mask header; each masked slot starts with a field mask and encodes only nonzero fields (bit0 buttons as unsigned LEB128, bits1/2 nonzero triggers, bits3–6 nonzero i16 axes little-endian, bit7 DualShock flags). Unchanged pads mix heartbeats with occasional reliable full snapshots so state cannot wedge inputs; hosts neutralize active pads after 750 ms without reports. Keyboard typematic repeats are generated by the host while a key remains held; viewers only forward sparse repeat ticks as liveness, and hosts ignore those ticks as input events. JSON input forms are not part of wire v3.
+
 ### Gamepads
 
 When `capabilities.gamepad` is true, an opted-in viewer with control permission sends
-`{"type":"gamepad","pads":[[0,4096,128,0,0,0,0,0]]}` on the reliable control channel,
-or on the unordered pointer channel (`nanoctl.pointer.v1`) — snapshots carry full
-state, so the unordered lane drops stale reports instead of delaying fresh ones.
-Each entry is `[slot, buttons, leftTrigger, rightTrigger, leftX, leftY, rightX, rightY]`:
-slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes
-are signed 16-bit values with positive Y up. For PlayStation controllers, the viewer adds
-an optional `dualShock4` array to the snapshot with one
-`{"slot":0,"leftTriggerPressed":false,"rightTriggerPressed":false,"touchpadPressed":false}`
-entry per PlayStation pad. The host presents those slots as DualShock 4 controllers and
-all other slots as Xbox 360 controllers. The original `pads` entries are unchanged, so
-older hosts can ignore the extension. Each message is a full snapshot; the host unplugs
-slots not present. An empty snapshot detaches all pads. The viewer sends
-changes and a 500 ms keepalive while forwarding; after 2 seconds without a snapshot
-the host neutralizes the current pads. Channel or session teardown unplugs them.
+binary gamepad snapshots with a u8 sequence; stale or reordered snapshots are discarded.
+Kind-2 full snapshots rebase all four slots and unplug slots absent from the mask. They ride
+the reliable control channel (`nanoctl.control.v1`) because they are the baseline for sparse
+state. Kind-12 sparse snapshots and heartbeats ride the unordered bounded-retransmit gamepad channel
+(`nanoctl.gamepad.v1`, `maxPacketLifeTime: 100`); sparse snapshots name only slots whose state differs from the last full baseline,
+and omitted slots keep their current host state. Each sparse slot entry remains absolute
+rather than delta-encoded: zero-valued buttons, triggers, and axes are omitted behind the
+field mask, so any received entry completely repairs that slot even after earlier packet
+loss. Empty detach snapshots also use the reliable control channel because they are one-shot
+control transitions rather than repeatable state. The host keeps the latest pointer move and
+latest gamepad snapshot in separate slots, so a per-frame snapshot never replaces the
+pointer move sent in the same frame.
+
+Slots are 0–3, buttons use XInput flags, triggers are unsigned 8-bit values, and axes are
+signed 16-bit values with positive Y up. The host presents slots with DualShock flags as
+DualShock 4 controllers and all other slots as Xbox 360 controllers. The viewer sends a
+change immediately and repeats it only briefly as a final-state anchor while bounded SCTP
+retransmission repairs loss, then keeps an unchanged pad alive with heartbeats every 250 ms and reliable full
+snapshots at least every 2 s; after 750 ms without a report the host neutralizes the current
+pads. Sparse snapshots received before any full baseline are ignored without consuming their
+sequence, so a delayed reliable baseline can still reset the stream. Channel or session
+teardown unplugs all pads.

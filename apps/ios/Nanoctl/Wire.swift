@@ -5,6 +5,36 @@ struct HostEndpoint {
     let socket: URL
     let origin: String
 
+    /// nanoctl media is tailnet-only: the host publishes only Tailscale ICE
+    /// addresses. Physical-interface candidates on the viewer can still win
+    /// ICE priority, especially because VPN interfaces rank below Wi-Fi, but
+    /// packets sourced from those interfaces cannot make the return trip
+    /// through the tunnel. Treat MagicDNS names and Tailscale CGNAT/ULA
+    /// addresses as requiring the VPN/unknown adapter classes. Literal LAN
+    /// addresses remain direct so simulator and development loopback keep
+    /// working.
+    var usesTailnetMediaPath: Bool {
+        guard let host = base.host()?.lowercased() else { return false }
+        if isLoopbackHost(host) { return false }
+        if host.hasSuffix(".ts.net") { return true }
+        if host.hasPrefix("fd7a:115c:a1e0:") { return true }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        if octets.count == 4 {
+            return octets[0] == 100 && (64...127).contains(octets[1])
+        }
+        if host.contains(":") || host.hasSuffix(".local") || host.hasSuffix(".lan") { return false }
+        return true
+    }
+
+    var isLoopback: Bool {
+        guard let host = base.host()?.lowercased() else { return false }
+        return isLoopbackHost(host)
+    }
+
+    private func isLoopbackHost(_ host: String) -> Bool {
+        host == "localhost" || host == "::1" || host.hasPrefix("127.")
+    }
+
     init(_ address: String, allowSimulatorLoopback: Bool = false) throws {
         let text = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var parts = URLComponents(string: text.contains("://") ? text : "https://\(text)"),
@@ -48,6 +78,52 @@ struct AudioOutput: Decodable, Identifiable {
     let isDefault: Bool?
 }
 
+struct DiscoveredHost: Decodable, Equatable, Identifiable {
+    let hostName: String
+    let dnsName: String?
+    let os: String?
+    let online: Bool
+    var url: String
+    /// Directory agent that told us about this host; populated locally, not by the wire.
+    var source: String?
+
+    var id: String { url }
+    var displayName: String {
+        if !hostName.isEmpty { return hostName }
+        if let dnsName, !dnsName.isEmpty { return dnsName }
+        return URL(string: url)?.host() ?? url
+    }
+
+    var endpointLabel: String {
+        guard let endpoint = URL(string: url), let host = endpoint.host() else { return url }
+        return endpoint.port.map { "\(host):\($0)" } ?? host
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case hostName, dnsName, os, online, url
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        hostName = try values.decodeIfPresent(String.self, forKey: .hostName) ?? "nanoctl host"
+        dnsName = try values.decodeIfPresent(String.self, forKey: .dnsName)
+        os = try values.decodeIfPresent(String.self, forKey: .os)
+        online = try values.decodeIfPresent(Bool.self, forKey: .online) ?? true
+        url = try values.decodeIfPresent(String.self, forKey: .url) ?? ""
+        source = nil
+    }
+}
+
+struct HostDirectory: Decodable {
+    let selfHost: DiscoveredHost
+    let hosts: [DiscoveredHost]
+
+    enum CodingKeys: String, CodingKey {
+        case selfHost = "self"
+        case hosts
+    }
+}
+
 struct HostInfo: Decodable {
     struct Viewer: Decodable { let mayControl: Bool }
     struct Capabilities: Decodable {
@@ -59,6 +135,7 @@ struct HostInfo: Decodable {
         let input: Bool?
         let clipboard: Bool?
         let displays: [DisplayInfo]?
+        let binaryInput: Bool?
     }
 
     let hostName: String
@@ -126,6 +203,90 @@ struct GamepadMessage: Encodable, Equatable {
     let type = "gamepad"
     let pads: [[Int]]
     var dualShock4: [DualShock4]? = nil
+
+    /// Binary input v3 full gamepad report (`2, sequence, slot mask, then
+    /// 13 bytes per masked slot`), matching the viewer and the agent.
+    func binary(sequence: UInt8) -> Data? {
+        guard pads.count <= 4, pads.allSatisfy({ $0.count == 8 }) else { return nil }
+        let sony = Dictionary((dualShock4 ?? []).map { ($0.slot, $0) }, uniquingKeysWith: { $1 })
+        var mask: UInt8 = 0
+        for pad in pads {
+            guard (0...3).contains(pad[0]), mask & UInt8(1 << pad[0]) == 0 else { return nil }
+            mask |= UInt8(1 << pad[0])
+        }
+        var data = Data([2, sequence, mask])
+        for pad in pads.sorted(by: { $0[0] < $1[0] }) {
+            guard let buttons = UInt16(exactly: pad[1]),
+                  let left = UInt8(exactly: pad[2]), let right = UInt8(exactly: pad[3]) else { return nil }
+            var axes = [UInt16]()
+            for value in pad[4...] {
+                guard let axis = Int16(exactly: value) else { return nil }
+                axes.append(UInt16(bitPattern: axis))
+            }
+            var flags: UInt8 = 0
+            if let ds4 = sony[pad[0]] {
+                flags = 1
+                if ds4.leftTriggerPressed { flags |= 2 }
+                if ds4.rightTriggerPressed { flags |= 4 }
+                if ds4.touchpadPressed { flags |= 8 }
+            }
+            data.append(contentsOf: [UInt8(buttons & 0xff), UInt8(buttons >> 8), left, right])
+            for axis in axes { data.append(contentsOf: [UInt8(axis & 0xff), UInt8(axis >> 8)]) }
+            data.append(flags)
+        }
+        return data
+    }
+
+    /// Sparse input v3 gamepad report (`12, sequence, slot mask, then field-masked
+    /// slots`). Zero-valued fields are omitted but each slot remains absolute state.
+    func sparseBinary(sequence: UInt8) -> Data? {
+        guard pads.count <= 4, pads.allSatisfy({ $0.count == 8 }) else { return nil }
+        let sony = Dictionary((dualShock4 ?? []).map { ($0.slot, $0) }, uniquingKeysWith: { $1 })
+        var mask: UInt8 = 0
+        for pad in pads {
+            guard (0...3).contains(pad[0]), mask & UInt8(1 << pad[0]) == 0 else { return nil }
+            mask |= UInt8(1 << pad[0])
+        }
+        var data = Data([12, sequence, mask])
+        for pad in pads.sorted(by: { $0[0] < $1[0] }) {
+            guard let buttons = UInt16(exactly: pad[1]),
+                  let left = UInt8(exactly: pad[2]), let right = UInt8(exactly: pad[3]) else { return nil }
+            var axes = [UInt16]()
+            for value in pad[4...] {
+                guard let axis = Int16(exactly: value) else { return nil }
+                axes.append(UInt16(bitPattern: axis))
+            }
+            let ds4 = sony[pad[0]]
+            var fields: UInt8 = 0
+            if buttons != 0 { fields |= 1 }
+            if left != 0 { fields |= 2 }
+            if right != 0 { fields |= 4 }
+            for (bit, axis) in axes.enumerated() where axis != 0 { fields |= UInt8(8 << bit) }
+            if ds4 != nil { fields |= 128 }
+            data.append(fields)
+            if buttons != 0 {
+                var compact = buttons
+                repeat {
+                    let byte = UInt8(compact & 0x7f)
+                    compact >>= 7
+                    data.append(compact != 0 ? byte | 0x80 : byte)
+                } while compact != 0
+            }
+            if left != 0 { data.append(left) }
+            if right != 0 { data.append(right) }
+            for axis in axes where axis != 0 {
+                data.append(contentsOf: [UInt8(axis & 0xff), UInt8(axis >> 8)])
+            }
+            if let ds4 {
+                var flags: UInt8 = 1
+                if ds4.leftTriggerPressed { flags |= 2 }
+                if ds4.rightTriggerPressed { flags |= 4 }
+                if ds4.touchpadPressed { flags |= 8 }
+                data.append(flags)
+            }
+        }
+        return data
+    }
 
     static func axis(_ value: Float) -> Int {
         guard value.isFinite else { return 0 }

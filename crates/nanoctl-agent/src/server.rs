@@ -33,8 +33,10 @@ type ActiveSession = (watch::Sender<String>, tokio::task::JoinHandle<()>);
 
 async fn stop_session((stop, task): ActiveSession, reason: &'static str) {
     stop.send_replace(reason.into());
-    if let Err(error) = task.await {
-        tracing::warn!(%error, reason, "viewer session task failed");
+    match tokio::time::timeout(Duration::from_secs(5), task).await {
+        Ok(Err(error)) => tracing::warn!(%error, reason, "viewer session task failed"),
+        Err(_) => tracing::warn!(reason, "viewer session teardown timed out"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -89,9 +91,7 @@ impl ServerState {
         ))
         .unwrap();
         json!({
-            "hostName": if node.host_name.is_empty() {
-                hostname::get().ok().and_then(|name| name.into_string().ok()).unwrap_or_else(|| "nanoctl host".into())
-            } else { node.host_name.clone() }, "platform":crate::platform::PLATFORM,
+            "hostName": host_display_name(&node), "platform":crate::platform::PLATFORM,
             "version":env!("CARGO_PKG_VERSION"), "displays":capabilities["displays"],
             "remoteInput": capabilities["remoteInput"], "capabilities":capabilities,
             "viewer":{"identity":identity,"mayControl":control}
@@ -244,6 +244,31 @@ fn host_url(node: &Node, port: u16, tls: bool) -> String {
     }
 }
 
+fn host_display_name(node: &Node) -> String {
+    if !node.host_name.is_empty() {
+        return node.host_name.clone();
+    }
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_else(|| "nanoctl host".into())
+}
+
+fn self_host(node: &Node, port: u16, tls: bool, loopback: bool) -> Value {
+    let mut url = host_url(node, port, tls);
+    if url.is_empty() && loopback {
+        let scheme = if tls { "https" } else { "http" };
+        url = format!("{scheme}://127.0.0.1:{port}/");
+    }
+    json!({
+        "hostName": host_display_name(node),
+        "dnsName": node.dns_name,
+        "os": crate::platform::PLATFORM,
+        "online": true,
+        "url": url,
+    })
+}
+
 async fn probe_peer(peer: tailnet::Peer, port: u16) -> Option<tailnet::Peer> {
     if !peer.online {
         return None;
@@ -317,11 +342,7 @@ async fn hosts(
         })
         .collect();
     axum::Json(json!({
-        "self": {
-            "hostName": node.host_name,
-            "dnsName": node.dns_name,
-            "url": host_url(&node, state.config.tailnet.port, tls),
-        },
+        "self": self_host(&node, state.config.tailnet.port, tls, peer.ip().is_loopback()),
         "hosts": hosts,
     }))
     .into_response()
@@ -416,7 +437,13 @@ async fn connect(
                 return;
             }
             if let Some(previous) = active.take() {
-                stop_session(previous, "replaced").await;
+                // Do not await the old session's teardown here: it can take
+                // seconds or hang on a dead transport, and this lock is held
+                // for the whole wait — so every reconnect wedged before the
+                // new session even existed (no hello, no ICE, exactly the
+                // field failure). The stop signal already started its exit;
+                // let it finish in the background.
+                tokio::spawn(stop_session(previous, "replaced"));
             }
             let (stop, receiver) = watch::channel(String::new());
             let session_state = state.clone();
@@ -878,9 +905,34 @@ mod tests {
         peer.online = false;
         assert!(super::probe_peer(peer.clone(), port).await.is_none());
         peer.online = true;
-        drop(listener);
-        assert!(super::probe_peer(peer, port).await.is_none());
+        let closed_port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(super::probe_peer(peer, closed_port).await.is_none());
     }
+    #[test]
+    fn self_host_has_stable_identity_fields_and_loopback_fallback() {
+        let empty = Node::default();
+        let host = self_host(&empty, 7337, false, true);
+        assert_eq!(host["url"], "http://127.0.0.1:7337/");
+        assert_eq!(host["online"], true);
+        assert_eq!(host["os"], crate::platform::PLATFORM);
+        assert!(!host["hostName"].as_str().unwrap().is_empty());
+
+        let node = Node {
+            ips: vec!["100.64.1.2".parse().unwrap()],
+            dns_name: "host.tailnet.ts.net".into(),
+            host_name: "host".into(),
+            ..Default::default()
+        };
+        let host = self_host(&node, 7337, false, true);
+        assert_eq!(host["url"], "http://host.tailnet.ts.net:7337/");
+        assert_eq!(host["hostName"], "host");
+    }
+
     #[tokio::test]
     async fn view_only_info_never_advertises_clipboard() {
         for (remote_input, control) in [(false, true), (true, false), (false, false)] {
@@ -975,6 +1027,8 @@ mod tests {
             .unwrap();
         assert_eq!(hosts["hosts"], json!([]));
         assert_eq!(hosts["self"]["url"], "http://100.64.1.2:7337/");
+        assert_eq!(hosts["self"]["online"], true);
+        assert_eq!(hosts["self"]["os"], crate::platform::PLATFORM);
         assert!(hosts["self"]["hostName"].is_string());
         let request = || {
             let mut request = format!("ws://{addr}/v1/connect")

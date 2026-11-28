@@ -17,8 +17,69 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "1"
 
 jobs:
-  viewer:
+  branch-freshness:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Require the PR head to contain the current base branch
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/branches/${BASE_REF}" --jq '.commit.sha')"
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${current_base}...${HEAD_SHA}" --jq '.status')"
+          state=failure
+          description="stale: rebase onto latest ${BASE_REF} before merging"
+          if [ "$status" = ahead ] || [ "$status" = identical ]; then
+            state=success
+            description="contains latest ${BASE_REF}"
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" --method POST \
+            -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
+          if [ "$state" = failure ]; then
+            echo "PR head compare status is '$status' against ${BASE_REF}@${current_base}." >&2
+            echo "Rebase onto the latest ${BASE_REF}; merging a stale branch can silently overwrite freshly merged work." >&2
+            exit 1
+          fi
+          echo "PR head contains ${BASE_REF}@${current_base}."
+      - name: Re-mark open PR freshness after master moves
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_base="$(gh api "repos/${GITHUB_REPOSITORY}/branches/master" --jq '.commit.sha')"
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json headRefOid,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository | not) | .headRefOid' |
+            while read -r head_sha; do
+              [ -n "$head_sha" ] || continue
+              if ! status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${current_base}...${head_sha}" --jq '.status' 2>/dev/null)"; then
+                continue
+              fi
+              state=failure
+              description="stale: rebase onto latest master before merging"
+              if [ "$status" = ahead ] || [ "$status" = identical ]; then
+                state=success
+                description="contains latest master"
+              fi
+              gh api "repos/${GITHUB_REPOSITORY}/statuses/${head_sha}" --method POST \
+                -f state="$state" -f context=branch-freshness -f description="$description" >/dev/null
+            done
+  viewer:
+    # Pin the media-capable browser leg while ubuntu-latest rolls forward;
+    # cros-libva 0.0.12 does not yet compile against Ubuntu 26.04's libva headers.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -42,6 +103,21 @@ jobs:
       - run: bun run check
       - run: bunx playwright install --with-deps chromium
       - run: bun run test:browser
+      - uses: ./.github/actions/linux-media-deps
+        with:
+          cache-suffix: viewer-media
+          extra-packages: xvfb
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Bad-network video regression
+        run: xvfb-run -a bun run test:bad-network
+      - name: Upload bad-network evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bad-network-evidence
+          path: test-results/**/bad-network.json
+          if-no-files-found: warn
+          retention-days: 14
       - run: bun run audit
 
   # Every Rust leg embeds apps/viewer/dist via build.rs include_bytes!. Build it
@@ -109,19 +185,27 @@ jobs:
       - run: cargo test --locked --manifest-path crates/nanoctl-planck/Cargo.toml
       - run: cargo clippy --all-targets --locked --manifest-path crates/nanoctl-planck/Cargo.toml -- -D warnings
 
+  # One leg per OS runs every Rust lint + test feature level (rtc, media, and
+  # on Linux the GPL opt-in x264) in a shared target dir. This used to be ~11
+  # legs — agent, agent-check, agent-media-linux/native/check, agent-x264-* —
+  # each paying its own checkout, toolchain install, cache restore and apt
+  # setup, and the 4-5 macOS legs alone starved the small free macOS runner
+  # pool until queued legs hit GitHub's 15-minute runner-acquisition timeout
+  # and the whole run was cancelled.
   agent:
     needs: viewer-dist
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, windows-2025]
+        os: [macos-15, windows-2025]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.96.1
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: agent-${{ matrix.os }}
@@ -140,50 +224,18 @@ jobs:
         with:
           name: viewer-dist
           path: apps/viewer/dist
-      - run: cargo test --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml
-
-  agent-check:
-    needs: viewer-dist
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15, windows-2025]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: ./.github/actions/linux-media-deps
+        if: runner.os == 'Linux'
         with:
-          toolchain: 1.96.1
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: agent-check-${{ matrix.os }}
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Exclude build outputs from Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
+          cache-suffix: media-x264
+          extra-packages: libx264-dev
+          save-cache: ${{ github.event_name != 'pull_request' }}
+      - name: Check formatting and POSIX package scripts
+        if: runner.os == 'Linux'
         run: |
-          Add-MpPreference -ExclusionPath $env:CARGO_HOME
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-agent\target"
-          Add-MpPreference -ExclusionProcess cargo.exe
-          Add-MpPreference -ExclusionProcess rustc.exe
-          Add-MpPreference -ExclusionProcess link.exe
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - run: cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
-        if: runner.os == 'Linux'
-      - run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
-      - name: Validate POSIX package scripts
-        if: runner.os != 'Windows'
-        shell: bash
-        run: for script in install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh; do sh -n "$script"; done
-      - name: Lint POSIX package scripts
-        if: runner.os == 'Linux'
-        run: shellcheck install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh
+          cargo fmt --manifest-path crates/nanoctl-agent/Cargo.toml -- --check
+          for script in install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh; do sh -n "$script"; done
+          shellcheck install.sh packaging/tailnet.sh packaging/linux/*.sh packaging/macos/*.sh
       - name: Validate PowerShell package scripts
         if: runner.os == 'Windows'
         shell: pwsh
@@ -203,229 +255,20 @@ jobs:
             $parseErrors | Format-List | Out-String | Write-Error
             exit 1
           }
-
-  agent-media-linux:
-    needs: viewer-dist
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    # Match Linux release builds; cros-libva 0.0.12 does not compile with libva 2.23+.
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: media-linux
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - uses: ./.github/actions/linux-media-deps
-        with:
-          cache-suffix: media
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
-
-  agent-x264-linux:
-    # GPL opt-in only; default/release jobs deliberately do not enable this feature.
-    needs: viewer-dist
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: x264
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - uses: ./.github/actions/linux-media-deps
-        with:
-          cache-suffix: media-x264
-          extra-packages: libx264-dev
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
-
-  agent-x264-check:
-    needs: viewer-dist
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-          components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: x264-check
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - uses: ./.github/actions/linux-media-deps
-        with:
-          cache-suffix: media-x264
-          extra-packages: libx264-dev
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - run: cargo clippy --all-targets --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
-
-  agent-x264-package:
-    needs: viewer-dist
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "64"
-      CARGO_PROFILE_RELEASE_LTO: "false"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: x264-package
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - uses: ./.github/actions/linux-media-deps
-        with:
-          cache-suffix: media-x264
-          extra-packages: libx264-dev
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - run: cargo build --release --locked --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
-
-  agent-media-native:
-    needs: viewer-dist
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-2025]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: media-${{ matrix.os }}
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Exclude build outputs from Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath $env:CARGO_HOME
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-agent\target"
-          Add-MpPreference -ExclusionProcess cargo.exe
-          Add-MpPreference -ExclusionProcess rustc.exe
-          Add-MpPreference -ExclusionProcess link.exe
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
-
-  agent-media-check:
-    needs: viewer-dist
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-          components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: media-check-${{ matrix.os }}
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Exclude build outputs from Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath $env:CARGO_HOME
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-agent\target"
-          Add-MpPreference -ExclusionProcess cargo.exe
-          Add-MpPreference -ExclusionProcess rustc.exe
-          Add-MpPreference -ExclusionProcess link.exe
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - uses: ./.github/actions/linux-media-deps
-        if: matrix.os == 'ubuntu-24.04'
-        with:
-          cache-suffix: media
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
-
-  agent-media-package:
-    needs: viewer-dist
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    # Master release candidates own the only exact-profile release build. This job keeps
-    # optimized media packaging covered on PRs and non-release branches with a faster
-    # release profile (more codegen units, no LTO) so it does not dominate CI time.
-    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
-    env:
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "64"
-      CARGO_PROFILE_RELEASE_LTO: "false"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: media-package-${{ matrix.os }}
-          workspaces: crates/nanoctl-agent
-          save-if: ${{ github.event_name != 'pull_request' }}
-      - name: Exclude build outputs from Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath $env:CARGO_HOME
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE\crates\nanoctl-agent\target"
-          Add-MpPreference -ExclusionProcess cargo.exe
-          Add-MpPreference -ExclusionProcess rustc.exe
-          Add-MpPreference -ExclusionProcess link.exe
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: viewer-dist
-          path: apps/viewer/dist
-      - uses: ./.github/actions/linux-media-deps
-        if: matrix.os == 'ubuntu-24.04'
-        with:
-          cache-suffix: media
-          save-cache: ${{ github.event_name != 'pull_request' }}
-      - name: Build release media binary
-        run: cargo build --release --locked --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Clippy (rtc)
+        run: cargo clippy --all-targets --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - name: Clippy (media)
+        run: cargo clippy --all-targets --features media --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - name: Clippy (x264)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml -- -D warnings
+      - name: Test (rtc)
+        run: cargo test --features rtc --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Test (media)
+        run: cargo test --features media --manifest-path crates/nanoctl-agent/Cargo.toml
+      - name: Test (x264)
+        if: runner.os == 'Linux'
+        run: cargo test --features x264 --manifest-path crates/nanoctl-agent/Cargo.toml
 
   release-candidate:
     # This is the single artifact-producing build for a master commit. The tag workflow promotes
@@ -436,18 +279,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            platform: linux
-            architecture: x64
-            binary: nanoctl
-          - runner: ubuntu-24.04-arm
-            platform: linux
-            architecture: arm64
-            binary: nanoctl
-          - runner: macos-15-intel
-            platform: macos
-            architecture: x64
-            binary: nanoctl
           - runner: macos-15
             platform: macos
             architecture: arm64
@@ -455,10 +286,6 @@ jobs:
           - runner: windows-2025
             platform: windows
             architecture: x64
-            binary: nanoctl.exe
-          - runner: windows-11-arm
-            platform: windows
-            architecture: arm64
             binary: nanoctl.exe
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90

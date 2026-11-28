@@ -7,7 +7,7 @@ use openh264::formats::YUVSource;
 
 #[cfg(test)]
 use super::bitrate_target;
-use super::{EncodedFrame, FrameEncoder, I420Frame, RgbaFrame, SoftwareEncoder};
+use super::{EncodedFrame, FrameEncoder, I420Frame, PixelFormat, RgbaFrame, SoftwareEncoder};
 use crate::config::LatencyMode;
 
 unsafe extern "C" {
@@ -31,6 +31,7 @@ unsafe extern "C" {
         keyframe: c_int,
         bytes: *mut *const u8,
     ) -> c_int;
+    fn nano_x264_adapt(context: *mut c_void, tier: c_int) -> c_int;
     #[cfg(test)]
     fn nano_x264_parameters(context: *mut c_void, params: *mut Parameters);
 }
@@ -122,6 +123,13 @@ impl Active {
         Ok(())
     }
 
+    /// Re-opens the encoder with a different adaptive tier; env-pinned knobs win.
+    /// Returns 0 on a re-open, 1 when already there, -2 when adapt is disabled.
+    fn adapt(&mut self, tier: u8) -> c_int {
+        // SAFETY: The handle is exclusively borrowed and the shim takes one scalar.
+        unsafe { nano_x264_adapt(self.handle.as_ptr(), tier.into()) }
+    }
+
     #[cfg(test)]
     fn parameters(&mut self) -> Parameters {
         let mut params = Parameters::default();
@@ -138,6 +146,106 @@ impl Drop for Active {
     }
 }
 
+/// Content-driven encoder parameter negotiation. Tier 0 (baseline/hex/subme2)
+/// is the measured worst-case-safe configuration; tiers 1-3 spend encode
+/// headroom on CABAC/8x8, UMH, and finally a slower preset for fewer bits.
+/// The policy only promotes after a sustained easy window and demotes fast
+/// under stress — defaults must never regress the hard scene.
+struct AdaptPolicy {
+    tier: u8,
+    encode_ewma_ns: f64,
+    bytes_ewma: f64,
+    ease_frames: u32,
+    stress_frames: u32,
+    cooldown: u32,
+    switches: u32,
+    network_constrained: bool,
+}
+
+impl AdaptPolicy {
+    const MAX_TIER: u8 = 3;
+    /// Frames of sustained ease before each promotion step — cheap tier 1
+    /// (CABAC/8x8) engages fast, the slower-preset tier 3 stays careful.
+    /// ~1s/1.5s/2.5s at 60fps.
+    const EASE_FRAMES: [u32; 3] = [60, 90, 150];
+    /// Consecutive stressed frames before a demotion (~0.33s at 60fps).
+    const STRESS_FRAMES: u32 = 20;
+    /// Minimum frames between any two tier switches.
+    const SWITCH_COOLDOWN: u32 = 60;
+    const EWMA_ALPHA: f64 = 0.1;
+
+    /// Returns `Some(tier)` when a switch is warranted; the caller applies it
+    /// and reports back through `committed` (success) or `failed`.
+    fn observe(
+        &mut self,
+        encode_ns: u64,
+        au_bytes: usize,
+        budget_ns: f64,
+        cap_bytes: f64,
+    ) -> Option<u8> {
+        let encode = encode_ns as f64;
+        let bytes = au_bytes as f64;
+        if self.encode_ewma_ns == 0.0 {
+            self.encode_ewma_ns = encode;
+            self.bytes_ewma = bytes;
+        } else {
+            self.encode_ewma_ns += (encode - self.encode_ewma_ns) * Self::EWMA_ALPHA;
+            self.bytes_ewma += (bytes - self.bytes_ewma) * Self::EWMA_ALPHA;
+        }
+        self.cooldown = self.cooldown.saturating_add(1);
+        // Hard overload: drop straight to the safe tier.
+        if self.tier > 0 && self.encode_ewma_ns > 0.85 * budget_ns {
+            return Some(0);
+        }
+        let byte_stress = self.bytes_ewma > 0.85 * cap_bytes;
+        // A full rate-control bucket means two very different things. With
+        // network headroom it is content stress, so falling back to cheaper
+        // analysis protects fps. When the network itself is the constraint,
+        // the bucket is expected to be full; falling back would spend the
+        // scarce bytes less efficiently for no latency benefit. CPU overload
+        // remains a hard stress signal in both cases.
+        if self.encode_ewma_ns > 0.55 * budget_ns || (byte_stress && !self.network_constrained) {
+            self.ease_frames = 0;
+            self.stress_frames = self.stress_frames.saturating_add(1);
+            if self.tier > 0 && self.stress_frames >= Self::STRESS_FRAMES {
+                return Some(self.tier - 1);
+            }
+            return None;
+        }
+        self.stress_frames = 0;
+        self.ease_frames = self.ease_frames.saturating_add(1);
+        if self.tier < Self::MAX_TIER
+            && self.ease_frames >= Self::EASE_FRAMES[self.tier as usize]
+            && self.cooldown >= Self::SWITCH_COOLDOWN
+            && self.encode_ewma_ns < 0.30 * budget_ns
+            && (self.bytes_ewma < 0.50 * cap_bytes || self.network_constrained)
+        {
+            // Trivially easy content skips intermediate tiers entirely —
+            // one re-open/IDR instead of one per rung.
+            if self.encode_ewma_ns < 0.12 * budget_ns && self.bytes_ewma < 0.20 * cap_bytes {
+                return Some((self.tier + 2).min(Self::MAX_TIER));
+            }
+            return Some(self.tier + 1);
+        }
+        None
+    }
+
+    fn committed(&mut self, tier: u8) {
+        self.tier = tier;
+        self.ease_frames = 0;
+        self.stress_frames = 0;
+        self.cooldown = 0;
+        self.switches += 1;
+    }
+
+    /// A failed shim call gets a quiet period so we don't retry every frame.
+    fn failed(&mut self) {
+        self.ease_frames = 0;
+        self.stress_frames = 0;
+        self.cooldown = 0;
+    }
+}
+
 pub(super) struct X264Encoder {
     active: Active,
     pub(super) bitrate_kbps: u32,
@@ -148,6 +256,8 @@ pub(super) struct X264Encoder {
     force_keyframe: bool,
     started: Instant,
     last_pts: i64,
+    adapt: AdaptPolicy,
+    adapt_enabled: bool,
 }
 
 impl X264Encoder {
@@ -167,7 +277,31 @@ impl X264Encoder {
             force_keyframe: true,
             started: Instant::now(),
             last_pts: -1,
+            adapt: AdaptPolicy {
+                tier: 0,
+                encode_ewma_ns: 0.0,
+                bytes_ewma: 0.0,
+                ease_frames: 0,
+                stress_frames: 0,
+                cooldown: 0,
+                switches: 0,
+                network_constrained: false,
+            },
+            adapt_enabled: !matches!(
+                std::env::var("NANOCTL_X264_ADAPT").as_deref(),
+                Ok("0") | Ok("false")
+            ),
         })
+    }
+
+    pub(super) fn set_network_constrained(&mut self, constrained: bool) {
+        self.adapt.network_constrained = constrained;
+    }
+
+    /// Current negotiation tier and how many switches have fired — consumed by
+    /// media-smoke for per-second adaptation observability.
+    pub(super) fn adapt_state(&self) -> (u8, u32) {
+        (self.adapt.tier, self.adapt.switches)
     }
 
     pub(super) fn force_keyframe(&mut self) {
@@ -202,6 +336,29 @@ impl X264Encoder {
             impl std::ops::Deref<Target = [u8]>,
         >,
     ) -> Result<EncodedFrame> {
+        self.encode_format(image, PixelFormat::Rgba)
+    }
+
+    pub(super) fn encode_format(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+        format: PixelFormat,
+    ) -> Result<EncodedFrame> {
+        self.encode_format_with_constant_mb(image, format, None)
+    }
+
+    pub(super) fn encode_format_with_constant_mb(
+        &mut self,
+        image: &xcap::image::ImageBuffer<
+            xcap::image::Rgba<u8>,
+            impl std::ops::Deref<Target = [u8]>,
+        >,
+        format: PixelFormat,
+        constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
         let dimensions = (image.width(), image.height());
         if self.active.dimensions != dimensions {
             self.active = Active::new(
@@ -215,14 +372,20 @@ impl X264Encoder {
             self.force_keyframe = true;
         }
         let color_started = Instant::now();
+        let mut fresh_i420 = false;
         if self.yuv.is_none() {
             self.yuv = Some(I420Frame::new(
                 dimensions.0 as usize,
                 dimensions.1 as usize,
             )?);
+            fresh_i420 = true;
         }
         let yuv = self.yuv.as_mut().context("I420 buffer is unavailable")?;
-        yuv.read_rgba(image.as_raw())?;
+        if !fresh_i420 && let Some(constant_mb) = constant_mb {
+            yuv.read_pixels_constant_mb(image.as_raw(), format, constant_mb)?;
+        } else {
+            yuv.read_pixels(image.as_raw(), format)?;
+        }
         self.color_convert_ns += color_started.elapsed().as_nanos() as u64;
         let pts = (self
             .started
@@ -230,9 +393,40 @@ impl X264Encoder {
             .as_micros()
             .min((i64::MAX - 1) as u128) as i64)
             .max(self.last_pts + 1);
+        let encode_started = Instant::now();
         let bytes = self.active.encode(yuv, pts, self.force_keyframe)?;
+        let encode_ns = encode_started.elapsed().as_nanos() as u64;
         self.last_pts = pts;
         self.force_keyframe = false;
+        if self.adapt_enabled {
+            let fps = f64::from(self.max_fps.max(1));
+            let budget_ns = 1_000_000_000.0 / fps;
+            let cap_bytes = f64::from(self.bitrate_kbps) * 125.0 / fps;
+            if let Some(target) = self
+                .adapt
+                .observe(encode_ns, bytes.len(), budget_ns, cap_bytes)
+            {
+                match self.active.adapt(target) {
+                    // 0 = re-opened with new params; 1 = already at the masked target.
+                    0 => {
+                        self.adapt.committed(target);
+                        // A re-open resets the decoder chain — land on a fresh IDR.
+                        self.force_keyframe = true;
+                        tracing::info!(tier = target, "x264 adaptive tier switch");
+                    }
+                    1 => {
+                        self.adapt.committed(target);
+                    }
+                    -2 => {
+                        self.adapt_enabled = false;
+                    }
+                    result => {
+                        tracing::warn!(result, "x264 adaptive re-open failed");
+                        self.adapt.failed();
+                    }
+                }
+            }
+        }
         Ok(EncodedFrame {
             bytes,
             width: dimensions.0,
@@ -261,6 +455,12 @@ impl FrameEncoder for ResilientX264 {
         }
     }
 
+    fn set_network_constrained(&mut self, constrained: bool) {
+        if let Self::Native(encoder) = self {
+            encoder.set_network_constrained(constrained);
+        }
+    }
+
     fn color_convert_ns(&self) -> u64 {
         match self {
             Self::Native(encoder) => encoder.color_convert_ns,
@@ -285,6 +485,64 @@ impl FrameEncoder for ResilientX264 {
                 }
             },
             Self::Fallback(encoder) => encoder.encode(image),
+        }
+    }
+
+    fn encode_format(
+        &mut self,
+        image: &RgbaFrame<'_>,
+        format: PixelFormat,
+    ) -> Result<EncodedFrame> {
+        match self {
+            Self::Native(encoder) => match encoder.encode_format(image, format) {
+                Ok(frame) => Ok(frame),
+                Err(error) => {
+                    tracing::warn!(%error, "x264 failed; switching session to OpenH264");
+                    let fallback = SoftwareEncoder::new(
+                        encoder.bitrate_kbps,
+                        encoder.max_fps,
+                        encoder.latency_mode,
+                    )
+                    .context("x264 failed and OpenH264 fallback is unavailable")?;
+                    *self = Self::Fallback(Box::new(fallback));
+                    self.encode_format(image, format)
+                }
+            },
+            Self::Fallback(encoder) => encoder.encode_format(image, format),
+        }
+    }
+
+    fn encode_format_with_constant_mb(
+        &mut self,
+        image: &RgbaFrame<'_>,
+        format: PixelFormat,
+        constant_mb: Option<&[u8]>,
+    ) -> Result<EncodedFrame> {
+        match self {
+            Self::Native(encoder) => {
+                match encoder.encode_format_with_constant_mb(image, format, constant_mb) {
+                    Ok(frame) => Ok(frame),
+                    Err(error) => {
+                        tracing::warn!(%error, "x264 failed; switching session to OpenH264");
+                        let fallback = SoftwareEncoder::new(
+                            encoder.bitrate_kbps,
+                            encoder.max_fps,
+                            encoder.latency_mode,
+                        )
+                        .context("x264 failed and OpenH264 fallback is unavailable")?;
+                        *self = Self::Fallback(Box::new(fallback));
+                        self.encode_format(image, format)
+                    }
+                }
+            }
+            Self::Fallback(encoder) => encoder.encode_format(image, format),
+        }
+    }
+
+    fn adapt_state(&self) -> Option<(u8, u32)> {
+        match self {
+            Self::Native(encoder) => Some(encoder.adapt_state()),
+            Self::Fallback(_) => None,
         }
     }
 
@@ -320,6 +578,8 @@ struct Parameters {
     chroma_location: c_int,
     keyint: c_int,
     rc_method: c_int,
+    me: c_int,
+    subme: c_int,
 }
 
 #[cfg(test)]
@@ -346,14 +606,16 @@ mod tests {
             (LatencyMode::Balanced, 2),
             (LatencyMode::Quality, 4),
         ] {
-            let mut encoder = X264Encoder::new(4_000, 60, mode, (128, 128)).unwrap();
+            // Height 320: x264 clamps slice threads on short frames (~64 rows each).
+            let mut encoder = X264Encoder::new(4_000, 60, mode, (128, 320)).unwrap();
             let p = encoder.active.parameters();
             assert_eq!(
                 (p.bitrate, p.buffer_kbit),
                 (4_000, (4_000 * frames + 59) / 60)
             );
             assert_eq!((p.rc_method, p.crf_milli, p.qp_max), (1, 18_000, 51));
-            assert_eq!((p.csp, p.threads), (2, 2));
+            assert_eq!(p.csp, 2);
+            assert!(p.threads >= 2);
             assert_eq!((p.bframes, p.lookahead, p.sync_lookahead), (0, 0, 0));
             assert_eq!((p.cabac, p.transform8x8), (0, 0));
             assert_eq!((p.annexb, p.repeat_headers, p.keyint), (1, 1, 1 << 30));
@@ -451,6 +713,123 @@ mod tests {
         encoder.encode(&image(64, 64)).unwrap();
         assert!(encoder.active.parameters().bitrate > p.bitrate);
         assert!(encoder.encode(&image(64, 64)).is_ok());
+    }
+
+    #[test]
+    fn adaptive_tiers_reopen_with_cabac_and_umh_then_restore_and_decode() {
+        const ME_HEX: i32 = 1;
+        const ME_UMH: i32 = 2;
+        let mut encoder = X264Encoder::new(4_000, 60, LatencyMode::Balanced, (64, 320)).unwrap();
+        let p = encoder.active.parameters();
+        assert_eq!((p.cabac, p.transform8x8, p.me, p.subme), (0, 0, ME_HEX, 2));
+        assert!(p.threads >= 2);
+        let tier0_threads = p.threads;
+        assert_eq!(encoder.active.adapt(1), 0);
+        let p = encoder.active.parameters();
+        assert_eq!((p.cabac, p.transform8x8, p.me, p.subme), (1, 1, ME_HEX, 2));
+        assert_eq!(p.threads, 2);
+        assert!(tier0_threads >= p.threads);
+        assert_eq!(encoder.active.adapt(1), 1);
+        assert_eq!(encoder.active.adapt(2), 0);
+        assert_eq!(encoder.active.parameters().me, ME_UMH);
+        assert_eq!(encoder.active.adapt(3), 0);
+        let p = encoder.active.parameters();
+        assert_eq!((p.cabac, p.me, p.subme), (1, ME_UMH, 6));
+        assert_eq!(encoder.active.adapt(0), 0);
+        let p = encoder.active.parameters();
+        assert_eq!((p.cabac, p.transform8x8, p.me), (0, 0, ME_HEX));
+        assert!(p.threads >= 2);
+        assert_eq!(encoder.active.adapt(9), -1);
+        // The stream is still valid after all the re-opens.
+        encoder.force_keyframe();
+        let frame = encoder.encode(&image(64, 64)).unwrap();
+        let mut decoder = openh264::decoder::Decoder::new().unwrap();
+        assert!(decoder.decode(&frame.bytes).unwrap().is_some());
+    }
+
+    #[test]
+    fn adapt_policy_promotes_on_ease_demotes_on_stress() {
+        let mut policy = AdaptPolicy {
+            tier: 0,
+            encode_ewma_ns: 0.0,
+            bytes_ewma: 0.0,
+            ease_frames: 0,
+            stress_frames: 0,
+            cooldown: 0,
+            switches: 0,
+            network_constrained: false,
+        };
+        let budget = 1_000_000_000.0 / 60.0;
+        let cap = 4_000.0 * 125.0 / 60.0;
+        // Moderately easy frames climb one rung at a time.
+        for _ in 0..AdaptPolicy::EASE_FRAMES[0] - 1 {
+            assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), None);
+        }
+        assert_eq!(policy.observe(4_500_000, 2_500, budget, cap), Some(1));
+        policy.committed(1);
+        // Trivially easy frames skip intermediate tiers (one re-open).
+        for _ in 0..AdaptPolicy::EASE_FRAMES[1] + AdaptPolicy::SWITCH_COOLDOWN {
+            policy.observe(1_000_000, 500, budget, cap);
+        }
+        assert_eq!(policy.observe(1_000_000, 500, budget, cap), Some(3));
+        policy.committed(3);
+        // Hard overload drops straight to tier 0.
+        for _ in 0..40 {
+            policy.observe(15_000_000, 500, budget, cap);
+        }
+        assert_eq!(policy.observe(15_000_000, 500, budget, cap), Some(0));
+        policy.committed(0);
+        // Bitrate pressure alone demotes one tier at a time (the bytes EWMA
+        // needs ~30 frames to cross the cap, then 20 stressed frames).
+        policy.tier = 2;
+        for _ in 0..80 {
+            policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap);
+        }
+        assert_eq!(
+            policy.observe(1_000_000, (cap * 0.9) as usize, budget, cap),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn adapt_policy_network_pressure_does_not_look_like_content_stress() {
+        let mut policy = AdaptPolicy {
+            tier: 1,
+            encode_ewma_ns: 0.0,
+            bytes_ewma: 0.0,
+            ease_frames: 0,
+            stress_frames: 0,
+            cooldown: 0,
+            switches: 0,
+            network_constrained: true,
+        };
+        let budget = 1_000_000_000.0 / 60.0;
+        let cap = 4_000.0 * 125.0 / 60.0;
+        // Full-rate frames under a network cap neither demote efficient tiers
+        // nor block promotion when the CPU has headroom.
+        for _ in 0..AdaptPolicy::EASE_FRAMES[0] + AdaptPolicy::SWITCH_COOLDOWN - 1 {
+            assert_ne!(
+                policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap),
+            Some(2)
+        );
+
+        // Once the network proves headroom, the same full bucket is content
+        // stress again and cheap analysis returns after the stress window.
+        policy.committed(2);
+        policy.network_constrained = false;
+        let mut demoted = None;
+        for _ in 0..120 {
+            if let Some(tier) = policy.observe(4_500_000, (cap * 0.9) as usize, budget, cap) {
+                demoted = Some(tier);
+                break;
+            }
+        }
+        assert_eq!(demoted, Some(1));
     }
 
     #[test]

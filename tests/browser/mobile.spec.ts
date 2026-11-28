@@ -63,6 +63,49 @@ test("iPhone session options explain standalone launch in a narrow viewport", as
   await expect(card).toBeVisible();
 });
 
+test("mobile viewport caps the host encode resolution", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires real media harness");
+  await page.setViewportSize({ width: 200, height: 300 });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  const cap = await page.evaluate(
+    () =>
+      Math.ceil(
+        (document.querySelector("video")!.getBoundingClientRect().width * devicePixelRatio) / 2,
+      ) * 2,
+  );
+  expect(cap).toBeGreaterThan(0);
+  const videoWidth = () =>
+    page.locator("video").evaluate((video) => (video as HTMLVideoElement).videoWidth);
+  await expect.poll(videoWidth, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect.poll(videoWidth, { timeout: 15_000 }).toBeLessThanOrEqual(cap + 2);
+});
+
+test("Safari-style canvas fallback still caps host encode resolution", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires real media harness");
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "MediaStreamTrackGenerator", {
+      value: undefined,
+      configurable: true,
+    });
+  });
+  await page.setViewportSize({ width: 200, height: 300 });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  const canvas = page.locator(".webcodecs-video");
+  await expect(canvas).toBeVisible();
+  const cap = await page.evaluate(
+    () =>
+      Math.ceil(
+        (document.querySelector("video")!.getBoundingClientRect().width * devicePixelRatio) / 2,
+      ) * 2,
+  );
+  expect(cap).toBeGreaterThan(0);
+  const encodedWidth = () => canvas.evaluate((element) => (element as HTMLCanvasElement).width);
+  await expect.poll(encodedWidth, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect.poll(encodedWidth, { timeout: 15_000 }).toBeLessThanOrEqual(cap + 2);
+});
+
 test("mobile layout, reachable touch targets, keyboard focus and persisted mode", async ({
   page,
 }) => {
@@ -161,6 +204,74 @@ test("mobile layout, reachable touch targets, keyboard focus and persisted mode"
     true,
   );
   await screenshot(page, "iphone-landscape-connected.png");
+});
+
+test("Safari canvas fallback still delivers trackpad pointer movement", async ({ page }) => {
+  test.skip(process.env.NANOCTL_BROWSER_MEDIA !== "1", "Requires live video");
+  test.skip(process.platform !== "win32", "Windows host cursor validation");
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "MediaStreamTrackGenerator", {
+      value: undefined,
+      configurable: true,
+    });
+    const state = { moves: 0, pointer: null as RTCDataChannel | null };
+    Object.assign(window, { state });
+    const create = RTCPeerConnection.prototype.createDataChannel;
+    RTCPeerConnection.prototype.createDataChannel = function (...args) {
+      const channel = Reflect.apply(create, this, args) as RTCDataChannel;
+      if (args[0] === "nanoctl.pointer.v1") state.pointer = channel;
+      return channel;
+    };
+    const send = RTCDataChannel.prototype.send;
+    RTCDataChannel.prototype.send = function (data) {
+      const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : null;
+      if (this.label === "nanoctl.pointer.v1" && bytes?.[0] === 1) state.moves += 1;
+      return Reflect.apply(send, this, [data]);
+    };
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-state")).toHaveText("Live", { timeout: 30_000 });
+  await expect(page.locator(".webcodecs-video")).toBeVisible();
+  expect(
+    await page.locator("video").evaluate((video) => (video as HTMLVideoElement).videoWidth),
+  ).toBe(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { state: { pointer: RTCDataChannel | null } }).state.pointer
+            ?.readyState,
+      ),
+    )
+    .toBe("open");
+  const box = (await page.locator("video").boundingBox())!;
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  await page.evaluate(
+    ({ x, y }) => {
+      const video = document.querySelector("video")!;
+      const fire = (type: string, dx = 0, dy = 0) =>
+        video.dispatchEvent(
+          new PointerEvent(type, {
+            pointerId: 1,
+            pointerType: "touch",
+            clientX: x + dx,
+            clientY: y + dy,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      fire("pointerdown");
+      for (let step = 1; step <= 8; step += 1) fire("pointermove", step * 9, step * 5);
+      fire("pointerup", 72, 40);
+    },
+    { x, y },
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as unknown as { state: { moves: number } }).state.moves),
+    )
+    .toBeGreaterThan(0);
 });
 
 test("the sound panel explains when the host has no available audio", async ({ page }) => {

@@ -5,6 +5,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::codec::VideoCodec;
 use anyhow::{Context, Result};
+#[cfg(any(feature = "media", test))]
+use bytes::Bytes;
 use interceptor::registry::Registry;
 use serde::{Deserialize, Serialize};
 use webrtc::api::APIBuilder;
@@ -75,24 +77,69 @@ const RELIABLE_CONTROL_QUEUE_CAPACITY: usize = 1024;
 #[cfg(any(feature = "media", test))]
 #[derive(Clone)]
 enum InputSender {
-    Reliable(tokio::sync::mpsc::Sender<Vec<u8>>),
-    Motion(tokio::sync::watch::Sender<Option<Vec<u8>>>),
+    Reliable(tokio::sync::mpsc::Sender<Bytes>),
+    Motion(MotionSlots<tokio::sync::watch::Sender<LatestReport>>),
 }
 
 #[cfg(any(feature = "media", test))]
 enum InputReceiver {
-    Reliable(tokio::sync::mpsc::Receiver<Vec<u8>>),
-    Motion(tokio::sync::watch::Receiver<Option<Vec<u8>>>),
+    Reliable(tokio::sync::mpsc::Receiver<Bytes>),
+    Motion(MotionSlots<tokio::sync::watch::Receiver<LatestReport>>),
+}
+
+#[cfg(any(feature = "media", test))]
+type LatestReport = Option<Bytes>;
+
+/// The pointer lane keeps the latest report per kind: one shared slot would let a per-frame
+/// gamepad snapshot overwrite the pointer move sent in the same frame, and vice versa.
+#[cfg(any(feature = "media", test))]
+#[derive(Clone)]
+struct MotionSlots<T> {
+    pointer: T,
+    gamepad: T,
+}
+
+#[cfg(any(feature = "media", test))]
+fn motion_channel() -> (
+    MotionSlots<tokio::sync::watch::Sender<LatestReport>>,
+    MotionSlots<tokio::sync::watch::Receiver<LatestReport>>,
+) {
+    let (pointer, pointer_receiver) = tokio::sync::watch::channel(None);
+    let (gamepad, gamepad_receiver) = tokio::sync::watch::channel(None);
+    (
+        MotionSlots { pointer, gamepad },
+        MotionSlots {
+            pointer: pointer_receiver,
+            gamepad: gamepad_receiver,
+        },
+    )
+}
+
+#[cfg(any(feature = "media", test))]
+fn is_gamepad_report(bytes: &[u8]) -> bool {
+    // Input wire v3: byte zero is the kind; kinds 2/12 are gamepad reports
+    // and kind 11 their heartbeat. Keep this local because the input module exists
+    // only with the media feature.
+    matches!(bytes.first().copied(), Some(2 | 11 | 12))
 }
 
 #[cfg(any(feature = "media", test))]
 impl InputReceiver {
-    async fn recv(&mut self) -> Option<Vec<u8>> {
+    async fn recv(&mut self) -> Option<Bytes> {
         match self {
             Self::Reliable(receiver) => receiver.recv().await,
-            Self::Motion(receiver) => {
-                receiver.changed().await.ok()?;
-                receiver.borrow_and_update().clone()
+            Self::Motion(slots) => {
+                let gamepad = tokio::select! {
+                    changed = slots.pointer.changed() => changed.map(|()| false),
+                    changed = slots.gamepad.changed() => changed.map(|()| true),
+                }
+                .ok()?;
+                let slot = if gamepad {
+                    &mut slots.gamepad
+                } else {
+                    &mut slots.pointer
+                };
+                slot.borrow_and_update().clone()
             }
         }
     }
@@ -107,13 +154,30 @@ enum InputAdmission {
 }
 
 #[cfg(any(feature = "media", test))]
-async fn admit_input_message(sender: &InputSender, bytes: Vec<u8>) -> InputAdmission {
+fn parse_audio_enabled(bytes: &[u8]) -> Option<bool> {
+    (bytes.len() == 2 && bytes[0] == 9).then(|| bytes[1] != 0)
+}
+
+#[cfg(any(feature = "media", test))]
+async fn admit_input_message(sender: &InputSender, bytes: Bytes) -> InputAdmission {
     if bytes.len() > MAX_CONTROL_MESSAGE_BYTES {
         return InputAdmission::Oversized;
     }
     let accepted = match sender {
         InputSender::Reliable(sender) => sender.send(bytes).await.is_ok(),
-        InputSender::Motion(sender) => sender.send(Some(bytes)).is_ok(),
+        InputSender::Motion(slots) => {
+            let slot = if is_gamepad_report(&bytes) {
+                &slots.gamepad
+            } else {
+                &slots.pointer
+            };
+            // A heartbeat carries no state, so it must never evict a pending
+            // full snapshot from the lossy lane's single coalescing slot.
+            if bytes.len() == 1 && bytes[0] == 11 && slot.borrow().is_some() {
+                return InputAdmission::Accepted;
+            }
+            slot.send(Some(bytes)).is_ok()
+        }
     };
     if accepted {
         InputAdmission::Accepted
@@ -133,6 +197,8 @@ pub struct HostPeer {
     publication_lock: Arc<tokio::sync::Mutex<()>>,
     ice_ufrag_generations: Arc<tokio::sync::RwLock<HashMap<String, u64>>>,
     terminal: Arc<AtomicBool>,
+    #[cfg(feature = "media")]
+    connection_state: tokio::sync::watch::Sender<RTCPeerConnectionState>,
     rtcp_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "media")]
     input_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -152,7 +218,7 @@ pub struct HostPeer {
     input_revoked: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
     video: Arc<TrackLocalStaticSample>,
-    /// Optional viewer-created unreliable channel carrying H.264 access
+    /// Optional viewer-created unreliable channel carrying compressed access
     /// units straight to WebCodecs, bypassing the track's jitter buffer.
     #[cfg(feature = "media")]
     video_data_channel: Arc<DataChannelVideo>,
@@ -162,7 +228,7 @@ pub struct HostPeer {
     h264_high: bool,
 }
 
-/// Viewer-created unreliable data channel carrying raw Annex-B access units
+/// Viewer-created unreliable data channel carrying raw compressed access units
 /// straight to WebCodecs. The viewer can request a keyframe by sending `KF`
 /// when it detects a sequence gap. `idr_channel` is the reliable channel
 /// (`nanoctl.video-idr.v1`) used to deliver keyframes, which are too large
@@ -172,31 +238,31 @@ pub(crate) struct DataChannelVideo {
     pub channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub idr_channel: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     pub keyframe_requests: AtomicU64,
+    pub needs_keyframe: AtomicBool,
     pub replay: Arc<std::sync::Mutex<VideoReplay>>,
 }
 
-/// The most recent complete keyframe plus every delta produced after it, kept
-/// so a freshly attached viewer can be caught up without waiting for the
-/// encoder to produce a new keyframe.
-#[cfg(feature = "media")]
+/// The most recent complete keyframe, kept so a freshly attached viewer can
+/// show a warm frame while the encoder produces a fresh keyframe. Delta tails
+/// are deliberately not retained: replaying them can burst megabytes into SCTP
+/// and make the decoder catch up through stale video instead of presenting the
+/// current desktop.
+#[cfg(any(feature = "media", test))]
 #[derive(Default)]
 pub(crate) struct VideoReplay {
-    idr: Vec<Vec<u8>>,
-    pending_idr: Vec<Vec<u8>>,
-    deltas: Vec<Vec<u8>>,
-    bytes: usize,
+    idr: Vec<Bytes>,
+    pending_idr: Vec<Bytes>,
+    codec: Option<crate::codec::VideoCodec>,
 }
 
-/// A copied replay window: the keyframe's wire messages and the deltas after it.
-#[cfg(feature = "media")]
-pub(crate) type VideoReplaySnapshot = (Vec<Vec<u8>>, Vec<Vec<u8>>);
-
-#[cfg(feature = "media")]
-const VIDEO_REPLAY_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// A reference-counted keyframe. Cloning the snapshot is cheap; messages are
+/// shared with the live send path instead of copied a second time.
+#[cfg(any(feature = "media", test))]
+pub(crate) type VideoReplaySnapshot = Vec<Bytes>;
 
 /// The replay window outlives a single peer connection: a freshly attached
-/// viewer replays the previous stream's tail and reaches live video without
-/// waiting for the new pipeline to produce its first keyframe.
+/// viewer replays the previous stream's latest keyframe while a fresh one is
+/// encoded.
 #[cfg(feature = "media")]
 static VIDEO_REPLAY: std::sync::OnceLock<Arc<std::sync::Mutex<VideoReplay>>> =
     std::sync::OnceLock::new();
@@ -208,57 +274,52 @@ pub(crate) fn video_replay() -> Arc<std::sync::Mutex<VideoReplay>> {
         .clone()
 }
 
-#[cfg(feature = "media")]
+#[cfg(any(feature = "media", test))]
 impl VideoReplay {
     /// Records a wire-format video message. `is_idr`, `part` and `parts` come
     /// from the message header the producer already computed.
-    pub fn push(&mut self, is_idr: bool, part: u16, parts: u16, message: &[u8]) {
+    pub fn push(
+        &mut self,
+        codec: crate::codec::VideoCodec,
+        is_idr: bool,
+        part: u16,
+        parts: u16,
+        message: Bytes,
+    ) {
         if is_idr {
             if part == 0 {
                 self.pending_idr.clear();
             }
-            self.pending_idr.push(message.to_vec());
+            self.pending_idr.push(message);
             if part + 1 == parts {
                 self.idr = std::mem::take(&mut self.pending_idr);
-                self.deltas.clear();
-                self.bytes = self.idr.iter().map(Vec::len).sum();
+                self.codec = Some(codec);
             }
-            return;
         }
-        if self.idr.is_empty() {
-            // No complete keyframe base to anchor the delta to.
-            return;
-        }
-        if self.bytes + message.len() > VIDEO_REPLAY_MAX_BYTES {
-            self.idr.clear();
-            self.deltas.clear();
-            self.bytes = 0;
-            return;
-        }
-        self.bytes += message.len();
-        self.deltas.push(message.to_vec());
     }
 
     /// Installs a ready-made keyframe only while the window is still empty.
     /// Checking and installing under one lock keeps a warm frame from ever
-    /// overwriting a live stream's keyframe, which would corrupt the deltas
-    /// anchored to it.
-    pub fn seed(&mut self, idr: Vec<Vec<u8>>) -> bool {
+    /// overwriting a live stream's keyframe.
+    pub fn seed(&mut self, codec: crate::codec::VideoCodec, idr: Vec<Bytes>) -> bool {
         if !self.idr.is_empty() || !self.pending_idr.is_empty() {
             return false;
         }
-        self.bytes = idr.iter().map(Vec::len).sum();
         self.idr = idr;
+        self.codec = Some(codec);
         true
     }
 
-    /// Clones the replay for a newly attached channel. The cache keeps
-    /// accumulating so later attaches get a fresh window too.
-    pub fn snapshot(&self) -> Option<VideoReplaySnapshot> {
-        if self.idr.is_empty() {
+    /// Clones the warm keyframe for a newly attached channel — but only when
+    /// it belongs to the codec the new pipeline actually encodes. The window
+    /// outlives sessions, so a codec switch otherwise replays the previous
+    /// codec's parameter sets into a decoder expecting another format, which
+    /// is exactly how AV1 sessions received HEVC bits and never decoded.
+    pub fn snapshot(&self, codec: crate::codec::VideoCodec) -> Option<VideoReplaySnapshot> {
+        if self.idr.is_empty() || self.codec != Some(codec) {
             return None;
         }
-        Some((self.idr.clone(), self.deltas.clone()))
+        Some(self.idr.clone())
     }
 }
 
@@ -530,6 +591,113 @@ async fn forward_clipboard(
     }
 }
 
+#[cfg(all(feature = "media", target_os = "windows"))]
+async fn forward_cursor(
+    output: Arc<RTCDataChannel>,
+    mut pointer: tokio::sync::watch::Receiver<Option<Arc<RTCDataChannel>>>,
+    input: Arc<std::sync::Mutex<crate::input::InputController>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    while output.ready_state()
+        == webrtc::data_channel::data_channel_state::RTCDataChannelState::Connecting
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if output.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+        return;
+    }
+    let motion_output = loop {
+        let current = { pointer.borrow().as_ref().cloned() };
+        if let Some(channel) = current {
+            while channel.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Connecting
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if channel.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            {
+                break channel;
+            }
+            return;
+        }
+        if pointer.changed().await.is_err() {
+            return;
+        }
+    };
+    tracing::debug!("cursor metadata forwarder started");
+    let mut interval = tokio::time::interval(Duration::from_millis(33));
+    let mut shape_key: Option<usize> = None;
+    let mut sequence = 0_u32;
+    let mut tick = 0_u32;
+    let mut last_sent: Option<(i32, i32, bool)> = None;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = interval.tick() => {
+                let sample = match crate::cursor::sample(shape_key) {
+                    Ok(sample) => sample,
+                    Err(error) => {
+                        tracing::debug!(%error, "cursor sample failed");
+                        continue;
+                    }
+                };
+                if let Some(shape) = sample.shape.as_ref() {
+                    let message = serde_json::json!({
+                        "type": "cursorShape",
+                        "width": shape.width,
+                        "height": shape.height,
+                        "hotspotX": shape.hotspot_x,
+                        "hotspotY": shape.hotspot_y,
+                        "pixels": STANDARD.encode(&shape.rgba),
+                    });
+                    if output.send_text(message.to_string()).await.is_ok() {
+                        shape_key = Some(sample.shape_key);
+                    }
+                }
+                let Some((origin_x, origin_y, width, height)) = input
+                    .lock()
+                    .ok()
+                    .map(|controller| controller.display_geometry())
+                else {
+                    continue;
+                };
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let x = (sample.x - origin_x) as f64 / width as f64;
+                let y = (sample.y - origin_y) as f64 / height as f64;
+                let visible = sample.visible
+                    && (0.0..=1.0).contains(&x)
+                    && (0.0..=1.0).contains(&y);
+                tick = tick.wrapping_add(1);
+                let position = (sample.x, sample.y, visible);
+                if last_sent == Some(position) && !tick.is_multiple_of(15) {
+                    continue;
+                }
+                last_sent = Some(position);
+                sequence = sequence.wrapping_add(1);
+                let message = serde_json::json!({
+                    "type": "cursor",
+                    "seq": sequence,
+                    "x": (x * 10_000.0).round() / 10_000.0,
+                    "y": (y * 10_000.0).round() / 10_000.0,
+                    "visible": visible,
+                });
+                if motion_output.buffered_amount().await <= 32 * 1024
+                    && let Err(error) = motion_output.send_text(message.to_string()).await
+                {
+                    tracing::debug!(%error, "cursor position send failed");
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl HostPeer {
     #[allow(clippy::too_many_arguments)]
     pub async fn answer_with_host_epoch(
@@ -618,11 +786,36 @@ impl HostPeer {
             })
             .await?,
         );
+        // ICE-state visibility host-side: the client log cannot distinguish
+        // "host never saw the checks" from "host answered but the response
+        // died", and these transitions are the only ground truth for that.
+        peer.on_ice_connection_state_change(Box::new(|state| {
+            tracing::info!(state = %state, "ice connection state");
+            Box::pin(async {})
+        }));
+        #[cfg(feature = "media")]
+        let (connection_state, _) = tokio::sync::watch::channel(RTCPeerConnectionState::New);
+        peer.on_peer_connection_state_change({
+            #[cfg(feature = "media")]
+            let connection_state = connection_state.clone();
+            Box::new(move |state| {
+                #[cfg(feature = "media")]
+                let _ = connection_state.send(state);
+                tracing::info!(state = %state, "peer connection state");
+                Box::pin(async {})
+            })
+        });
+        peer.sctp().transport().on_state_change(Box::new(|state| {
+            tracing::info!(state = %state, "dtls transport state");
+            Box::pin(async {})
+        }));
         #[cfg(feature = "media")]
         let (display_selection, _) = tokio::sync::watch::channel(String::new());
         #[cfg(feature = "media")]
         let (viewer_limits, _) =
             tokio::sync::watch::channel(crate::adaptive::ViewerLimits::default());
+        #[cfg(feature = "media")]
+        let (audio_enabled, _) = tokio::sync::watch::channel(true);
         let (link_feedback, _) = tokio::sync::watch::channel(None);
         #[cfg(feature = "media")]
         let (display_selection_feedback, display_selection_feedback_receiver) =
@@ -638,6 +831,7 @@ impl HostPeer {
             channel: std::sync::Mutex::new(None),
             idr_channel: std::sync::Mutex::new(None),
             keyframe_requests: AtomicU64::new(0),
+            needs_keyframe: AtomicBool::new(false),
             replay: video_replay(),
         });
         #[cfg(feature = "media")]
@@ -657,7 +851,8 @@ impl HostPeer {
                 let input = Arc::downgrade(input);
                 let mut shutdown = input_shutdown.subscribe();
                 input_tasks.push(tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_millis(500));
+                    let mut interval = tokio::time::interval(Duration::from_millis(10));
+                    let mut tick = 0_u8;
                     loop {
                         tokio::select! {
                             _ = shutdown.changed() => break,
@@ -666,7 +861,17 @@ impl HostPeer {
                                     break;
                                 };
                                 if let Ok(mut input) = input.lock() {
-                                    input.release_if_idle(Duration::from_secs(2));
+                                    input.pump_key_repeats(Instant::now());
+                                    tick = tick.wrapping_add(1);
+                                    if tick.is_multiple_of(5) {
+                                        // Gamepad viewers heartbeat every 250ms while idle. Three
+                                        // missed heartbeats mean the transport or viewer is badly
+                                        // impaired; don't let a held stick/button keep driving.
+                                        input.release_if_idle(
+                                            Duration::from_secs(2),
+                                            Duration::from_millis(750),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -675,7 +880,10 @@ impl HostPeer {
             }
             let (control_sender, control_receiver) =
                 tokio::sync::mpsc::channel(RELIABLE_CONTROL_QUEUE_CAPACITY);
-            let (pointer_sender, pointer_receiver) = tokio::sync::watch::channel(None);
+            let (pointer_sender, pointer_receiver) = motion_channel();
+            #[cfg(target_os = "windows")]
+            let (cursor_pointer_sender, cursor_pointer_receiver) =
+                tokio::sync::watch::channel(None::<Arc<RTCDataChannel>>);
             let blocked_notices = InputBlockedNotices::default();
             if let Some(input) = &input {
                 input_tasks.push(spawn_input_worker(
@@ -700,6 +908,8 @@ impl HostPeer {
                 ));
             }
             let input_revoked_for_channel = input_revoked.clone();
+            #[cfg(target_os = "windows")]
+            let input_shutdown_for_channel = input_shutdown.clone();
             let clipboard = if allow_clipboard {
                 crate::clipboard::backend()
             } else {
@@ -708,26 +918,30 @@ impl HostPeer {
             let clipboard_shutdown = input_shutdown.subscribe();
             let video_dc_for_channel = video_data_channel.clone();
             let viewer_limits_for_channel = viewer_limits.clone();
-            // The data-channel video path decodes Annex-B access units: the
-            // browser viewer handles H.264 and the iOS app adds HEVC via
-            // VideoToolbox. A viewer in "auto" may open the channels before
-            // negotiation decides the codec, so they are honoured solely when
-            // an Annex-B codec won (anything else, e.g. AV1, keeps RTP only).
+            let audio_enabled_for_channel = audio_enabled.clone();
+            let link_feedback_for_channel = link_feedback.clone();
+            // The data-channel video path carries the encoder's exact
+            // temporal units: H.264/HEVC Annex-B or AV1 low-overhead OBUs.
+            // A viewer in "auto" may open the channels before negotiation
+            // decides the codec, so they are closed again when unsupported.
             let video_dc_codec_ok = matches!(
                 negotiated.codec,
-                crate::codec::VideoCodec::H264 | crate::codec::VideoCodec::Hevc
+                crate::codec::VideoCodec::H264
+                    | crate::codec::VideoCodec::Hevc
+                    | crate::codec::VideoCodec::Av1
             );
             peer.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
                 let input = input.clone();
                 let viewer_limits = viewer_limits_for_channel.clone();
                 let input_revoked = input_revoked_for_channel.clone();
+                let link_feedback = link_feedback_for_channel.clone();
                 if channel.label() == "nanoctl.video.v1"
                     || channel.label() == "nanoctl.video-idr.v1"
                 {
                     if !video_dc_codec_ok {
                         tracing::info!(
                             codec = negotiated.codec.id(),
-                            "video data channel ignored: negotiated codec is not Annex-B"
+                            "video data channel ignored: negotiated codec cannot use data-channel video"
                         );
                         return Box::pin(async {});
                     }
@@ -737,6 +951,10 @@ impl HostPeer {
                     if is_idr {
                         *slot.idr_channel.lock().unwrap() = Some(channel.clone());
                     } else {
+                        // Publish the resync requirement with the channel so a
+                        // just-encoded delta can never race ahead of the fresh
+                        // keyframe this attachment is about to request.
+                        slot.needs_keyframe.store(true, Ordering::Release);
                         *slot.channel.lock().unwrap() = Some(channel.clone());
                     }
                     let kf = video_dc_for_channel.clone();
@@ -788,35 +1006,87 @@ impl HostPeer {
                 if input.is_none() {
                     // View-only sessions still adjust stream quality and transport.
                     if reliable {
+                        let audio_enabled = audio_enabled_for_channel.clone();
                         channel.on_message(Box::new(move |message: DataChannelMessage| {
                             if message.is_string
                                 && let Some(limits) =
                                     crate::adaptive::ViewerLimits::parse(&message.data)
                             {
+                                tracing::info!(?limits, "viewer quality limits received");
                                 viewer_limits.send_replace(limits);
+                                return Box::pin(async {});
+                            }
+                            if message.is_string
+                                && let Some(loss) = crate::adaptive::parse_link_stats(&message.data)
+                            {
+                                link_feedback.send_replace(Some(crate::adaptive::LinkSample {
+                                    fraction_lost: loss,
+                                    rtt: None,
+                                    remb_kbps: None,
+                                    at: std::time::Instant::now(),
+                                    receiver_report_at: Some(std::time::Instant::now()),
+                                }));
+                                return Box::pin(async {});
+                            }
+                            if let Some(enabled) = parse_audio_enabled(&message.data) {
+                                audio_enabled.send_replace(enabled);
                             }
                             Box::pin(async {})
                         }));
                     }
                     return Box::pin(async {});
                 }
+                #[cfg(all(feature = "media", target_os = "windows"))]
+                if channel.label() == "nanoctl.cursor.v1" {
+                    cursor_pointer_sender.send_replace(Some(channel.clone()));
+                }
                 if reliable {
                     blocked_notices.attach(&channel);
+                    #[cfg(all(feature = "media", target_os = "windows"))]
+                    if let Some(cursor_input) = input.clone() {
+                        tokio::spawn(forward_cursor(
+                            channel.clone(),
+                            cursor_pointer_receiver.clone(),
+                            cursor_input,
+                            input_shutdown_for_channel.subscribe(),
+                        ));
+                    }
                 }
                 let sender = match channel.label() {
                     "nanoctl.control.v1" => InputSender::Reliable(control_sender.clone()),
-                    "nanoctl.pointer.v1" => InputSender::Motion(pointer_sender.clone()),
+                    "nanoctl.pointer.v1" | "nanoctl.gamepad.v1" => {
+                        InputSender::Motion(pointer_sender.clone())
+                    }
                     _ => return Box::pin(async {}),
                 };
                 let message_input = input.clone();
                 let weak_channel = Arc::downgrade(&channel);
+                let audio_enabled = audio_enabled_for_channel.clone();
                 channel.on_message(Box::new(move |message: DataChannelMessage| {
-                    if reliable
-                        && message.is_string
-                        && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
-                    {
-                        viewer_limits.send_replace(limits);
-                        return Box::pin(async {});
+                    if reliable {
+                        if message.is_string
+                            && let Some(limits) = crate::adaptive::ViewerLimits::parse(&message.data)
+                        {
+                            tracing::info!(?limits, "viewer quality limits received");
+                            viewer_limits.send_replace(limits);
+                            return Box::pin(async {});
+                        }
+                        if message.is_string
+                            && let Some(loss) = crate::adaptive::parse_link_stats(&message.data)
+                        {
+                            link_feedback.send_replace(Some(crate::adaptive::LinkSample {
+                                fraction_lost: loss,
+                                rtt: None,
+                                remb_kbps: None,
+                                at: std::time::Instant::now(),
+                                receiver_report_at: Some(std::time::Instant::now()),
+                            }));
+                            return Box::pin(async {});
+                        }
+                        if let Some(enabled) = parse_audio_enabled(&message.data) {
+                            audio_enabled.send_replace(enabled);
+                            return Box::pin(async {});
+                        }
                     }
                     #[cfg(target_os = "linux")]
                     crate::media::trace::input(0, &message.data);
@@ -825,10 +1095,13 @@ impl HostPeer {
                     let weak_channel = weak_channel.clone();
                     let input_revoked = input_revoked.clone();
                     Box::pin(async move {
-                        if !message.is_string || input_revoked.load(Ordering::Acquire) {
+                        let binary_input = crate::input::is_binary_input_message(&message.data);
+                        if (!message.is_string && !binary_input)
+                            || input_revoked.load(Ordering::Acquire)
+                        {
                             return;
                         }
-                        let admission = admit_input_message(&sender, message.data.to_vec()).await;
+                        let admission = admit_input_message(&sender, message.data).await;
                         if admission != InputAdmission::Accepted {
                             input_revoked.store(true, Ordering::Release);
                             tracing::warn!(?admission, "input rejected; closing control channel");
@@ -870,23 +1143,26 @@ impl HostPeer {
         if let Some(output) = audio_output
             && offer.lines().any(|line| line.starts_with("m=audio "))
         {
-            let audio = Arc::new(TrackLocalStaticSample::new(
-                RTCRtpCodecCapability {
-                    mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
-                    clock_rate: 48_000,
-                    channels: 2,
-                    sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".into(),
-                    ..Default::default()
-                },
-                "system-audio".into(),
-                "nanoctl-audio".into(),
-            ));
+            let audio = Arc::new(
+                webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP::new(
+                    RTCRtpCodecCapability {
+                        mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.into(),
+                        clock_rate: 48_000,
+                        channels: 2,
+                        sdp_fmtp_line: "minptime=10;useinbandfec=1;stereo=1".into(),
+                        ..Default::default()
+                    },
+                    "system-audio".into(),
+                    "nanoctl-audio".into(),
+                ),
+            );
             let sender = peer.add_track(audio.clone()).await?;
             input_tasks.push(tokio::spawn(crate::audio::run(
                 audio,
                 peer.clone(),
                 input_shutdown.subscribe(),
                 output,
+                audio_enabled.subscribe(),
             )));
             let mut shutdown = input_shutdown.subscribe();
             input_tasks.push(tokio::spawn(async move {
@@ -1163,6 +1439,8 @@ impl HostPeer {
             publication_lock,
             ice_ufrag_generations,
             terminal,
+            #[cfg(feature = "media")]
+            connection_state,
             rtcp_task: tokio::sync::Mutex::new(Some(rtcp_task)),
             #[cfg(feature = "media")]
             input_tasks: tokio::sync::Mutex::new(input_tasks),
@@ -1373,6 +1651,11 @@ impl HostPeer {
 
     pub fn connection_failed(&self) -> bool {
         self.peer.connection_state() == RTCPeerConnectionState::Failed
+    }
+
+    #[cfg(feature = "media")]
+    pub fn connection_state(&self) -> tokio::sync::watch::Receiver<RTCPeerConnectionState> {
+        self.connection_state.subscribe()
     }
 
     /// Revoke data-channel input before asynchronous peer/media teardown begins. This closes the
@@ -1763,6 +2046,105 @@ mod tests {
     use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
     #[test]
+    fn parses_audio_enabled_control() {
+        assert_eq!(parse_audio_enabled(&[9, 0]), Some(false));
+        assert_eq!(parse_audio_enabled(&[9, 1]), Some(true));
+        assert_eq!(
+            parse_audio_enabled(br#"{"type":"audio","enabled":true}"#),
+            None
+        );
+        assert_eq!(parse_audio_enabled(&[9]), None);
+    }
+
+    #[test]
+    fn video_replay_snapshot_shares_keyframe_allocations_and_drops_deltas() {
+        let mut replay = VideoReplay::default();
+        let idr = Bytes::from(vec![1, 2, 3, 4]);
+        let delta = Bytes::from(vec![5, 6, 7]);
+        replay.push(crate::codec::VideoCodec::H264, true, 0, 1, idr.clone());
+        replay.push(crate::codec::VideoCodec::H264, false, 0, 1, delta);
+
+        let idr_replay = replay
+            .snapshot(crate::codec::VideoCodec::H264)
+            .expect("complete replay window");
+        assert_eq!(idr_replay.len(), 1);
+        assert_eq!(idr_replay[0].as_ptr(), idr.as_ptr());
+        assert_eq!(idr_replay[0].len(), idr.len());
+    }
+
+    #[test]
+    fn video_replay_requires_complete_keyframe_and_resets_at_next_idr() {
+        let mut replay = VideoReplay::default();
+        assert!(replay.seed(
+            crate::codec::VideoCodec::H264,
+            vec![Bytes::from_static(b"seed-idr")]
+        ));
+        assert!(!replay.seed(
+            crate::codec::VideoCodec::H264,
+            vec![Bytes::from_static(b"replacement")]
+        ));
+        assert_eq!(
+            replay
+                .snapshot(crate::codec::VideoCodec::H264)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut replay = VideoReplay::default();
+        replay.push(
+            crate::codec::VideoCodec::H264,
+            true,
+            0,
+            2,
+            Bytes::from_static(b"first-half"),
+        );
+        assert!(replay.snapshot(crate::codec::VideoCodec::H264).is_none());
+        replay.push(
+            crate::codec::VideoCodec::H264,
+            true,
+            1,
+            2,
+            Bytes::from_static(b"second-half"),
+        );
+        assert_eq!(
+            replay
+                .snapshot(crate::codec::VideoCodec::H264)
+                .unwrap()
+                .len(),
+            2
+        );
+        replay.push(
+            crate::codec::VideoCodec::H264,
+            false,
+            0,
+            1,
+            Bytes::from_static(b"delta"),
+        );
+        assert_eq!(
+            replay
+                .snapshot(crate::codec::VideoCodec::H264)
+                .unwrap()
+                .len(),
+            2
+        );
+        replay.push(
+            crate::codec::VideoCodec::H264,
+            true,
+            0,
+            1,
+            Bytes::from_static(b"new-idr"),
+        );
+        assert_eq!(
+            replay
+                .snapshot(crate::codec::VideoCodec::H264)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn receiver_report_sample_converts_loss_rtt_and_remb() {
         let at = std::time::Instant::now();
         let report = super::ReceptionReport {
@@ -1945,10 +2327,10 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let sender = InputSender::Reliable(sender);
         assert_eq!(
-            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES]).await,
+            admit_input_message(&sender, Bytes::from(vec![0; MAX_CONTROL_MESSAGE_BYTES])).await,
             InputAdmission::Accepted
         );
-        let pending = admit_input_message(&sender, vec![1]);
+        let pending = admit_input_message(&sender, Bytes::from_static(&[1]));
         tokio::pin!(pending);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
@@ -1962,12 +2344,12 @@ mod tests {
         assert_eq!(pending.await, InputAdmission::Accepted);
         assert_eq!(receiver.recv().await.unwrap(), vec![1]);
         assert_eq!(
-            admit_input_message(&sender, vec![0; MAX_CONTROL_MESSAGE_BYTES + 1]).await,
+            admit_input_message(&sender, Bytes::from(vec![0; MAX_CONTROL_MESSAGE_BYTES + 1])).await,
             InputAdmission::Oversized
         );
         drop(receiver);
         assert_eq!(
-            admit_input_message(&sender, vec![0; 1]).await,
+            admit_input_message(&sender, Bytes::from_static(&[0])).await,
             InputAdmission::Closed
         );
     }
@@ -1987,7 +2369,7 @@ mod tests {
         }).collect();
         for event in &events[..1000] {
             assert_eq!(
-                admit_input_message(&sender, event.clone()).await,
+                admit_input_message(&sender, Bytes::from(event.clone())).await,
                 InputAdmission::Accepted
             );
         }
@@ -1995,7 +2377,7 @@ mod tests {
         let producer = tokio::spawn(async move {
             for event in &events[1000..] {
                 assert_eq!(
-                    admit_input_message(&sender, event.clone()).await,
+                    admit_input_message(&sender, Bytes::from(event.clone())).await,
                     InputAdmission::Accepted
                 );
             }
@@ -2013,16 +2395,71 @@ mod tests {
 
     #[tokio::test]
     async fn pointer_motion_is_coalesced_to_the_latest_event() {
-        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (sender, receiver) = motion_channel();
         let sender = InputSender::Motion(sender);
         let mut receiver = InputReceiver::Motion(receiver);
         for index in 0_u32..500 {
             assert_eq!(
-                admit_input_message(&sender, index.to_be_bytes().to_vec()).await,
+                admit_input_message(&sender, Bytes::from(index.to_be_bytes().to_vec())).await,
                 InputAdmission::Accepted
             );
         }
-        assert_eq!(receiver.recv().await.unwrap(), 499_u32.to_be_bytes());
+        assert_eq!(
+            receiver.recv().await.unwrap().as_ref(),
+            499_u32.to_be_bytes()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn gamepad_snapshots_and_pointer_motion_coalesce_in_separate_slots() {
+        let (sender, receiver) = motion_channel();
+        let sender = InputSender::Motion(sender);
+        let mut receiver = InputReceiver::Motion(receiver);
+        let pointer = |x: u32| {
+            let x = x.min(65535) as u16;
+            vec![1, x as u8, (x >> 8) as u8, 0, 0]
+        };
+        let gamepad = |x: u32| {
+            let x = x.min(32767) as u16;
+            vec![
+                2,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                x as u8,
+                (x >> 8) as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        };
+        // Each viewer frame sends its pointer move just before the frame's gamepad poll.
+        for frame in 1_u32..=100 {
+            for message in [pointer(frame), gamepad(frame)] {
+                assert_eq!(
+                    admit_input_message(&sender, Bytes::from(message)).await,
+                    InputAdmission::Accepted
+                );
+            }
+        }
+        let mut delivered = vec![
+            receiver.recv().await.unwrap().to_vec(),
+            receiver.recv().await.unwrap().to_vec(),
+        ];
+        delivered.sort();
+        assert_eq!(delivered, [pointer(100), gamepad(100)]);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
                 .await

@@ -7,7 +7,10 @@ use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::rtp::header::Header;
+use webrtc::rtp::packet::Packet;
+use webrtc::track::track_local::TrackLocalWriter;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 const SAMPLES: usize = 960 * 2;
 const FRAME_DURATION: Duration = Duration::from_millis(20);
@@ -395,9 +398,16 @@ where
     let mut phase = 0_u64;
     let mut frame = Vec::with_capacity(SAMPLES);
     let mut failed = Some(failed);
+    let mut mmcss = None;
     Ok(device.build_input_stream(
         config,
         move |data: &[T], _| {
+            // WASAPI invokes this callback on its realtime capture thread. Register
+            // that thread with MMCSS once rather than the control thread that built
+            // the stream; the guard reverts when the stream is dropped.
+            if mmcss.is_none() {
+                mmcss = crate::media::register_mmcss();
+            }
             for input in data.chunks_exact(channels) {
                 phase += 48_000;
                 while phase >= rate {
@@ -429,10 +439,11 @@ fn capture() -> Result<((), mpsc::Receiver<Vec<i16>>)> {
 }
 
 pub async fn run(
-    track: Arc<TrackLocalStaticSample>,
+    track: Arc<TrackLocalStaticRTP>,
     peer: Arc<RTCPeerConnection>,
     mut shutdown: watch::Receiver<bool>,
     output: watch::Receiver<Option<String>>,
+    enabled: watch::Receiver<bool>,
 ) {
     if *shutdown.borrow() {
         return;
@@ -450,7 +461,7 @@ pub async fn run(
         Ok((_capture, pcm)) => {
             tokio::select! {
                 _ = shutdown.changed() => {},
-                _ = stream(&track, pcm) => {},
+                _ = stream(&track, pcm, enabled.clone()) => {},
             }
         }
         Err(error) => tracing::warn!(%error, "system audio stopped"),
@@ -470,7 +481,7 @@ pub async fn run(
                             if result.is_err() { return; }
                             continue;
                         },
-                        _ = stream(&track, pcm) => {},
+                        _ = stream(&track, pcm, enabled.clone()) => {},
                         _ = &mut capture.failed => {},
                     }
                 }
@@ -490,25 +501,36 @@ pub async fn run(
     }
 }
 
-async fn stream(track: &TrackLocalStaticSample, pcm: mpsc::Receiver<Vec<i16>>) {
-    if let Err(error) = stream_inner(track, pcm).await {
+async fn stream(
+    track: &TrackLocalStaticRTP,
+    pcm: mpsc::Receiver<Vec<i16>>,
+    enabled: watch::Receiver<bool>,
+) {
+    if let Err(error) = stream_inner(track, pcm, enabled).await {
         tracing::warn!(%error, "system audio stopped");
     }
 }
 
 async fn stream_inner(
-    track: &TrackLocalStaticSample,
+    track: &TrackLocalStaticRTP,
     mut pcm: mpsc::Receiver<Vec<i16>>,
+    enabled: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut encoder = encoder()?;
     let (encoded, mut packets) = mpsc::channel(2);
+    let encode_enabled = enabled.clone();
     tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        let _mmcss = crate::media::register_mmcss();
         let mut output = [0; 4000];
         while let Some(frame) = pcm.blocking_recv() {
             if encoded.is_closed() {
                 break;
             }
             if frame.len() != SAMPLES {
+                continue;
+            }
+            if !*encode_enabled.borrow() {
                 continue;
             }
             match encoder.encode(&frame, &mut output) {
@@ -522,15 +544,58 @@ async fn stream_inner(
             }
         }
     });
+    let mut rtp = OpusRtp::default();
     while let Some(packet) = packets.recv().await {
-        let sample = webrtc::media::Sample {
-            data: packet.into(),
-            duration: FRAME_DURATION,
-            ..Default::default()
-        };
-        let _ = tokio::time::timeout(FRAME_DURATION * 2, track.write_sample(&sample)).await;
+        if !*enabled.borrow() {
+            continue;
+        }
+        if let Some(packet) = rtp.packet(packet) {
+            let _ = tokio::time::timeout(FRAME_DURATION * 2, track.write_rtp(&packet)).await;
+        }
     }
     Ok(())
+}
+
+/// Opus samples per 20 ms frame at the 48 kHz RTP clock.
+const RTP_FRAME_TICKS: u32 = 960;
+
+/// Turns encoded Opus frames into RTP packets, dropping DTX frames.
+///
+/// With DTX on, libopus emits 1-2 byte TOC-only frames for every 20 ms of
+/// silence and a real comfort-noise update every 400 ms. Sending the tiny
+/// frames still costs a full IP/UDP/RTP/SRTP header 50 times a second, so,
+/// like libwebrtc, they are not sent: the timestamp keeps advancing, the
+/// sequence number does not (receivers see a gap in time, not loss), and the
+/// first packet after a gap carries the marker bit to start a talkspurt.
+#[derive(Default)]
+struct OpusRtp {
+    sequence_number: u16,
+    timestamp: u32,
+    in_dtx: bool,
+}
+
+impl OpusRtp {
+    fn packet(&mut self, payload: Vec<u8>) -> Option<Packet> {
+        let timestamp = self.timestamp;
+        self.timestamp = self.timestamp.wrapping_add(RTP_FRAME_TICKS);
+        if payload.len() <= 2 {
+            self.in_dtx = true;
+            return None;
+        }
+        let marker = std::mem::take(&mut self.in_dtx);
+        let sequence_number = self.sequence_number;
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+        Some(Packet {
+            header: Header {
+                version: 2,
+                marker,
+                sequence_number,
+                timestamp,
+                ..Default::default()
+            },
+            payload: payload.into(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -598,6 +663,92 @@ mod tests {
         assert_eq!(frames.len(), 3);
         assert_eq!(frames.concat(), samples[..SAMPLES * 3]);
         assert_eq!(framer.bytes.len(), 10);
+    }
+
+    #[test]
+    fn dtx_frames_are_not_sent_but_keep_time() {
+        let mut rtp = OpusRtp::default();
+        let first = rtp.packet(vec![1; 40]).unwrap();
+        assert_eq!(
+            (first.header.sequence_number, first.header.timestamp),
+            (0, 0)
+        );
+        assert!(!first.header.marker);
+        assert!(rtp.packet(vec![8]).is_none());
+        assert!(rtp.packet(vec![8, 0]).is_none());
+        let resumed = rtp.packet(vec![1; 3]).unwrap();
+        assert_eq!(resumed.header.sequence_number, 1);
+        assert_eq!(resumed.header.timestamp, 3 * RTP_FRAME_TICKS);
+        assert!(resumed.header.marker);
+        assert!(!rtp.packet(vec![1; 40]).unwrap().header.marker);
+    }
+
+    /// Wire bytes per second for synthetic system-audio scenes, before and
+    /// after DTX gating. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_audio_wire_bytes() {
+        // IPv4 + UDP + RTP + SRTP auth tag.
+        const OVERHEAD: usize = 20 + 8 + 12 + 10;
+        const SECONDS: usize = 30;
+        type Scene = Box<dyn Fn(usize) -> Vec<i16>>;
+        let frames = SECONDS * 50;
+        let tone = |frame: usize, amplitude: f64| -> Vec<i16> {
+            (0..SAMPLES / 2)
+                .flat_map(|i| {
+                    let t = (frame * SAMPLES / 2 + i) as f64 / 48_000.0;
+                    let v = (amplitude * (t * 440.0 * std::f64::consts::TAU).sin()) as i16;
+                    [v, v]
+                })
+                .collect()
+        };
+        let scenes: [(&str, Scene); 4] = [
+            ("silent desktop", Box::new(|_| vec![0; SAMPLES])),
+            (
+                "game: 2s sound / 3s silence",
+                Box::new(move |f| {
+                    if f % 250 < 100 {
+                        tone(f, 8_000.0)
+                    } else {
+                        vec![0; SAMPLES]
+                    }
+                }),
+            ),
+            (
+                "notification ping every 10s",
+                Box::new(move |f| {
+                    if f % 500 < 15 {
+                        tone(f, 8_000.0)
+                    } else {
+                        vec![0; SAMPLES]
+                    }
+                }),
+            ),
+            ("continuous tone", Box::new(move |f| tone(f, 8_000.0))),
+        ];
+        for (name, scene) in scenes {
+            let mut encoder = encoder().unwrap();
+            let mut output = [0; 4000];
+            let mut rtp = OpusRtp::default();
+            let (mut before, mut after, mut before_packets, mut after_packets) = (0, 0, 0, 0);
+            for frame in 0..frames {
+                let size = encoder.encode(&scene(frame), &mut output).unwrap();
+                before += size + OVERHEAD;
+                before_packets += 1;
+                if let Some(packet) = rtp.packet(output[..size].to_vec()) {
+                    after += packet.payload.len() + OVERHEAD;
+                    after_packets += 1;
+                }
+            }
+            println!(
+                "{name}: {:.2} -> {:.2} kbps ({:+.1}%), {:.1} -> {:.1} pkt/s",
+                before as f64 * 8.0 / SECONDS as f64 / 1000.0,
+                after as f64 * 8.0 / SECONDS as f64 / 1000.0,
+                (after as f64 / before as f64 - 1.0) * 100.0,
+                before_packets as f64 / SECONDS as f64,
+                after_packets as f64 / SECONDS as f64,
+            );
+        }
     }
 
     #[test]

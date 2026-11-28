@@ -40,12 +40,41 @@ pub(crate) async fn run_worker(config: AgentConfig) -> Result<()> {
     .await
 }
 
+#[cfg(all(feature = "media", windows))]
+struct TimerResolutionGuard(bool);
+
+#[cfg(all(feature = "media", windows))]
+impl TimerResolutionGuard {
+    /// Windows otherwise quantizes ordinary timer waits to a much coarser
+    /// scheduler tick, which shows up directly as capture/pacing jitter at
+    /// 60fps and above. The process-wide request is paired on shutdown and
+    /// released by Windows even if the agent exits unexpectedly.
+    fn acquire() -> Self {
+        let acquired = unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0;
+        if !acquired {
+            tracing::warn!("Windows high-resolution timer request failed");
+        }
+        Self(acquired)
+    }
+}
+
+#[cfg(all(feature = "media", windows))]
+impl Drop for TimerResolutionGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { windows::Win32::Media::timeEndPeriod(1) };
+        }
+    }
+}
+
 async fn run_until(
     config: AgentConfig,
     ready_file: Option<PathBuf>,
     ready_token: Option<String>,
     shutdown_requested: impl Future<Output = Result<&'static str>>,
 ) -> Result<()> {
+    #[cfg(all(feature = "media", windows))]
+    let _timer_resolution = TimerResolutionGuard::acquire();
     let state =
         crate::server::ServerState::new(config.clone(), crate::tailnet::real(&config.tailnet));
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
@@ -133,6 +162,7 @@ pub(crate) fn spawn_media(
         peer.viewer_limits(),
         peer.display_selection(),
         peer.display_selection_feedback_sender(),
+        peer.connection_state(),
         crate::media::VideoQuality {
             max_bitrate_kbps: config.quality.max_bitrate_kbps,
             max_fps: crate::media::effective_max_fps(config.quality.max_fps),

@@ -23,23 +23,26 @@ test("reports whether the browser sees a supported controller", () => {
   expect(gamepad.sample([pad(1, ""), pad(2)], 2)).toBe("connected");
 });
 
-test("maps standard controls and sends snapshots on change or keepalive", () => {
+test("maps standard controls and repeats active snapshots every poll", () => {
   const messages: unknown[] = [];
   const gamepad = new GamepadForwarder((message) => Boolean(messages.push(message)));
   const controller = pad(10);
   gamepad.sample([null, controller, pad(12, "")], 0);
-  gamepad.sample([controller], 499);
-  const state = { type: "gamepad", pads: [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]] };
-  expect(messages).toEqual([state]);
-  gamepad.sample([controller], 500);
-  gamepad.sample([{ ...controller, axes: [NaN] }], 501);
-  gamepad.sample([], 502);
+  gamepad.sample([controller], 16);
+  const pads = [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]];
+  expect(messages).toEqual([
+    { type: "gamepad", sequence: 0, pads },
+    { type: "gamepad-sparse", sequence: 1, pads },
+  ]);
+  gamepad.sample([controller], 32);
+  gamepad.sample([{ ...controller, axes: [NaN] }], 48);
+  gamepad.sample([], 64);
   gamepad.release();
   expect(messages).toEqual([
-    state,
-    state,
-    { type: "gamepad", pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
-    { type: "gamepad", pads: [] },
+    { type: "gamepad", sequence: 0, pads },
+    { type: "gamepad-sparse", sequence: 1, pads },
+    { type: "gamepad-sparse", sequence: 2, pads: [[0, 5121, 128, 255, 0, 0, 0, 0]] },
+    { type: "gamepad", sequence: 3, pads: [] },
   ]);
 });
 
@@ -66,19 +69,33 @@ test.each([
     1,
   );
   const reports = [[0, 5121, 128, 255, -32768, 32767, 16384, -32768]];
-  const extra = { slot: 0, leftTriggerPressed: true, rightTriggerPressed: false };
+  const extra = {
+    slot: 0,
+    leftTriggerPressed: true,
+    rightTriggerPressed: false,
+  };
   expect(messages).toEqual([
-    { type: "gamepad", pads: reports, dualShock4: [{ ...extra, touchpadPressed: false }] },
-    { type: "gamepad", pads: reports, dualShock4: [{ ...extra, touchpadPressed: true }] },
+    {
+      type: "gamepad",
+      sequence: 0,
+      pads: reports,
+      dualShock4: [{ ...extra, touchpadPressed: false }],
+    },
+    {
+      type: "gamepad-sparse",
+      sequence: 1,
+      pads: reports,
+      dualShock4: [{ ...extra, touchpadPressed: true }],
+    },
   ]);
 });
 
 test("bounds to four controllers, preserves slots, and retries a blocked release", () => {
   let blocked = false;
   const slots: number[][] = [];
-  const gamepad = new GamepadForwarder(({ pads }) => {
-    if (blocked) return false;
-    slots.push(pads.map((pad) => pad[0]));
+  const gamepad = new GamepadForwarder((message) => {
+    if ((message.type !== "gamepad" && message.type !== "gamepad-sparse") || blocked) return false;
+    slots.push(message.pads.map((pad) => pad[0] ?? -1));
     return true;
   });
   gamepad.sample([pad(2), pad(3), pad(4), pad(8), pad(9)], 0);
@@ -93,5 +110,18 @@ test("bounds to four controllers, preserves slots, and retries a blocked release
     [0, 1, 2, 3],
     [0, 1, 2],
     [0, 1, 2],
+    [0, 1, 2],
   ]);
+});
+
+test("repeats a change for 30ms, then heartbeats an unchanged pad about every 250ms", () => {
+  const sentAt: number[] = [];
+  const gamepad = new GamepadForwarder(() => Boolean(sentAt.push(now)));
+  const controller = pad(0);
+  let now = 0;
+  for (; now <= 400; now += 20) gamepad.sample([controller], now);
+  expect(sentAt).toEqual([0, 20, 280]);
+  const pressed = { ...controller, axes: [0, 0, 0, 0] };
+  for (; now <= 800; now += 20) gamepad.sample([pressed], now);
+  expect(sentAt.slice(3)).toEqual([420, 440, 700]);
 });

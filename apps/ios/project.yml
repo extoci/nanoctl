@@ -5,7 +5,7 @@ options:
 packages:
   WebRTC:
     url: https://github.com/stasel/WebRTC.git
-    exactVersion: 149.0.0
+    exactVersion: 158.0.0
 settings:
   base:
     SWIFT_VERSION: 5.0
@@ -17,6 +17,19 @@ targets:
     sources: [Nanoctl]
     dependencies:
       - package: WebRTC
+    postBuildScripts:
+      - name: Stamp build info
+        shell: /bin/sh
+        script: |
+          plist="$BUILT_PRODUCTS_DIR/$INFOPLIST_PATH"
+          [ -f "$plist" ] || exit 0
+          cd "$SRCROOT/../.." 2>/dev/null || exit 0
+          commit=$(git rev-parse HEAD 2>/dev/null) || exit 0
+          git diff --quiet 2>/dev/null || commit="$commit-dirty"
+          /usr/libexec/PlistBuddy -c "Add NanoctlCommit string $commit" "$plist" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Set NanoctlCommit $commit" "$plist"
+          /usr/libexec/PlistBuddy -c "Add NanoctlBuiltAt string $(date '+%b %-d %H:%M')" "$plist" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Set NanoctlBuiltAt $(date '+%b %-d %H:%M')" "$plist"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.nanoctl.viewer

@@ -154,6 +154,9 @@ export type ControlMessage =
       readonly type: "quality";
       readonly maxFps?: number;
       readonly maxBitrateKbps?: number;
+      /** Physical pixels available to the rendered video; caps host encode dimensions. */
+      readonly maxWidth?: number;
+      readonly maxHeight?: number;
     }
   | {
       readonly type: "gamepad";
@@ -166,9 +169,15 @@ export type ControlMessage =
       }[];
     }
   | { readonly type: "release" }
+  | { readonly type: "audio"; readonly enabled: boolean }
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "ping"; readonly nonce: number; readonly sentAt: number }
-  | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number };
+  | { readonly type: "pong"; readonly nonce: number; readonly sentAt: number }
+  | {
+      /** Viewer-measured data-channel loss fraction; the host adapts bitrate and fps to it. */
+      readonly type: "link-stats";
+      readonly loss: number;
+    };
 
 export type DeviceCapabilities = {
   readonly protocolVersion: SupportedProtocolVersion;
@@ -183,6 +192,8 @@ export type DeviceCapabilities = {
   readonly audioOutputs?: readonly AudioOutput[];
   /** Whether the agent can accept remote input in this capability state. */
   readonly remoteInput?: boolean;
+  /** Compact binary pointer-motion/gamepad messages on the normal input channels. */
+  readonly binaryInput?: boolean;
   readonly gamepad?: boolean;
   readonly ready?: boolean;
   readonly readiness?: ReadinessState;

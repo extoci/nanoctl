@@ -7,6 +7,8 @@ mod clipboard;
 #[cfg(feature = "rtc")]
 mod codec;
 mod config;
+#[cfg(all(feature = "media", target_os = "windows"))]
+mod cursor;
 mod diagnostics;
 #[cfg(feature = "media")]
 mod gamepad;
@@ -20,10 +22,15 @@ mod macos_encoder;
 mod media;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod media_bench;
-#[cfg(any(all(feature = "media", target_os = "windows"), test))]
+#[cfg(any(
+    all(feature = "media", any(target_os = "linux", target_os = "windows")),
+    test
+))]
 mod nv12;
 #[cfg(all(feature = "media", target_os = "linux"))]
 mod nvenc_encoder;
+#[cfg(any(feature = "media", test))]
+mod pixel_format;
 mod platform;
 #[cfg(feature = "rtc")]
 mod rtc;

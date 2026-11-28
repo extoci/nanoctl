@@ -19,7 +19,7 @@ afterEach(() => {
 const info: HostInfo = {
   hostName: "desktop",
   platform: "linux",
-  version: "3.0.0-alpha.5",
+  version: "3.0.0-alpha.28",
   displays: [],
   remoteInput: false,
   viewer: {
@@ -151,7 +151,7 @@ test("hello creates a view-only controller with no ICE servers and streams host 
   expect(controller.started).toBe(true);
   expect(controller.options.iceServers).toEqual([]);
   expect(controller.options.remoteInputPolicy).toBe(false);
-  expect(state.hosts).toEqual([info, info]);
+  expect(state.hosts.at(-1)).toEqual(info);
   const envelope = {
     version: 2,
     sessionId: "one",
@@ -216,12 +216,57 @@ test("replacement releases the peer and requires manual reconnect", async () => 
   });
 });
 
-test("forbidden responses preserve the agent explanation without opening a socket", async () => {
+test("the signaling socket opens without waiting for host info", () => {
+  const state = fixture();
+  expect(FakeSocket.instances).toHaveLength(1);
+  FakeSocket.instances[0]!.receive({ type: "hello", sessionId: "one", host: info });
+  expect(state.controllers[0]!.started).toBe(true);
+});
+
+test("forbidden responses preserve the agent explanation and close the socket", async () => {
   const state = fixture("http:", new Response("identity=dev: forbidden", { status: 403 }));
+  const ws = await socket();
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(state.statuses.at(-1)).toBe("error");
   expect(state.details.at(-1)).toBe("identity=dev: forbidden");
-  expect(FakeSocket.instances).toEqual([]);
+  expect(ws.readyState).toBe(3);
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  expect(FakeSocket.instances).toHaveLength(1);
+});
+
+test("a socket refused before hello reports the forbidden explanation, not a retry", async () => {
+  let respond: (response: Response) => void = () => {};
+  const state = fixture("http:");
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: () => new Promise<Response>((resolve) => (respond = resolve)),
+  });
+  state.session.connect();
+  const ws = await socket();
+  ws.onerror!();
+  ws.onclose!();
+  expect(state.statuses.at(-1)).toBe("connecting");
+  respond(new Response("identity=dev: forbidden", { status: 403 }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(state.statuses.at(-1)).toBe("error");
+  expect(state.details.at(-1)).toBe("identity=dev: forbidden");
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  expect(FakeSocket.instances.filter((value) => value.readyState === 1)).toEqual([]);
+});
+
+test("host info that arrives after hello does not overwrite it", async () => {
+  let respond: (response: Response) => void = () => {};
+  const state = fixture("http:");
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: () => new Promise<Response>((resolve) => (respond = resolve)),
+  });
+  state.session.connect();
+  const ws = await socket();
+  ws.receive({ type: "hello", sessionId: "one", host: info });
+  respond(Response.json({ ...info, hostName: "stale" }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(state.hosts.at(-1)).toEqual(info);
 });
 
 test("replacement survives a data-channel close racing the terminal socket message", async () => {

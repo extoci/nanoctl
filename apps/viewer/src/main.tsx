@@ -1,13 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { AudioOutputState, ControlMessage, HostInfo } from "@nanoctl/protocol";
-import type { QualityLimits, RemoteSessionSnapshot } from "./lib/remote-session";
+import type {
+  QualityLimits,
+  RemoteCursorPosition,
+  RemoteCursorShape,
+  RemoteSessionSnapshot,
+} from "./lib/remote-session";
 import { SocketSession, type SocketStatus } from "./lib/socket-session";
 import { TouchGestures, attachTouchInput, videoGeometry, type TouchMode } from "./lib/touch-input";
 import { SoftKeyboard } from "./soft-keyboard";
 import { SoundPlayback, type SoundState } from "./lib/sound";
 import {
   CODEC_CHOICES,
+  browserDecodeSupport,
   loadCodecChoice,
   saveCodecChoice,
   type CodecChoice,
@@ -33,6 +39,7 @@ const initial: RemoteSessionSnapshot = {
   reconnectAttempt: 0,
   iceGeneration: 0,
   inputEnabled: false,
+  mouseLocked: false,
   gamepadEnabled: false,
   gamepadStatus: "waiting",
   firstFrameReceived: false,
@@ -49,6 +56,11 @@ function Viewer() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const soundPlayback = useRef<SoundPlayback | null>(null);
   const [sound, setSound] = useState<SoundState>("muted");
+  const soundStateRef = useRef<SoundState>("muted");
+  const updateSound = useCallback((next: SoundState) => {
+    soundStateRef.current = next;
+    setSound(next);
+  }, []);
   const [audioOutputState, setAudioOutputState] = useState<AudioOutputState | null>(null);
   const [soundPromptDismissed, setSoundPromptDismissed] = useState(false);
   const transport = useRef<SocketSession | null>(null);
@@ -67,6 +79,7 @@ function Viewer() {
     }
   });
   const codecChoiceRef = useRef(codecChoice);
+  const [av1DecodeSupported, setAv1DecodeSupported] = useState<boolean | null>(null);
   const [qualityLimits, setQualityLimitsState] = useState<QualityLimits>(() => {
     try {
       return JSON.parse(localStorage.getItem("quality-limits") ?? "{}") as QualityLimits;
@@ -83,6 +96,24 @@ function Viewer() {
     } catch {}
     transport.current?.controller?.setQualityLimits(next);
   };
+  useEffect(() => {
+    let active = true;
+    void browserDecodeSupport("av1").then(({ supported }) => {
+      if (!active) return;
+      setAv1DecodeSupported(supported);
+      if (!supported && codecChoiceRef.current === "av1") {
+        codecChoiceRef.current = "auto";
+        setCodecChoiceState("auto");
+        try {
+          saveCodecChoice("auto");
+        } catch {}
+        transport.current?.connect();
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
   const setCodecChoice = (next: CodecChoice) => {
     codecChoiceRef.current = next;
     setCodecChoiceState(next);
@@ -128,11 +159,65 @@ function Viewer() {
       return "trackpad";
     }
   });
+  const [touchCursorVisible, setTouchCursorVisible] = useState(() => {
+    try {
+      return localStorage.getItem("touch-cursor") !== "hidden";
+    } catch {
+      return true;
+    }
+  });
   const cursorRef = useRef<HTMLSpanElement>(null);
+  const touchCursorVisibleRef = useRef(touchCursorVisible);
+  const paintCursorRef = useRef<(() => void) | null>(null);
+  const remoteCursorShapeRef = useRef<{
+    url: string;
+    width: number;
+    height: number;
+    hotspotX: number;
+    hotspotY: number;
+  } | null>(null);
+  const remoteCursorPositionRef = useRef<(RemoteCursorPosition & { at: number }) | null>(null);
+  const onRemoteCursorShape = useCallback((shape: RemoteCursorShape) => {
+    const length = shape.width * shape.height * 4;
+    let bytes: Uint8Array;
+    try {
+      bytes = Uint8Array.from(atob(shape.pixels), (char) => char.charCodeAt(0));
+    } catch {
+      return;
+    }
+    if (bytes.length !== length) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = shape.width;
+    canvas.height = shape.height;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.putImageData(
+      new ImageData(new Uint8ClampedArray(bytes), shape.width, shape.height),
+      0,
+      0,
+    );
+    remoteCursorShapeRef.current = {
+      url: canvas.toDataURL("image/png"),
+      width: shape.width,
+      height: shape.height,
+      hotspotX: shape.hotspotX,
+      hotspotY: shape.hotspotY,
+    };
+    paintCursorRef.current?.();
+  }, []);
+  const onRemoteCursorPosition = useCallback((position: RemoteCursorPosition) => {
+    remoteCursorPositionRef.current = { ...position, at: performance.now() };
+    paintCursorRef.current?.();
+  }, []);
+  useEffect(() => {
+    touchCursorVisibleRef.current = touchCursorVisible;
+    paintCursorRef.current?.();
+  }, [touchCursorVisible]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    const inputElement = video;
     try {
       localStorage.setItem("touch-mode", touchMode);
     } catch {
@@ -140,20 +225,56 @@ function Viewer() {
     }
     let cursor = { x: 0.5, y: 0.5 };
     const paintCursor = () => {
-      const geometry = videoGeometry(
-        video.getBoundingClientRect(),
-        video.videoWidth,
-        video.videoHeight,
-      );
+      const geometry = inputGeometry();
       const stage = video.parentElement?.getBoundingClientRect();
-      if (!geometry || !stage || !cursorRef.current) return;
-      cursorRef.current.style.left = `${geometry.left - stage.left + cursor.x * geometry.width}px`;
-      cursorRef.current.style.top = `${geometry.top - stage.top + cursor.y * geometry.height}px`;
+      const element = cursorRef.current;
+      if (!geometry || !stage || !element) return;
+      const remotePosition = remoteCursorPositionRef.current;
+      const remoteShape = remoteCursorShapeRef.current;
+      const remoteActive =
+        remotePosition !== null &&
+        performance.now() - remotePosition.at < 750 &&
+        remoteShape !== null;
+      const remoteFresh = remoteActive && remotePosition.visible;
+      const position = remoteActive && remotePosition ? remotePosition : cursor;
+      const show = remoteActive ? remotePosition.visible : touchCursorVisibleRef.current;
+      element.style.display = show ? "block" : "none";
+      element.style.left = `${geometry.left - stage.left + position.x * geometry.width}px`;
+      element.style.top = `${geometry.top - stage.top + position.y * geometry.height}px`;
+      element.classList.toggle("remote-cursor", remoteFresh);
+      if (remoteFresh && remoteShape) {
+        const rect = inputElement.getBoundingClientRect();
+        const canvas =
+          inputElement.parentElement?.querySelector<HTMLCanvasElement>(".webcodecs-video");
+        const sourceWidth = inputElement.videoWidth || canvas?.width || rect.width;
+        const scale = sourceWidth > 0 ? geometry.width / sourceWidth : 1;
+        element.style.width = `${remoteShape.width * scale}px`;
+        element.style.height = `${remoteShape.height * scale}px`;
+        element.style.backgroundImage = `url(${remoteShape.url})`;
+        element.style.transform = `translate(${-remoteShape.hotspotX * scale}px, ${-remoteShape.hotspotY * scale}px)`;
+      } else {
+        element.style.width = "";
+        element.style.height = "";
+        element.style.backgroundImage = "";
+        element.style.transform = "";
+      }
     };
+    paintCursorRef.current = paintCursor;
+    function inputGeometry() {
+      const rect = inputElement.getBoundingClientRect();
+      // Safari's direct-video path renders WebCodecs frames into a canvas while
+      // the hidden video element has no track dimensions. Using zero as the
+      // source size made touch geometry null, so taps still clicked at the
+      // previous cursor position but trackpad movement never reached the host.
+      const canvas =
+        inputElement.parentElement?.querySelector<HTMLCanvasElement>(".webcodecs-video");
+      const width = inputElement.videoWidth || canvas?.width || rect.width;
+      const height = inputElement.videoHeight || canvas?.height || rect.height;
+      return videoGeometry(rect, width, height);
+    }
     const gestures = new TouchGestures({
       mode: touchMode,
-      geometry: () =>
-        videoGeometry(video.getBoundingClientRect(), video.videoWidth, video.videoHeight),
+      geometry: inputGeometry,
       send: (message) => transport.current?.controller?.sendControl(message),
       onCursor: (position) => {
         cursor = position;
@@ -171,6 +292,7 @@ function Viewer() {
     window.addEventListener("resize", paintCursor);
     paintCursor();
     return () => {
+      if (paintCursorRef.current === paintCursor) paintCursorRef.current = null;
       detach();
       resize.disconnect();
       video.removeEventListener("loadeddata", paintCursor);
@@ -191,7 +313,7 @@ function Viewer() {
       return;
     }
     const audio = audioRef.current;
-    if (audio) soundPlayback.current = new SoundPlayback(audio, setSound);
+    if (audio) soundPlayback.current = new SoundPlayback(audio, updateSound);
     const session = new SocketSession({
       video: videoRef.current,
       audio: audio ?? undefined,
@@ -210,8 +332,11 @@ function Viewer() {
         if (next.metrics) recordMetrics(next.metrics);
         setSnapshot(next);
       },
+      onCursorShape: onRemoteCursorShape,
+      onCursorPosition: onRemoteCursorPosition,
       codecChoice: () => codecChoiceRef.current,
       qualityLimits: () => qualityLimitsRef.current,
+      audioEnabled: () => !["muted", "blocked"].includes(soundStateRef.current),
       onStatus: (next, message) => {
         recordDebugEvent(`socket ${next}`, message);
         setStatus(next);
@@ -226,7 +351,15 @@ function Viewer() {
       session.dispose();
       transport.current = null;
     };
-  }, []);
+  }, [updateSound, onRemoteCursorShape, onRemoteCursorPosition]);
+
+  const soundEnabledRef = useRef(false);
+  useEffect(() => {
+    const enabled = !["muted", "blocked"].includes(sound);
+    if (soundEnabledRef.current === enabled) return;
+    soundEnabledRef.current = enabled;
+    transport.current?.controller?.setAudioEnabled(enabled);
+  }, [sound]);
 
   useEffect(() => {
     recordDebugEvent(
@@ -419,6 +552,11 @@ function Viewer() {
             </span>
           </aside>
         )}
+        {snapshot.mouseLocked && (
+          <div className="mouse-lock-hint" role="status">
+            Mouse locked · Ctrl+Alt+M or Esc to release
+          </div>
+        )}
         {touchMode === "trackpad" && live && (
           <span ref={cursorRef} className="touch-cursor" aria-hidden="true" />
         )}
@@ -572,7 +710,12 @@ function Viewer() {
                   <button
                     key={choice.value}
                     aria-pressed={choice.value === codecChoice}
-                    disabled={terminal}
+                    disabled={terminal || (choice.value === "av1" && av1DecodeSupported === false)}
+                    title={
+                      choice.value === "av1" && av1DecodeSupported === false
+                        ? "Safari/WebRTC on this device does not support AV1; use HEVC/H.264 here or the native app for AV1."
+                        : undefined
+                    }
                     onClick={() => {
                       if (choice.value !== codecChoice) setCodecChoice(choice.value);
                     }}
@@ -581,6 +724,12 @@ function Viewer() {
                   </button>
                 ))}
               </div>
+              {av1DecodeSupported === false && info.capabilities.codecs.includes("av1") && (
+                <p className="panel-hint">
+                  AV1 is unavailable in Safari/WebRTC on this device. Use HEVC/H.264 here or the
+                  native app for AV1.
+                </p>
+              )}
             </>
           )}
           <h2>Frame rate</h2>
@@ -614,11 +763,21 @@ function Viewer() {
             <button
               aria-pressed={snapshot.inputEnabled}
               disabled={!info?.remoteInput || terminal || status !== "online"}
-              title="Release input: Ctrl+Alt+Shift+Esc"
+              title="Release input: Ctrl+Alt+Shift+Esc. Toggle gaming mouse lock: Ctrl+Alt+M"
               onClick={() => transport.current?.controller?.setInputEnabled(!snapshot.inputEnabled)}
             >
               {info?.remoteInput ? `Input ${snapshot.inputEnabled ? "on" : "off"}` : "View only"}
             </button>
+            {!coarse && (
+              <button
+                aria-pressed={snapshot.mouseLocked}
+                disabled={!snapshot.inputEnabled || terminal || status !== "online"}
+                title="Toggle gaming mouse lock: Ctrl+Alt+M"
+                onClick={() => transport.current?.controller?.togglePointerLock()}
+              >
+                {snapshot.mouseLocked ? "Mouse locked" : "Mouse absolute"}
+              </button>
+            )}
             {showGamepad && (
               <button
                 aria-pressed={snapshot.gamepadEnabled}
@@ -640,6 +799,23 @@ function Viewer() {
                 onClick={() => setTouchMode(touchMode === "trackpad" ? "direct" : "trackpad")}
               >
                 {touchMode === "trackpad" ? "Trackpad" : "Direct"}
+              </button>
+            )}
+            {coarse && touchMode === "trackpad" && (
+              <button
+                aria-pressed={!touchCursorVisible}
+                onClick={() => {
+                  setTouchCursorVisible((visible) => {
+                    try {
+                      localStorage.setItem("touch-cursor", visible ? "hidden" : "shown");
+                    } catch {
+                      /* Storage may be unavailable. */
+                    }
+                    return !visible;
+                  });
+                }}
+              >
+                {touchCursorVisible ? "Cursor dot shown" : "Cursor dot hidden"}
               </button>
             )}
             <span

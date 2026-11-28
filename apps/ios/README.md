@@ -22,20 +22,41 @@ control messages the agent understands.
    and direct WebRTC UDP in tailnet policy and host firewalls. There is no STUN or TURN
    fallback, and the app does not bypass TLS validation.
 
-Touch the video to click or swipe to move the remote pointer. Pair a controller with
-iOS to forward its standard controls. The app uses native controller change events
-instead of polling; only idle keepalive uses a timer. A DualSense or DualShock profile
-requests a **virtual DualShock 4** on a Windows host with ViGEm; other supported
-profiles request an Xbox 360. This is not a native DualSense device on the host, and
-does not forward rumble, adaptive triggers, touchpad, or motion.
+The desktop fills the screen as soon as you connect. A single glass button in the
+top-right corner expands into AirPlay, touch mode and a menu for sound, paste,
+display, stream limits (frame rate, bitrate, codec, stats) and disconnect.
+
+Touch defaults to **trackpad** mode, like the web viewer: drag to move the cursor,
+tap to click, double-tap and hold to drag, two fingers to scroll or right-click,
+three fingers to middle-click, pinch to zoom. **Direct touch** (tap where you want to
+click, hold to right-click) is one tap away and remembered. Pair up to four
+controllers with iOS to forward them as independent host gamepads; each controller
+keeps a stable player slot while others join or leave. The connect screen and the
+in-session Controllers panel show how iOS recognized each controller, which virtual
+host device it maps to, its player slot, and battery level/state when GameController
+publishes it. The app uses native
+controller change events instead of polling; only active-input liveness and idle
+keepalive use a timer. A DualSense or DualShock profile requests a **virtual
+DualShock 4** on a Windows host with ViGEm; other supported profiles request an
+Xbox 360. This is not a native DualSense device on the host, and does not forward
+rumble, adaptive triggers, touchpad, or motion.
+
+Hardware keyboards forward real key down/up events, including key repeat, arrows,
+function keys and modifiers. The Keyboard button opens the iOS keyboard for text;
+its accessory strip sends Escape, Tab, navigation keys and Delete, with latchable
+Shift/Ctrl/Alt/Win modifiers for shortcuts. Text and key input use the same compact
+binary wire format as the web viewer.
 
 ## External display, no tvOS app
 
 When iOS provides a separate external-display scene, nanoctl sends only video there
-and keeps the touchpad, gamepad and connection controls on the phone. When the display
-disconnects, playback returns to the phone without a second WebRTC session.
+and keeps the touchpad, gamepad and connection controls on the phone. Direct touch is
+temporarily translated to trackpad input while mirroring because the phone no longer
+shares the video's geometry; the saved touch mode returns when the external display
+disconnects. Playback returns to the phone without a second WebRTC session.
 
-For AirPlay, select the TV from iOS Control Center. The split view requires iOS to
+For AirPlay, use **Control Center › Screen Mirroring**; the AirPlay button in the
+session controls routes sound and explains this if no second screen appears. The split view requires iOS to
 expose that AirPlay route as a separate screen. A mirrored-only route cannot show
 different phone and TV content; this prototype does not implement a separate AirPlay
 transport or promise split view on all receivers. The Simulator can exercise the
@@ -79,6 +100,32 @@ viewer alongside the summary. Native samples include decoder entry and callback,
 mailbox delivery, render start, submission and GPU completion callback. The
 summary also reports interval averages from inbound WebRTC counters (actual,
 target and minimum jitter-buffer residence, and decode time).
+
+## Repeat the bad-network Simulator harness
+
+The network probe uses the same real agent, encoder, SCTP data channels and
+VideoToolbox decoder, then applies the agent's test-only impairment at the SCTP
+send boundary. It writes `network-probe.json` in the Simulator container and the
+runner scores frame continuity, decode progress, input readiness and final state:
+
+```sh
+cargo build --release --locked --features media \
+  --manifest-path crates/nanoctl-agent/Cargo.toml
+bun apps/ios/Benchmark/network.ts \
+  apps/ios/DerivedData/Build/Products/Debug-iphonesimulator/Nanoctl.app \
+  "$SIMULATOR_ID" /tmp/nanoctl-ios-network
+```
+
+The feature flags matter: a plain `cargo build --release` produces an agent without
+RTC/media support, and the harness now fails fast instead of scoring that as an app
+regression.
+
+Scenarios are `clean` (loopback control), `lossy-wifi` (2% loss, 2% long-tail
+reorder, up to 25ms jitter, 20 Mbps), `congested` (5% loss, 10% long-tail
+reorder, up to 35ms jitter, 3 Mbps), and `service-restart` (the agent process
+stops for five seconds mid-session, then returns). Pass a scenario name as the
+fourth argument to run only one. These impairment knobs are development-only and never enable
+authentication bypass outside the loopback harness.
 
 For per-frame receive timing on this Mac-only loopback workload, start this
 capture in another terminal before the benchmark, and set

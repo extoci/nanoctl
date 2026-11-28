@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { RemoteSessionController, wheelPixels, type HostSignalRow } from "./remote-session";
-import { attachWebCodecsVideo } from "./webcodecs-video";
+import { attachDataChannelVideo, attachWebCodecsVideo } from "./webcodecs-video";
 
 const originalWindow = globalThis.window;
 const originalDocument = globalThis.document;
@@ -77,6 +77,65 @@ describe("remote session lifecycle", () => {
     await controller.stop();
   });
 
+  test("direct video stats publish even when inbound RTP stats are unavailable", async () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    const peer = new FakePeer();
+    const video = new FakeVideo();
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    (
+      controller as unknown as {
+        webCodecsVideo: {
+          directDataChannel: boolean;
+          stats: () => Record<string, unknown>;
+          takeLinkLoss: () => number;
+          drop: () => void;
+        };
+      }
+    ).webCodecsVideo = {
+      directDataChannel: true,
+      stats: () => ({
+        bytes: 12_000,
+        decoded: 30,
+        width: 1280,
+        height: 720,
+        codec: "h264",
+        packetsLost: 0,
+        dropped: 0,
+        decodeTimeMs: 30,
+        decodeTimedFrames: 30,
+      }),
+      takeLinkLoss: () => 0.02,
+      drop: () => {},
+    };
+
+    for (const callback of intervals) callback();
+    await flushSignals();
+
+    expect(controller.snapshot.metrics).toMatchObject({
+      resolution: "1280×720",
+      codec: "H.264",
+      decoder: "WebCodecs",
+      lossPercent: 2,
+      packetsLost: 0,
+      framesDropped: 0,
+    });
+    await controller.stop();
+  });
+
   test("audio is recvonly when advertised, even for view-only sessions", async () => {
     installBrowserGlobals();
     for (const enabled of [false, true]) {
@@ -125,6 +184,73 @@ describe("remote session lifecycle", () => {
       expect(audio.srcObject).toBeNull();
       if (enabled) expect(sources.at(-1)).toBeNull();
     }
+  });
+
+  test("publishes audio preference when control opens and when it changes", async () => {
+    installBrowserGlobals();
+    for (const initialAudioEnabled of [false, true]) {
+      const peer = new FakePeer();
+      const controller = new RemoteSessionController({
+        sessionId: "session",
+        controllerEpoch: "controller",
+        displays: [],
+        iceServers: [],
+        video: new FakeVideo() as unknown as HTMLVideoElement,
+        initialAudioEnabled,
+        operations: { sendSignal: async () => null, endSession: async () => null },
+        peerFactory: () => peer as unknown as RTCPeerConnection,
+        onSnapshot: () => {},
+      });
+      await controller.start();
+      const channel = peer.channels.get("nanoctl.control.v1")!;
+      channel.sent = [];
+      channel.onopen?.();
+      expect(channel.sent.map((message) => JSON.parse(message))).toContainEqual({
+        type: "audio",
+        enabled: initialAudioEnabled,
+      });
+      channel.sent = [];
+      expect(controller.setAudioEnabled(!initialAudioEnabled)).toBe(true);
+      expect(channel.sent.map((message) => JSON.parse(message))).toContainEqual({
+        type: "audio",
+        enabled: !initialAudioEnabled,
+      });
+      await controller.stop();
+    }
+  });
+
+  test("publishes physical viewport dimensions when control opens", async () => {
+    installBrowserGlobals();
+    Object.assign(window, { devicePixelRatio: 2 });
+    const peer = new FakePeer();
+    const video = Object.assign(new FakeVideo(), {
+      getBoundingClientRect: () => ({ width: 640, height: 360 }),
+    });
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [
+        {
+          id: "display",
+          name: "Display",
+          width: 1920,
+          height: 1080,
+          scaleFactor: 1,
+          primary: true,
+        },
+      ],
+      iceServers: [],
+      video: video as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+    });
+    await controller.start();
+    peer.channels.get("nanoctl.control.v1")!.onopen?.();
+    expect(
+      peer.channels.get("nanoctl.control.v1")!.sent.map((message) => JSON.parse(message)),
+    ).toContainEqual({ type: "quality", maxWidth: 1280, maxHeight: 720 });
+    await controller.stop();
   });
 
   test("clipboard is control-only and sends text before a remote paste key", async () => {
@@ -196,15 +322,27 @@ describe("remote session lifecycle", () => {
     await controller.start();
     peer.connectionState = "connected";
     peer.onconnectionstatechange?.();
-    const channel = peer.channels.get("nanoctl.control.v1")!;
+    const controlChannel = peer.channels.get("nanoctl.control.v1")!;
+    const channel = peer.channels.get("nanoctl.gamepad.v1")!;
+    expect(peer.channelConfigs.get("nanoctl.gamepad.v1")).toMatchObject({
+      ordered: false,
+      maxPacketLifeTime: 100,
+    });
     controller.setGamepadEnabled(true);
     expect(controller.snapshot.gamepadEnabled).toBe(true);
+    controlChannel.sent = [];
     channel.sent = [];
     flushAnimationFrame(1_000);
-    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+    expect(channel.sent).toEqual([]);
+    channel.sent = [];
+    expect(controller.sendControl({ type: "gamepad", pads: [] })).toBe(true);
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toEqual({ type: "gamepad", pads: [] });
+    expect(channel.sent).toEqual([]);
+    controlChannel.sent = [];
 
     peer.connectionState = "disconnected";
     peer.onconnectionstatechange?.();
@@ -217,10 +355,11 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     channel.sent = [];
     flushAnimationFrame(2_000);
-    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+    expect(channel.sent).toEqual([]);
 
     controller.setInputEnabled(false);
     expect(controller.snapshot.gamepadEnabled).toBe(false);
@@ -228,10 +367,11 @@ describe("remote session lifecycle", () => {
     expect(controller.snapshot.gamepadEnabled).toBe(true);
     channel.sent = [];
     flushAnimationFrame(3_000);
-    expect(JSON.parse(channel.sent.at(-1)!)).toMatchObject({
+    expect(JSON.parse(controlChannel.sent.at(-1)!)).toMatchObject({
       type: "gamepad",
       pads: [[0, 0, 0, 0, 0, 0, 0, 0]],
     });
+    expect(channel.sent).toEqual([]);
     await controller.stop();
   });
 
@@ -342,6 +482,10 @@ describe("remote session lifecycle", () => {
     pressKey("keydown", body, { code: "ShiftLeft", key: "Shift", shiftKey: true });
     pressKey("keyup", { tagName: "BUTTON" }, { code: "ShiftLeft", key: "Shift" });
     expect(channel.sent.map((data) => JSON.parse(data).action)).toEqual(["down", "up"]);
+    channel.sent = [];
+    for (const timeStamp of [500, 600, 760])
+      pressKey("keydown", body, { code: "KeyD", key: "d", repeat: true, timeStamp });
+    expect(channel.sent.map((data) => JSON.parse(data).repeat)).toEqual([true, true]);
     await controller.stop();
   });
 
@@ -365,6 +509,69 @@ describe("remote session lifecycle", () => {
       channel.onmessage?.({ data } as MessageEvent);
     expect(controller.snapshot.inputBlocked).toBe(1);
     expect(snapshots.at(-1)).toBe(1);
+    await controller.stop();
+  });
+
+  test("forwards host cursor metadata from control and pointer channels", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const shapes: unknown[] = [];
+    const positions: unknown[] = [];
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: new FakeVideo() as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+      onCursorShape: (shape) => shapes.push(shape),
+      onCursorPosition: (position) => positions.push(position),
+    });
+    await controller.start();
+    const control = peer.channels.get("nanoctl.control.v1")!;
+    const cursor = peer.channels.get("nanoctl.cursor.v1")!;
+    control.onmessage?.({
+      data: '{"type":"cursorShape","width":32,"height":32,"hotspotX":4,"hotspotY":2,"pixels":"AAAA"}',
+    } as MessageEvent);
+    cursor.onmessage?.({
+      data: '{"type":"cursor","x":0.25,"y":0.75,"visible":true}',
+    } as MessageEvent);
+    expect(shapes).toEqual([
+      { type: "cursorShape", width: 32, height: 32, hotspotX: 4, hotspotY: 2, pixels: "AAAA" },
+    ]);
+    expect(positions).toEqual([{ type: "cursor", x: 0.25, y: 0.75, visible: true }]);
+    await controller.stop();
+  });
+
+  test("drops reordered remote cursor positions", async () => {
+    installBrowserGlobals();
+    const peer = new FakePeer();
+    const positions: unknown[] = [];
+    const controller = new RemoteSessionController({
+      sessionId: "session",
+      controllerEpoch: "controller",
+      displays: [],
+      iceServers: [],
+      video: new FakeVideo() as unknown as HTMLVideoElement,
+      operations: { sendSignal: async () => null, endSession: async () => null },
+      peerFactory: () => peer as unknown as RTCPeerConnection,
+      onSnapshot: () => {},
+      onCursorPosition: (position) => positions.push(position),
+    });
+    await controller.start();
+    const cursor = peer.channels.get("nanoctl.cursor.v1")!;
+    for (const data of [
+      '{"type":"cursor","seq":2,"x":0.5,"y":0.5,"visible":true}',
+      '{"type":"cursor","seq":1,"x":0.1,"y":0.1,"visible":true}',
+      '{"type":"cursor","seq":3,"x":0.7,"y":0.7,"visible":true}',
+    ])
+      cursor.onmessage?.({ data } as MessageEvent);
+    expect(positions).toEqual([
+      { type: "cursor", seq: 2, x: 0.5, y: 0.5, visible: true },
+      { type: "cursor", seq: 3, x: 0.7, y: 0.7, visible: true },
+    ]);
     await controller.stop();
   });
 
@@ -403,10 +610,11 @@ describe("remote session lifecycle", () => {
       peer.channels.get("nanoctl.control.v1")!.sent = [];
       peer.channels.get("nanoctl.control.v1")!.onopen?.();
       expect(controller.snapshot.inputEnabled).toBe(false);
+      const audio = JSON.stringify({ type: "audio", enabled: true });
       expect(peer.channels.get("nanoctl.control.v1")!.sent).toEqual(
         mayControl && displays.length
-          ? [JSON.stringify({ type: "display", displayId: "secondary" })]
-          : [],
+          ? [JSON.stringify({ type: "display", displayId: "secondary" }), audio]
+          : [audio],
       );
       await controller.stop();
     }
@@ -762,7 +970,9 @@ const windowListeners = new Map<string, Set<(event: Event) => void>>();
 
 /** Delivers a key event to window listeners as if it bubbled up from `target`. */
 function pressKey(type: string, target: unknown, properties: object): void {
-  const event = Object.assign(new Event(type, { cancelable: true }), properties);
+  const { timeStamp, ...assignable } = properties as { timeStamp?: number };
+  const event = Object.assign(new Event(type, { cancelable: true }), assignable);
+  if (timeStamp !== undefined) Object.defineProperty(event, "timeStamp", { value: timeStamp });
   Object.defineProperty(event, "target", { value: target });
   for (const listener of windowListeners.get(type) ?? []) listener(event);
 }
@@ -867,6 +1077,7 @@ class FakePeer {
   stats = new Map<string, Record<string, unknown>>();
   transceivers: [string, RTCRtpTransceiverDirection | undefined][] = [];
   channels = new Map<string, FakeDataChannel>();
+  channelConfigs = new Map<string, RTCDataChannelInit | undefined>();
   sent: [string, string][] = [];
   connectionState: RTCPeerConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -876,9 +1087,10 @@ class FakePeer {
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onRemoteDescription: ((sdp: string) => void) | null = null;
 
-  createDataChannel(label: string): FakeDataChannel {
+  createDataChannel(label: string, init?: RTCDataChannelInit): FakeDataChannel {
     const channel = new FakeDataChannel((message) => this.sent.push([label, message]));
     this.channels.set(label, channel);
+    this.channelConfigs.set(label, init);
     return channel;
   }
 
@@ -953,8 +1165,663 @@ describe("webcodecs video gating and teardown", () => {
       expect(createEncodedStreamsCalls).toBe(
         codecChoice === "av1" || codecChoice === "hevc" ? 0 : 1,
       );
+      expect(peer.channelConfigs.get("nanoctl.video.v1")).toMatchObject({
+        ordered: false,
+        maxPacketLifeTime: 160,
+      });
       await controller.stop("done", false);
     }
+  });
+
+  test("data-channel decode drops resync at a keyframe instead of decoding corrupt deltas", () => {
+    installBrowserGlobals(() => 0);
+    const decoded: string[] = [];
+    let resets = 0;
+    const decoderInstances: FakeVideoDecoderForRecovery[] = [];
+    class FakeVideoDecoderForRecovery {
+      decodeQueueSize = 0;
+      constructor() {
+        decoderInstances.push(this);
+      }
+      configure() {}
+      reset() {
+        resets += 1;
+        this.decodeQueueSize = 0;
+      }
+      decode(chunk: { init: { type: string } }) {
+        decoded.push(chunk.init.type);
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoderForRecovery);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+    channel.sent = [];
+    receive(0, true);
+    receive(1);
+    expect(decoded).toEqual(["key", "delta"]);
+
+    decoderInstances[0]!.decodeQueueSize = 2;
+    receive(2);
+    expect(channel.sent).toContain("KF");
+    expect(decoded).toEqual(["key", "delta"]);
+    receive(3);
+    expect(decoded).toEqual(["key", "delta"]);
+    receive(4, true);
+    expect(decoded).toEqual(["key", "delta", "key"]);
+    expect(resets).toBeGreaterThan(0);
+  });
+
+  test("data-channel stats expose wire bytes, decode shape, and loss counters", () => {
+    installBrowserGlobals(() => 0);
+    let output: ((frame: unknown) => void) | null = null;
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      constructor(init: { output: (frame: unknown) => void }) {
+        output = init.output;
+      }
+      configure() {}
+      reset() {}
+      decode(chunk: { init: { timestamp: number } }) {
+        output?.({
+          timestamp: chunk.init.timestamp,
+          displayWidth: 1280,
+          displayHeight: 720,
+          close() {},
+        });
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    channel.onmessage?.({ data: message(0, true) } as MessageEvent);
+    channel.onmessage?.({ data: message(1, false) } as MessageEvent);
+    expect(handle.stats()).toMatchObject({
+      decoded: 2,
+      width: 1280,
+      height: 720,
+      codec: "h264",
+      bytes: 22,
+      packetsLost: 0,
+    });
+    expect(handle.stats().decodeTimedFrames).toBe(2);
+    handle.drop();
+  });
+
+  test("keyframe recovery skips do not amplify data-channel loss feedback", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+
+    receive(0, true);
+    for (let seq = 1; seq <= 10; seq += 1) receive(seq);
+    expect(handle.takeLinkLoss?.()).toBe(0);
+
+    // Lose only sequence 11. Sequences 12-28 overflow the reorder window and
+    // sequence 40 is the recovery IDR; the 29 dependent frames skipped by that
+    // IDR must not be treated as independent network loss.
+    for (let seq = 12; seq <= 28; seq += 1) receive(seq);
+    expect(channel.sent).toContain("KF");
+    receive(40, true);
+
+    const loss = handle.takeLinkLoss?.();
+    expect(loss).toBeGreaterThan(0);
+    expect(loss).toBeLessThan(0.1);
+    handle.drop();
+  });
+
+  test("post-key deltas arriving before the recovery keyframe are preserved", () => {
+    installBrowserGlobals(() => 0);
+    const decoded: number[] = [];
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode(chunk: { init: { timestamp: number } }) {
+        decoded.push(Math.round(chunk.init.timestamp / 16_000));
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+
+    receive(0, true);
+    for (let seq = 1; seq <= 10; seq += 1) receive(seq);
+    for (let seq = 12; seq <= 28; seq += 1) receive(seq);
+    expect(channel.sent).toContain("KF");
+
+    // The unordered delta lane can overtake the reliable IDR lane. Sequences
+    // 41 and 42 belong after the recovery IDR at sequence 40, so they must
+    // drain immediately after it instead of becoming another artificial gap.
+    receive(41);
+    receive(42);
+    receive(40, true);
+
+    expect(decoded).toEqual([...Array.from({ length: 11 }, (_, seq) => seq), 40, 41, 42]);
+    handle.drop();
+  });
+
+  test("fragmented recovery keyframes survive delta reorder expiry", () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    const decoded: number[] = [];
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode(chunk: { init: { timestamp: number } }) {
+        decoded.push(Math.round(chunk.init.timestamp / 16_000));
+      }
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean, part = 0, parts = 1) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const fragmented = parts > 1;
+      const bytes = new Uint8Array((fragmented ? 9 : 5) + au.length);
+      bytes[0] = seq;
+      bytes[4] = (key ? 1 : 0) | (fragmented ? 2 : 0);
+      let offset = 5;
+      if (fragmented) {
+        bytes[5] = part;
+        bytes[7] = parts;
+        offset = 9;
+      }
+      bytes.set(au, offset);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false, part = 0, parts = 1) =>
+      channel.onmessage?.({ data: message(seq, key, part, parts) } as MessageEvent);
+
+    receive(0, true);
+    for (let seq = 2; seq <= 18; seq += 1) receive(seq);
+    expect(channel.sent).toContain("KF");
+    receive(30, true, 0, 2);
+    receive(31);
+    receive(32);
+    for (const callback of intervals) callback();
+
+    // A constrained reliable IDR lane may need longer than the lossy delta
+    // reorder window. The half-received keyframe must still accept its final
+    // fragment and drain the post-key deltas that overtook it.
+    receive(30, true, 1, 2);
+    expect(decoded).toEqual([0, 30, 31, 32]);
+    handle.drop();
+  });
+
+  test("keyframe requests use the reliable idr channel when present", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const idrChannel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      idrChannel as unknown as RTCDataChannel,
+      video as unknown as HTMLVideoElement,
+    );
+    expect(idrChannel.sent).toContain("KF");
+    expect(channel.sent).not.toContain("KF");
+  });
+
+  test("data-channel loss requests recovery as soon as the reorder window overflows", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(17 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes[7] = 1;
+      bytes.set(au, 17);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+    receive(0, true);
+    channel.sent = [];
+    for (let seq = 2; seq <= 17; seq += 1) receive(seq);
+    expect(channel.sent).not.toContain("KF");
+    receive(18);
+    expect(channel.sent).toContain("KF");
+  });
+
+  test("data-channel loss recovery does not wait for sixteen frames at low frame rates", () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false) =>
+      channel.onmessage?.({ data: message(seq, key) } as MessageEvent);
+    const originalNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    try {
+      receive(0, true);
+      channel.sent = [];
+      now = 1_100;
+      receive(2);
+      receive(3);
+      expect(channel.sent).not.toContain("KF");
+      now = 1_501;
+      for (const callback of intervals) callback();
+      expect(channel.sent).toContain("KF");
+    } finally {
+      Date.now = originalNow;
+      handle.drop();
+    }
+  });
+
+  test("data-channel reassembly tolerates fragmented frames interleaved with newer sequences", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean, part = 0, parts = 1) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const fragmented = parts > 1;
+      const bytes = new Uint8Array((fragmented ? 9 : 5) + au.length);
+      bytes[0] = seq;
+      bytes[4] = (key ? 1 : 0) | (fragmented ? 2 : 0);
+      let offset = 5;
+      if (fragmented) {
+        bytes[5] = part;
+        bytes[7] = parts;
+        offset = 9;
+      }
+      bytes.set(au, offset);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false, part = 0, parts = 1) =>
+      channel.onmessage?.({ data: message(seq, key, part, parts) } as MessageEvent);
+    receive(0, true);
+    channel.sent = [];
+    receive(1, false, 0, 2);
+    for (let seq = 2; seq <= 17; seq += 1) receive(seq);
+    expect(channel.sent).not.toContain("KF");
+    receive(1, false, 1, 2);
+    expect(channel.sent).not.toContain("KF");
+  });
+
+  test("idle heartbeat sequence watermarks expose a lost final delta", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const frame = (seq: number, key: boolean) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const bytes = new Uint8Array(5 + au.length);
+      bytes[0] = seq;
+      bytes[4] = key ? 1 : 0;
+      bytes.set(au, 5);
+      return bytes.buffer;
+    };
+    const heartbeat = (seq: number) => {
+      const bytes = new Uint8Array(5);
+      bytes[0] = seq;
+      bytes[4] = 8;
+      return bytes.buffer;
+    };
+    const receive = (data: ArrayBuffer) => channel.onmessage?.({ data } as MessageEvent);
+    receive(frame(0, true));
+    channel.sent = [];
+    receive(heartbeat(1));
+    expect(channel.sent).not.toContain("KF");
+    receive(heartbeat(2));
+    expect(channel.sent).toContain("KF");
+  });
+
+  test("incomplete access-unit loss requests keyframe recovery after the reorder window", () => {
+    installBrowserGlobals(() => 0);
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    const message = (seq: number, key: boolean, part = 0, parts = 1) => {
+      const au = key ? [0, 0, 0, 1, 0x65, 1] : [0, 0, 0, 1, 0x41, 1];
+      const fragmented = parts > 1;
+      const bytes = new Uint8Array((fragmented ? 9 : 5) + au.length);
+      bytes[0] = seq;
+      bytes[4] = (key ? 1 : 0) | (fragmented ? 2 : 0);
+      let offset = 5;
+      if (fragmented) {
+        bytes[5] = part;
+        bytes[7] = parts;
+        offset = 9;
+      }
+      bytes.set(au, offset);
+      return bytes.buffer;
+    };
+    const receive = (seq: number, key = false, part = 0, parts = 1) =>
+      channel.onmessage?.({ data: message(seq, key, part, parts) } as MessageEvent);
+    receive(0, true);
+    channel.sent = [];
+    receive(1, false, 0, 2);
+    for (let seq = 2; seq <= 17; seq += 1) receive(seq);
+    expect(channel.sent).not.toContain("KF");
+    receive(18);
+    expect(channel.sent).toContain("KF");
+  });
+
+  test("waiting for a keyframe retries the recovery request", () => {
+    const intervals: (() => void)[] = [];
+    installBrowserGlobals((callback) => {
+      intervals.push(callback);
+      return intervals.length;
+    });
+    class FakeVideoDecoder {
+      decodeQueueSize = 0;
+      configure() {}
+      reset() {}
+      decode() {}
+      close() {}
+    }
+    class FakeEncodedVideoChunk {
+      constructor(public readonly init: unknown) {}
+    }
+    class FakeTrackGenerator {
+      track = { stop() {} };
+      writable = new WritableStream();
+    }
+    defineGlobal("VideoDecoder", FakeVideoDecoder);
+    defineGlobal("EncodedVideoChunk", FakeEncodedVideoChunk);
+    defineGlobal("MediaStreamTrackGenerator", FakeTrackGenerator);
+    const video = Object.assign(new FakeVideo(), {
+      ownerDocument: { createElement: () => ({}) },
+    });
+    const channel = new FakeDataChannel();
+    (window as unknown as { __noEarlyKf?: boolean }).__noEarlyKf = true;
+    const handle = attachDataChannelVideo(
+      channel as unknown as RTCDataChannel,
+      null,
+      video as unknown as HTMLVideoElement,
+    );
+    expect(channel.sent).not.toContain("KF");
+    for (const callback of intervals) callback();
+    expect(channel.sent).toContain("KF");
+    channel.sent = [];
+    handle.drop();
+    for (const callback of intervals) callback();
+    expect(channel.sent).not.toContain("KF");
   });
 
   test("webcodecs teardown does not clear an unowned video srcObject", async () => {
@@ -1009,8 +1876,15 @@ describe("webcodecs video gating and teardown", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(decoderError).not.toBeNull();
+    // A single decoder error is not fatal: the decoder is rebuilt on the next
+    // keyframe and the RTP leg stays untouched.
     decoderError!(new Error("Decoding error"));
-
+    expect(video.srcObject).toBe(liveStream);
+    expect(teardownNotified).toBe(0);
+    // Repeated failure gives up on the WebCodecs path so the session falls
+    // back to RTP video.
+    decoderError!(new Error("Decoding error"));
+    decoderError!(new Error("Decoding error"));
     expect(video.srcObject).toBe(liveStream);
     expect(teardownNotified).toBe(1);
     handle.drop();

@@ -504,3 +504,477 @@ runtime, not one static tuple. The sweeps define the policy table:
 - Debugging needed first: per-second time-series (fps/kbps/encode_ms)
   in media-smoke JSON + effective-param echo, so adaptation is
   observable and re-sweeps stay honest.
+
+## Adaptive encoder negotiation (cycle 24-25)
+
+Shipped: content-driven parameter negotiation for the x264 backend.
+`AdaptPolicy` (in `x264_encoder.rs`) watches per-frame encode_ns and AU
+bytes, promotes after ~150 easy frames under 30% encode budget / 50%
+VBV, demotes after ~20 stressed frames, drops straight to tier 0 on
+hard overload. Tier switches re-open the encoder (profile/ME can't
+reconfig) + force an IDR. Viewer `webcodecs-video.ts` re-configures
+the decoder when the in-band SPS profile changes between IDRs.
+Kill-switch: `NANOCTL_X264_ADAPT=0`; any env-pinned knob
+(PROFILE/ME/SUBME) is excluded from adaptation.
+
+| tier | params                   | when                  |
+| ---- | ------------------------ | --------------------- |
+| 0    | baseline / hex / subme 2 | default + stressed    |
+| 1    | + high (CABAC, 8x8)      | sustained easy window |
+| 2    | + umh                    | still easy at tier 1  |
+
+Measured (15s smokes; per-second tier in JSON makes it observable):
+
+- motion: promotes 0->1 @ ~4s, 1->2 @ ~7s, holds. Steady tier-2
+  seconds ~135kbps vs ~235 tier-0 (-42%), fps 58.2, encode p50
+  4.6ms, PSNR p05 56.5dB - same quality, ~2 extra IDRs total.
+- noise (worst case): stays tier 0, 0 switches, 55fps, 10.9Mbps,
+  encode p50 10.4ms - identical to the fixed baseline, zero
+  regression by construction (same params, EWMA overhead only).
+
+Observability: `x264_tier` per-second field + `x264_adapt_tier` /
+`x264_adapt_switches` top-level in smoke JSON; `tracing::info!` on
+every switch.
+
+## NR / scenecut / fast-path sweep on noise (cycle 26)
+
+New env knobs `NANOCTL_X264_NR` (x264 `analyse.i_noise_reduction`) and
+`NANOCTL_X264_SCENECUT` (`i_scenecut_threshold`, default stays 0).
+Worst-case noise, 15s smokes (baseline: 53.8fps, 10.6Mbps, encode
+10.6ms, PSNR p05 24.07dB, tier 0 / 0 switches):
+
+| env             | fps  | Mbps  | enc ms | p05 dB |
+| --------------- | ---- | ----- | ------ | ------ |
+| baseline        | 53.8 | 10.62 | 10.57  | 24.07  |
+| NR=150          | 53.6 | 10.60 | 10.56  | 24.08  |
+| NR=300          | 54.3 | 10.73 | 10.38  | 24.07  |
+| NR=600          | 52.9 | 10.42 | 10.50  | 24.08  |
+| NR=1000         | 53.0 | 10.44 | 10.69  | 24.08  |
+| ME=dia          | 55.9 | 11.03 | 9.90   | 24.08  |
+| TUNE=fastdecode | 56.9 | 11.11 | 10.20  | 24.02  |
+
+Rejected — all flat or +4%-bits-for-+4%-fps trades: under noise the
+encoder is VBV-capped (CRF unreachable), so denoising has no bits to
+recover and cheaper analysis only buys fps at the cap's bitrate.
+Flash scene sanity: 57fps / 292kbps / 57.5dB, adapt promotes
+correctly to tier 1 between flashes.
+
+## Adaptive tier 3: slower preset on easy content (cycle 27)
+
+Tier ladder extended: 0 baseline/hex/subme2, 1 +high, 2 +umh, 3 =
+preset `fast` + subme 6 (preset env-pinned via `NANOCTL_X264_PRESET`
+masks it like the other knobs). Policy `MAX_TIER` 2->3; promotion
+still requires <30% encode budget and <50% VBV for ~150 frames, so
+tier 3 only engages on easy content and demotes on any stress.
+
+Measured (20s motion smoke): 0->1 @ ~2s, ->2 @ ~5s, ->3 @ ~8s, holds
+
+- steady tier-3 ~128-133kbps vs ~135 tier-2 (-4%), PSNR p05 56.5dB,
+  fps 57.5. Encode p50 5.78ms overall (fits under the 55% stress
+  threshold; anything slower than `fast` would not). Noise: tier 0,
+  0 switches, metrics identical - no regression by construction.
+
+## Real-content + live demotion (cycle 28)
+
+ffplay fullscreen on screen during media-smoke (real video instead of
+synthetic scenes):
+
+| content                       | tier | fps  | avg kbps | p05 dB |
+| ----------------------------- | ---- | ---- | -------- | ------ |
+| Big Buck Bunny 720p (cartoon) | 3    | 58.4 | 292      | 56.1   |
+| testsrc2 lavfi (dense charts) | 0    | 51.8 | 10258    | 24.05  |
+
+testsrc2 is effectively worst-case: dense per-frame-changing detail
+lands within ~4% of the per-pixel-noise numbers, so synthetic noise is
+a representative hard bound. BBB promotes to tier 3 and sits at
+~240-290kbps steady - real video between the two synthetic extremes.
+
+Mid-stream hard transition (motion 9s -> noise): adapt climbed to
+tier 3, then hard-dropped 3->0 inside the first noise second; the
+transition second dipped to 50fps (vs 54-56 steady) during the
+re-open, then matched pure-noise metrics exactly. Worst-case safety
+holds end-to-end, not just in the unit test.
+
+## Faster promotion ramp (cycle 29)
+
+Per-step ease windows `[60, 90, 150]` frames (was a flat 150): tier 1
+(CABAC, cheap) engages ~1s in, tier 3 stays careful at ~2.5s of ease.
+Motion reaches tier 3 at ~5s vs ~8s (-38% time-to-optimal); steady
+state unchanged ~135kbps / 56.6dB / 57.9fps; noise tier 0, 0 switches.
+
+Also swept under noise and rejected: threads=4 (+6% fps, +80% bits,
++0.8dB), AQ modes 1/2/3 (flat - noise is CRF-bound at ~11Mbps against
+the 24Mbps VBV cap, not VBV-bound).
+
+## Trellis sweep + latency-mode comparison (cycle 30)
+
+`NANOCTL_X264_TRELLIS` env knob → `analyse.i_trellis` (default 0).
+Rejected hard: trellis=1/2 under noise → encode 10.4→30ms, fps
+55→25-26 (pipe becomes encode-bound); motion flat (218 vs 216kbps).
+
+Latency-mode A-B (VBV window: Resp=1f, Balanced=2f, Quality=4f):
+
+| mode           | noise kbps | noise fps | noise dB | queue p50 ms | motion kbps | motion dB |
+| -------------- | ---------- | --------- | -------- | ------------ | ----------- | --------- |
+| responsiveness | 10,620     | 55.2      | 23.9     | ~0.9         | 203         | 56.7      |
+| balanced       | 15,113     | 50.3      | 24.7     | 8.5          | 256         | 55.1      |
+| quality        | 19,889     | 50.6      | 25.2     | 8.6          | 253         | 55.3      |
+
+Balanced/Quality add ~8.5ms of encode queueing AND 42-88% more bits
+for +0.8-1.3dB under noise, and _lower_ motion PSNR. Responsiveness is
+the best mode on every axis with the adaptive encoder — the larger VBV
+windows just let rate control spend more under CRF-bound content.
+
+## Input→photon decomposition (cycle 31)
+
+`input-photon.ts`: CDP `Input.dispatchMouseEvent` into the viewer page
+→ remote DC → SendInput → band `INPUT_COUNT` bump decoded from the
+stream. 10 clicks, loopback: **p50 48ms / min 43 / mean 55** while the
+same run's clock-marker G2G read p50 61ms — the input lane (reliable DC
+
+- coalesced motion watch-channel) adds ≈0-5ms over the video path;
+  input→photon is entirely pipeline-bound, nothing to shave.
+
+## fps decimation disproven + trivial-content tier skip (cycle 32)
+
+`max_fps=30` under noise: 11.57Mbps vs 10.62 at 60fps, PSNR 25.0 vs
+23.9 — halving the frame rate does NOT halve bits; x264 refills the
+per-frame VBV budget and returns quality instead (+1.1dB). The
+fps-degrade lever is dead: it costs fps for ~0 bit savings.
+
+input→photon under noise: p50 49ms / mean 59 (n=8) — same as clean
+pipeline; the input lane survives worst-case unchanged.
+
+`AdaptPolicy` promotion can now jump `tier+2` when content is
+trivially easy (encode EWMA <12% budget AND bytes <20% cap) — saves
+one re-open/IDR burst on attaches to near-idle desktops. Verified as
+a no-op on this VM: even a static desktop encodes ~5.5ms/frame
+(>12%), so all scenes still promote 0→1→2→3 stepwise; worst case
+unchanged (noise tier 0, 0 switches).
+
+## Live wire bytes vs smoke (cycle 33)
+
+`window.__dcv.bytes` added to the viewer (sum of DC message bytes). Measured
+live under `band --motion --height 300` on loopback: steady-state wire rate
+~179 kbps vs media-smoke encode output ~190 kbps for the same scene — parity
+within measurement noise. The initial attach replay burst (~400KB: latest
+keyframe + replayed deltas) is one-time and amortizes to nothing on any
+session longer than ~30s. Conclusion: smoke numbers are honest wire numbers;
+no hidden overhead in the live path.
+
+## Idle + install-size axes (cycle 34)
+
+Measured on this VM (8 logical CPUs):
+
+| Condition                | nanoctl agent                    | Sunshine                       |
+| ------------------------ | -------------------------------- | ------------------------------ |
+| Idle, no viewer          | 0.0% CPU, pipeline fully stopped | 0.0% CPU, ~31MB RSS            |
+| Streaming static desktop | ~8.6% CPU, ~115MB RSS            | ~21% CPU, ~112MB RSS (earlier) |
+
+The streaming-static cost is xcap's Windows pull model (continuous frame
+readback at capture cadence; no dirty-rect events — Linux gets XDamage, macOS
+ScreenCaptureKit). The producer skips encode on unchanged frames; remaining
+cost is capture readback (~4.3ms) + compare (~0.9ms) per poll — platform floor
+on this backend.
+
+Install/runtime footprint: nanoctl agent = 20MB exe + 2MB libx264 = **22MB**,
+viewer = any browser (0 install). Sunshine = 96MB, Moonlight client = 103MB —
+total stack ~199MB vs ~22MB (**~9x lighter**, and the client side needs nothing
+installed at all).
+
+Flash-scene adapt verification (same cycle): `band --flash` → tier 0, 0
+switches, ~1.1Mbps — policy correctly refuses promotion under byte-spiky
+content.
+
+## Sunshine matched-scene A-B (cycle 35)
+
+Moonlight CLI `stream 127.0.0.1 Desktop` against Sunshine on the same
+`band --motion` scene (pktmon can't count loopback bytes; figures are
+Sunshine's logged wire target + process sampling):
+
+|                  | Sunshine+Moonlight                        | nanoctl                                          |
+| ---------------- | ----------------------------------------- | ------------------------------------------------ |
+| Encoder          | libx264 software, High L4.2               | x264 software, adaptive tier (baseline→high+UMH) |
+| Wire bitrate     | fixed target 14,988 kbps                  | ~190 kbps adaptive (**~79x less**)               |
+| Server CPU / RSS | 13.8%, 105MB                              | ~8.6-13%, ~115MB                                 |
+| Client CPU / RSS | Moonlight 56.5% (FFmpeg sw decode), 129MB | Chrome viewer ~4%, ~466MB                        |
+
+Sunshine's CBR-ish target means its bitrate is content-independent — the gap
+is largest exactly where adaptivity pays (static/motion desktop). Under
+worst-case noise nanoctl still sends ~11.2Mbps < 15Mbps. Client-side the
+browser viewer costs 1/14th the CPU of Moonlight's software-decode path but
+~3.5x the RSS.
+||||||| parent of a5aff93 (viewer: open the signaling socket alongside /v1/info)
+
+## Session startup round trips (cycle 36)
+
+`connect-bench.ts <base-url> [N]` (Playwright Chromium, fresh page per run)
+timestamps navigation → signaling `WebSocket` created → server hello →
+`RTCPeerConnection` connected. RTT modeled with `tc qdisc add dev lo root
+netem delay 20ms` (40ms RTT) against a Linux loopback agent, n=15 medians:
+
+| variant                          | ws    | hello | connected |
+| -------------------------------- | ----- | ----- | --------- |
+| 0ms: `/v1/info` gates the socket | 73.8  | 75.6  | 166.1     |
+| 0ms: `/v1/info` alongside socket | 62.1  | 67.5  | 149.2     |
+| 40ms RTT: gated                  | 186.1 | 307.8 | 588.9     |
+| **40ms RTT: alongside**          | 144.2 | 266.3 | **548.5** |
+
+The hello already carries the host info, so the serialized `/v1/info` fetch
+cost exactly one RTT on every connect and reconnect. It still runs (its 403
+body is the only verbatim refusal explanation): a socket that fails before
+hello waits for its outcome before retrying.
+
+## DXGI dirty-rect capture (cycle 37)
+
+Replaced the xcap DDAPI recorder (full-texture readback + full-frame memcmp
+every composite) with a custom `IDXGIOutputDuplication` path that honors
+`GetFrameDirtyRects`/`GetFrameMoveRects`: only dirty regions are copied
+GPU→staging→CPU, frames emit only when the desktop actually presented
+changes, and `backend_changed` carries the backend's own change verdict so
+the producer skips the full-frame memcmp entirely. `NANOCTL_DXGI_CAPTURE=0`
+restores the xcap path.
+
+A-B, same `band --clock` scene, adapt pinned off (single nanoctl proc):
+
+|               | xcap path      | DXGI dirty-rect |
+| ------------- | -------------- | --------------- |
+| Agent CPU     | 10.9%          | **6.1% (−44%)** |
+| fps / bitrate | 58.2 / 106kbps | 58.0 / 101kbps  |
+
+Worst case (`band --noise`, full-screen dirty every frame): 58.2fps /
+19.4Mbps / tier 0 — no regression vs the xcap path. Remaining known cost:
+`accum` still clones ~7.7MB per emit (~1% CPU); a generation-tracked buffer
+recycle could reclaim it later. On a real GPU box the compositor path is the
+same API — dirty rects should help even more where present rates are 144Hz+.
+
+## Emit-buffer recycling (cycle 38)
+
+`LatestFrame` now stashes pixel buffers of fully-dropped `CapturedFrame`s,
+tagged by emit generation; the DXGI capture thread reuses them instead of
+`accum.clone()`-ing 7.7MB per emit. A recycled buffer emitted `g` gens ago
+is brought current by replaying `patch_log` — the swizzled dirty-region
+pixels of recent small-dirty emits (dirt >25% of the frame clears the log,
+so worst case degenerates to the clone, never worse).
+
+Same `band --clock` A-B: agent CPU **6.1% → 5.6%**; cumulative vs xcap path
+**10.9% → 5.6% (−49%)**. fps/bitrate unchanged (58.1 / 108kbps); noise
+worst case unchanged (57.3fps / 19.2Mbps / tier 0).
+
+## Cycle 39 — G2G A-B: DXGI dirty-rect emit-on-present vs xcap poll (2026-11-25)
+
+Same rig/scene (`band --clock --height 80 --fps 120`), same agent binary, only `NANOCTL_DXGI_CAPTURE` toggled. g2g-probe, n≈600-1000 per run:
+
+| capture                       | G2G p50  | mean      | p99   | agent CPU (clock scene) |
+| ----------------------------- | -------- | --------- | ----- | ----------------------- |
+| DXGI dirty-rect (default)     | 41-42 ms | 43.1-43.6 | 78-79 | ~5.6 %                  |
+| xcap (NANOCTL_DXGI_CAPTURE=0) | 48 ms    | 48.7      | 73    | ~15.7 %                 |
+
+**DXGI path is also a glass-to-glass win: −6.4 ms p50 vs xcap** — emitting on present beats xcap's fixed-poll cadence. Absolute p50 drifts run-to-run (~34-42 ms across cycles on this ~30 Hz composite VM); only same-rig A-B deltas are comparable.
+
+## Cycle 40 — wire jitter under motion (2026-11-25)
+
+dcv-snap, `band --motion`, 20 s window: 926 deltas, **0 gaps, 0 KF resyncs, 0 decode-drops**; transit avg 1.43 ms, decode avg 1.09 ms (~46 fps consumed). No queueing behind IDR bursts or decode backlog — axis verified clean, nothing to climb.
+
+## Cycle 41 — MMCSS "Pro Audio" thread registration (2026-11-25)
+
+DXGI capture thread, xcap forwarder and encode producer now register with MMCSS `Pro Audio` (`AvSetMmThreadCharacteristicsW` via `Win32_System_Threading`), same trick Sunshine uses for gaming latency scheduling.
+
+G2G A-B, `band --clock`, same rig/session phase (n≈600-1300/run):
+
+|        | p50       | mean     | p99       |
+| ------ | --------- | -------- | --------- |
+| before | 41-42 ms  | 43.6     | 78-79     |
+| MMCSS  | **38 ms** | **39.4** | **63-65** |
+
+**−3.5 ms p50, −14 ms p99** — scheduling-jitter tail mostly gone. Noise fps unchanged (57.8); 60/60 media tests pass.
+
+## Cycle 42 — consolidated smoke table post-MMCSS + flash worst-case (2026-11-25)
+
+- `band --clock`: 58.1fps / 186kbps / enc p50 5.26ms / adapt→tier3
+- `band --motion`: 58.3fps / 149kbps / enc p50 5.13ms / adapt→tier3
+- `band --flash` (full-frame periodic flips): 58.2fps / ~8-32KB/s steady, enc max 13.2ms / adapt→tier3 — no bursts, recycle clone-fallback clean
+- Harness gotcha found: an occluded benchwin window emits nothing under DXGI (fake ~147kbps noise run vs real ~19Mbps) — scene must be visible on the composited screen for smoke numbers to count.
+
+## Cycle 43 — pipeline CPU/RSS under small-dirty motion scene (2026-11-25)
+
+Measured on the media-smoke pipeline (in-process, 30s window under `band --motion --fps 120`):
+
+- Agent pipeline: **8.6% CPU (of 8 cores) / 98MB RSS**, 58.1fps / 241kbps / encode p50 6.33ms.
+- Delta vs static clock scene (~5.6-6.1%): +2.5% is mostly x264 encode of the moving block — capture diff/copy path adds little under small dirty rects.
+- Tooling: `bench/cpu-agent.ps1` (agent by working set) and `bench/cpu-smoke.ps1` (smoke by command line) — cpu2.ps1 breaks when >1 nanoctl process exists (service + agent, or agent + smoke).
+
+## Cycle 45-46 — worst-case re-verification + wire under load (2026-11-25)
+
+- `band --noise --height 1200` (unoccluded): **57.6fps / 21.0Mbps / encode p50 11.46ms / 0 adapt switches** (tier 0 held — correct). No regression vs historical ~57-58fps/19-21Mbps.
+- Live DC under ~14Mbps sustained to a real viewer (noise strip visible above Chrome): **transit avg 4.08ms** (vs 1.4ms at low bitrate), decode 2.79ms, present 5.96ms, **0 seq gaps / 0 KF requests / 0 decode drops** — no send-queue backup at wire worst case.
+- Harness note: `--noise` fills below the 56px band; worst case needs `--height 1200`. `--height 600` + a non-overlapping Chrome window keeps both scene and viewer composited (an occluded scene emits nothing — see cycle 42).
+
+## Cycle 47 — input lane under worst-case video load (2026-11-25)
+
+`band --clock --noise --height 600` (clock marker + noise load, ~16Mbps wire):
+
+- input→photon **p50 84ms** vs ~48ms idle — but G2G context also rose to p50 68ms (encode 11.5ms + transit 4.1 + decode 2.8 + present ~6 under load).
+- Input lane delta vs G2G ≈ +16ms ≈ idle (+~10ms) — **no SCTP head-of-line blocking**: input keeps pace with the video path under worst-case bitrate.
+- First G2G-under-noise datapoint: ~68ms p50 vs ~38ms clock-scene — worst-case inflation is encode-time dominated (11.5ms/frame), consistent with the swept x264 trade table.
+
+## Cycle 48 — ICE-dip + DXGI starvation watchdog: recovery ~15s → ~1s (2026-11-25)
+
+- `netsh advfirewall` UDP blocks on 127.0.0.1 do **not** touch loopback WebRTC traffic (msgs flowed at full rate through the "block") — Windows doesn't filter localhost.
+- Working dip method (from the gamepad-testing skill): `NtSuspendProcess`/`NtResumeProcess` on the agent process. 7s suspension = real partition: media + signaling stall, Chrome marks `disconnected` at ~5s; keep it under the 15s `Failed` watchdog.
+- Recovery profile after a 7s suspend (pre-fix): msgs frozen 7s → ~1 msg/s trickle for ~15s → full ~57/s. Root cause in agent.log: ICE reconnected in 200ms but `frames_captured` stayed flat — the DXGI duplication session went stale during the freeze and `AcquireNextFrame` kept returning `WAIT_TIMEOUT` instead of `ACCESS_LOST`, so the rebuild path never fired; the trickle was keepalive IDRs.
+- Fix: capture-thread watchdog — no fresh frame for ≥4s → rebuild `Duplication` (same path as `ACCESS_LOST`). Post-fix dip: **frozen 7s → full ~58 msg/s within ~1s of resume**, 0 seq gaps, 0 KF requests.
+- Caveat: a process freeze also stops the producer (a pure network partition would let the encoder keep filling the DC backlog → `dc_skips` → seq gaps → KF resync — untested; needs two machines).
+- Also on this branch: `EncoderBackend::encode` gated `#[cfg(test)]` (windows-2025 clippy `dead_code` on a newer toolchain; its one runtime caller now uses `encode_format` directly).
+- Noted during the same run: decoded ~47/s vs ~58 emitted/s = negotiated-fps pacer, not a drop defect.
+
+## Cycle 49 — fps "gap" debunked + multi-viewer baseline (2026-11-25)
+
+- **fps fidelity is perfect, ceiling is the VM**: smoke fresh_frames 530/698 (44.2 fresh/s) matches live agent capture ~45/s exactly — capture ≈ encode ≈ deliver end-to-end with no internal drops. Smoke's 58fps headline counts stale re-encodes. Display is 60Hz; the compositor delivers ~45fps under streaming load on this GPU-less box. Lifting fps needs real hardware, not pipeline work.
+- **Multi-viewer measured: one active stream, newest attach wins.** 3 concurrent tabs: first streams 45.6fps, others frozen — `DataChannelVideo.channel`/`idr_channel` are single `Mutex<Option<…>>` slots in rtc.rs, so each new viewer's channel replaces the previous one. Older viewers never error; their seq just stops. No fanout today — a real fix is architectural (per-channel fanout), recorded here as the baseline before any multi-client work.
+
+## Cycle 50 — adaptive tier-dependent x264 thread count
+
+Axis: worst-case encode time. Prior sweeps showed threads=4 wins everything on
+incompressible noise (−34% encode, equal quality/bits) but costs ~1dB/+8% bits
+on easy motion content — neither fixed default is no-trade. The adaptive
+negotiator already re-opens the encoder on tier transitions, so thread count
+is now tier-dependent: tier 0 (stress/worst-case) → 4 slice threads, tiers 1-3
+→ 2. `NANOCTL_X264_THREADS` still pins and opts out of adaptation.
+
+Measured (same binary, env-pinned A-B, noise 1600x1200 worst case):
+
+| config                     | fps  | encode p50 | capture→encode p50 | bitrate  | PSNR p50 |
+| -------------------------- | ---- | ---------- | ------------------ | -------- | -------- |
+| tier0 threads=4 (adaptive) | 46.5 | 8.28ms     | 18.1ms             | 17.0Mbps | 17.3dB   |
+| threads=2 pinned           | 46.0 | 11.21ms    | 19.96ms            | 16.9Mbps | 17.3dB   |
+
+Encode −26%, capture→encode −1.9ms, quality/bitrate identical — pure win.
+Motion (band --height 600): promotes to tier 3 within the window, 57.5fps,
+284kbps, PSNR p05 57.1dB — threads back to 2 on easy content, no regression.
+Clock: 58fps, 219kbps, tier 3. x264 clamps slice threads on short frames
+(~64 rows/thread); unit tests assert at height 320.
+
+## Cycle 51 — tier-0 thread count: fixed 4 → x264 auto
+
+Follow-up sweep on the noise worst case (same binary, env-pinned):
+
+| threads  | fps  | encode p50 | capture→encode p50 |
+| -------- | ---- | ---------- | ------------------ |
+| 4        | 58.2 | 8.04ms     | 16.8ms             |
+| 6        | 58.2 | 6.56ms     | 15.3ms             |
+| 8        | 58.0 | 5.91ms     | 14.7ms             |
+| 0 (auto) | 58.1 | 6.06ms     | 14.3ms             |
+
+PSNR identical (17.15 p50) at 4 vs 8, bitrate parity. Auto scales with core
+count, so tier 0 now uses x264 auto-threads (8 on this box) — cumulative
+worst-case encode 11.2→~6ms vs the pre-cycle-50 default. Tiers 1-3 stay at 2
+(bit-efficiency measured better on easy content).
+
+## Cycle 53 — convert cost measured, tier-0 preset frontier swept (all trades rejected)
+
+`media-smoke` now reports `color_convert_mean_milliseconds` (per-frame RGBA→I420
+conversion, inside encode time). Worst-case noise: **0.755ms of 7.26ms encode** —
+parallelizing conversion is at best a ~10% encode win, deprioritized.
+
+Preset frontier at tier 0 (noise worst case, 3-run means, PSNR identical everywhere):
+
+| preset             | fps  | encode p50 | bitrate  | PSNR p50 |
+| ------------------ | ---- | ---------- | -------- | -------- |
+| veryfast (default) | 45.6 | 7.78ms     | 16.7Mbps | 17.33dB  |
+| superfast          | 49.6 | 6.44ms     | 18.1Mbps | 17.31dB  |
+| ultrafast          | 55.2 | 5.55ms     | 21.2Mbps | 17.34dB  |
+
+Faster presets buy encode time and fps with bits at equal quality — a trade,
+not a hill-climb win, so the default is unchanged. The frontier belongs in
+network-adaptive negotiation: when RTT/loss prove bandwidth headroom, faster
+presets are nearly free latency; when congested, compression efficiency wins.
+That coupling (adapt tiers are content-driven today, RateController is
+network-driven) is the next structural axis. Also learned: single-run noise
+fps/bitrate swing ±20% on this VM — worst-case comparisons need 3-run means.
+
+## Cycle 54 — responsiveness becomes the default latency mode (2026-11-25)
+
+Cycle 30 had already shown Responsiveness dominating Balanced with the adaptive
+encoder, but the configuration default still said Balanced. Re-ran the worst
+case on this rig (`band --noise --height 1200`, 15s, two runs per mode,
+24Mbps ceiling, x264 tier 0 with 0 switches in every run):
+
+| mode           | fps  | bitrate | encode p50 | capture→encode p50 | PSNR p50 |
+| -------------- | ---- | ------- | ---------- | ------------------ | -------- |
+| balanced       | 56.0 | 22.38M  | 6.08ms     | 14.39ms            | 17.27dB  |
+| responsiveness | 57.3 | 20.96M  | 5.55ms     | 13.95ms            | 17.19dB  |
+
+Responsiveness is **+2.3% fps, −6.3% bitrate, −8.7% encode time and −0.44ms
+capture→encode** for a negligible −0.09dB on uncompressible noise; realistic
+motion was already measured better in cycle 30. It is now the default.
+`latency_mode = "balanced"` and `"quality"` remain available explicitly.
+
+## Cycle 55 — DXGI-damage partial RGBA→I420 conversion (2026-11-25)
+
+The conversion itself is bit-exact per 2x2 pixel block, so unchanged pixels do
+not need to be reconverted. DXGI dirty/move rects are accumulated relative to
+the last encoded frame (including pacer-skipped and encoder-busy replacements),
+expanded to conservative 16x16 macroblock coverage, and used to convert only
+damaged rows in the persistent I420 buffer. Fragmented or >=30% damage falls
+back to full conversion. A unit test asserts partial output is byte-identical
+to full conversion, including damage on the final row of a converted block.
+
+Clock motion (`band --clock --height 80`, 10s, two runs each, x264 adapt pinned
+to tier 0):
+
+| path     | fps   | bitrate | encode p50 | convert mean | capture→encode p50 | PSNR p50 |
+| -------- | ----- | ------- | ---------- | ------------ | ------------------ | -------- |
+| baseline | 58.18 | 324kbps | 2.826ms    | 0.436ms      | 11.142ms           | 52.36dB  |
+| partial  | 58.12 | 335kbps | 2.419ms    | 0.034ms      | 10.466ms           | 52.27dB  |
+
+Partial conversion is **−92.1% conversion time, −14.4% encode p50 and −0.68ms
+capture→encode** at fps/PSNR parity. Bitrate stays within this scene's run-to-
+run variance (the two baseline runs alone span 311-338kbps); byte-identical
+conversion means there is no encoder-input quality or compression change.
+
+Noise fallback regression check (`band --noise --height 1200`, 10s, two runs
+each): fps 57.32→57.02, bitrate 20.96→20.74Mbps, encode p50 5.551→5.528ms,
+PSNR 17.186→17.193dB — within noise-run variance, no regression.
+
+## Cycle 56 — duplicate DXGI dirty copies removed (2026-11-25)
+
+DXGI capture kept a persistent full-frame accumulation buffer and copied every
+dirty row twice: once into that buffer and once into the emitted frame. The
+recycled emit-buffer generation/patch log already carries the same image state,
+so the steady path now copies dirty rows only into the emit buffer. The cold
+path (first frame, mode change, or no recyclable emission) reads the complete
+current texture once instead of cloning the accumulator. `media-smoke` now
+reports mean capture-backend copy time.
+
+Noise worst case (`band --noise --height 1200`, 10s, two runs each, x264 adapt
+pinned to tier 0; bitrate rises with fps because the scene remains VBV-capped):
+
+| path      | fps   | bitrate | encode p50 | copy mean | convert mean | capture→encode p50 | PSNR p50 |
+| --------- | ----- | ------- | ---------- | --------- | ------------ | ------------------ | -------- |
+| baseline  | 55.71 | 20.59M  | 6.249ms    | 4.010ms   | 0.533ms      | 14.696ms           | 17.156dB |
+| optimized | 57.50 | 21.31M  | 5.936ms    | 3.891ms   | 0.490ms      | 14.657ms           | 17.152dB |
+
+Clock motion (`band --clock --height 80`, 10s, two valid optimized runs):
+
+| path      | fps   | bitrate | encode p50 | copy mean | convert mean | capture→encode p50 | PSNR p50 |
+| --------- | ----- | ------- | ---------- | --------- | ------------ | ------------------ | -------- |
+| baseline  | 57.73 | 204kbps | 2.563ms    | 0.728ms   | 0.055ms      | 11.116ms           | 55.21dB  |
+| optimized | 58.14 | 180kbps | 2.384ms    | 0.598ms   | 0.036ms      | 10.764ms           | 55.74dB  |
+
+Clock capture copy is **−17.9%**, encode p50 **−7.0%**, capture→encode
+**−0.35ms**, with fps/PSNR not regressed. Noise is a smaller but positive copy
+and encode delta at PSNR parity; the large encode variance on this VM means the
+trustworthy invariant is the eliminated row copy itself.
+
+## Cycle 57 — full-frame parallel RGBA→I420 conversion rejected (2026-11-25)
+
+A custom even-row-band rayon conversion was bit-identical to serial conversion,
+but it was not a pipeline win at the 1920x1200 test resolution. Isolated
+back-to-back conversion looked faster because rayon workers stayed warm;
+realistic 16ms-spaced conversion exposed wake-up overhead. End-to-end noise
+conversion means were 0.475ms serial, 0.718ms with four workers, and 0.585ms
+with eight workers. Small dirty-strip conversion would remain serial by design,
+so there was no compensating clock-motion win. The experiment was rejected and
+not merged; do not retry parallel conversion at desktop resolutions without a
+wakeup-free design or a measured 4K end-to-end pipeline.

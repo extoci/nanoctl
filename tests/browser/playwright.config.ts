@@ -21,6 +21,7 @@ if (!process.env.NANOCTL_BROWSER_PORT) {
 }
 const baseURL = `http://127.0.0.1:${process.env.NANOCTL_BROWSER_PORT}`;
 const latency = process.env.NANOCTL_BROWSER_LATENCY === "1";
+const badNetwork = process.env.NANOCTL_BROWSER_BAD_NETWORK === "1";
 if (process.env.NANOCTL_BROWSER_MEDIA === "1" && !latency)
   process.env.NANOCTL_DEV_GAMEPAD_REPORTS ??= join(
     homedir(),
@@ -49,7 +50,7 @@ export default defineConfig({
     command: "bun tests/browser/agent.ts",
     url: baseURL + "/v1/info",
     reuseExistingServer: false,
-    timeout: latency ? 1_200_000 : 300_000,
+    timeout: latency || badNetwork ? 1_200_000 : 300_000,
     gracefulShutdown: { signal: "SIGTERM", timeout: 15_000 },
   },
   projects: [

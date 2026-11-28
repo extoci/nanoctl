@@ -348,6 +348,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
         host.viewer_limits(),
         host.display_selection(),
         host.display_selection_feedback_sender(),
+        host.connection_state(),
         VideoQuality {
             max_bitrate_kbps: 8000,
             max_fps: 60,

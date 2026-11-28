@@ -41,6 +41,10 @@ struct DelaySignal {
 pub struct ViewerLimits {
     pub max_fps: Option<u16>,
     pub max_bitrate_kbps: Option<u32>,
+    /// Physical pixels available to the rendered video. They can lower the
+    /// configured encode dimensions for one session, never exceed them.
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
 }
 
 impl ViewerLimits {
@@ -61,6 +65,18 @@ impl ViewerLimits {
     }
 
     #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    pub fn resolve_dimensions(self, max_width: u32, max_height: u32) -> (u32, u32) {
+        (
+            self.max_width
+                .filter(|cap| *cap >= 2)
+                .map_or(max_width, |cap| cap.min(max_width) & !1),
+            self.max_height
+                .filter(|cap| *cap >= 2)
+                .map_or(max_height, |cap| cap.min(max_height) & !1),
+        )
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
     pub fn resolve(self, max_bitrate_kbps: u32, max_fps: u16) -> (u32, u16) {
         (
             self.max_bitrate_kbps.map_or(max_bitrate_kbps, |cap| {
@@ -70,6 +86,24 @@ impl ViewerLimits {
                 .map_or(max_fps, |cap| cap.clamp(15.min(max_fps), max_fps)),
         )
     }
+}
+
+/// Viewer-measured data-channel link quality, sent as JSON on the reliable
+/// control channel. RTP feedback is blind while video rides the data channel,
+/// so this is the signal that lets the rate controller adapt to congestion.
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
+pub fn parse_link_stats(data: &[u8]) -> Option<f64> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        #[serde(rename = "type")]
+        kind: String,
+        loss: Option<f64>,
+    }
+    if !data.windows(12).any(|window| window == b"\"link-stats\"") {
+        return None;
+    }
+    let envelope: Envelope = serde_json::from_slice(data).ok()?;
+    (envelope.kind == "link-stats").then_some(envelope.loss?)
 }
 
 pub struct RateController {
@@ -86,6 +120,7 @@ pub struct RateController {
     congestion_rate: Option<f64>,
     clean_since: Option<Instant>,
     low_fps_since: Option<Instant>,
+    last_local_backpressure_cut: Option<Instant>,
     send_kbps: Option<f64>,
     app_limited: bool,
     active_since: Option<Instant>,
@@ -99,7 +134,7 @@ impl RateController {
         // Start high enough for a presentable first frame — a 4Mbps opening undershoots a
         // LAN-scale link badly, and the probe-up path recovers in seconds on a real WAN.
         let initial = (ceiling_kbps / 4)
-            .min(6_000)
+            .min(2_000)
             .clamp(ceiling_kbps.min(MIN_BITRATE_KBPS), ceiling_kbps);
         let max_fps = max_fps.max(1);
         let fps = Self::tier(initial as f64, max_fps);
@@ -120,6 +155,7 @@ impl RateController {
             congestion_rate: None,
             clean_since: None,
             low_fps_since: None,
+            last_local_backpressure_cut: None,
             send_kbps: None,
             app_limited: false,
             active_since: None,
@@ -168,12 +204,71 @@ impl RateController {
         // dropping to 15-20fps reads as broken to a viewer, while the same budget at
         // 60fps just looks softer. Hold 60fps (or the configured ceiling) down to
         // 500kbps, and never go below 30.
-        if rate >= 2_500.0 {
+        if rate >= 5_000.0 {
             max_fps
-        } else if rate >= 500.0 {
+        } else if rate >= 2_000.0 {
             max_fps.min(60)
-        } else {
+        } else if rate >= 700.0 {
             max_fps.min(30)
+        } else {
+            max_fps.min(15)
+        }
+    }
+
+    fn update_fps(&mut self, at: Instant, allow_increase: bool) {
+        let target_fps = Self::tier(self.rate, self.max_fps);
+        if target_fps < self.fps {
+            let since = *self.low_fps_since.get_or_insert(at);
+            if at.duration_since(since) >= Duration::from_secs(1) {
+                self.fps = target_fps;
+                self.low_fps_since = None;
+            }
+        } else {
+            self.low_fps_since = None;
+            if allow_increase && target_fps > self.fps {
+                self.fps = Self::tier(self.rate / 1.2, self.max_fps).max(self.fps);
+            }
+        }
+    }
+
+    /// Applies an immediate multiplicative decrease for congestion observed at the
+    /// local SCTP send queue. Unlike receiver-reported frame loss this signal is
+    /// not one or more RTTs old, but it can flap during keyframe bursts, so cuts
+    /// are limited to twice per second.
+    pub fn note_local_backpressure(&mut self, at: Instant) -> Option<RateDecision> {
+        if self
+            .last_local_backpressure_cut
+            .is_some_and(|last| at.saturating_duration_since(last) < Duration::from_millis(500))
+        {
+            return None;
+        }
+        self.last_local_backpressure_cut = Some(at);
+        self.last_congestion = Some(at);
+        self.congestion_rate = Some(self.rate);
+        self.clean_since = None;
+        let previous_rate = self.rate;
+        self.rate *= 0.8;
+        self.rate = self.rate.clamp(
+            self.ceiling.min(MIN_BITRATE_KBPS) as f64,
+            self.ceiling as f64,
+        );
+        self.update_fps(at, false);
+        let decision = self.decision();
+        let changed = decision != self.reported;
+        tracing::info!(
+            reason = "local-backpressure",
+            previous_kbps = previous_rate,
+            target_kbps = decision.bitrate_kbps,
+            target_fps = decision.fps,
+            applied = changed,
+            send_kbps = self.send_kbps,
+            "video rate decision"
+        );
+        if changed {
+            self.reported = decision;
+            Some(decision)
+        } else {
+            None
         }
     }
 
@@ -390,19 +485,7 @@ impl RateController {
             self.ceiling as f64,
         );
 
-        let target_fps = Self::tier(self.rate, self.max_fps);
-        if target_fps < self.fps {
-            let since = *self.low_fps_since.get_or_insert(sample.at);
-            if sample.at.duration_since(since) >= Duration::from_secs(1) {
-                self.fps = target_fps;
-                self.low_fps_since = None;
-            }
-        } else {
-            self.low_fps_since = None;
-            if target_fps > self.fps {
-                self.fps = Self::tier(self.rate / 1.2, self.max_fps).max(self.fps);
-            }
-        }
+        self.update_fps(sample.at, true);
         let decision = self.decision();
         let delta = decision.bitrate_kbps.abs_diff(self.reported.bitrate_kbps) as f64;
         let changed = decision.fps != self.reported.fps
@@ -573,6 +656,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn link_stats_parse_loss_reports() {
+        assert_eq!(
+            parse_link_stats(br#"{"type":"link-stats","loss":0.25}"#),
+            Some(0.25)
+        );
+        assert_eq!(parse_link_stats(br#"{"type":"link-stats"}"#), None);
+        assert_eq!(parse_link_stats(br#"{"type":"quality","loss":0.5}"#), None);
+        assert_eq!(parse_link_stats(b"binary"), None);
+    }
+
+    #[test]
+    fn local_backpressure_cut_is_immediate_and_rate_limited() {
+        let now = Instant::now();
+        let mut controller = RateController::new(8_000, 60);
+        let first = controller.note_local_backpressure(now).unwrap();
+        assert_eq!(first.bitrate_kbps, 1_600);
+        assert_eq!(first.fps, 60, "fps hysteresis survives one transient cut");
+        assert!(
+            controller
+                .note_local_backpressure(now + Duration::from_millis(499))
+                .is_none()
+        );
+        let second = controller
+            .note_local_backpressure(now + Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(second.bitrate_kbps, 1_280);
+        assert_eq!(second.fps, 60);
+        let third = controller
+            .note_local_backpressure(now + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(third.bitrate_kbps, 1_024);
+        assert_eq!(third.fps, 30, "sustained low bitrate lowers fps after 1s");
+    }
+
+    #[test]
+    fn dc_loss_feedback_drives_the_rate_controller_down() {
+        let mut controller = RateController::new(24_000, 60);
+        let start = controller.decision().bitrate_kbps;
+        let mut at = Instant::now();
+        let mut last = start;
+        for _ in 0..4 {
+            at += Duration::from_secs(1);
+            if let Some(decision) = controller.observe(LinkSample {
+                fraction_lost: 0.25,
+                rtt: None,
+                remb_kbps: None,
+                at,
+                receiver_report_at: Some(at),
+            }) {
+                last = decision.bitrate_kbps;
+            }
+        }
+        assert!(
+            last < start,
+            "sustained receiver-reported loss must cut bitrate: start={start} end={last}"
+        );
+    }
+
+    #[test]
     fn viewer_limits_lower_but_never_exceed_the_configured_maximums() {
         let limits =
             ViewerLimits::parse(br#"{"type":"quality","maxFps":30,"maxBitrateKbps":10000}"#)
@@ -594,14 +736,28 @@ mod tests {
     }
 
     #[test]
+    fn viewer_dimension_limits_are_even_and_never_exceed_configured_maximums() {
+        let limits =
+            ViewerLimits::parse(br#"{"type":"quality","maxWidth":1281,"maxHeight":719}"#).unwrap();
+        assert_eq!(limits.resolve_dimensions(3840, 2160), (1280, 718));
+        let raised =
+            ViewerLimits::parse(br#"{"type":"quality","maxWidth":7680,"maxHeight":4320}"#).unwrap();
+        assert_eq!(raised.resolve_dimensions(3840, 2160), (3840, 2160));
+        assert_eq!(
+            ViewerLimits::default().resolve_dimensions(3840, 2160),
+            (3840, 2160)
+        );
+    }
+
+    #[test]
     fn set_limits_clamps_rate_and_recomputes_fps() {
         let mut controller = RateController::new(50_000, 120);
         let initial = controller.decision();
         assert_eq!(
             initial,
             RateDecision {
-                bitrate_kbps: 6_000,
-                fps: 120
+                bitrate_kbps: 2_000,
+                fps: 60
             }
         );
         assert_eq!(
@@ -669,9 +825,11 @@ mod tests {
             controller.observe(sample(now, 0.2)).unwrap().bitrate_kbps,
             1_800
         );
-        assert_eq!(
-            controller.observe(sample(now + Duration::from_secs(20), 0.05)),
-            None
+        let before = controller.decision().bitrate_kbps;
+        assert!(
+            controller
+                .observe(sample(now + Duration::from_secs(20), 0.05))
+                .is_none_or(|decision| decision.bitrate_kbps == before)
         );
         assert_eq!(controller.decision().bitrate_kbps, 1_800);
     }
@@ -734,9 +892,9 @@ mod tests {
     fn clean_feedback_reaches_a_fifty_megabit_ceiling() {
         let now = Instant::now();
         let mut controller = RateController::new(50_000, 60);
-        assert_eq!(controller.decision().bitrate_kbps, 6_000);
+        assert_eq!(controller.decision().bitrate_kbps, 2_000);
         let mut ceiling_at = None;
-        for second in 0..=14 {
+        for second in 0..=20 {
             let mut input = sample(now + Duration::from_secs(second), 0.0);
             input.rtt = Some(Duration::from_millis(20));
             if let Some(decision) = controller.observe(input)
@@ -746,7 +904,7 @@ mod tests {
                 assert_eq!(decision.fps, 60);
             }
         }
-        assert!(ceiling_at.is_some_and(|second| second <= 13));
+        assert!(ceiling_at.is_some_and(|second| second <= 19));
     }
 
     #[test]
@@ -780,7 +938,7 @@ mod tests {
             input.rtt = Some(Duration::from_millis(1));
             controller.observe(input);
         }
-        assert_eq!(controller.decision().bitrate_kbps, 17_544);
+        assert_eq!(controller.decision().bitrate_kbps, 5_848);
     }
 
     #[test]
@@ -873,7 +1031,7 @@ mod tests {
         controller.observe(input);
         assert_eq!(controller.decision().fps, 60);
         input.at += Duration::from_millis(1);
-        assert_eq!(controller.observe(input).unwrap().fps, 30);
+        assert_eq!(controller.observe(input).unwrap().fps, 15);
         input.remb_kbps = None;
         input.fraction_lost = 0.0;
         input.rtt = Some(Duration::from_millis(80));
@@ -883,13 +1041,13 @@ mod tests {
             controller.observe(input);
         }
         assert!(controller.decision().bitrate_kbps > 400);
-        assert_eq!(controller.decision().fps, 30);
-        for second in 9..=14 {
+        assert_eq!(controller.decision().fps, 15);
+        for second in 9..=20 {
             input.at = now + Duration::from_secs(second);
             input.receiver_report_at = Some(input.at);
             controller.observe(input);
         }
-        assert_eq!(controller.decision().fps, 60);
+        assert_eq!(controller.decision().fps, 30);
     }
 
     #[test]

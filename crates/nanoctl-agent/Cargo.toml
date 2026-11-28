@@ -1,6 +1,6 @@
 [package]
 name = "nanoctl-agent"
-version = "3.0.0-alpha.5"
+version = "3.0.0-alpha.28"
 edition = "2024"
 license = "MIT"
 description = "Headless nanoctl remote desktop agent"
@@ -30,6 +30,7 @@ capture = [
 ]
 media = [
   "capture",
+  "dep:libloading",
   "dep:arboard",
   "dep:cpal",
   "dep:enigo",
@@ -39,7 +40,6 @@ media = [
   "dep:x11rb",
   "dep:xkeysym",
   "rtc",
-  "dep:yuv",
 ]
 rtc = ["dep:interceptor", "dep:webrtc", "dep:bytes"]
 x264 = ["media", "dep:pkg-config"]
@@ -94,7 +94,7 @@ opus = { version = "0.4", optional = true }
 webrtc = { version = "0.17.1", optional = true }
 xcap = { version = "0.9.7", features = ["wgc"], optional = true }
 x509-parser = "0.16"
-yuv = { version = "0.8.21", optional = true }
+yuv = "0.8.21"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xcb = { version = "1.7", features = ["damage", "randr"], optional = true }
@@ -141,6 +141,7 @@ videotoolbox = { version = "0.18.1", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+libloading = { version = "0.8", optional = true }
 anstyle-query = "1.1.5"
 cpal = { version = "0.16", optional = true }
 fast_image_resize = { version = "6.2", default-features = false, features = [
@@ -149,6 +150,18 @@ fast_image_resize = { version = "6.2", default-features = false, features = [
 ], optional = true }
 vigem-client = { version = "0.1.4", features = ["unstable_ds4"], optional = true }
 windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Power",
+  "Win32_NetworkManagement_WiFi",
+  "Win32_Media",
   "Win32_Media_MediaFoundation",
   "Win32_System_Com",
   "Win32_System_Ole",

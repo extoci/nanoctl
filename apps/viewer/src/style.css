@@ -183,6 +183,21 @@ video {
   object-fit: contain;
   pointer-events: none;
 }
+.mouse-lock-hint {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  padding: 7px 11px;
+  border: 1px solid #ffffff24;
+  border-radius: 999px;
+  background: #060a10cc;
+  color: #d7e5f5;
+  font-size: 12px;
+  pointer-events: none;
+  box-shadow: 0 8px 28px #0009;
+}
 .touch-cursor {
   position: absolute;
   left: 50%;
@@ -194,6 +209,16 @@ video {
   background: #10182299;
   transform: translate(-50%, -50%);
   pointer-events: none;
+}
+.touch-cursor.remote-cursor {
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  transform: none;
 }
 .overlay {
   position: absolute;

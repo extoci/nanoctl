@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "nanoctl-agent"
-version = "3.0.0-alpha.5"
+version = "3.0.0-alpha.28"
 dependencies = [
  "anstyle-query",
  "anyhow",
@@ -2735,6 +2735,7 @@ dependencies = [
  "hostname",
  "interceptor",
  "libc",
+ "libloading",
  "nanoctl-update",
  "objc2",
  "objc2-core-graphics",

@@ -133,9 +133,9 @@ static int initialize_session(NanoNvenc *h, uint32_t codec, uint32_t h264_high, 
         return fail(error, len, "querying low-latency NVENC preset failed", status);
 
     h->config = defaults.presetCfg;
-    /* A 30s GOP, not 2s: unrepairable IDRs already force a keyframe through
-     * the RTCP loss path, so periodic IDRs are pure overhead. */
-    h->config.gopLength = fps * 30;
+    /* Unrepairable IDRs already force a keyframe through the RTCP loss path,
+     * so periodic IDRs are pure overhead. */
+    h->config.gopLength = NVENC_INFINITE_GOPLENGTH;
     h->config.frameIntervalP = 1;
     h->config.rcParams.enableLookahead = 0;
     h->config.rcParams.enableTemporalAQ = 0;

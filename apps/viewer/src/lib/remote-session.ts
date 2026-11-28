@@ -11,6 +11,7 @@ import {
 } from "@nanoctl/protocol";
 import { recordDebugEvent } from "./debug-report";
 import { codecLabel, orderVideoCodecs, type CodecChoice } from "./video-codec";
+import { encodeBinaryInput, encodeGamepadHeartbeat, type GamepadStateInput } from "./binary-input";
 import { reliableControlBufferIsSaturated } from "./control-backpressure";
 import { ClipboardSync } from "./clipboard-sync";
 import { GamepadForwarder, type GamepadStatus } from "./gamepad";
@@ -20,6 +21,7 @@ import {
   attachWebCodecsVideo,
   createVideoEncodedStreams,
   supportsWebCodecsVideo,
+  type DirectVideoCodec,
   type WebCodecsVideoHandle,
 } from "./webcodecs-video";
 import { normalizedPosition, videoGeometry } from "./touch-input";
@@ -54,6 +56,7 @@ export type RemoteSessionSnapshot = {
   reconnectAttempt: number;
   iceGeneration: number;
   inputEnabled: boolean;
+  mouseLocked: boolean;
   gamepadEnabled: boolean;
   gamepadStatus: GamepadStatus;
   firstFrameReceived: boolean;
@@ -76,7 +79,25 @@ export type HostSignalRow = {
   envelope: string;
 };
 
-export type QualityLimits = { maxFps?: number; maxBitrateKbps?: number };
+export type QualityLimits = {
+  maxFps?: number;
+  maxBitrateKbps?: number;
+  maxWidth?: number;
+  maxHeight?: number;
+};
+
+const controlTextEncoder = new TextEncoder();
+
+export type RemoteCursorShape = {
+  width: number;
+  height: number;
+  hotspotX: number;
+  hotspotY: number;
+  /** Base64-encoded RGBA pixels. */
+  pixels: string;
+};
+
+export type RemoteCursorPosition = { x: number; y: number; visible: boolean; seq?: number };
 
 export type RemoteSessionOptions = {
   sessionId: string;
@@ -87,9 +108,12 @@ export type RemoteSessionOptions = {
   audio?: HTMLAudioElement;
   onAudioTrackChange?: () => void;
   systemAudioEnabled?: boolean;
+  initialAudioEnabled?: boolean;
   remoteInputEnabled?: boolean;
   clipboardEnabled?: boolean;
   gamepadAvailable?: boolean;
+  /** Host understands compact binary motion reports. */
+  binaryInput?: boolean;
   /** An immutable browser-side policy can further restrict host capabilities. */
   remoteInputPolicy?: boolean;
   preferences?: { inputEnabled: boolean; displayId?: string; gamepadEnabled?: boolean };
@@ -105,6 +129,8 @@ export type RemoteSessionOptions = {
   }>;
   onPageRestore?: (controllerEpoch?: string) => void;
   onSnapshot: (snapshot: RemoteSessionSnapshot) => void;
+  onCursorShape?: (shape: RemoteCursorShape) => void;
+  onCursorPosition?: (position: RemoteCursorPosition) => void;
   peerFactory?: (configuration: RTCConfiguration) => RTCPeerConnection;
 };
 
@@ -113,7 +139,6 @@ const FIRST_FRAME_TIMEOUT_MS = 15_000;
 const DISCONNECTED_GRACE_MS = 1_500;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const STATS_INTERVAL_MS = 1_000;
-const KEEPALIVE_INTERVAL_MS = 1_000;
 const MAX_PENDING_CANDIDATES = 128;
 
 /**
@@ -143,13 +168,21 @@ export class RemoteSessionController {
     writable: WritableStream;
   } | null = null;
   private pointerChannel: RTCDataChannel | null = null;
+  private cursorChannel: RTCDataChannel | null = null;
+  private cursorSequence = 0;
+  private gamepadChannel: RTCDataChannel | null = null;
   private controlChannel: RTCDataChannel | null = null;
   private clipboardChannel: RTCDataChannel | null = null;
   private clipboard: ClipboardSync | null = null;
   private gamepadFrame: number | null = null;
   private gamepadStatus: GamepadStatus = "waiting";
-  private readonly gamepad = new GamepadForwarder((message) => this.sendControl(message));
+  private readonly gamepad = new GamepadForwarder((message) =>
+    message.type === "gamepad" || message.type === "gamepad-sparse"
+      ? this.sendControl(message)
+      : this.sendGamepadHeartbeat(),
+  );
   private keyQueue: Promise<void> = Promise.resolve();
+  private lastKeyRepeatAt = 0;
   private readonly onClipboardFocus = () => {
     void this.clipboard?.focus();
   };
@@ -172,6 +205,7 @@ export class RemoteSessionController {
   private lifecycleGeneration = 0;
   private inputEnabled = false;
   private inputBlocked = 0;
+  private audioEnabled: boolean;
   private readonly pressedKeys = new Set<string>();
   private readonly preferences: {
     inputEnabled: boolean;
@@ -187,19 +221,26 @@ export class RemoteSessionController {
   private restartTimer: number | null = null;
   private negotiationTimer: number | null = null;
   private firstFrameTimer: number | null = null;
-  private keepaliveTimer: number | null = null;
   private statsTimer: number | null = null;
   private recoveryPromise: Promise<void> | null = null;
   private recoveryRetryRequested = false;
   private notifiedEnd = false;
   private statsInFlight = false;
   private previousVideoSample: VideoSample | null = null;
+  private previousDirectVideoSample:
+    | (VideoSample & {
+        decodeTimeMs?: number;
+        decodeTimedFrames?: number;
+      })
+    | null = null;
   private readonly localUfragGenerations = new Map<string, number>();
   private readonly offerPublicationGates = new Map<number, Promise<boolean>>();
   private readonly offerCompletionWaiters = new Map<number, () => void>();
   private metrics: RemoteSessionMetrics | null = null;
   private videoTransceiver: RTCRtpTransceiver | null = null;
   private qualityLimits: QualityLimits = {};
+  private viewportObserver: ResizeObserver | null = null;
+  private lastViewportQualityKey = "";
   private codecPreferencesApplied = false;
   private previousDecode: { id: string; time: number; frames: number } | null = null;
   private previousLoss: { id: string; lost: number; received: number } | null = null;
@@ -253,7 +294,17 @@ export class RemoteSessionController {
     if (this.phase === "ending" || this.phase === "ended" || this.phase === "failed") return;
     this.firstFrameReceived = true;
     this.clearFirstFrameTimer();
+    this.sendQualityLimits();
     this.publishSnapshot();
+  };
+
+  // The WebCodecs path renders through a track generator or a plain canvas;
+  // where neither touches the <video> element (WebKit has no
+  // MediaStreamTrackGenerator), loadeddata never fires and the session would
+  // otherwise hit the first-frame timeout despite video being on screen.
+  private readonly onDirectVideoFrame = () => {
+    if (this.firstFrameReceived) return;
+    this.onVideoLoadedData();
   };
 
   constructor(options: RemoteSessionOptions) {
@@ -264,10 +315,15 @@ export class RemoteSessionController {
     this.remoteInputPolicy = options.remoteInputPolicy !== false;
     this.displays = options.displays;
     this.remoteInputAllowed = this.remoteInputPolicy && options.remoteInputEnabled !== false;
+    this.audioEnabled = options.initialAudioEnabled !== false;
     // Keep sequence numbers fresh and exactly representable by JavaScript clients.
     this.nextSequence = safeSequenceSeed();
     this.peerFactory =
       options.peerFactory ?? ((configuration) => new RTCPeerConnection(configuration));
+    if (typeof ResizeObserver !== "undefined") {
+      this.viewportObserver = new ResizeObserver(() => this.sendQualityLimits());
+      this.viewportObserver.observe(options.video);
+    }
   }
 
   get snapshot(): RemoteSessionSnapshot {
@@ -277,6 +333,7 @@ export class RemoteSessionController {
       reconnectAttempt: this.reconnectAttempt,
       iceGeneration: this.iceGeneration,
       inputEnabled: this.inputEnabled,
+      mouseLocked: document.pointerLockElement === this.options.video,
       gamepadEnabled: this.gamepadFrame !== null,
       gamepadStatus: this.gamepadStatus,
       firstFrameReceived: this.firstFrameReceived,
@@ -308,9 +365,6 @@ export class RemoteSessionController {
     this.firstFrameReceived = false;
     this.attachPeer(peer, lifecycle);
     this.attachInput();
-    this.keepaliveTimer = window.setInterval(() => {
-      this.sendControl({ type: "ping", nonce: Date.now(), sentAt: Date.now() });
-    }, KEEPALIVE_INTERVAL_MS);
     this.statsTimer = window.setInterval(() => this.collectStats(lifecycle), STATS_INTERVAL_MS);
     this.publishSnapshot();
     return this.sendOffer(false, lifecycle).catch(() => {
@@ -350,6 +404,25 @@ export class RemoteSessionController {
     this.publishSnapshot();
   }
 
+  togglePointerLock(): void {
+    if (!this.inputEnabled || typeof this.options.video.requestPointerLock !== "function") return;
+    if (document.pointerLockElement === this.options.video) {
+      document.exitPointerLock();
+      return;
+    }
+    const request = this.options.video.requestPointerLock as (options?: {
+      unadjustedMovement?: boolean;
+    }) => Promise<void> | void;
+    try {
+      const pending = request.call(this.options.video, { unadjustedMovement: true });
+      if (pending instanceof Promise) {
+        void pending.catch(() => this.options.video.requestPointerLock());
+      }
+    } catch {
+      void this.options.video.requestPointerLock();
+    }
+  }
+
   setGamepadEnabled(enabled: boolean): void {
     this.preferences.gamepadEnabled = enabled;
     if (enabled) {
@@ -371,6 +444,7 @@ export class RemoteSessionController {
       typeof navigator.getGamepads !== "function"
     )
       return;
+    this.gamepad.resume();
     this.gamepadFrame = window.requestAnimationFrame(this.pollGamepads);
   }
 
@@ -404,10 +478,36 @@ export class RemoteSessionController {
     this.gamepad.release();
   }
 
+  private sendGamepadHeartbeat(): boolean {
+    const channel = this.gamepadChannel;
+    if (
+      !this.options.binaryInput ||
+      !this.inputEnabled ||
+      !this.remoteInputAllowed ||
+      !channel ||
+      channel.readyState !== "open" ||
+      channel.bufferedAmount > 4 * 1024
+    )
+      return false;
+    try {
+      channel.send(encodeGamepadHeartbeat());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Applies live without renegotiation; muted viewers do not receive Opus packets. */
+  setAudioEnabled(enabled: boolean): boolean {
+    this.audioEnabled = enabled;
+    return this.sendControl({ type: "audio", enabled });
+  }
+
   /** Applies live without renegotiation; the host clamps to its configured maximums. */
   setQualityLimits(limits: QualityLimits): boolean {
     this.qualityLimits = { ...limits };
-    return this.sendControl({ type: "quality", ...this.qualityLimits });
+    this.lastViewportQualityKey = "";
+    return this.sendQualityLimits() !== false;
   }
 
   selectDisplay(displayId: string): boolean {
@@ -418,13 +518,19 @@ export class RemoteSessionController {
     return true;
   }
 
-  sendControl(payload: ControlMessage): boolean {
-    const channel =
-      payload.type === "pointer" && payload.action === "move"
+  sendControl(payload: ControlMessage | GamepadStateInput): boolean {
+    const gamepadState = payload.type === "gamepad" || payload.type === "gamepad-sparse";
+    // Sparse snapshots self-repair individual slots and use the bounded-loss
+    // gamepad lane. Full snapshots are the sparse baseline, so they must not be
+    // dropped; they ride the reliable control lane even when they carry pads.
+    const lossyGamepadSnapshot = payload.type === "gamepad-sparse" && payload.pads.length > 0;
+    const channel = lossyGamepadSnapshot
+      ? this.gamepadChannel
+      : payload.type === "pointer" && payload.action === "move"
         ? this.pointerChannel
         : this.controlChannel;
     if (!channel || channel.readyState !== "open") return false;
-    if (payload.type === "gamepad") {
+    if (gamepadState) {
       if (
         !this.options.gamepadAvailable ||
         (payload.pads.length > 0 && (!this.inputEnabled || !this.remoteInputAllowed)) ||
@@ -432,7 +538,9 @@ export class RemoteSessionController {
       )
         return false;
       try {
-        channel.send(JSON.stringify(payload));
+        const binary = this.options.binaryInput ? encodeBinaryInput(payload) : null;
+        if (binary) channel.send(binary);
+        else channel.send(JSON.stringify(payload));
         return true;
       } catch {
         return false;
@@ -446,8 +554,13 @@ export class RemoteSessionController {
     }
     if (payload.type === "display" && !this.remoteInputAllowed) return false;
     const isMotion = payload.type === "pointer" && payload.action === "move";
-    const serialized = JSON.stringify(payload);
-    if (new TextEncoder().encode(serialized).byteLength > MAX_CONTROL_MESSAGE_BYTES) return false;
+    const binary = this.options.binaryInput ? encodeBinaryInput(payload) : null;
+    let serialized: string | null = null;
+    if (!binary) {
+      serialized = JSON.stringify(payload);
+      if (controlTextEncoder.encode(serialized).byteLength > MAX_CONTROL_MESSAGE_BYTES)
+        return false;
+    }
     if (isMotion && channel.bufferedAmount > 64 * 1024) return false;
     if (!isMotion && reliableControlBufferIsSaturated(channel.bufferedAmount)) {
       this.inputEnabled = false;
@@ -457,7 +570,8 @@ export class RemoteSessionController {
       return false;
     }
     try {
-      channel.send(serialized);
+      if (binary) channel.send(binary);
+      else channel.send(serialized!);
       return true;
     } catch {
       if (!isMotion) {
@@ -498,7 +612,11 @@ export class RemoteSessionController {
         peer.onicecandidate = null;
         peer.ontrack = null;
         this.options.video.removeEventListener("loadeddata", this.onVideoLoadedData);
+        this.viewportObserver?.disconnect();
+        this.viewportObserver = null;
         this.pointerChannel?.close();
+        this.cursorChannel?.close();
+        this.gamepadChannel?.close();
         this.controlChannel?.close();
         this.clipboardChannel?.close();
         this.clipboardChannel = null;
@@ -509,6 +627,8 @@ export class RemoteSessionController {
           this.options.onAudioTrackChange?.();
         }
         this.pointerChannel = null;
+        this.cursorChannel = null;
+        this.gamepadChannel = null;
         this.controlChannel = null;
         peer.close();
       }
@@ -568,22 +688,76 @@ export class RemoteSessionController {
       ordered: false,
       maxRetransmits: 0,
     });
+    this.gamepadChannel = peer.createDataChannel("nanoctl.gamepad.v1", {
+      ordered: false,
+      // Sparse gamepad reports are sequenced absolute slot state, so delayed
+      // retransmits cannot regress newer input. Bounded repair replaces the
+      // expensive always-on application duplicate window; expired copies are
+      // too stale to matter for game input.
+      maxPacketLifeTime: 100,
+    });
     this.controlChannel = peer.createDataChannel("nanoctl.control.v1", {
       ordered: true,
+    });
+    this.cursorChannel = peer.createDataChannel("nanoctl.cursor.v1", {
+      ordered: false,
+      maxRetransmits: 0,
     });
     this.inputEnabled =
       this.preferences.inputEnabled &&
       this.remoteInputAllowed &&
       this.controlChannel.readyState === "open";
-    this.controlChannel.onmessage = (event) => {
+    const receiveCursorMessage = (message: { type?: unknown }) => {
+      if (message.type === "cursorShape") {
+        const shape = message as unknown as RemoteCursorShape;
+        if (
+          shape.width > 0 &&
+          shape.height > 0 &&
+          typeof shape.pixels === "string" &&
+          shape.hotspotX >= 0 &&
+          shape.hotspotY >= 0
+        ) {
+          this.options.onCursorShape?.(shape);
+        }
+        return;
+      }
+      if (message.type === "cursor") {
+        const position = message as unknown as RemoteCursorPosition;
+        if (
+          Number.isFinite(position.x) &&
+          Number.isFinite(position.y) &&
+          typeof position.visible === "boolean"
+        ) {
+          const sequence =
+            typeof position.seq === "number" && Number.isFinite(position.seq)
+              ? position.seq
+              : this.cursorSequence;
+          if (sequence < this.cursorSequence) return;
+          this.cursorSequence = Math.max(this.cursorSequence, sequence);
+          this.options.onCursorPosition?.(position);
+        }
+      }
+    };
+    this.cursorChannel.onmessage = (event) => {
       if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
       try {
-        if ((JSON.parse(event.data) as { type?: unknown }).type !== "inputBlocked") return;
+        receiveCursorMessage(JSON.parse(event.data) as { type?: unknown });
+      } catch {}
+    };
+    this.controlChannel.onmessage = (event) => {
+      if (!this.isCurrent(lifecycle, peer) || typeof event.data !== "string") return;
+      let message: { type?: unknown };
+      try {
+        message = JSON.parse(event.data) as { type?: unknown };
       } catch {
         return;
       }
-      this.inputBlocked += 1;
-      this.publishSnapshot();
+      if (message.type === "inputBlocked") {
+        this.inputBlocked += 1;
+        this.publishSnapshot();
+        return;
+      }
+      receiveCursorMessage(message);
     };
     this.controlChannel.onopen = () => {
       if (!this.isCurrent(lifecycle, peer)) return;
@@ -596,16 +770,19 @@ export class RemoteSessionController {
     this.codecPreferencesApplied = false;
     // Chrome only allows encoded streams before any RTP arrives, so the
     // transform must be created here — before negotiation — not in ontrack.
-    // The WebCodecs decode paths only handle Annex-B H.264: an explicit
-    // H.264 choice engages them outright, and "auto" engages them only when
-    // the negotiated codec turns out to be H.264 (checked on the answer).
-    const h264Eligible =
+    // The data-channel WebCodecs path handles H.264/HEVC Annex-B and AV1
+    // low-overhead OBUs. The RTP encoded-transform tap remains H.264-only;
+    // in "auto" it must be created before the answer reveals whether H.264
+    // was selected.
+    const h264TapEligible =
       this.options.codecChoice === undefined ||
       this.options.codecChoice === "auto" ||
       this.options.codecChoice === "h264";
+    const directVideoEligible =
+      h264TapEligible || this.options.codecChoice === "hevc" || this.options.codecChoice === "av1";
     const receiver = this.videoTransceiver?.receiver as RTCRtpReceiver | undefined;
     this.pendingEncodedStreams =
-      h264Eligible && receiver && supportsWebCodecsVideo(receiver)
+      h264TapEligible && receiver && supportsWebCodecsVideo(receiver)
         ? (createVideoEncodedStreams(receiver) as {
             readable: ReadableStream;
             writable: WritableStream;
@@ -620,18 +797,29 @@ export class RemoteSessionController {
     };
     // True low-latency path: raw AUs over an unreliable data channel feed
     // WebCodecs directly — no jitter buffer anywhere. The channels are
-    // created whenever the choice allows H.264, then kept only when the
-    // negotiated codec is H.264 — otherwise they close so the agent falls
-    // back to carrying the whole stream over RTP.
-    if (typeof VideoDecoder === "function" && h264Eligible) {
+    // created whenever the choice allows a direct-decode codec, then kept only
+    // when the negotiated codec is one WebCodecs can decode that way —
+    // otherwise they close so the agent falls back to RTP.
+    if (typeof VideoDecoder === "function" && directVideoEligible) {
       const videoChannel = peer.createDataChannel("nanoctl.video.v1", {
         ordered: false,
-        maxRetransmits: 0,
+        // Time-bounded retransmission repairs isolated SCTP loss for a fraction
+        // of an IDR's cost. Unordered delivery means it cannot head-of-line
+        // block newer frames. The lifetime covers one retransmission on real
+        // WAN/Tailscale RTTs while staying well below the viewer's 400ms
+        // reorder expiry, after which copies would be too stale to matter.
+        maxPacketLifeTime: 160,
       });
       const idrChannel = peer.createDataChannel("nanoctl.video-idr.v1");
+      // Compressed access units must arrive as ArrayBuffer. The spec default is
+      // Blob in some implementations, which would make the zero-copy feed path
+      // ignore every frame.
+      videoChannel.binaryType = "arraybuffer";
+      idrChannel.binaryType = "arraybuffer";
       videoChannel.onopen = () => {
         if (!this.isCurrent(lifecycle, peer)) return;
-        if (!negotiatedH264(peer)) {
+        const directVideoCodec = negotiatedDirectVideoCodec(peer);
+        if (!directVideoCodec) {
           videoChannel.close();
           idrChannel.close();
           return;
@@ -643,6 +831,8 @@ export class RemoteSessionController {
           idrChannel,
           this.options.video,
           restoreRemoteVideo,
+          directVideoCodec,
+          this.onDirectVideoFrame,
         );
       };
     }
@@ -670,9 +860,18 @@ export class RemoteSessionController {
       // The transform tap sits behind Chrome's jitter buffer anyway, so
       // only use it when the data-channel path did not attach — and only
       // when the negotiated codec is H.264, which is all the tap decodes.
-      if (this.pendingEncodedStreams && !this.webCodecsVideo && negotiatedH264(peer)) {
+      if (
+        this.pendingEncodedStreams &&
+        !this.webCodecsVideo &&
+        negotiatedDirectVideoCodec(peer) === "h264"
+      ) {
         const encoded = this.pendingEncodedStreams as Parameters<typeof attachWebCodecsVideo>[0];
-        this.webCodecsVideo = attachWebCodecsVideo(encoded, this.options.video, restoreRemoteVideo);
+        this.webCodecsVideo = attachWebCodecsVideo(
+          encoded,
+          this.options.video,
+          restoreRemoteVideo,
+          this.onDirectVideoFrame,
+        );
       }
       // The data-channel path owns the element through its track generator:
       // writing the RTP stream over srcObject starves the generator, so the
@@ -758,6 +957,7 @@ export class RemoteSessionController {
 
   private attachInput(): void {
     const video = this.options.video;
+    document.addEventListener("pointerlockchange", this.onPointerLockChange);
     video.addEventListener("pointermove", this.onPointer);
     video.addEventListener("pointerdown", this.onPointer);
     video.addEventListener("pointerup", this.onPointer);
@@ -778,6 +978,7 @@ export class RemoteSessionController {
 
   private detachInput(): void {
     const video = this.options.video;
+    document.removeEventListener("pointerlockchange", this.onPointerLockChange);
     video.removeEventListener("pointermove", this.onPointer);
     video.removeEventListener("pointerdown", this.onPointer);
     video.removeEventListener("pointerup", this.onPointer);
@@ -796,6 +997,8 @@ export class RemoteSessionController {
     window.removeEventListener("pageshow", this.onPageShow);
   }
 
+  private readonly onPointerLockChange = (): void => this.publishSnapshot();
+
   private readonly onPointer = (event: PointerEvent): void => {
     if (event.pointerType === "touch") return;
     if (!this.inputEnabled) return;
@@ -810,10 +1013,23 @@ export class RemoteSessionController {
         // Synthetic or already-ended pointers can reject capture; still deliver the click.
       }
     }
+    const locked = document.pointerLockElement === this.options.video;
+    if (locked && event.type === "pointermove") {
+      this.sendControl({
+        type: "pointer",
+        action: "move",
+        x: 0,
+        y: 0,
+        deltaX: event.movementX,
+        deltaY: event.movementY,
+      });
+      return;
+    }
     this.sendControl({
       type: "pointer",
       action: event.type === "pointermove" ? "move" : event.type === "pointerdown" ? "down" : "up",
       ...position,
+      ...(locked && { deltaX: 0, deltaY: 0 }),
       button: event.button === 1 || event.button === 2 ? event.button : 0,
     });
   };
@@ -846,6 +1062,11 @@ export class RemoteSessionController {
 
   private readonly onKey = (event: KeyboardEvent): void => {
     if (!this.inputEnabled) return;
+    if (event.type === "keydown" && event.ctrlKey && event.altKey && event.code === "KeyM") {
+      event.preventDefault();
+      this.togglePointerLock();
+      return;
+    }
     // Keys go to the host while the video or nothing in particular has focus; panel controls keep
     // theirs, and Tab from the page still moves browser focus so the controls stay reachable.
     // A key the host saw pressed is always released there, wherever focus has moved since.
@@ -859,6 +1080,13 @@ export class RemoteSessionController {
       return;
     if (event.type === "keydown") this.pressedKeys.add(event.code);
     event.preventDefault();
+    // The host synthesizes typematic repeats from the held key state. Browser
+    // repeats are throttled to liveness ticks so a stuck key still times out
+    // when the viewer or network dies, without paying a datagram at typematic rate.
+    if (event.type === "keydown" && event.repeat) {
+      if (event.timeStamp - this.lastKeyRepeatAt < 250) return;
+      this.lastKeyRepeatAt = event.timeStamp;
+    }
     const message: ControlMessage = {
       type: "key",
       action: event.type === "keydown" ? "down" : "up",
@@ -1307,12 +1535,17 @@ export class RemoteSessionController {
   }
 
   private releaseInput(): void {
+    if (document.pointerLockElement === this.options.video) document.exitPointerLock();
     this.pressedKeys.clear();
     if (!this.inputEnabled) this.stopGamepads();
     const channel = this.controlChannel;
     if (channel?.readyState === "open") {
       try {
-        channel.send(JSON.stringify({ type: "release" } satisfies ControlMessage));
+        // Wire v3 is binary-only on the input lanes: the JSON form was
+        // rejected host-side, so stuck keys and buttons were never released.
+        const binary = this.options.binaryInput ? encodeBinaryInput({ type: "release" }) : null;
+        if (binary) channel.send(binary);
+        else channel.send(JSON.stringify({ type: "release" } satisfies ControlMessage));
       } catch {
         // Closing a channel is already a release boundary.
       }
@@ -1324,14 +1557,60 @@ export class RemoteSessionController {
     return this.controlChannel?.readyState === "open";
   }
 
+  private viewportEncodeLimits(): { maxWidth?: number; maxHeight?: number } {
+    const video = this.options.video;
+    if (typeof video.getBoundingClientRect !== "function") return {};
+    const rect = video.getBoundingClientRect();
+    const display =
+      this.displays.find((candidate) => candidate.id === this.preferences.displayId) ??
+      this.displays.find((candidate) => candidate.primary) ??
+      this.displays[0];
+    const sourceWidth = video.videoWidth || display?.width || 0;
+    const sourceHeight = video.videoHeight || display?.height || 0;
+    if (!rect.width || !rect.height || !sourceWidth || !sourceHeight) return {};
+    const fit =
+      typeof getComputedStyle === "function" ? getComputedStyle(video).objectFit : "contain";
+    if (fit === "none") return {};
+    let width = rect.width;
+    let height = rect.height;
+    if (fit === "contain" || fit === "cover" || fit === "scale-down") {
+      const xScale = rect.width / sourceWidth;
+      const yScale = rect.height / sourceHeight;
+      const scale = fit === "cover" ? Math.max(xScale, yScale) : Math.min(xScale, yScale);
+      width = sourceWidth * scale;
+      height = sourceHeight * scale;
+    }
+    const density = window.devicePixelRatio || 1;
+    const even = (value: number) => Math.max(2, Math.ceil((value * density) / 2) * 2);
+    return { maxWidth: even(width), maxHeight: even(height) };
+  }
+
+  private sendQualityLimits(): boolean {
+    if (!this.isControlOpen()) return false;
+    const viewport = this.viewportEncodeLimits();
+    const limits: QualityLimits = { ...this.qualityLimits, ...viewport };
+    if (this.qualityLimits.maxWidth)
+      limits.maxWidth = Math.min(this.qualityLimits.maxWidth, viewport.maxWidth ?? Infinity);
+    if (this.qualityLimits.maxHeight)
+      limits.maxHeight = Math.min(this.qualityLimits.maxHeight, viewport.maxHeight ?? Infinity);
+    const key = `${limits.maxFps ?? ""}:${limits.maxBitrateKbps ?? ""}:${limits.maxWidth ?? ""}:${limits.maxHeight ?? ""}`;
+    if (key === this.lastViewportQualityKey) return true;
+    if (limits.maxFps || limits.maxBitrateKbps || (limits.maxWidth && limits.maxHeight)) {
+      this.lastViewportQualityKey = key;
+      return this.sendControl({ type: "quality", ...limits });
+    }
+    return true;
+  }
+
   private onControlReady(): void {
     if (!this.isControlOpen()) return;
+    this.lastViewportQualityKey = "";
     this.inputEnabled = this.preferences.inputEnabled && this.remoteInputAllowed;
     const displayId = this.preferences.displayId;
     if (displayId && this.displays.some((display) => display.id === displayId))
       this.sendControl({ type: "display", displayId });
-    if (this.qualityLimits.maxFps || this.qualityLimits.maxBitrateKbps)
-      this.sendControl({ type: "quality", ...this.qualityLimits });
+    this.sendQualityLimits();
+    this.sendControl({ type: "audio", enabled: this.audioEnabled });
     this.startGamepadPolling();
     this.publishSnapshot();
   }
@@ -1348,9 +1627,7 @@ export class RemoteSessionController {
     this.clearRecoveryTimer();
     this.clearNegotiationTimer();
     this.clearFirstFrameTimer();
-    if (this.keepaliveTimer !== null) window.clearInterval(this.keepaliveTimer);
     if (this.statsTimer !== null) window.clearInterval(this.statsTimer);
-    this.keepaliveTimer = null;
     this.statsTimer = null;
   }
 
@@ -1402,7 +1679,76 @@ export class RemoteSessionController {
     }
   }
 
+  private applyDirectVideoStats(dcLoss: number | undefined): void {
+    const directStats = this.webCodecsVideo?.directDataChannel ? this.webCodecsVideo.stats() : null;
+    if (directStats?.bytes === undefined) return;
+    const base: RemoteSessionMetrics = this.metrics ?? {
+      resolution: "—",
+      fps: null,
+      bitrateKbps: null,
+      rttMs: null,
+      packetsLost: 0,
+      framesDropped: 0,
+      lossPercent: null,
+      jitterMs: null,
+      route: "unknown",
+      codec: null,
+      decoder: null,
+      decodeMs: null,
+    };
+    const directSample = {
+      id: "direct-video",
+      bytes: directStats.bytes,
+      frames: directStats.decoded,
+      timestamp: performance.now(),
+      decodeTimeMs: directStats.decodeTimeMs,
+      decodeTimedFrames: directStats.decodeTimedFrames,
+    };
+    const directRates = videoRates(directSample, this.previousDirectVideoSample);
+    const previousDirect = this.previousDirectVideoSample;
+    const decodeTimeDelta =
+      directSample.decodeTimeMs !== undefined && previousDirect?.decodeTimeMs !== undefined
+        ? directSample.decodeTimeMs - previousDirect.decodeTimeMs
+        : 0;
+    const decodeFrameDelta =
+      directSample.decodeTimedFrames !== undefined &&
+      previousDirect?.decodeTimedFrames !== undefined
+        ? directSample.decodeTimedFrames - previousDirect.decodeTimedFrames
+        : 0;
+    this.previousDirectVideoSample = directSample;
+    this.metrics = {
+      ...base,
+      resolution:
+        directStats.width && directStats.height
+          ? `${directStats.width}×${directStats.height}`
+          : base.resolution,
+      fps: directRates.fps,
+      bitrateKbps: directRates.bitrateKbps,
+      packetsLost: directStats.packetsLost ?? base.packetsLost,
+      framesDropped: directStats.dropped,
+      lossPercent: dcLoss !== undefined ? Math.round(dcLoss * 1_000) / 10 : base.lossPercent,
+      codec:
+        directStats.codec === "h264"
+          ? "H.264"
+          : directStats.codec === "hevc"
+            ? "HEVC"
+            : directStats.codec === "av1"
+              ? "AV1"
+              : base.codec,
+      decoder: "WebCodecs",
+      decodeMs:
+        decodeFrameDelta > 0 && decodeTimeDelta >= 0
+          ? Math.round((decodeTimeDelta / decodeFrameDelta) * 10) / 10
+          : null,
+    };
+  }
+
   private async collectStats(lifecycle: number): Promise<void> {
+    // Receiver-measured data-channel loss is the host's only congestion
+    // signal while video rides the data channel — RTP feedback describes the
+    // thin keepalive leg — so report it every second before any early return.
+    const dcLoss = this.webCodecsVideo?.takeLinkLoss?.();
+    if (dcLoss !== undefined) this.sendControl({ type: "link-stats", loss: dcLoss });
     const peer = this.peer;
     if (!peer || !this.isCurrent(lifecycle, peer) || this.statsInFlight) return;
     this.statsInFlight = true;
@@ -1426,7 +1772,14 @@ export class RemoteSessionController {
           nominatedPairs.push(stats);
         }
       });
-      if (!inbound) return;
+      if (!inbound) {
+        // Safari can omit inbound RTP stats while the thin RTP keepalive leg is
+        // suppressed. Direct data-channel video has its own byte/frame counters
+        // and must not depend on that RTP stats object existing.
+        this.applyDirectVideoStats(dcLoss);
+        this.publishSnapshot();
+        return;
+      }
       const sample: VideoSample = {
         id: inbound.id,
         bytes: statNumber(inbound, "bytesReceived") ?? 0,
@@ -1514,6 +1867,7 @@ export class RemoteSessionController {
         decoder: statString(inbound, "decoderImplementation") ?? null,
         decodeMs: decodeMs !== null && decodeMs >= 0 ? Math.round(decodeMs * 10) / 10 : null,
       };
+      this.applyDirectVideoStats(dcLoss);
       this.publishSnapshot();
     } catch {
       // Stats are advisory. A browser can reject the query while the media path is healthy.
@@ -1572,21 +1926,24 @@ export function createControllerEpoch(): string {
 }
 
 /**
- * True when the answer's video m-line resolves to H.264 — the codec the
- * WebCodecs decode paths handle. Reads the first rtpmap in the video media
- * section of the remote description; false when it is missing or unreadable
+ * Returns the answer's video codec when the low-latency data-channel decode
+ * path can carry it. Reads the first rtpmap in the video media section of the
+ * remote description; null when it is missing, unreadable, or unsupported
  * (safe fallback: the RTP path keeps working untouched).
  */
-function negotiatedH264(peer: RTCPeerConnection): boolean {
+function negotiatedDirectVideoCodec(peer: RTCPeerConnection): DirectVideoCodec | null {
   const sdp = peer.remoteDescription?.sdp;
-  if (!sdp) return false;
+  if (!sdp) return null;
   const start = sdp.indexOf("m=video");
-  if (start === -1) return false;
+  if (start === -1) return null;
   const videoSection = sdp.slice(start);
   const end = videoSection.indexOf("\nm=", "m=video".length);
   const section = end === -1 ? videoSection : videoSection.slice(0, end);
-  const codec = /a=rtpmap:\d+ ([A-Za-z0-9-]+)\//.exec(section)?.[1];
-  return codec?.toUpperCase() === "H264";
+  const codec = /a=rtpmap:\d+ ([A-Za-z0-9-]+)\//.exec(section)?.[1]?.toUpperCase();
+  if (codec === "H264") return "h264";
+  if (codec === "H265" || codec === "HEVC") return "hevc";
+  if (codec === "AV1") return "av1";
+  return null;
 }
 
 function statValue(stats: RTCStats | undefined, key: string): unknown {

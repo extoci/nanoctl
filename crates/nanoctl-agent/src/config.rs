@@ -74,11 +74,11 @@ pub enum EncoderPreference {
     Software,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LatencyMode {
-    Responsiveness,
     #[default]
+    Responsiveness,
     Balanced,
     Quality,
 }
@@ -92,7 +92,7 @@ impl Default for QualityConfig {
             max_bitrate_kbps: 100_000,
             max_width: 3840,
             max_height: 2160,
-            latency_mode: LatencyMode::Balanced,
+            latency_mode: LatencyMode::Responsiveness,
         }
     }
 }
@@ -271,6 +271,14 @@ mod tests {
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.quality.max_fps, 60);
         assert!(!config.features.system_audio);
+    }
+
+    #[test]
+    fn defaults_to_the_lowest_latency_measured_mode() {
+        assert_eq!(
+            AgentConfig::default().quality.latency_mode,
+            LatencyMode::Responsiveness
+        );
     }
 
     #[test]

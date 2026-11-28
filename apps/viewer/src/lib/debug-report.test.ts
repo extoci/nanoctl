@@ -27,6 +27,7 @@ const snapshot: RemoteSessionSnapshot = {
   reconnectAttempt: 0,
   iceGeneration: 1,
   inputEnabled: true,
+  mouseLocked: false,
   gamepadEnabled: false,
   gamepadStatus: "waiting",
   firstFrameReceived: true,

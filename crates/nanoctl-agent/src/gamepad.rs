@@ -68,7 +68,143 @@ struct WirePad(usize, u16, u8, u8, i16, i16, i16, i16);
 
 #[derive(Debug, Deserialize)]
 #[serde(try_from = "WireSnapshot")]
-pub struct Snapshot([Option<PadReport>; MAX_PADS]);
+pub struct Snapshot([Option<PadReport>; MAX_PADS], bool, u8);
+
+impl Snapshot {
+    /// Parses wire-v3 gamepad state: u8 sequence, u4 slot mask, then 13 bytes
+    /// for each masked slot in ascending order — u16 buttons, u8 LT/RT,
+    /// i16 LX/LY/RX/RY, and u8 DualShock flags. In sparse reports masked slots
+    /// are absolute replacement state and omitted slots are unchanged.
+    pub(crate) fn parse_binary(data: &[u8], sparse: bool) -> Result<Self, &'static str> {
+        if data.len() < 2 {
+            return Err("truncated gamepad report");
+        }
+        let sequence = data[0];
+        let mask = data[1];
+        if mask & !0x0f != 0 {
+            return Err("invalid gamepad slot mask");
+        }
+        let count = mask.count_ones() as usize;
+        let mut pads = Vec::with_capacity(count);
+        let mut dual_shock4 = Vec::new();
+        let mut offset = 2;
+        if !sparse && data.len() - offset != count * 13 {
+            return Err("invalid gamepad report length");
+        }
+        for slot in 0..MAX_PADS {
+            if mask & (1 << slot) == 0 {
+                continue;
+            }
+            let (buttons, left_trigger, right_trigger, axes, ds4_flags) = if sparse {
+                let Some(&fields) = data.get(offset) else {
+                    return Err("truncated sparse gamepad report");
+                };
+                offset += 1;
+                let take = |offset: &mut usize, len: usize| -> Result<&[u8], &'static str> {
+                    let end = offset
+                        .checked_add(len)
+                        .ok_or("invalid sparse gamepad length")?;
+                    let bytes = data
+                        .get(*offset..end)
+                        .ok_or("truncated sparse gamepad report")?;
+                    *offset = end;
+                    Ok(bytes)
+                };
+                let mut buttons = 0;
+                let mut triggers = [0, 0];
+                let mut axes = [0, 0, 0, 0];
+                let mut ds4_flags = None;
+                if fields & 1 != 0 {
+                    let mut value = 0_u32;
+                    for shift in (0..=21).step_by(7) {
+                        let byte = take(&mut offset, 1)?[0];
+                        value |= u32::from(byte & 0x7f) << shift;
+                        if byte & 0x80 == 0 {
+                            buttons = u16::try_from(value)
+                                .map_err(|_| "invalid sparse gamepad buttons")?;
+                            if buttons == 0 {
+                                return Err("invalid sparse gamepad buttons");
+                            }
+                            break;
+                        }
+                        if shift == 21 {
+                            return Err("invalid sparse gamepad buttons");
+                        }
+                    }
+                }
+                if fields & 2 != 0 {
+                    triggers[0] = take(&mut offset, 1)?[0];
+                    if triggers[0] == 0 {
+                        return Err("invalid sparse gamepad trigger");
+                    }
+                }
+                if fields & 4 != 0 {
+                    triggers[1] = take(&mut offset, 1)?[0];
+                    if triggers[1] == 0 {
+                        return Err("invalid sparse gamepad trigger");
+                    }
+                }
+                for (bit, axis) in axes.iter_mut().enumerate() {
+                    if fields & (8 << bit) != 0 {
+                        let bytes = take(&mut offset, 2)?;
+                        *axis = i16::from_le_bytes([bytes[0], bytes[1]]);
+                        if *axis == 0 {
+                            return Err("invalid sparse gamepad axis");
+                        }
+                    }
+                }
+                if fields & 128 != 0 {
+                    ds4_flags = Some(take(&mut offset, 1)?[0]);
+                }
+                (buttons, triggers[0], triggers[1], axes, ds4_flags)
+            } else {
+                let entry = &data[offset..offset + 13];
+                offset += 13;
+                if entry[12] & !0x0f != 0 {
+                    return Err("invalid DualShock 4 flags");
+                }
+                let axis = |index: usize| i16::from_le_bytes([entry[index], entry[index + 1]]);
+                (
+                    u16::from_le_bytes([entry[0], entry[1]]),
+                    entry[2],
+                    entry[3],
+                    [axis(4), axis(6), axis(8), axis(10)],
+                    (entry[12] & 1 != 0).then_some(entry[12]),
+                )
+            };
+            pads.push(WirePad(
+                slot,
+                buttons,
+                left_trigger,
+                right_trigger,
+                axes[0],
+                axes[1],
+                axes[2],
+                axes[3],
+            ));
+            if let Some(flags) = ds4_flags {
+                if flags & !0x0f != 0 || flags & 1 == 0 {
+                    return Err("invalid DualShock 4 flags");
+                }
+                dual_shock4.push(WireDs4Pad {
+                    slot,
+                    buttons: Ds4Buttons {
+                        left_trigger_pressed: flags & 0x02 != 0,
+                        right_trigger_pressed: flags & 0x04 != 0,
+                        touchpad_pressed: flags & 0x08 != 0,
+                    },
+                });
+            }
+        }
+        if offset != data.len() {
+            return Err("invalid gamepad report length");
+        }
+        let mut snapshot = Snapshot::try_from(WireSnapshot { pads, dual_shock4 })?;
+        snapshot.1 = sparse;
+        snapshot.2 = sequence;
+        Ok(snapshot)
+    }
+}
 
 impl TryFrom<WireSnapshot> for Snapshot {
     type Error = &'static str;
@@ -92,7 +228,7 @@ impl TryFrom<WireSnapshot> for Snapshot {
                 return Err("duplicate DualShock 4 slot");
             }
         }
-        Ok(Self(pads))
+        Ok(Self(pads, false, 0))
     }
 }
 
@@ -121,17 +257,43 @@ struct Pad {
 pub struct Gamepads {
     pads: [Option<Pad>; MAX_PADS],
     last_snapshot: Option<Instant>,
+    sequence: Option<u8>,
+    waiting_for_full: bool,
 }
 
 #[cfg(feature = "media")]
 impl Gamepads {
     pub fn update(&mut self, snapshot: Snapshot) -> Result<()> {
+        let sparse = snapshot.1;
+        let sequence = snapshot.2;
+        if let Some(last) = self.sequence {
+            let newer = sequence != last && sequence.wrapping_sub(last) < 0x80;
+            if !newer {
+                return Ok(());
+            }
+        }
+        let missing_base = self.sequence.is_none() || self.waiting_for_full;
+        if sparse && missing_base {
+            // Sparse records arrive on a different lane from their reliable
+            // full baseline. Do not consume their sequence while dropping them:
+            // when the delayed baseline arrives it is still the newest usable
+            // reset point even if its sequence number is lower.
+            self.waiting_for_full = true;
+            return Ok(());
+        }
+        self.sequence = Some(sequence);
+        if !sparse {
+            self.waiting_for_full = false;
+        }
         if !available() {
             return Ok(());
         }
         self.last_snapshot = Some(Instant::now());
         for (current, report) in self.pads.iter_mut().zip(snapshot.0) {
-            if current.as_ref().map(|pad| pad.kind) != report.map(PadReport::kind) {
+            let detach = !sparse && report.is_none();
+            if (detach || report.is_some())
+                && current.as_ref().map(|pad| pad.kind) != report.map(PadReport::kind)
+            {
                 *current = None;
             }
         }
@@ -146,6 +308,14 @@ impl Gamepads {
             }
         }
         error.map_or(Ok(()), Err)
+    }
+
+    /// A heartbeat proves the viewer is alive but carries no replacement
+    /// state. Once pads have been neutralized it must not resurrect them.
+    pub fn heartbeat(&mut self) {
+        if self.last_snapshot.is_some() {
+            self.last_snapshot = Some(Instant::now());
+        }
     }
 
     /// Zero every attached pad without unplugging it, so a transient channel
@@ -434,6 +604,92 @@ mod tests {
     }
 
     #[test]
+    fn decodes_binary_reports_by_slot() {
+        let report = Snapshot::parse_binary(
+            &[
+                7, 4, 0x01, 0x10, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.2, 7);
+        assert_eq!(
+            report.0[2],
+            Some(PadReport {
+                state: Report(0x1001, 7, 8, -32768, 32767, -1, 1),
+                ds4: Some(Ds4Buttons {
+                    left_trigger_pressed: true,
+                    right_trigger_pressed: false,
+                    touchpad_pressed: true,
+                }),
+            })
+        );
+        assert!(
+            Snapshot::parse_binary(&[0, 0], false)
+                .unwrap()
+                .0
+                .iter()
+                .all(Option::is_none)
+        );
+        for invalid in [
+            &[][..],
+            &[1],
+            &[1, 0x10],
+            &[1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10],
+        ] {
+            assert!(
+                Snapshot::parse_binary(invalid, false).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_sparse_binary_reports_with_zero_fields_omitted() {
+        let report = Snapshot::parse_binary(
+            &[
+                9, 4, 0xff, 0x81, 0x20, 7, 8, 0x00, 0x80, 0xff, 0x7f, 0xff, 0xff, 0x01, 0x00, 0x0b,
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(report.2, 9);
+        assert!(report.1);
+        assert_eq!(
+            report.0[2],
+            Some(PadReport {
+                state: Report(0x1001, 7, 8, -32768, 32767, -1, 1),
+                ds4: Some(Ds4Buttons {
+                    left_trigger_pressed: true,
+                    right_trigger_pressed: false,
+                    touchpad_pressed: true,
+                }),
+            })
+        );
+
+        let report = Snapshot::parse_binary(&[10, 2, 12, 7, 0xfe, 0xff], true).unwrap();
+        assert_eq!(
+            report.0[1],
+            Some(PadReport {
+                state: Report(0, 0, 7, -2, 0, 0, 0),
+                ds4: None,
+            })
+        );
+        for invalid in [
+            &[10, 2][..],
+            &[10, 2, 0x80],
+            &[10, 2, 1, 0],
+            &[10, 2, 0x40, 0],
+            &[10, 2, 0, 0],
+        ] {
+            assert!(
+                Snapshot::parse_binary(invalid, true).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_reports() {
         for invalid in [
             "[[4,0,0,0,0,0,0,0]]",
@@ -597,6 +853,25 @@ mod tests {
                 updates.lock().unwrap().as_slice(),
                 &[PadReport::neutral(PadKind::DualShock4)]
             );
+        }
+
+        #[test]
+        fn dropped_sparse_before_baseline_does_not_consume_its_sequence() {
+            let mut gamepads = Gamepads::default();
+            let report = PadReport {
+                state: Report(0x1000, 0, 0, 0, 0, 0, 0),
+                ds4: None,
+            };
+            let mut slots = [None, None, None, None];
+            slots[0] = Some(report);
+
+            gamepads.update(Snapshot(slots, true, 5)).unwrap();
+            assert_eq!(gamepads.sequence, None);
+            assert!(gamepads.waiting_for_full);
+
+            gamepads.update(Snapshot(slots, false, 4)).unwrap();
+            assert_eq!(gamepads.sequence, Some(4));
+            assert!(!gamepads.waiting_for_full);
         }
 
         #[test]

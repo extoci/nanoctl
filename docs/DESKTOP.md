@@ -20,7 +20,7 @@ bun run test:desktop
 bun run build:desktop
 ```
 
-The release executable is `crates/nanoctl-planck/target/release/nanoctl-desktop.exe`. Windows release candidates publish `nanoctl-desktop-windows-x64.exe` and `nanoctl-desktop-windows-arm64.exe` beside the agent artifacts.
+The release executable is `crates/nanoctl-planck/target/release/nanoctl-desktop.exe`. Windows release candidates publish `nanoctl-desktop-windows-x64.exe` beside the agent artifacts.
 
 ## Labs
 
