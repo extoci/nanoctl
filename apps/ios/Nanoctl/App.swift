@@ -22,6 +22,8 @@ final class ViewerModel {
     var stats = ""
     var audioAvailable = false
     var audioEnabled = true
+    var audioOutputs: [AudioOutput] = []
+    var selectedAudioOutput: String?
     var clipboard = false
     var displays: [DisplayInfo] = []
     var toast: String?
@@ -96,6 +98,8 @@ final class Desktop {
         model.stats = session.statsLine
         model.audioAvailable = host?.audioAvailable == true
         model.audioEnabled = session.audioEnabled
+        model.audioOutputs = session.audioOutputs
+        model.selectedAudioOutput = session.selectedAudioOutput
         model.clipboard = host?.capabilities.clipboard == true && session.inputReady
         model.displays = host?.displayList ?? []
         model.touchMode = stage.touchMode
