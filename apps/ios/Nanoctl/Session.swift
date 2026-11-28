@@ -113,6 +113,7 @@ final class Session {
     /// Session-local codec degradation. A persistent HEVC decode fault must not
     /// leave the app black or permanently overwrite the user's codec preference.
     private var forceH264 = false
+    private var restoringStreamSettings = false
 
     private(set) var track: RTCVideoTrack?
     private(set) var audioTrack: RTCAudioTrack?
@@ -129,7 +130,10 @@ final class Session {
     var codecPreference: CodecPreference = {
         CodecPreference(rawValue: UserDefaults.standard.string(forKey: "codec") ?? "") ?? .auto
     }() {
-        didSet { UserDefaults.standard.set(codecPreference.rawValue, forKey: "codec") }
+        didSet {
+            guard !restoringStreamSettings else { return }
+            persistStreamSettings()
+        }
     }
     var audioEnabled = true {
         didSet {
@@ -141,8 +145,20 @@ final class Session {
     private var viewportHeight: Int?
     private var gamepadSequence: UInt8 = 0
     /// Viewer caps below the host's maximums; nil means the maximum.
-    var maxFps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
-    var maxBitrateKbps: Int? { didSet { _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps) } }
+    var maxFps: Int? {
+        didSet {
+            guard !restoringStreamSettings else { return }
+            persistStreamSettings()
+            _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps)
+        }
+    }
+    var maxBitrateKbps: Int? {
+        didSet {
+            guard !restoringStreamSettings else { return }
+            persistStreamSettings()
+            _ = setQuality(maxFps: maxFps, maxBitrateKbps: maxBitrateKbps)
+        }
+    }
     var onChange: (() -> Void)?
     var onClipboard: ((String) -> Void)?
 
@@ -195,8 +211,33 @@ final class Session {
         network = URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
     }
 
+    private func restoreStreamSettings(for endpoint: HostEndpoint) {
+        let stored = StreamSettingsStore().settings(for: endpoint.base.absoluteString)
+        let fallbackCodec = CodecPreference(rawValue: UserDefaults.standard.string(forKey: "codec") ?? "") ?? .auto
+        restoringStreamSettings = true
+        codecPreference = stored.flatMap { CodecPreference(rawValue: $0.codec) } ?? fallbackCodec
+        maxFps = stored?.maxFps
+        maxBitrateKbps = stored?.maxBitrateKbps
+        restoringStreamSettings = false
+        if stored == nil {
+            // Freeze the inherited defaults for this host at first use. Later
+            // changes made for another machine must not silently alter an
+            // existing host merely because the user never opened its settings.
+            persistStreamSettings()
+        }
+    }
+
+    private func persistStreamSettings() {
+        guard let endpoint else { return }
+        StreamSettingsStore().save(HostStreamSettings(codec: codecPreference.rawValue,
+                                                      maxFps: maxFps,
+                                                      maxBitrateKbps: maxBitrateKbps),
+                                   for: endpoint.base.absoluteString)
+    }
+
     func start(_ endpoint: HostEndpoint) {
         self.endpoint = endpoint
+        restoreStreamSettings(for: endpoint)
         wantsConnection = true
         reconnectAttempts = 0
         forceH264 = false
