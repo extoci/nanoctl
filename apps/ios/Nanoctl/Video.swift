@@ -318,18 +318,30 @@ final class VideoView: UIView {
         let source = frame.buffer.toI420()
         let width = Int(source.width), height = Int(source.height)
         var buffer: CVPixelBuffer?
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8Planar,
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                                   [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
                                   &buffer) == kCVReturnSuccess, let buffer else { return nil }
         guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return nil }
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        let planes = [(source.dataY, source.strideY), (source.dataU, source.strideU), (source.dataV, source.strideV)]
-        for (plane, (base, stride)) in planes.enumerated() {
-            guard let dest = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) else { return nil }
-            let outStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
-            for y in 0..<CVPixelBufferGetHeightOfPlane(buffer, plane) {
-                dest.advanced(by: y * outStride).copyMemory(from: base.advanced(by: y * Int(stride)),
-                                                          byteCount: CVPixelBufferGetWidthOfPlane(buffer, plane))
+        guard let luma = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let chroma = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return nil }
+        let lumaStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        for y in 0..<height {
+            luma.advanced(by: y * lumaStride).copyMemory(
+                from: source.dataY.advanced(by: y * Int(source.strideY)),
+                byteCount: width
+            )
+        }
+        let chromaWidth = (width + 1) / 2
+        let chromaHeight = (height + 1) / 2
+        let chromaStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        for y in 0..<chromaHeight {
+            let out = chroma.advanced(by: y * chromaStride).assumingMemoryBound(to: UInt8.self)
+            let u = source.dataU.advanced(by: y * Int(source.strideU))
+            let v = source.dataV.advanced(by: y * Int(source.strideV))
+            for x in 0..<chromaWidth {
+                out[x * 2] = u[x]
+                out[x * 2 + 1] = v[x]
             }
         }
         return buffer

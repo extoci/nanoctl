@@ -26,6 +26,7 @@ type Scenario = {
   description: string;
   codec?: "h264" | "av1";
   av1Fixture?: boolean;
+  minScreenshotLuma?: number;
 };
 const scenarios: Record<string, Scenario> = {
   clean: {
@@ -43,6 +44,7 @@ const scenarios: Record<string, Scenario> = {
     description: "clean loopback AV1 IVF fixture through the real RTP path plus a VideoToolbox bitstream proof",
     codec: "av1",
     av1Fixture: true,
+    minScreenshotLuma: 25,
   },
   "lossy-wifi": {
     durationMs: 20_000,
@@ -103,6 +105,16 @@ async function runCommand(args: string[], env?: NodeJS.ProcessEnv) {
   return out.trim();
 }
 const sim = (...args: string[]) => runCommand(["xcrun", "simctl", ...args]);
+async function runCombinedOutput(args: string[]) {
+  const child = Bun.spawn(args, { cwd: root, stdout: "pipe", stderr: "pipe" });
+  const [out, err, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  if (code !== 0) throw new Error(`${args.join(" ")} failed`);
+  return out + err;
+}
 const wait = async <T>(probe: () => Promise<T | undefined>, seconds: number, label: string) => {
   const deadline = performance.now() + seconds * 1000;
   while (performance.now() < deadline) {
@@ -278,7 +290,27 @@ try {
         10,
         `${name} network probe`,
       );
-      await sim("io", device, "screenshot", join(resultsPath, `${name}.png`)).catch(() => "");
+      const screenshotPath = join(resultsPath, `${name}.png`);
+      await sim("io", device, "screenshot", screenshotPath).catch(() => "");
+      if (scenario.minScreenshotLuma) {
+        const stats = await runCombinedOutput([
+          "ffmpeg",
+          "-hide_banner",
+          "-v",
+          "info",
+          "-i",
+          screenshotPath,
+          "-vf",
+          "signalstats,metadata=print",
+          "-f",
+          "null",
+          "-",
+        ]);
+        const luma = Number(stats.match(/lavfi\.signalstats\.YAVG=([0-9.]+)/)?.[1] ?? 0);
+        if (luma < scenario.minScreenshotLuma) {
+          failures.push(`${name}: screenshot luma ${luma.toFixed(1)} < ${scenario.minScreenshotLuma}`);
+        }
+      }
 
       const last = report.samples.at(-1);
       const connectingAt =
