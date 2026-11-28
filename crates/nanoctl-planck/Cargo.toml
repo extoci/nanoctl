@@ -26,3 +26,6 @@ lto = "thin"
 opt-level = 3
 panic = "unwind"
 strip = "symbols"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3.0"

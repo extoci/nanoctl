@@ -21,6 +21,8 @@ replacing that streaming workflow yet. See [ADR 0004](adr/0004-tailnet-native.md
 
 Desktop experiments are opt-in, independently toggleable and platform-specific. They stay off
 by default so alpha users can track current builds without inheriting unfinished behavior.
+Client experiments affect the desktop shell; host experiments are written to the host agent
+configuration and applied after the agent restarts.
 
 ## Boundaries
 

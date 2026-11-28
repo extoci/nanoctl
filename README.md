@@ -75,7 +75,7 @@ focused viewer. It does not replace Tailscale or require a native iOS helper.
 
 ## Windows desktop
 
-nanoctl includes a native Windows desktop shell built with GPUI. It discovers nanoctl hosts, opens their secure embedded viewer, and exposes opt-in experimental features through Labs. See [Windows desktop](docs/DESKTOP.md).
+nanoctl includes a native Windows desktop shell built with GPUI. It discovers nanoctl hosts, opens their secure embedded viewer, manages the local host agent, and exposes opt-in client and host experiments through Labs. See [Windows desktop](docs/DESKTOP.md).
 
 ```powershell
 bun run build:desktop

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod app;
 mod config;
 mod labs;
@@ -31,7 +32,10 @@ fn main() {
             },
             |_, cx| {
                 let view = cx.new(|_| Planck::new());
-                view.update(cx, |planck, cx| planck.refresh(cx));
+                view.update(cx, |planck, cx| {
+                    planck.refresh(cx);
+                    planck.refresh_agent(cx);
+                });
                 view
             },
         )

@@ -358,6 +358,7 @@ pub async fn run(seconds: u64) -> Result<Value> {
             encoder_preference: EncoderPreference::Software,
             codec: crate::codec::VideoCodec::H264,
             h264_high: false,
+            strict_dxgi_capture: false,
         },
     );
     tokio::time::sleep(Duration::from_secs(5)).await;

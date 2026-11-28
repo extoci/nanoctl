@@ -3,8 +3,9 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
+use crate::agent::{self, AgentSnapshot};
 use crate::config::PlanckConfig;
-use crate::labs::{self, Experiment, Labs, Platform, TAILNET_DISCOVERY};
+use crate::labs::{self, Experiment, Labs, Platform, Scope, TAILNET_DISCOVERY};
 use crate::tailnet::{self, Host};
 
 const AGENT_PORT: u16 = 7337;
@@ -28,6 +29,7 @@ const WARNING: u32 = 0xfbbf24;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Hosts,
+    Agent,
     Labs,
 }
 
@@ -44,8 +46,11 @@ pub struct Planck {
     config_path: Option<std::path::PathBuf>,
     labs: Labs,
     hosts: Vec<Host>,
+    agent: Option<AgentSnapshot>,
     status: String,
     discovering: bool,
+    agent_busy: bool,
+    agent_snapshot_generation: usize,
 }
 
 impl Planck {
@@ -68,8 +73,11 @@ impl Planck {
             config,
             config_path,
             hosts: Vec::new(),
+            agent: None,
             status,
             discovering: false,
+            agent_busy: false,
+            agent_snapshot_generation: 0,
         }
     }
 
@@ -116,6 +124,70 @@ impl Planck {
         .detach();
     }
 
+    pub fn refresh_agent(&mut self, cx: &mut Context<Self>) {
+        if self.agent_busy {
+            return;
+        }
+        self.agent_snapshot_generation = self.agent_snapshot_generation.wrapping_add(1);
+        let generation = self.agent_snapshot_generation;
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx.background_spawn(async move { agent::inspect() }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.agent_snapshot_generation == generation {
+                    this.agent = Some(snapshot);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn agent_action(&mut self, action: AgentAction, cx: &mut Context<Self>) {
+        if self.agent_busy {
+            return;
+        }
+        self.agent_busy = true;
+        self.agent_snapshot_generation = self.agent_snapshot_generation.wrapping_add(1);
+        let generation = self.agent_snapshot_generation;
+        self.status = action.busy_label().to_owned();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (result, snapshot) = cx
+                .background_spawn(async move { (action.run(), agent::inspect()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.agent_busy = false;
+                if this.agent_snapshot_generation == generation {
+                    this.agent = Some(snapshot);
+                }
+                this.status = match result {
+                    Ok(message) => message.lines().next().unwrap_or("Done").to_owned(),
+                    Err(error) => format!("{error:#}"),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_host_experiment(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        let next = !self
+            .agent
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.labs.get(id).copied().unwrap_or(false));
+        self.status = match agent::set_host_lab(id, next) {
+            Ok(()) => {
+                if let Some(snapshot) = &mut self.agent {
+                    snapshot.labs.insert(id.to_owned(), next);
+                }
+                self.refresh_agent(cx);
+                "Host experiment saved; restart the agent to apply it".to_owned()
+            }
+            Err(error) => format!("Could not save host experiment: {error:#}"),
+        };
+        cx.notify();
+    }
+
     fn toggle_experiment(&mut self, id: &'static str, cx: &mut Context<Self>) {
         let next = !self.labs.stored(id);
         if !self.labs.set(id, next) {
@@ -152,6 +224,7 @@ impl Render for Planck {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.tab {
             Tab::Hosts => self.hosts_tab(cx).into_any_element(),
+            Tab::Agent => self.agent_tab(cx).into_any_element(),
             Tab::Labs => self.labs_tab(cx).into_any_element(),
         };
         div()
@@ -199,6 +272,13 @@ impl Planck {
                             "Hosts",
                             self.tab == Tab::Hosts,
                             cx.listener(|this, _, _, cx| this.select_tab(Tab::Hosts, cx)),
+                        ))
+                        .child(nav_item(
+                            "nav-agent",
+                            "A",
+                            "Agent",
+                            self.tab == Tab::Agent,
+                            cx.listener(|this, _, _, cx| this.select_tab(Tab::Agent, cx)),
                         ))
                         .child(nav_item(
                             "nav-labs",
@@ -320,6 +400,10 @@ impl Planck {
                     "Choose a desktop to control. Peer discovery is available in Labs."
                 },
             ),
+            Tab::Agent => (
+                "Agent",
+                "Manage this PC as a nanoctl host and its host-side experiments.",
+            ),
             Tab::Labs => (
                 "Labs",
                 "Preview upcoming alpha features without changing stable behavior.",
@@ -347,6 +431,18 @@ impl Planck {
                     )
                     .child(div().text_sm().text_color(rgb(MUTED)).child(detail)),
             )
+            .when(self.tab == Tab::Agent, |this| {
+                this.child(action_button(
+                    "refresh-agent",
+                    if self.agent_busy {
+                        "Working…"
+                    } else {
+                        "Refresh"
+                    },
+                    ButtonTone::Primary,
+                    cx.listener(|this, _, _, cx| this.refresh_agent(cx)),
+                ))
+            })
             .when(self.tab == Tab::Hosts, |this| {
                 this.child(action_button(
                     "refresh-hosts",
@@ -386,9 +482,56 @@ impl Planck {
             )
     }
 
+    fn agent_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut children = Vec::new();
+        if let Some(snapshot) = &self.agent {
+            children.push(agent_status_card(snapshot).into_any_element());
+            children.push(agent_actions_card(snapshot, cx).into_any_element());
+            children.push(
+                section_title(
+                    "Host Labs",
+                    "Opt into host-side alpha behavior. Changes require an agent restart.",
+                )
+                .into_any_element(),
+            );
+            for experiment in labs::EXPERIMENTS
+                .iter()
+                .filter(|experiment| experiment.scope == Scope::Host)
+            {
+                children
+                    .push(host_experiment_row(experiment, &snapshot.labs, cx).into_any_element());
+            }
+        } else {
+            children.push(
+                info_card(
+                    "Loading agent state",
+                    "Inspecting the local nanoctl installation.",
+                )
+                .into_any_element(),
+            );
+        }
+        div()
+            .id("agent-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_8()
+            .py_6()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(920.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(children),
+            )
+    }
+
     fn labs_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = labs::EXPERIMENTS
             .iter()
+            .filter(|experiment| experiment.scope == Scope::Client)
             .map(|experiment| experiment_row(experiment, &self.labs, cx).into_any_element())
             .collect::<Vec<_>>();
         div()
@@ -418,6 +561,268 @@ impl Planck {
                     }),
             )
     }
+}
+
+#[derive(Clone, Copy)]
+enum AgentAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl AgentAction {
+    fn busy_label(self) -> &'static str {
+        match self {
+            Self::Start => "Starting agent",
+            Self::Stop => "Stopping agent",
+            Self::Restart => "Restarting agent",
+        }
+    }
+
+    fn run(self) -> anyhow::Result<String> {
+        match self {
+            Self::Start => agent::start(),
+            Self::Stop => agent::stop(),
+            Self::Restart => agent::restart(),
+        }
+    }
+}
+
+fn section_title(title: &'static str, detail: &'static str) -> impl IntoElement {
+    div()
+        .pt_3()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_lg()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(div().text_sm().text_color(rgb(MUTED)).child(detail))
+}
+
+fn info_card(title: &'static str, detail: &'static str) -> impl IntoElement {
+    div()
+        .w_full()
+        .p_4()
+        .rounded_xl()
+        .bg(rgb(PANEL_SOFT))
+        .border_1()
+        .border_color(rgb(BORDER_SOFT))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(div().text_sm().text_color(rgb(MUTED)).child(detail))
+}
+
+fn agent_status_card(snapshot: &AgentSnapshot) -> impl IntoElement {
+    let state = if snapshot.running {
+        "Running"
+    } else if snapshot.installed {
+        "Stopped"
+    } else {
+        "Not installed"
+    };
+    div()
+        .w_full()
+        .p_4()
+        .rounded_xl()
+        .bg(rgb(PANEL))
+        .border_1()
+        .border_color(rgb(BORDER_SOFT))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child("Local host agent"),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(MUTED)).child(
+                                snapshot
+                                    .version
+                                    .clone()
+                                    .unwrap_or_else(|| "nanoctl not found".into()),
+                            ),
+                        ),
+                )
+                .child(subtle_badge(
+                    if snapshot.running {
+                        "RUNNING"
+                    } else if snapshot.installed {
+                        "STOPPED"
+                    } else {
+                        "NOT INSTALLED"
+                    },
+                    if snapshot.running {
+                        rgb(GREEN)
+                    } else {
+                        rgb(WARNING)
+                    },
+                )),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child(format!("State: {state}")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(FAINT))
+                .child(format!("Config: {}", snapshot.config_path.display())),
+        )
+        .when_some(snapshot.binary_path.as_ref(), |this, path| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(FAINT))
+                    .child(format!("Binary: {}", path.display())),
+            )
+        })
+}
+
+fn agent_actions_card(snapshot: &AgentSnapshot, cx: &mut Context<Planck>) -> impl IntoElement {
+    let config_path = snapshot.config_path.clone();
+    div()
+        .w_full()
+        .p_4()
+        .rounded_xl()
+        .bg(rgb(PANEL))
+        .border_1()
+        .border_color(rgb(BORDER_SOFT))
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .child(action_button(
+            "agent-start",
+            "Start",
+            ButtonTone::Primary,
+            cx.listener(|this, _, _, cx| this.agent_action(AgentAction::Start, cx)),
+        ))
+        .child(action_button(
+            "agent-stop",
+            "Stop",
+            ButtonTone::Secondary,
+            cx.listener(|this, _, _, cx| this.agent_action(AgentAction::Stop, cx)),
+        ))
+        .child(action_button(
+            "agent-restart",
+            "Restart",
+            ButtonTone::Secondary,
+            cx.listener(|this, _, _, cx| this.agent_action(AgentAction::Restart, cx)),
+        ))
+        .child(action_button(
+            "agent-open-config",
+            "Open config",
+            ButtonTone::Ghost,
+            move |_, _, _| {
+                let _ = agent::open_file(&config_path);
+            },
+        ))
+}
+
+fn host_experiment_row(
+    experiment: &'static Experiment,
+    values: &std::collections::BTreeMap<String, bool>,
+    cx: &mut Context<Planck>,
+) -> impl IntoElement {
+    let id = experiment.id;
+    let active = experiment.available_here() && values.get(id).copied().unwrap_or(false);
+    div()
+        .w_full()
+        .p_4()
+        .rounded_xl()
+        .bg(rgb(PANEL))
+        .border_1()
+        .border_color(if active {
+            rgb(ACCENT_DEEP)
+        } else {
+            rgb(BORDER_SOFT)
+        })
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_5()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(experiment.title),
+                        )
+                        .child(subtle_badge("HOST EXPERIMENT", rgb(WARNING))),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(experiment.description),
+                )
+                .child(div().text_xs().text_color(rgb(FAINT)).child(format!(
+                    "{} · {}",
+                    experiment.id,
+                    experiment.platform_label()
+                ))),
+        )
+        .child(host_switch(id, active, cx))
+}
+
+fn host_switch(id: &'static str, active: bool, cx: &mut Context<Planck>) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("host-experiment-{id}")))
+        .flex_none()
+        .flex()
+        .items_center()
+        .w(px(46.0))
+        .h(px(26.0))
+        .px(px(3.0))
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if active { rgb(ACCENT) } else { rgb(BORDER) })
+        .when(active, |this| this.justify_end())
+        .when(!active, |this| this.justify_start())
+        .child(
+            div()
+                .size(px(20.0))
+                .rounded_full()
+                .bg(rgb(TEXT))
+                .shadow_md(),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.toggle_host_experiment(id, cx);
+        }))
 }
 
 fn nav_item(

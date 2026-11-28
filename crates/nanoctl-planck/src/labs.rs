@@ -27,7 +27,14 @@ impl Platform {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Client,
+    Host,
+}
+
 pub struct Experiment {
+    pub scope: Scope,
     pub id: &'static str,
     pub title: &'static str,
     pub description: &'static str,
@@ -53,13 +60,24 @@ impl Experiment {
 }
 
 pub const TAILNET_DISCOVERY: &str = "windows.tailnet-discovery";
+pub const STRICT_DXGI_CAPTURE: &str = "windows.strict-dxgi-capture";
 
-pub const EXPERIMENTS: &[Experiment] = &[Experiment {
-    id: TAILNET_DISCOVERY,
-    title: "Tailnet host discovery",
-    description: "Probe online Tailscale peers for nanoctl agents and list them beside this PC.",
-    platforms: &[Platform::Windows],
-}];
+pub const EXPERIMENTS: &[Experiment] = &[
+    Experiment {
+        scope: Scope::Client,
+        id: TAILNET_DISCOVERY,
+        title: "Tailnet host discovery",
+        description: "Probe online Tailscale peers for nanoctl agents and list them beside this PC.",
+        platforms: &[Platform::Windows],
+    },
+    Experiment {
+        scope: Scope::Host,
+        id: STRICT_DXGI_CAPTURE,
+        title: "Strict DXGI capture",
+        description: "Require the low-latency DXGI capture path and surface failures instead of falling back to legacy capture.",
+        platforms: &[Platform::Windows],
+    },
+];
 
 pub fn experiment(id: &str) -> Option<&'static Experiment> {
     EXPERIMENTS.iter().find(|experiment| experiment.id == id)

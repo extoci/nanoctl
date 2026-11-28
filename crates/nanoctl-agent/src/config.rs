@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,8 @@ pub struct AgentConfig {
     pub tailnet: TailnetConfig,
     pub quality: QualityConfig,
     pub features: FeatureConfig,
+    /// Opt-in host-side experiments. Unknown keys are preserved for newer clients.
+    pub labs: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -204,6 +207,9 @@ fn drop_control_plane_defaults(raw: &mut toml::Value) {
 }
 
 fn warn_unknown(value: &toml::Value, known: &toml::Value, prefix: &str) {
+    if prefix == "labs." {
+        return;
+    }
     if let Some(table) = value.as_table() {
         for (key, value) in table {
             let path = format!("{prefix}{key}");
@@ -271,6 +277,23 @@ mod tests {
         let config = AgentConfig::load(&path).unwrap();
         assert_eq!(config.quality.max_fps, 60);
         assert!(!config.features.system_audio);
+    }
+
+    #[test]
+    fn host_labs_are_typed_and_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[labs]
+\"windows.strict-dxgi-capture\" = true
+\"future.host-feature\" = false
+",
+        )
+        .unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        assert!(config.labs["windows.strict-dxgi-capture"]);
+        assert!(!config.labs["future.host-feature"]);
     }
 
     #[test]

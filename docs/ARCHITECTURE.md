@@ -31,9 +31,9 @@ WireGuard transport, NAT traversal and, when needed, DERP relay.
 
 ## Desktop shell
 
-`crates/nanoctl-planck` is the native Windows desktop shell, branded nanoctl and internally codenamed `planck`. This GPUI application discovers agents and launches their existing secure embedded viewer; it does not duplicate the streaming media pipeline yet.
+`crates/nanoctl-planck` is the native Windows desktop shell, branded nanoctl and internally codenamed `planck`. This GPUI application discovers agents, launches their existing secure embedded viewer, manages the local host agent lifecycle, and edits host experiments in agent configuration; it does not duplicate the streaming media pipeline yet.
 
-Labs is a typed experiment registry owned by the desktop shell. Experiments are off by default, platform-gated, locally persisted, and independent from agent configuration. The initial `windows.tailnet-discovery` experiment expands host discovery from the local device to online Tailscale peers.
+Labs is a typed experiment registry owned by the desktop shell. Experiments are off by default, platform-gated and independently toggleable. Client experiments persist in desktop configuration; host experiments persist under `[labs]` in agent configuration and are read when the agent starts a media session. The initial `windows.tailnet-discovery` client experiment expands host discovery from the local device to online Tailscale peers. The initial `windows.strict-dxgi-capture` host experiment removes the legacy capture fallback so DXGI failures are visible during alpha validation.
 
 ## Viewer
 

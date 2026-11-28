@@ -172,6 +172,11 @@ pub(crate) fn spawn_media(
             encoder_preference: config.quality.encoder,
             codec: peer.video_codec(),
             h264_high: peer.h264_high(),
+            strict_dxgi_capture: config
+                .labs
+                .get("windows.strict-dxgi-capture")
+                .copied()
+                .unwrap_or(false),
         },
     )
 }
