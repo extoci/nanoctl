@@ -415,6 +415,8 @@ struct ConnectProgressView: View {
 /// that expands on tap and gets out of the way otherwise.
 struct SessionView: View {
     let desktop: Desktop
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+    @Environment(\.accessibilitySwitchControlEnabled) private var switchControlEnabled
     @State private var expanded = false
     @State private var showControllers = false
     @State private var collapseTask: Task<Void, Never>?
@@ -706,7 +708,7 @@ struct SessionView: View {
     /// Collapses the controls after a few idle seconds.
     private func poke() {
         collapseTask?.cancel()
-        guard expanded else { return }
+        guard expanded, !voiceOverEnabled, !switchControlEnabled else { return }
         collapseTask = Task {
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled else { return }
