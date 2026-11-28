@@ -53,6 +53,9 @@ struct ConnectProgress: Equatable {
         if text.contains("did not establish") {
             return "Check that the host is online, nanoctl is running, and Tailscale is connected."
         }
+        if text.contains("could not connect") {
+            return "Check that the host is online and nanoctl is running, then try again."
+        }
         if text.contains("connection lost") {
             return "The network path dropped. If this repeats, check Wi-Fi and Tailscale or lower the stream bitrate."
         }

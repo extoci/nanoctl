@@ -7,21 +7,20 @@ struct GamepadStatusList: View {
     var body: some View {
         if statuses.isEmpty {
             HStack(spacing: 14) {
-                Image(systemName: "gamecontroller")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 34)
+                NanoIconBadge(systemImage: "gamecontroller", tint: .secondary, size: 40)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("No controller paired")
-                        .font(.subheadline.weight(.medium))
+                        .font(.subheadline.weight(.semibold))
                     Text(emptyMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 13)
+            .glass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), interactive: false)
         } else {
             VStack(spacing: 8) {
                 ForEach(statuses) { status in
@@ -38,12 +37,13 @@ struct GamepadStatusRow: View {
     var body: some View {
         HStack(spacing: 14) {
             ZStack {
-                Circle()
-                    .fill(.white.opacity(0.1))
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(NanoTheme.accent.opacity(0.16))
                 Text("\(status.slot)")
-                    .font(.caption.weight(.bold).monospacedDigit())
+                    .font(.subheadline.weight(.bold).monospacedDigit())
+                    .foregroundStyle(NanoTheme.accent)
             }
-            .frame(width: 34, height: 34)
+            .frame(width: 40, height: 40)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(status.recognition)
@@ -55,19 +55,28 @@ struct GamepadStatusRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
-            VStack(alignment: .trailing, spacing: 3) {
+            HStack(spacing: 5) {
                 Image(systemName: batteryIcon)
+                    .font(.caption)
                     .foregroundStyle(batteryColor)
-                Text(status.batteryLabel)
-                    .font(.caption2.monospacedDigit())
+                Text(shortBatteryLabel)
+                    .font(.caption2.weight(.medium).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(.white.opacity(0.06), in: Capsule())
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .glass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glass(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(status.recognition), player \(status.slot), maps to \(status.hostDevice), \(status.batteryLabel)")
+    }
+
+    private var shortBatteryLabel: String {
+        let label = status.batteryLabel.replacingOccurrences(of: "Battery ", with: "")
+        return label == "unknown" ? "Unknown" : label
     }
 
     private var batteryIcon: String {
@@ -108,10 +117,14 @@ struct GamepadSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
+                    Button("Done") {
+                        NanoHaptics.selection()
+                        dismiss()
+                    }
                 }
             }
         }
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 }

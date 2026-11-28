@@ -47,6 +47,7 @@ final class TouchGestures {
     var send: (PointerEvent) -> Void
     var onCursor: ((CGPoint) -> Void)?
     var onZoom: ((Zoom) -> Void)?
+    var onContact: ((Bool) -> Void)?
     var cursor = CGPoint(x: 0.5, y: 0.5)
     var zoom = Zoom()
 
@@ -88,7 +89,8 @@ final class TouchGestures {
 
     func down(_ sample: TouchSample) {
         guard fingers[sample.id] == nil else { return }
-        if fingers.isEmpty {
+        let firstContact = fingers.isEmpty
+        if firstContact {
             started = sample.t
             count = 0
             moved = false
@@ -97,6 +99,7 @@ final class TouchGestures {
             scroll = .zero
         }
         fingers[sample.id] = Finger(start: sample, last: sample)
+        if firstContact { onContact?(true) }
         order.append(sample.id)
         count = max(count, fingers.count)
         clearTimer()
@@ -192,6 +195,7 @@ final class TouchGestures {
         release()
         fingers[sample.id] = nil
         order.removeAll { $0 == sample.id }
+        if fingers.isEmpty { onContact?(false) }
         guard fingers.isEmpty else { return }
         if !moved && !consumed && sample.t - started < 250 {
             if mode == .direct { locate(CGPoint(x: sample.x, y: sample.y)) }
@@ -213,6 +217,7 @@ final class TouchGestures {
     func reset() {
         clearTimer()
         release()
+        if !fingers.isEmpty { onContact?(false) }
         fingers.removeAll()
         order.removeAll()
         pair = nil

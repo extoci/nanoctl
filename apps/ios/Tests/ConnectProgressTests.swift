@@ -28,6 +28,10 @@ final class ConnectProgressTests: XCTestCase {
             ConnectProgress.hint(for: "This viewer requires agent protocol 2."),
             "Update nanoctl on both this device and the host."
         )
+        XCTAssertEqual(
+            ConnectProgress.hint(for: "Could not connect to the server."),
+            "Check that the host is online and nanoctl is running, then try again."
+        )
         XCTAssertTrue(ConnectProgress.hint(for: "Connection lost.").contains("network path"))
     }
 }

@@ -84,6 +84,7 @@ final class Stage: UIView {
         }
         surface.gestures = gestures
         gestures.onCursor = { [weak self] _ in self?.placeCursor() }
+        gestures.onContact = { [weak self] contacting in self?.setCursorContact(contacting) }
         gestures.onZoom = { [weak self] zoom in
             self?.video.transform = CGAffineTransform(translationX: zoom.offsetX, y: zoom.offsetY)
                 .scaledBy(x: zoom.scale, y: zoom.scale)
@@ -91,14 +92,20 @@ final class Stage: UIView {
             self?.publishViewportSize()
         }
         cursor.isUserInteractionEnabled = false
-        cursor.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
-        cursor.layer.cornerRadius = 8
-        cursor.layer.borderWidth = 2
-        cursor.layer.borderColor = UIColor.white.cgColor
-        cursor.backgroundColor = UIColor(red: 0.06, green: 0.09, blue: 0.13, alpha: 0.6)
-        cursor.layer.shadowOpacity = 0.4
-        cursor.layer.shadowRadius = 2
+        cursor.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+        cursor.layer.cornerRadius = 10
+        cursor.layer.borderWidth = 1.5
+        cursor.layer.borderColor = UIColor.white.withAlphaComponent(0.94).cgColor
+        cursor.backgroundColor = UIColor.black.withAlphaComponent(0.3)
+        cursor.layer.shadowColor = UIColor.black.cgColor
+        cursor.layer.shadowOpacity = 0.42
+        cursor.layer.shadowRadius = 5
         cursor.layer.shadowOffset = .zero
+        let dot = UIView(frame: CGRect(x: 8, y: 8, width: 4, height: 4))
+        dot.layer.cornerRadius = 2
+        dot.backgroundColor = .white
+        dot.autoresizingMask = [.flexibleLeftMargin, .flexibleRightMargin, .flexibleTopMargin, .flexibleBottomMargin]
+        cursor.addSubview(dot)
         addSubview(cursor)
     }
 
@@ -196,6 +203,15 @@ final class Stage: UIView {
         return area.isEmpty ? nil : area
     }
 
+    private func setCursorContact(_ contacting: Bool) {
+        UIView.animate(withDuration: 0.16, delay: 0, options: [.beginFromCurrentState, .curveEaseOut]) {
+            self.cursor.transform = contacting ? CGAffineTransform(scaleX: 0.78, y: 0.78) : .identity
+            self.cursor.backgroundColor = contacting
+                ? UIColor.white.withAlphaComponent(0.22)
+                : UIColor.black.withAlphaComponent(0.3)
+        }
+    }
+
     private func placeCursor() {
         cursor.isHidden = gestures.mode != .trackpad || external || desktop?.hasVideo != true
             || desktop?.session.inputReady != true
@@ -254,7 +270,28 @@ final class TouchSurface: UIView {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        samples(touches).forEach { gestures?.down($0) }
+        let touchSamples = samples(touches)
+        touchSamples.forEach { gestures?.down($0) }
+        if gestures?.mode == .direct {
+            touchSamples.forEach { ripple(at: CGPoint(x: $0.x, y: $0.y)) }
+        }
+    }
+
+    private func ripple(at point: CGPoint) {
+        let size: CGFloat = 24
+        let view = UIView(frame: CGRect(x: point.x - size / 2, y: point.y - size / 2, width: size, height: size))
+        view.isUserInteractionEnabled = false
+        view.layer.cornerRadius = size / 2
+        view.layer.borderWidth = 1.5
+        view.layer.borderColor = UIColor.white.withAlphaComponent(0.32).cgColor
+        view.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        addSubview(view)
+        UIView.animate(withDuration: 0.28, delay: 0, options: [.curveEaseOut]) {
+            view.transform = CGAffineTransform(scaleX: 1.75, y: 1.75)
+            view.alpha = 0
+        } completion: { _ in
+            view.removeFromSuperview()
+        }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {

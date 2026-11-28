@@ -9,22 +9,17 @@ struct RootView: View {
         ZStack {
             if model.active {
                 SessionView(desktop: desktop)
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.985)))
             } else {
                 ConnectView(desktop: desktop)
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 1.015)))
             }
         }
         .overlay(alignment: .bottom) {
             if let toast = model.toast {
-                Text(toast)
-                    .font(.callout)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 12)
-                    .glass(in: Capsule(), interactive: false)
+                NanoToast(message: toast)
                     .padding(24)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(.move(edge: .bottom).combined(with: .opacity).combined(with: .scale(scale: 0.94)))
                     .allowsHitTesting(false)
             }
         }
@@ -50,96 +45,148 @@ struct ConnectView: View {
     var body: some View {
         let model = desktop.model
         ZStack {
-            LinearGradient(colors: [Color(red: 0.05, green: 0.07, blue: 0.12), .black],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
+            ConnectBackdrop()
             ScrollView {
                 VStack(spacing: 28) {
-                    VStack(spacing: 10) {
-                        Image(systemName: "display")
-                            .font(.system(size: 44, weight: .light))
-                            .foregroundStyle(.secondary)
-                        Text("nanoctl")
-                            .font(.largeTitle.bold())
-                        Text("Connect to a host on your tailnet.")
-                            .foregroundStyle(.secondary)
+                    VStack(spacing: 14) {
+                        NanoBrandMark()
+                        VStack(spacing: 6) {
+                            Text("nanoctl")
+                                .font(.system(size: 42, weight: .bold, design: .rounded))
+                                .tracking(-1.2)
+                            Text("Your computers, instantly at hand.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                    .padding(.top, 72)
+                    .padding(.top, 62)
 
                     GlassGroup(spacing: 12) {
                         VStack(spacing: 12) {
                             HStack(spacing: 10) {
-                                TextField("host.tailnet.ts.net", text: $address)
-                                    .textContentType(.URL)
-                                    .keyboardType(.URL)
-                                    .textInputAutocapitalization(.never)
-                                    .autocorrectionDisabled()
-                                    .submitLabel(.go)
-                                    .focused($focused)
-                                    .onSubmit(connect)
-                                    .padding(.horizontal, 20)
-                                    .frame(height: 52)
-                                    .glass(in: Capsule())
+                                HStack(spacing: 11) {
+                                    Image(systemName: "link")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(.tertiary)
+                                    TextField("host.tailnet.ts.net", text: $address)
+                                        .textContentType(.URL)
+                                        .keyboardType(.URL)
+                                        .textInputAutocapitalization(.never)
+                                        .autocorrectionDisabled()
+                                        .submitLabel(.go)
+                                        .focused($focused)
+                                        .onSubmit(connect)
+                                    if !address.isEmpty {
+                                        Button {
+                                            address = ""
+                                            NanoHaptics.selection()
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .font(.system(size: 17, weight: .medium))
+                                                .foregroundStyle(.tertiary)
+                                                .frame(width: 30, height: 30)
+                                                .contentShape(Circle())
+                                        }
+                                        .buttonStyle(NanoPressButtonStyle(scale: 0.9))
+                                        .accessibilityLabel("Clear host address")
+                                    }
+                                }
+                                .padding(.horizontal, 18)
+                                .frame(minHeight: 56)
+                                .glass(in: Capsule())
                                 Button {
                                     focused = false
+                                    NanoHaptics.selection()
                                     desktop.refreshHosts(extraSeed: address)
                                 } label: {
                                     Image(systemName: model.discoveringHosts ? "antenna.radiowaves.left.and.right" : "magnifyingglass")
                                         .font(.system(size: 17, weight: .semibold))
-                                        .frame(width: 52, height: 52)
+                                        .frame(width: 56, height: 56)
+                                        .contentShape(Circle())
+                                        .contentTransition(.symbolEffect(.replace))
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(NanoPressButtonStyle(scale: 0.92))
                                 .glass(in: Circle())
                                 .accessibilityLabel("Find hosts")
                             }
                             Button(action: connect) {
-                                Text("Connect")
-                                    .font(.headline)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 36)
+                                HStack(spacing: 8) {
+                                    Text("Connect")
+                                    Image(systemName: "arrow.right")
+                                        .font(.system(size: 15, weight: .bold))
+                                }
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .frame(minHeight: 40)
                             }
                             .glassButton(prominent: true)
                             .controlSize(.large)
+                            .tint(NanoTheme.accent)
                             .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
+                            .opacity(address.trimmingCharacters(in: .whitespaces).isEmpty ? 0.55 : 1)
                         }
                     }
                     .frame(maxWidth: 420)
 
                     if model.status != "Disconnected" {
                         Text(model.status)
-                            .font(.footnote)
+                            .font(.footnote.weight(.medium))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(.white.opacity(0.06), in: Capsule())
                     }
 
                     if model.discoveringHosts || !model.discoveredHosts.isEmpty || model.discoveryNotice != nil {
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
-                                Text("On your tailnet")
-                                    .font(.footnote.weight(.semibold))
-                                    .foregroundStyle(.secondary)
+                                NanoSectionHeader("On your tailnet")
                                 Spacer()
                                 if model.discoveringHosts {
                                     ProgressView()
                                         .controlSize(.small)
+                                        .padding(.trailing, 10)
                                 } else if let notice = model.discoveryNotice {
                                     Text(notice)
-                                        .font(.caption2)
+                                        .font(.caption2.weight(.medium))
                                         .foregroundStyle(.tertiary)
+                                        .padding(.trailing, 10)
                                 }
                             }
-                            .padding(.horizontal, 8)
                             if model.discoveredHosts.isEmpty, model.discoveringHosts {
                                 HStack(spacing: 12) {
                                     ProgressView()
-                                    Text("Looking for nanoctl hosts…")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
+                                        .controlSize(.small)
+                                        .frame(width: 34, height: 34)
+                                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Looking for nanoctl hosts")
+                                            .font(.subheadline.weight(.medium))
+                                        Text("Tailnet machines appear automatically")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 18)
-                                .frame(height: 54)
-                                .glass(in: Capsule(), interactive: false)
+                                .padding(.horizontal, 14)
+                                .frame(minHeight: 64)
+                                .glass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), interactive: false)
+                            } else if model.discoveredHosts.isEmpty {
+                                HStack(spacing: 12) {
+                                    NanoIconBadge(systemImage: "antenna.radiowaves.left.and.right", tint: .secondary, size: 38)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("No hosts visible yet")
+                                            .font(.subheadline.weight(.medium))
+                                        Text("Enter an address or use a recent host")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .frame(minHeight: 64)
+                                .glass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), interactive: false)
                             } else {
                                 GlassGroup(spacing: 8) {
                                     VStack(spacing: 8) {
@@ -149,9 +196,9 @@ struct ConnectView: View {
                                                 connect()
                                             } label: {
                                                 HStack(spacing: 13) {
-                                                    Image(systemName: hostIcon(host.os))
-                                                        .font(.title3)
-                                                        .frame(width: 28)
+                                                    NanoIconBadge(systemImage: hostIcon(host.os),
+                                                                  tint: host.online ? NanoTheme.accent : Color.secondary,
+                                                                  size: 40)
                                                     VStack(alignment: .leading, spacing: 3) {
                                                         Text(host.displayName)
                                                             .font(.subheadline.weight(.semibold))
@@ -162,18 +209,17 @@ struct ConnectView: View {
                                                             .lineLimit(1)
                                                     }
                                                     Spacer(minLength: 8)
-                                                    Text(host.online ? "Ready" : "Offline")
-                                                        .font(.caption2.weight(.semibold))
-                                                        .foregroundStyle(host.online ? .green : .secondary)
-                                                    Image(systemName: "play.fill")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
+                                                    NanoStatusPill(title: host.online ? "Ready" : "Offline",
+                                                                   color: host.online ? NanoTheme.success : .secondary)
+                                                    Image(systemName: "chevron.right")
+                                                        .font(.caption.weight(.semibold))
+                                                        .foregroundStyle(.tertiary)
                                                 }
-                                                .padding(.horizontal, 18)
-                                                .frame(height: 58)
+                                                .padding(.horizontal, 14)
+                                                .frame(minHeight: 66)
                                                 .contentShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                                             }
-                                            .buttonStyle(.plain)
+                                            .buttonStyle(NanoPressButtonStyle())
                                             .glass(in: RoundedRectangle(cornerRadius: 24, style: .continuous))
                                             .disabled(!host.online)
                                             .opacity(host.online ? 1 : 0.55)
@@ -187,33 +233,35 @@ struct ConnectView: View {
 
                     if !model.recents.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("Recent")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                                .padding(.leading, 8)
+                            NanoSectionHeader("Recent")
                             GlassGroup(spacing: 8) {
                                 VStack(spacing: 8) {
                                     ForEach(model.recents, id: \.self) { host in
                                         Button { address = host; connect() } label: {
-                                            HStack {
-                                                Image(systemName: "desktopcomputer")
+                                            HStack(spacing: 12) {
+                                                NanoIconBadge(systemImage: "clock.arrow.circlepath", tint: .secondary, size: 34)
                                                 Text(Self.label(host))
+                                                    .font(.subheadline.weight(.medium))
                                                     .lineLimit(1)
                                                 Spacer()
                                                 if URL(string: host)?.scheme == "http" {
                                                     Text("HTTP")
                                                         .font(.caption2.weight(.semibold))
                                                         .foregroundStyle(.secondary)
+                                                        .padding(.horizontal, 7)
+                                                        .padding(.vertical, 3)
+                                                        .background(.white.opacity(0.08), in: Capsule())
                                                 }
                                                 Image(systemName: "arrow.right")
-                                                    .foregroundStyle(.secondary)
+                                                    .font(.caption.weight(.semibold))
+                                                    .foregroundStyle(.tertiary)
                                             }
-                                            .padding(.horizontal, 18)
-                                            .frame(height: 48)
-                                            .contentShape(Capsule())
+                                            .padding(.horizontal, 14)
+                                            .frame(minHeight: 56)
+                                            .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                                         }
-                                        .buttonStyle(.plain)
-                                        .glass(in: Capsule())
+                                        .buttonStyle(NanoPressButtonStyle())
+                                        .glass(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                                         .contextMenu {
                                             Button("Forget", systemImage: "trash", role: .destructive) {
                                                 desktop.forget(host)
@@ -226,28 +274,33 @@ struct ConnectView: View {
                         .frame(maxWidth: 420)
                     }
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Controllers")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, 8)
+                        NanoSectionHeader("Controllers")
                         GamepadStatusList(statuses: model.gamepads)
                     }
                     .frame(maxWidth: 420)
 
-                    HStack(spacing: 14) {
+                    HStack(spacing: 12) {
                         Text(BuildInfo.versionLine)
                             .font(.caption2.monospaced())
                             .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        Spacer()
                         Button {
+                            NanoHaptics.selection()
                             showLogs = true
                         } label: {
                             Label("Logs", systemImage: "doc.text.magnifyingglass")
-                                .font(.caption.weight(.medium))
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 7)
+                                .contentShape(Capsule())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(NanoPressButtonStyle(scale: 0.94))
+                        .background(.white.opacity(0.07), in: Capsule())
                         .foregroundStyle(.secondary)
                     }
-                    .padding(.bottom, 8)
+                    .frame(maxWidth: 420)
+                    .padding(.bottom, 10)
                 }
                 .padding(24)
                 .frame(maxWidth: .infinity)
@@ -258,10 +311,14 @@ struct ConnectView: View {
             DebugLogView()
         }
         .onAppear { desktop.refreshHosts() }
+        .animation(.smooth(duration: 0.28), value: model.discoveredHosts)
+        .animation(.smooth(duration: 0.28), value: model.discoveringHosts)
+        .animation(.smooth(duration: 0.24), value: address.isEmpty)
     }
 
     private func connect() {
         focused = false
+        NanoHaptics.impact(.medium)
         desktop.connect(address)
     }
 
@@ -282,43 +339,75 @@ struct ConnectProgressView: View {
     private let stages: [ConnectStage] = [.signaling, .networking, .media]
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 7) {
+        VStack(spacing: 15) {
+            HStack(spacing: 0) {
                 ForEach(stages, id: \.self) { stage in
                     step(stage)
                     if stage != .media {
-                        Rectangle()
-                            .fill(stage.rawValue < progress.stage.rawValue ? Color.green : Color.white.opacity(0.2))
-                            .frame(width: 13, height: 1)
+                        Capsule()
+                            .fill(stage.rawValue < progress.stage.rawValue ? NanoTheme.success : Color.white.opacity(0.14))
+                            .frame(width: 16, height: 2)
+                            .padding(.bottom, 19)
                     }
                 }
             }
             Text(progress.detail)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(progress.failure == nil ? .secondary : NanoTheme.warning)
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .id(progress.detail)
+                .transition(.opacity)
             if let hint = progress.failureHint {
-                Text(hint)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Label(hint, systemImage: "lightbulb")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(NanoTheme.warning)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(NanoTheme.warning.opacity(0.1), in: Capsule())
             }
         }
+        .animation(.smooth(duration: 0.25), value: progress)
     }
 
     private func step(_ stage: ConnectStage) -> some View {
         let complete = progress.stage == .live || stage.rawValue < progress.stage.rawValue
         let current = stage.rawValue == progress.stage.rawValue
         let failed = current && progress.failure != nil
-        return VStack(spacing: 4) {
-            Image(systemName: complete ? "checkmark.circle.fill" : failed ? "exclamationmark.triangle.fill" : current ? "circle.fill" : "circle")
-                .font(.system(size: 15))
-                .foregroundStyle(complete ? Color.green : failed ? Color.orange : current ? Color.blue : Color.white.opacity(0.3))
+        let color: Color = complete ? NanoTheme.success : failed ? NanoTheme.warning : current ? NanoTheme.accent : Color.white.opacity(0.28)
+        return VStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .fill(color.opacity(current || complete ? 0.18 : 0.07))
+                    .overlay {
+                        Circle()
+                            .strokeBorder(color.opacity(current || complete ? 0.85 : 0.35), lineWidth: current ? 1.6 : 1)
+                    }
+                Image(systemName: complete ? "checkmark" : failed ? "exclamationmark" : icon(stage))
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(color)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .frame(width: 31, height: 31)
+            .scaleEffect(current && !failed ? 1.08 : 1)
             Text(stage.label)
-                .font(.caption2)
+                .font(.caption2.weight(current ? .semibold : .medium))
                 .foregroundStyle(current || complete ? Color.white : Color.white.opacity(0.45))
         }
-        .frame(width: 72)
+        .frame(width: 64)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(stage.label), \(failed ? "failed" : complete ? "complete" : current ? "in progress" : "pending")")
+    }
+
+    private func icon(_ stage: ConnectStage) -> String {
+        switch stage {
+        case .signaling: return "antenna.radiowaves.left.and.right"
+        case .networking: return "network"
+        case .media: return "play.fill"
+        case .live: return "checkmark"
+        }
     }
 }
 
@@ -326,6 +415,8 @@ struct ConnectProgressView: View {
 /// that expands on tap and gets out of the way otherwise.
 struct SessionView: View {
     let desktop: Desktop
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+    @Environment(\.accessibilitySwitchControlEnabled) private var switchControlEnabled
     @State private var expanded = false
     @State private var showControllers = false
     @State private var collapseTask: Task<Void, Never>?
@@ -338,52 +429,77 @@ struct SessionView: View {
                 .ignoresSafeArea()
 
             if model.external {
-                VStack(spacing: 8) {
-                    Image(systemName: "tv")
-                        .font(.system(size: 40, weight: .light))
+                VStack(spacing: 12) {
+                    NanoIconBadge(systemImage: "tv", tint: NanoTheme.accentSecondary, size: 58)
                     Text("Showing on your TV")
                         .font(.headline)
                     Text("Use this screen as a trackpad.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.white.opacity(0.6))
+                .padding(28)
+                .glass(in: RoundedRectangle(cornerRadius: 30, style: .continuous), interactive: false)
+                .foregroundStyle(.white.opacity(0.82))
                 .allowsHitTesting(false)
             } else if model.connectProgress.stage != .live {
-                VStack(spacing: 16) {
-                    ProgressView()
-                        .controlSize(.large)
-                    Text(model.hostName ?? "nanoctl")
-                        .font(.headline)
+                VStack(spacing: 18) {
+                    HStack(spacing: 10) {
+                        NanoIconBadge(systemImage: "desktopcomputer", size: 42)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(model.hostName ?? "nanoctl")
+                                .font(.headline)
+                                .lineLimit(1)
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                Text(model.connectProgress.failure == nil ? "Preparing your desktop" : "Retrying connection")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     ConnectProgressView(progress: model.connectProgress)
-                    Button("Cancel") { desktop.session.stop() }
-                        .glassButton()
+                    Button {
+                        NanoHaptics.selection()
+                        desktop.session.stop()
+                    } label: {
+                        Text("Cancel")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(minWidth: 118)
+                    }
+                    .glassButton()
+                    .controlSize(.large)
                 }
-                .padding(28)
-                .frame(maxWidth: 320)
-                .glass(in: RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: false)
+                .padding(24)
+                .frame(maxWidth: 342)
+                .glass(in: RoundedRectangle(cornerRadius: 34, style: .continuous), interactive: false)
+                .shadow(color: .black.opacity(0.34), radius: 30, y: 14)
             }
         }
         .overlay(alignment: .bottomLeading) {
             if model.showStats, !model.stats.isEmpty {
                 Text(model.stats)
-                    .font(.caption.monospaced())
+                    .font(.caption.monospaced().weight(.medium))
                     .multilineTextAlignment(.leading)
                     .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .glass(in: RoundedRectangle(cornerRadius: 14, style: .continuous), interactive: false)
-                    .padding(12)
+                    .padding(.vertical, 9)
+                    .glass(in: RoundedRectangle(cornerRadius: 16, style: .continuous), interactive: false)
+                    .shadow(color: .black.opacity(0.22), radius: 12, y: 5)
+                    .padding(14)
                     .allowsHitTesting(false)
             }
         }
         .overlay(alignment: .topTrailing) {
             chrome(model)
-                .padding(12)
+                .padding(.top, 14)
+                .padding(.trailing, 14)
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
-        .animation(.smooth(duration: 0.3), value: expanded)
+        .animation(.spring(response: 0.38, dampingFraction: 0.78), value: expanded)
         .sheet(isPresented: $showControllers) {
             GamepadSheet(statuses: model.gamepads)
         }
@@ -406,8 +522,9 @@ struct SessionView: View {
                         if model.external {
                             desktop.show("Trackpad input is required on an external display")
                         } else {
-                            desktop.setTouchMode(model.touchMode == .trackpad ? .direct : .trackpad)
-                            desktop.show(model.touchMode == .trackpad
+                            let next: TouchMode = model.touchMode == .trackpad ? .direct : .trackpad
+                            desktop.setTouchMode(next)
+                            desktop.show(next == .trackpad
                                          ? "Trackpad: drag to move, tap to click"
                                          : "Direct touch: tap where you want to click")
                         }
@@ -416,29 +533,22 @@ struct SessionView: View {
                     .glassID("touch", in: glass)
 
                     ChromeButton(model.keyboardVisible ? "Hide keyboard" : "Keyboard",
-                                 systemImage: model.keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard") {
+                                 systemImage: model.keyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
+                                 active: model.keyboardVisible) {
                         desktop.setKeyboardVisible(!model.keyboardVisible)
                         poke()
                     }
                     .opacity(model.keyboardVisible ? 1 : 0.92)
                     .glassID("keyboard", in: glass)
 
-                    ChromeButton("Controllers", systemImage: "gamecontroller.fill") {
+                    ChromeButton("Controllers", systemImage: "gamecontroller.fill",
+                                 active: !model.gamepads.isEmpty) {
                         showControllers = true
                         poke()
                     }
-                    .overlay(alignment: .topTrailing) {
-                        if !model.gamepads.isEmpty {
-                            Text("\(model.gamepads.count)")
-                                .font(.system(size: 10, weight: .bold).monospacedDigit())
-                                .foregroundStyle(.white)
-                                .frame(width: 17, height: 17)
-                                .background(.green.gradient, in: Circle())
-                                .offset(x: 2, y: -2)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .accessibilityHint("Shows controller type, player slot, host device, and battery")
+                    .accessibilityHint(model.gamepads.isEmpty
+                                       ? "Shows controller type, player slot, host device, and battery"
+                                       : "\(model.gamepads.count) connected. Shows controller type, player slot, host device, and battery")
                     .glassID("controllers", in: glass)
 
                     Menu {
@@ -598,7 +708,7 @@ struct SessionView: View {
     /// Collapses the controls after a few idle seconds.
     private func poke() {
         collapseTask?.cancel()
-        guard expanded else { return }
+        guard expanded, !voiceOverEnabled, !switchControlEnabled else { return }
         collapseTask = Task {
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled else { return }
@@ -610,23 +720,29 @@ struct SessionView: View {
 struct ChromeButton: View {
     let title: String
     let systemImage: String
+    let active: Bool
     let action: () -> Void
 
-    init(_ title: String, systemImage: String, action: @escaping () -> Void) {
+    init(_ title: String, systemImage: String, active: Bool = false, action: @escaping () -> Void) {
         self.title = title
         self.systemImage = systemImage
+        self.active = active
         self.action = action
     }
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            NanoHaptics.selection()
+            action()
+        } label: {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .semibold))
                 .frame(width: 44, height: 44)
                 .contentShape(Circle())
+                .contentTransition(.symbolEffect(.replace))
         }
-        .buttonStyle(.plain)
-        .glass(in: Circle())
+        .buttonStyle(NanoPressButtonStyle(scale: 0.9))
+        .glass(in: Circle(), tint: active ? NanoTheme.accent : nil)
         .accessibilityLabel(title)
     }
 }

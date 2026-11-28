@@ -91,7 +91,10 @@ struct DebugLogView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
+                    Button("Done") {
+                        NanoHaptics.selection()
+                        dismiss()
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     if !text.isEmpty {
@@ -102,6 +105,7 @@ struct DebugLogView: View {
                 }
             }
         }
+        .presentationDragIndicator(.visible)
         .onAppear { text = AppLog.shared.text() }
     }
 
