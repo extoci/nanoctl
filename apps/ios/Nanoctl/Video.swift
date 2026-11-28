@@ -13,10 +13,12 @@ final class FrameMailbox: NSObject, RTCVideoRenderer {
     private let lock = NSLock()
     private var entry = Entry(frame: nil, number: 0, receivedAt: 0)
     private var wakeup: DispatchSourceUserDataAdd?
+    var onFrame: (() -> Void)?
 
     func setSize(_ size: CGSize) {}
 
     func renderFrame(_ frame: RTCVideoFrame?) {
+        if frame != nil { onFrame?() }
         let now = CACurrentMediaTime()
         lock.lock()
         entry = Entry(frame: frame, number: entry.number + 1, receivedAt: now)

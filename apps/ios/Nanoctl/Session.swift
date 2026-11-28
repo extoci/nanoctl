@@ -86,6 +86,28 @@ enum VideoTransport {
     case dataChannel
 }
 
+private func statNumber(_ stat: RTCStatistics?, _ key: String) -> Double? {
+    (stat?.values[key] as? NSNumber)?.doubleValue
+}
+
+private func statString(_ stat: RTCStatistics?, _ key: String) -> String? {
+    stat?.values[key] as? String
+}
+
+/// libwebrtc exposes candidate network types as its adapter enum on some
+/// builds and as strings on others; the enum values are stable ABI constants.
+private func networkTypeName(_ stat: RTCStatistics?) -> String? {
+    if let name = statString(stat, "networkType") { return name }
+    switch (stat?.values["networkType"] as? NSNumber)?.intValue {
+    case 1: return "ethernet"
+    case 2: return "wifi"
+    case 3: return "cellular"
+    case 4: return "vpn"
+    case 5: return "loopback"
+    default: return nil
+    }
+}
+
 @MainActor
 final class Session {
     private let factory: RTCPeerConnectionFactory = {
@@ -118,6 +140,7 @@ final class Session {
     private(set) var track: RTCVideoTrack?
     private(set) var audioTrack: RTCAudioTrack?
     private(set) var state = "Disconnected"
+    private(set) var connectProgress = ConnectProgress()
     private(set) var transport: VideoTransport = .rtp
     private(set) var codec: String?
     private(set) var audioOutputs: [AudioOutput] = []
@@ -260,6 +283,7 @@ final class Session {
         connection = current
         sessionLog.info("connecting to \(endpoint.socket.absoluteString)")
         state = "Connecting…"
+        connectProgress = ConnectProgress()
         transport = .rtp
         sessionLog.notice("video transport switched to RTP")
         codec = nil
@@ -353,11 +377,13 @@ final class Session {
         sessionLog.error("connection failed: \(reason)")
         teardown()
         state = reason
+        connectProgress.fail(reason)
         onChange?()
         guard wantsConnection else { return }
         reconnectAttempts += 1
         let delay = min(30, reconnectAttempts == 1 ? 1 : reconnectAttempts * 3)
         state = "\(reason) Reconnecting in \(delay)s…"
+        connectProgress.detail = state
         onChange?()
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
@@ -600,6 +626,7 @@ final class Session {
             current.id = id
             current.host = host
             sessionLog.info("host hello: \(host.hostName) codecs=\(host.capabilities.codecs?.joined(separator: ",") ?? "?") audio=\(host.audioAvailable)")
+            connectProgress.advance(to: .signaling, detail: "Host answered. Negotiating stream…")
             audioOutputs = host.capabilities.audioOutputs ?? []
             if audioOutputs.isEmpty == false { _ = selectAudioOutput(nil) }
             try await negotiate(current, injectHevc: codecPreference.injectHevc && !forceH264)
@@ -639,6 +666,7 @@ final class Session {
                 }
                 try requireCurrent(current)
                 current.answered = true
+                connectProgress.advance(to: .networking, detail: "Checking network paths…")
                 codec = negotiated
                 sessionLog.info("negotiated video codec: \(negotiated ?? "none")")
                 let candidates = current.remoteCandidates
@@ -696,7 +724,7 @@ final class Session {
                 self.timeout?.cancel()
                 self.reconnectAttempts = 0
                 current.disconnectedSince = nil
-                self.state = "Live · \(current.host?.hostName ?? "nanoctl")"
+                self.connectProgress.advance(to: .media, detail: "Network connected. Opening media channels…")
                 self.onChange?()
             case .disconnected:
                 // ICE commonly flaps for a moment on Wi-Fi/cellular transitions.
@@ -850,6 +878,7 @@ final class Session {
         // offer carries the injected H265 payload.
         let wire = injectHevc ? (SDP.injectHevc(offer.sdp, order: codecOrder(for: current.host)) ?? offer.sdp) : offer.sdp
         try await publish(SignalPayload(type: "offer", sdp: wire), current)
+        connectProgress.advance(to: .signaling, detail: "Waiting for host answer…")
         current.offerSent = true
         flush(current)
     }
@@ -903,8 +932,12 @@ final class Session {
             // reliable IDR lane; the host accepts them on either channel.
             idr?.sendData(RTCDataBuffer(data: Data("KF".utf8), isBinary: false))
         }
-        receiver.onBuffer = { [weak self] buffer in
+        receiver.onBuffer = { [weak self, weak current] buffer in
             self?.pixelMailbox.put(buffer)
+            Task { @MainActor in
+                guard let self, let current, self.connection === current else { return }
+                self.markMediaLive(current, decodedFrames: 1)
+            }
         }
         receiver.onPersistentFault = { [weak self, weak current] in
             Task { @MainActor in
@@ -924,6 +957,7 @@ final class Session {
         current.dcVideo = receiver
         receiver.begin()
         transport = .dataChannel
+        connectProgress.advance(to: .media, detail: "Video channel open. Waiting for first frame…")
         sessionLog.info("data-channel video active: codec=\(receiver.codec?.rawValue ?? "pending")")
         // The agent suppresses delta-frame RTP writes automatically while the
         // video channel is open; IDRs still flow so RTCP feedback survives.
@@ -933,6 +967,13 @@ final class Session {
 
     func resetCodecFallback() {
         forceH264 = false
+    }
+
+    /// RTP frames share the thin keepalive leg while data-channel video is
+    /// active, so only the RTP transport may use them as first-media evidence.
+    func markRtpMediaLive() {
+        guard transport == .rtp, let connection else { return }
+        markMediaLive(connection, decodedFrames: 1)
     }
 
     /// Decoder failure is not a terminal UX state. If HEVC itself is the
@@ -979,15 +1020,92 @@ final class Session {
         }
     }
 
-    /// Refreshes the status line and watches for a decoder path that never
-    /// produces frames so it can fall back to RTP.
+    private func markMediaLive(_ current: Connection, decodedFrames: Int) {
+        guard connection === current, decodedFrames > 0, connectProgress.stage != .live else { return }
+        connectProgress.advance(to: .live, detail: "Live")
+        state = "Live · \(current.host?.hostName ?? "nanoctl")"
+        onChange?()
+    }
+
+    private func statisticsReport(_ peer: RTCPeerConnection) async -> RTCStatisticsReport {
+        await withCheckedContinuation { reply in
+            peer.statistics { report in reply.resume(returning: report) }
+        }
+    }
+
+    /// Refreshes the diagnostics overlay and watches for a decoder path that
+    /// never produces frames so it can fall back to RTP.
     private func collectStats(_ current: Connection) async {
+        var inbound: RTCStatistics?
+        var rttMs: Double?
+        var path: String?
+        if let peer = current.peer {
+            let report = await statisticsReport(peer)
+            let all = Array(report.statistics.values)
+            inbound = all.first {
+                $0.type == "inbound-rtp" && ((statString($0, "kind") ?? statString($0, "mediaType")) == "video")
+            }
+            let transport = all.first { $0.type == "transport" && statString($0, "selectedCandidatePairId") != nil }
+            let selectedId = transport.flatMap { statString($0, "selectedCandidatePairId") }
+            let selected = selectedId.flatMap { report.statistics[$0] }
+            let nominated = all.filter {
+                $0.type == "candidate-pair" && statString($0, "state") == "succeeded"
+                    && (statNumber($0, "nominated") ?? 0) != 0
+            }
+            let pair = selected?.type == "candidate-pair" ? selected : nominated.first
+            if let pair {
+                if let rtt = statNumber(pair, "currentRoundTripTime"), rtt > 0 {
+                    rttMs = rtt * 1000
+                }
+                let local = statString(pair, "localCandidateId").flatMap { report.statistics[$0] }
+                let remote = statString(pair, "remoteCandidateId").flatMap { report.statistics[$0] }
+                path = StreamDiagnostics.pathLabel(
+                    localType: statString(local, "candidateType"),
+                    remoteType: statString(remote, "candidateType"),
+                    networkType: networkTypeName(local),
+                    tailnet: endpoint?.usesTailnetMediaPath == true
+                )
+            }
+        }
+
         guard let receiver = current.dcVideo else {
-            statsLine = codec.map { "RTP · \($0)" } ?? ""
+            var diagnostics = StreamDiagnostics(transport: "RTP", codec: codec, rttMs: rttMs, path: path)
+            if let inbound {
+                let width = statNumber(inbound, "frameWidth") ?? 0
+                let height = statNumber(inbound, "frameHeight") ?? 0
+                if width > 0, height > 0 { diagnostics.resolution = "\(Int(width))×\(Int(height))" }
+                diagnostics.decoder = statString(inbound, "decoderImplementation")
+                let bytes = Int(statNumber(inbound, "bytesReceived") ?? 0)
+                let frames = Int(statNumber(inbound, "framesDecoded") ?? 0)
+                markMediaLive(current, decodedFrames: frames)
+                let received = Int(statNumber(inbound, "packetsReceived") ?? 0)
+                let lost = Int(statNumber(inbound, "packetsLost") ?? 0)
+                let now = Date()
+                if let before = current.rtpStatsAt {
+                    let elapsed = now.timeIntervalSince(before)
+                    if elapsed > 0 {
+                        diagnostics.bitrateKbps = Int((Double(bytes - current.rtpStatsBytes) * 8 / elapsed / 1000).rounded())
+                        diagnostics.fps = Int((Double(frames - current.rtpStatsFrames) / elapsed).rounded())
+                        let receivedDelta = received - current.rtpStatsReceived
+                        let lostDelta = lost - current.rtpStatsLost
+                        if receivedDelta + lostDelta > 0 {
+                            diagnostics.lossPercent = Double(max(0, lostDelta)) / Double(receivedDelta + lostDelta) * 100
+                        }
+                    }
+                }
+                current.rtpStatsAt = now
+                current.rtpStatsBytes = bytes
+                current.rtpStatsFrames = frames
+                current.rtpStatsReceived = received
+                current.rtpStatsLost = lost
+            }
+            statsLine = diagnostics.overlayText
             onChange?()
             return
         }
+
         let status = receiver.statusSnapshot()
+        markMediaLive(current, decodedFrames: status.decoded)
         let wire = status.stats
         let (loss, transit, frames) = receiver.takeLinkStats()
         // Receiver-measured loss is the host's only congestion signal while
@@ -996,7 +1114,29 @@ final class Session {
         // these reports instead — the difference between a stream that
         // degrades gracefully and one that collapses on a bad link.
         _ = sendControlFree(["type": "link-stats", "loss": loss])
-        statsLine = "DC · \(status.codec?.rawValue ?? codec ?? "?") · \(frames) fps · \(String(format: "%.0f", transit))ms · drop \(status.dropped) · loss \(String(format: "%.1f", loss * 100))%"
+        let now = Date()
+        var bitrateKbps: Int?
+        if let before = current.dcStatsAt {
+            let elapsed = now.timeIntervalSince(before)
+            if elapsed > 0 {
+                bitrateKbps = Int((Double(wire.bytes - current.dcStatsBytes) * 8 / elapsed / 1000).rounded())
+            }
+        }
+        current.dcStatsAt = now
+        current.dcStatsBytes = wire.bytes
+        var diagnostics = StreamDiagnostics(
+            transport: "DC",
+            codec: status.codec?.rawValue ?? codec,
+            fps: frames,
+            bitrateKbps: bitrateKbps,
+            rttMs: rttMs,
+            path: path,
+            lossPercent: loss * 100,
+            decoder: "VideoToolbox",
+            dropped: status.dropped
+        )
+        if status.width > 0, status.height > 0 { diagnostics.resolution = "\(status.width)×\(status.height)" }
+        statsLine = diagnostics.overlayText
         onChange?()
         // Loss/gap visibility is what distinguishes a congested or relayed
         // transport from decoder trouble in the field; log it once a second
@@ -1135,6 +1275,13 @@ private final class Connection {
     var lastVideoMessages = 0
     var lastVideoFed = 0
     var lastVideoDecoded = 0
+    var rtpStatsAt: Date?
+    var rtpStatsBytes = 0
+    var rtpStatsFrames = 0
+    var rtpStatsReceived = 0
+    var rtpStatsLost = 0
+    var dcStatsAt: Date?
+    var dcStatsBytes = 0
     var videoSilentSeconds = 0
     var decoderStallSeconds = 0
     var statePoll: Task<Void, Never>?

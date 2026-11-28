@@ -14,6 +14,7 @@ import Foundation
 final class DCVideoReceiver {
     struct Stats {
         var msgs = 0
+        var bytes = 0
         var heartbeats = 0
         var fed = 0
         var gaps = 0
@@ -33,6 +34,8 @@ final class DCVideoReceiver {
         let waitingForKey: Bool
         let reorderedCount: Int
         let pendingCount: Int
+        let width: Int
+        let height: Int
     }
 
     // Match the browser viewer: unordered SCTP reorders neighboring access
@@ -73,6 +76,8 @@ final class DCVideoReceiver {
     private var kfRequestedAt: CFAbsoluteTime = 0
     private var pending: [UInt32: (isKey: Bool, parts: Int, got: [Data?], n: Int, firstSeen: CFAbsoluteTime)] = [:]
     private var reordered: [UInt32: (au: Data, isKey: Bool, firstSeen: CFAbsoluteTime)] = [:]
+    private var decodedWidth = 0
+    private var decodedHeight = 0
     private var newestSeq: UInt32?
     private var maintenanceTimer: DispatchSourceTimer?
     private var consecutiveFaults = 0
@@ -129,7 +134,8 @@ final class DCVideoReceiver {
             Status(stats: stats, codec: codec, decoded: decoder?.decoded ?? 0,
                    dropped: decoder?.dropped ?? 0, faulted: (decoder?.faults ?? 0) > 0,
                    expectedSeq: expectedSeq, waitingForKey: waitingForKey,
-                   reorderedCount: reordered.count, pendingCount: pending.count)
+                   reorderedCount: reordered.count, pendingCount: pending.count,
+                   width: decodedWidth, height: decodedHeight)
         }
     }
 
@@ -203,6 +209,7 @@ final class DCVideoReceiver {
     }
 
     private func process(_ data: Data) {
+        stats.bytes += data.count
         guard data.count >= 5 else { return }
         stats.msgs += 1
         let seq = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
@@ -348,7 +355,11 @@ final class DCVideoReceiver {
         decoder.onFault = { [weak self] in self?.queue.async { self?.onDecoderFault() } }
         decoder.onFrame = { [weak self] buffer in
             self?.onBuffer(buffer)
-            self?.queue.async { self?.consecutiveFaults = 0 }
+            self?.queue.async {
+                self?.decodedWidth = CVPixelBufferGetWidth(buffer)
+                self?.decodedHeight = CVPixelBufferGetHeight(buffer)
+                self?.consecutiveFaults = 0
+            }
         }
         codec = detected
         self.decoder = decoder

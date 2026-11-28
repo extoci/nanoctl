@@ -18,6 +18,7 @@ final class ViewerModel {
     var hasVideo = false
     var external = false
     var status = "Disconnected"
+    var connectProgress = ConnectProgress()
     var hostName: String?
     var stats = ""
     var audioAvailable = false
@@ -64,6 +65,9 @@ final class Desktop {
     #endif
 
     init() {
+        mailbox.onFrame = { [weak self] in
+            Task { @MainActor in self?.session.markRtpMediaLive() }
+        }
         session.onChange = { [weak self] in self?.update() }
         session.onClipboard = { [weak self] _ in
             self?.show("Host clipboard copied to this device")
@@ -100,6 +104,7 @@ final class Desktop {
         model.hasVideo = hasVideo
         model.external = external != nil
         model.status = session.state
+        model.connectProgress = session.connectProgress
         model.hostName = host?.hostName ?? session.endpoint?.base.host()
         model.stats = session.statsLine
         model.audioAvailable = host?.audioAvailable == true
