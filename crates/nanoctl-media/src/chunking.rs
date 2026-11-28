@@ -188,15 +188,18 @@ where
         let Some(request) = self.sink.take_delta_repair_request() else {
             return Ok(None);
         };
+        let stream_sequence = request.stream_sequence;
         let Some(slot) = self
             .repair_cache
             .iter()
-            .position(|delta| delta.sequence == request.stream_sequence)
+            .position(|delta| delta.sequence == stream_sequence)
         else {
+            tracing::debug!(target: "nanoctl_media::delta_repair", stream_sequence, reason = "not-cached", "v4 delta repair skipped");
             return Ok(None);
         };
         let delta = &self.repair_cache[slot];
         if delta.sent_at.elapsed() > DELTA_REPAIR_MAX_AGE {
+            tracing::debug!(target: "nanoctl_media::delta_repair", stream_sequence, reason = "expired", "v4 delta repair skipped");
             return Ok(None);
         }
         let whole_delta = request.parts.is_empty();
@@ -209,6 +212,7 @@ where
         };
         let repair_chunks = if whole_delta {
             if delta.wire_bytes > repair_budget {
+                tracing::debug!(target: "nanoctl_media::delta_repair", stream_sequence, required_bytes = delta.wire_bytes, repair_budget, reason = "byte-budget", "v4 delta repair skipped");
                 return Ok(None);
             }
             delta.chunks.clone()
@@ -236,6 +240,7 @@ where
         let buffered = self.sink.buffered_bytes(lane).await;
         if wire_bytes > repair_budget || wire_bytes > capacity.div_ceil(2).saturating_sub(buffered)
         {
+            tracing::debug!(target: "nanoctl_media::delta_repair", stream_sequence, ?lane, wire_bytes, buffered, repair_budget, reason = "send-budget", "v4 delta repair skipped");
             return Ok(None);
         }
         let delta = &mut self.repair_cache[slot];
@@ -259,6 +264,10 @@ where
             }
             self.sink.write_chunk(lane, bytes).await?;
         }
+        tracing::debug!(
+            target: "nanoctl_media::delta_repair",
+            stream_sequence, ?lane, wire_bytes, "v4 delta repair queued"
+        );
         Ok(Some(LaneWriteReport {
             status: LaneWriteStatus::Written,
             buffered_bytes: self.sink.buffered_bytes(lane).await,

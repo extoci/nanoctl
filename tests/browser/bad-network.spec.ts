@@ -398,6 +398,7 @@ test("v4 real media survives 60 seconds and reconnect churn under packet impairm
     const activeLog = await activeReport.text();
     const activeLines = activeLog.split("\n");
     evidence.sctpTimeouts = activeLines.filter((line) => line.includes("T3-rtx timed out"));
+    evidence.hostDeltaRepairs = activeLines.filter((line) => line.includes("v4 delta repair "));
     const earlyStops = earlyMediaExits(activeLines, probe.timeOrigin + browserStart);
     evidence.earlyStops = earlyStops;
     expect.soft(activeReport.ok(), "host debug report during the measured session").toBe(true);
