@@ -24,6 +24,9 @@ type Scenario = {
   minFps: number;
   maxGapMs: number;
   description: string;
+  codec?: "h264" | "av1";
+  av1Fixture?: boolean;
+  minScreenshotLuma?: number;
 };
 const scenarios: Record<string, Scenario> = {
   clean: {
@@ -32,6 +35,17 @@ const scenarios: Record<string, Scenario> = {
     minFps: 15,
     maxGapMs: 700,
     description: "clean loopback control",
+  },
+  av1: {
+    durationMs: 15_000,
+    impairment: {},
+    minFps: 7,
+    maxGapMs: 700,
+    description:
+      "clean loopback AV1 IVF fixture through the real RTP path plus a VideoToolbox bitstream proof",
+    codec: "av1",
+    av1Fixture: true,
+    minScreenshotLuma: 25,
   },
   "lossy-wifi": {
     durationMs: 20_000,
@@ -92,6 +106,16 @@ async function runCommand(args: string[], env?: NodeJS.ProcessEnv) {
   return out.trim();
 }
 const sim = (...args: string[]) => runCommand(["xcrun", "simctl", ...args]);
+async function runCombinedOutput(args: string[]) {
+  const child = Bun.spawn(args, { cwd: root, stdout: "pipe", stderr: "pipe" });
+  const [out, err, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  if (code !== 0) throw new Error(`${args.join(" ")} failed`);
+  return out + err;
+}
 const wait = async <T>(probe: () => Promise<T | undefined>, seconds: number, label: string) => {
   const deadline = performance.now() + seconds * 1000;
   while (performance.now() < deadline) {
@@ -102,17 +126,15 @@ const wait = async <T>(probe: () => Promise<T | undefined>, seconds: number, lab
   throw new Error(`Timed out: ${label}`);
 };
 
-if (!(await Bun.file(join(root, "crates/nanoctl-agent/target/release/nanoctl")).exists())) {
-  await runCommand([
-    "cargo",
-    "build",
-    "--release",
-    "--features",
-    "media",
-    "--manifest-path",
-    "crates/nanoctl-agent/Cargo.toml",
-  ]);
-}
+await runCommand([
+  "cargo",
+  "build",
+  "--release",
+  "--features",
+  "media",
+  "--manifest-path",
+  "crates/nanoctl-agent/Cargo.toml",
+]);
 
 const markerBrowser = await chromium.launch({
   headless: false,
@@ -148,9 +170,6 @@ try {
     requestAnimationFrame(render);
   });
 
-  await sim("install", device, resolve(app));
-  await sim("spawn", device, "defaults", "write", bundle, "codec", "-string", "h264");
-
   for (const name of selected) {
     const scenario = scenarios[name];
     const directory = await mkdtemp(join(tmpdir(), "nanoctl-ios-network-"));
@@ -165,6 +184,48 @@ try {
       XDG_DATA_HOME: directory,
       XDG_CONFIG_HOME: directory,
     };
+    if (scenario.av1Fixture) {
+      const fixture = join(directory, "av1-fixture.ivf");
+      await runCommand([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x180:rate=10",
+        "-t",
+        "5",
+        "-c:v",
+        "libsvtav1",
+        "-g",
+        "5",
+        "-crf",
+        "35",
+        "-preset",
+        "8",
+        "-pix_fmt",
+        "yuv420p",
+        "-svtav1-params",
+        "lookahead=0:hierarchical-levels=0:enable-tf=0",
+        "-f",
+        "ivf",
+        fixture,
+      ]);
+      env.NANOCTL_TEST_AV1_IVF = fixture;
+      const proofBinary = join(directory, "av1-video-toolbox-proof");
+      await runCommand([
+        "swiftc",
+        "-O",
+        resolve(root, "apps/ios/Benchmark/av1-video-toolbox-proof.swift"),
+        resolve(root, "apps/ios/Nanoctl/AV1Bitstream.swift"),
+        "-o",
+        proofBinary,
+      ]);
+      console.log(`av1-video-toolbox: ${await runCommand([proofBinary, fixture])}`);
+    }
     const impairment = scenario.impairment;
     if (impairment.lossPpm) env.NANOCTL_TEST_VIDEO_LOSS_PPM = String(impairment.lossPpm);
     if (impairment.reorderPpm) env.NANOCTL_TEST_VIDEO_REORDER_PPM = String(impairment.reorderPpm);
@@ -200,6 +261,18 @@ try {
         );
       }
       await runCommand(["xcrun", "simctl", "terminate", device, bundle]).catch(() => "");
+      await sim("uninstall", device, bundle).catch(() => "");
+      await sim("install", device, resolve(app));
+      await sim(
+        "spawn",
+        device,
+        "defaults",
+        "write",
+        bundle,
+        "codec",
+        "-string",
+        scenario.codec ?? "h264",
+      );
       const container = await sim("get_app_container", device, bundle, "data");
       const reportPath = join(container, "Documents/network-probe.json");
       await rm(reportPath, { force: true });
@@ -227,7 +300,29 @@ try {
         10,
         `${name} network probe`,
       );
-      await sim("io", device, "screenshot", join(resultsPath, `${name}.png`)).catch(() => "");
+      const screenshotPath = join(resultsPath, `${name}.png`);
+      await sim("io", device, "screenshot", screenshotPath).catch(() => "");
+      if (scenario.minScreenshotLuma) {
+        const stats = await runCombinedOutput([
+          "ffmpeg",
+          "-hide_banner",
+          "-v",
+          "info",
+          "-i",
+          screenshotPath,
+          "-vf",
+          "signalstats,metadata=print",
+          "-f",
+          "null",
+          "-",
+        ]);
+        const luma = Number(stats.match(/lavfi\.signalstats\.YAVG=([0-9.]+)/)?.[1] ?? 0);
+        if (luma < scenario.minScreenshotLuma) {
+          failures.push(
+            `${name}: screenshot luma ${luma.toFixed(1)} < ${scenario.minScreenshotLuma}`,
+          );
+        }
+      }
 
       const last = report.samples.at(-1);
       const connectingAt =

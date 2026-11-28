@@ -21,6 +21,10 @@ enum AV1Bitstream {
         var width = 0
         var height = 0
         var bitdepth = 8
+        var colorPrimaries = 2
+        var transferCharacteristics = 2
+        var matrixCoefficients = 2
+        var colorRange = 0
     }
 
     struct OBU {
@@ -87,10 +91,29 @@ enum AV1Bitstream {
             | UInt8(info.initialPresentationDelayPresent == 1 ? info.initialPresentationDelay & 0x0f : 0))
         record.append(config)
 
-        let extensions: [CFString: Any] = [
+        let chromaLocation: CFString = switch info.chromaSamplePosition {
+        case 2: kCVImageBufferChromaLocation_TopLeft
+        default: kCVImageBufferChromaLocation_Left
+        }
+        var extensions: [CFString: Any] = [
             kCMFormatDescriptionExtension_BitsPerComponent: info.bitdepth,
+            kCMFormatDescriptionExtension_FieldCount: 1,
+            kCMFormatDescriptionExtension_ChromaLocationBottomField: chromaLocation,
+            kCMFormatDescriptionExtension_ChromaLocationTopField: chromaLocation,
+            kCMFormatDescriptionExtension_Depth: info.bitdepth * 3,
+            kCMFormatDescriptionExtension_FormatName: "av01",
+            kCMFormatDescriptionExtension_FullRangeVideo: info.colorRange == 1,
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: ["av1C": record],
         ]
+        if let primaries = colorPrimaries(info.colorPrimaries) {
+            extensions[kCMFormatDescriptionExtension_ColorPrimaries] = primaries
+        }
+        if let transfer = transferFunction(info.transferCharacteristics) {
+            extensions[kCMFormatDescriptionExtension_TransferFunction] = transfer
+        }
+        if let matrix = ycbcrMatrix(info.matrixCoefficients) {
+            extensions[kCMFormatDescriptionExtension_YCbCrMatrix] = matrix
+        }
         var format: CMFormatDescription?
         let status = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
@@ -101,6 +124,34 @@ enum AV1Bitstream {
             formatDescriptionOut: &format
         )
         return status == noErr ? format : nil
+    }
+
+    private static func colorPrimaries(_ value: Int) -> CFString? {
+        switch value {
+        case 1: kCVImageBufferColorPrimaries_ITU_R_709_2
+        case 9: kCVImageBufferColorPrimaries_ITU_R_2020
+        case 12: kCVImageBufferColorPrimaries_DCI_P3
+        default: nil
+        }
+    }
+
+    private static func transferFunction(_ value: Int) -> CFString? {
+        switch value {
+        case 1, 6: kCVImageBufferTransferFunction_ITU_R_709_2
+        case 13: kCVImageBufferTransferFunction_sRGB
+        case 16: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        case 18: kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        default: nil
+        }
+    }
+
+    private static func ycbcrMatrix(_ value: Int) -> CFString? {
+        switch value {
+        case 1: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        case 5, 6: kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        case 9: kCVImageBufferYCbCrMatrix_ITU_R_2020
+        default: nil
+        }
     }
 
     private static func leb128(_ data: Data, at start: Int) -> (value: Int, length: Int)? {
@@ -246,20 +297,19 @@ enum AV1Bitstream {
         }
         if info.profile != 1 { info.monochrome = bits.bit() }
         let colorDescriptionPresent = bits.bit()
-        var primaries = 2, transfer = 2, matrix = 2
         if colorDescriptionPresent == 1 {
-            primaries = bits.bits(8)
-            transfer = bits.bits(8)
-            matrix = bits.bits(8)
+            info.colorPrimaries = bits.bits(8)
+            info.transferCharacteristics = bits.bits(8)
+            info.matrixCoefficients = bits.bits(8)
         }
         if info.monochrome == 1 {
-            _ = bits.bit()
-        } else if primaries == 1, transfer == 13, matrix == 0 {
+            info.colorRange = bits.bit()
+        } else if info.colorPrimaries == 1, info.transferCharacteristics == 13, info.matrixCoefficients == 0 {
             info.subsamplingX = 0
             info.subsamplingY = 0
-            _ = bits.bit()
+            info.colorRange = bits.bit()
         } else {
-            _ = bits.bit() // color_range
+            info.colorRange = bits.bit()
             if info.profile == 0 {
                 info.subsamplingX = 1
                 info.subsamplingY = 1

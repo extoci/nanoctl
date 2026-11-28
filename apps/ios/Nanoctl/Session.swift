@@ -37,10 +37,10 @@ enum CodecPreference: String, CaseIterable {
         }
     }
 
-    /// Highest compression efficiency first — except AV1, whose data-channel
-    /// bitstream path has never once been verified decoding on a device;
-    /// HEVC leads auto until AV1 is proven end to end.
-    static let efficiency = ["hevc", "av1", "h264"]
+    /// Highest compression efficiency first. Devices without a real AV1
+    /// decoder still fall through to HEVC/H.264 because the hardware ordering
+    /// below probes decoder creation rather than trusting the support query.
+    static let efficiency = ["av1", "hevc", "h264"]
 
     /// Orders codecs by what both sides support, preferring hardware decode in
     /// auto mode. HEVC is representable through SDP injection even though the
@@ -73,7 +73,7 @@ enum CodecPreference: String, CaseIterable {
             if #available(iOS 26.2, *) {
                 VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
             }
-            return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+            return VTAV1CoreDecoder.videoToolboxAvailable
         case "hevc": return VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
         case "h264": return VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)
         default: return false
@@ -951,6 +951,8 @@ final class Session {
             // decodes for every negotiated codec.
             Task { @MainActor in
                 guard let session = self, let current = current ?? session.connection else { return }
+                current.video?.close()
+                current.videoIdr?.close()
                 session.deactivateDataChannelVideo(current)
             }
         }

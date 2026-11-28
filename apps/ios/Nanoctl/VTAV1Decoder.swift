@@ -10,6 +10,32 @@ private let av1Log = AppLogger(subsystem: "ai.nanoctl.viewer", category: "vtav1"
 /// Low-overhead-OBU AV1 decoder backed by VideoToolbox. The same core serves
 /// the jitter-buffered RTP decoder and nanoctl's direct data-channel path.
 final class VTAV1CoreDecoder {
+    /// Some Simulator runtimes report AV1 hardware support while omitting the
+    /// decoder itself, so probe session creation with a known sequence header.
+    static let videoToolboxAvailable: Bool = {
+        if #available(iOS 26.2, *) {
+            VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
+        }
+        guard VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) else { return false }
+        let bytes: [UInt8] = [
+            0x12, 0x00,
+            0x0a, 0x0b,
+            0x02, 0x00, 0x00, 0x05, 0x5d, 0xa7, 0xfb, 0x8d, 0x5f, 0x30, 0x08,
+        ]
+        guard let format = AV1Bitstream.formatDescription(Data(bytes)) else { return false }
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: format,
+            decoderSpecification: nil,
+            imageBufferAttributes: nil,
+            outputCallback: nil,
+            decompressionSessionOut: &session
+        )
+        if let session { VTDecompressionSessionInvalidate(session) }
+        return status == noErr && session != nil
+    }()
+
     /// Decoded image and the presentation timestamp supplied to `decode`.
     var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
     /// Decoder or bitstream failure. The caller should resynchronize from a keyframe.
@@ -47,8 +73,7 @@ final class VTAV1CoreDecoder {
             format = discovered
         }
         if session == nil {
-            guard let format else { return false }
-            guard createSession(format: format) else { return fault() }
+            guard let format, createSession(format: format) else { return fault() }
         }
         if let maxInflight, inflightCount() > maxInflight, !isKey {
             dropped += 1
@@ -157,6 +182,9 @@ final class VTAV1CoreDecoder {
     }
 
     private func createSession(format: CMFormatDescription) -> Bool {
+        if #available(iOS 26.2, *) {
+            VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
+        }
         var session: VTDecompressionSession?
         let attributes: [CFString: Any] = [kCVPixelBufferMetalCompatibilityKey: true]
         let status = VTDecompressionSessionCreate(
@@ -264,8 +292,8 @@ final class VTAV1Decoder: NSObject, RTCVideoDecoder {
     }
 }
 
-/// Uses VideoToolbox for AV1 where the device has a hardware decoder and the
-/// bundled WebRTC factory for every other codec/fallback case.
+/// Uses VideoToolbox for AV1 only when decoder creation actually succeeds and
+/// the bundled WebRTC factory for every other codec/fallback case.
 final class NanoctlDecoderFactory: NSObject, RTCVideoDecoderFactory {
     private let fallback = RTCDefaultVideoDecoderFactory()
 
@@ -277,7 +305,7 @@ final class NanoctlDecoderFactory: NSObject, RTCVideoDecoderFactory {
                 VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
             }
         }
-        if info.name.lowercased() == "av1", VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
+        if info.name.lowercased() == "av1", VTAV1CoreDecoder.videoToolboxAvailable {
             return VTAV1Decoder()
         }
         return fallback.createDecoder(info)

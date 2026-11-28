@@ -20,8 +20,7 @@ final class CodecNegotiationTests: XCTestCase {
             hostCodecs: ["av1", "hevc", "h264"],
             receivableCodecs: ["av1", "h264"]
         ) { codec in codec == "av1" || codec == "hevc" }
-        // HEVC leads auto while the AV1 data-channel path is unproven on device.
-        XCTAssertEqual(order, ["hevc", "av1", "h264"])
+        XCTAssertEqual(order, ["av1", "hevc", "h264"])
     }
 
     func testAutoDoesNotOfferCodecHostCannotEncode() {
@@ -89,7 +88,7 @@ final class NanoctlDecoderFactoryTests: XCTestCase {
         if #available(iOS 26.2, *) {
             VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1)
         }
-        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) {
+        if VTAV1CoreDecoder.videoToolboxAvailable {
             XCTAssertEqual(decoder?.implementationName(), "VideoToolbox-AV1")
         } else {
             XCTAssertNotEqual(decoder?.implementationName(), "VideoToolbox-AV1")
