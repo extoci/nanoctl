@@ -24,6 +24,8 @@ type Scenario = {
   minFps: number;
   maxGapMs: number;
   description: string;
+  codec?: "h264" | "av1";
+  av1Fixture?: boolean;
 };
 const scenarios: Record<string, Scenario> = {
   clean: {
@@ -32,6 +34,15 @@ const scenarios: Record<string, Scenario> = {
     minFps: 15,
     maxGapMs: 700,
     description: "clean loopback control",
+  },
+  av1: {
+    durationMs: 15_000,
+    impairment: {},
+    minFps: 7,
+    maxGapMs: 700,
+    description: "clean loopback AV1 IVF fixture through the real RTP path plus a VideoToolbox bitstream proof",
+    codec: "av1",
+    av1Fixture: true,
   },
   "lossy-wifi": {
     durationMs: 20_000,
@@ -102,17 +113,15 @@ const wait = async <T>(probe: () => Promise<T | undefined>, seconds: number, lab
   throw new Error(`Timed out: ${label}`);
 };
 
-if (!(await Bun.file(join(root, "crates/nanoctl-agent/target/release/nanoctl")).exists())) {
-  await runCommand([
-    "cargo",
-    "build",
-    "--release",
-    "--features",
-    "media",
-    "--manifest-path",
-    "crates/nanoctl-agent/Cargo.toml",
-  ]);
-}
+await runCommand([
+  "cargo",
+  "build",
+  "--release",
+  "--features",
+  "media",
+  "--manifest-path",
+  "crates/nanoctl-agent/Cargo.toml",
+]);
 
 const markerBrowser = await chromium.launch({
   headless: false,
@@ -148,9 +157,6 @@ try {
     requestAnimationFrame(render);
   });
 
-  await sim("install", device, resolve(app));
-  await sim("spawn", device, "defaults", "write", bundle, "codec", "-string", "h264");
-
   for (const name of selected) {
     const scenario = scenarios[name];
     const directory = await mkdtemp(join(tmpdir(), "nanoctl-ios-network-"));
@@ -165,6 +171,48 @@ try {
       XDG_DATA_HOME: directory,
       XDG_CONFIG_HOME: directory,
     };
+    if (scenario.av1Fixture) {
+      const fixture = join(directory, "av1-fixture.ivf");
+      await runCommand([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x180:rate=10",
+        "-t",
+        "5",
+        "-c:v",
+        "libsvtav1",
+        "-g",
+        "5",
+        "-crf",
+        "35",
+        "-preset",
+        "8",
+        "-pix_fmt",
+        "yuv420p",
+        "-svtav1-params",
+        "lookahead=0:hierarchical-levels=0:enable-tf=0",
+        "-f",
+        "ivf",
+        fixture,
+      ]);
+      env.NANOCTL_TEST_AV1_IVF = fixture;
+      const proofBinary = join(directory, "av1-video-toolbox-proof");
+      await runCommand([
+        "swiftc",
+        "-O",
+        resolve(root, "apps/ios/Benchmark/av1-video-toolbox-proof.swift"),
+        resolve(root, "apps/ios/Nanoctl/AV1Bitstream.swift"),
+        "-o",
+        proofBinary,
+      ]);
+      console.log(`av1-video-toolbox: ${await runCommand([proofBinary, fixture])}`);
+    }
     const impairment = scenario.impairment;
     if (impairment.lossPpm) env.NANOCTL_TEST_VIDEO_LOSS_PPM = String(impairment.lossPpm);
     if (impairment.reorderPpm) env.NANOCTL_TEST_VIDEO_REORDER_PPM = String(impairment.reorderPpm);
@@ -200,6 +248,9 @@ try {
         );
       }
       await runCommand(["xcrun", "simctl", "terminate", device, bundle]).catch(() => "");
+      await sim("uninstall", device, bundle).catch(() => "");
+      await sim("install", device, resolve(app));
+      await sim("spawn", device, "defaults", "write", bundle, "codec", "-string", scenario.codec ?? "h264");
       const container = await sim("get_app_container", device, bundle, "data");
       const reportPath = join(container, "Documents/network-probe.json");
       await rm(reportPath, { force: true });

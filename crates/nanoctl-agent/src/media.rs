@@ -2465,6 +2465,9 @@ pub fn ensure_codecs_probed(preference: EncoderPreference) {
 /// host can produce. H.264 is always included because a software fallback backs it.
 pub fn probe_codecs(preference: EncoderPreference) -> Vec<VideoCodec> {
     let mut codecs = Vec::new();
+    if std::env::var_os("NANOCTL_TEST_AV1_IVF").is_some() {
+        codecs.push(VideoCodec::Av1);
+    }
     if !matches!(preference, EncoderPreference::Software) {
         for codec in [VideoCodec::Av1, VideoCodec::Hevc] {
             match EncoderBackend::new_for_codec(
@@ -2482,7 +2485,9 @@ pub fn probe_codecs(preference: EncoderPreference) -> Vec<VideoCodec> {
                         backend = encoder.id(),
                         "hardware encoder available"
                     );
-                    codecs.push(codec);
+                    if !codecs.contains(&codec) {
+                        codecs.push(codec);
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(codec = codec.id(), %error, "hardware encoder unavailable")
@@ -2678,6 +2683,117 @@ impl Drop for EncodedFrameProducer {
     fn drop(&mut self) {
         self.0.close();
     }
+}
+
+struct Av1Fixture {
+    frames: Vec<EncodedFrame>,
+    frame_duration: Duration,
+}
+
+/// Loads a looping AV1 IVF stream for the loopback harness. macOS has no AV1
+/// encoder backend, while Apple clients need the same wire path validated
+/// end to end. The fixture is deliberately fed at the encoded-frame boundary
+/// so signaling, RTP packetization, SCTP chunking, recovery logic and client
+/// decode are all still real.
+fn av1_fixture_from_env() -> Result<Option<Av1Fixture>> {
+    let Some(path) = std::env::var_os("NANOCTL_TEST_AV1_IVF") else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read AV1 IVF fixture {}", path.to_string_lossy()))?;
+    if bytes.len() < 32 || &bytes[0..4] != b"DKIF" || &bytes[8..12] != b"AV01" {
+        bail!("AV1 fixture is not an AV01 IVF stream");
+    }
+    let width = u16::from_le_bytes(bytes[12..14].try_into()?) as u32;
+    let height = u16::from_le_bytes(bytes[14..16].try_into()?) as u32;
+    let denominator = u32::from_le_bytes(bytes[16..20].try_into()?);
+    let numerator = u32::from_le_bytes(bytes[20..24].try_into()?).max(1);
+    if denominator == 0 {
+        bail!("AV1 IVF fixture has a zero timebase denominator");
+    }
+    let frame_duration = Duration::from_secs_f64(f64::from(numerator) / f64::from(denominator));
+    let mut offset = 32_usize;
+    let mut frames = Vec::new();
+    while offset + 12 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+        offset += 12;
+        let end = offset
+            .checked_add(size)
+            .context("AV1 IVF frame size overflow")?;
+        let payload = bytes
+            .get(offset..end)
+            .context("AV1 IVF frame is truncated")?;
+        if !payload.is_empty() {
+            frames.push(EncodedFrame {
+                bytes: payload.to_vec(),
+                width,
+                height,
+            });
+        }
+        offset = end;
+    }
+    if frames.len() < 2 {
+        bail!("AV1 IVF fixture contains fewer than two frames");
+    }
+    crate::codec::validate_initial_access_unit(VideoCodec::Av1, &frames[0].bytes)
+        .context("AV1 IVF fixture does not start with a decodable keyframe")?;
+    if !frames
+        .iter()
+        .skip(1)
+        .any(|frame| is_keyframe(VideoCodec::Av1, &frame.bytes))
+    {
+        bail!("AV1 IVF fixture must contain periodic keyframes for recovery");
+    }
+    Ok(Some(Av1Fixture {
+        frames,
+        frame_duration,
+    }))
+}
+
+fn produce_av1_fixture(
+    slot: &EncodedFrameSlot,
+    stopped: &AtomicBool,
+    stats: &PipelineStats,
+    fixture: Av1Fixture,
+) -> Result<()> {
+    tracing::warn!(
+        frames = fixture.frames.len(),
+        width = fixture.frames[0].width,
+        height = fixture.frames[0].height,
+        "test AV1 IVF fixture video source enabled"
+    );
+    let mut index = 0_usize;
+    let mut next_frame_at = std::time::Instant::now();
+    while !stopped.load(Ordering::Acquire) {
+        // The normal capacity-one slot intentionally replaces obsolete camera-like
+        // frames. Fixture deltas must not be replaced: every skipped delta breaks
+        // the reference chain. Wait for the writer instead and let the fixture's
+        // frequent keyframes provide recovery after genuine transport loss.
+        while slot.is_occupied() && !stopped.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if stopped.load(Ordering::Acquire) {
+            break;
+        }
+        let source = &fixture.frames[index];
+        stats.encoded_width.store(source.width, Ordering::Relaxed);
+        stats.encoded_height.store(source.height, Ordering::Relaxed);
+        stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
+        if !slot.replace(EncodedFrame {
+            bytes: source.bytes.clone(),
+            width: source.width,
+            height: source.height,
+        }) {
+            break;
+        }
+        index = (index + 1) % fixture.frames.len();
+        next_frame_at += fixture.frame_duration;
+        let delay = next_frame_at.saturating_duration_since(std::time::Instant::now());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3365,6 +3481,16 @@ pub fn spawn_video(
                     startup_limits.resolve(quality.max_bitrate_kbps, quality.max_fps);
                 let mut controller = controller;
                 let startup = controller.set_limits(startup_ceiling, startup_fps_limit);
+                if quality.codec == VideoCodec::Av1 {
+                    if let Some(fixture) = av1_fixture_from_env()? {
+                        return produce_av1_fixture(
+                            &producer_slot.0,
+                            &producer_stopped,
+                            &producer_stats,
+                            fixture,
+                        );
+                    }
+                }
                 let mut encoder = CaptureEncoder::primary(
                     startup.bitrate_kbps,
                     startup_fps_limit,

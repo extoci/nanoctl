@@ -81,6 +81,7 @@ final class DCVideoReceiver {
     private var newestSeq: UInt32?
     private var maintenanceTimer: DispatchSourceTimer?
     private var consecutiveFaults = 0
+    private var unsupportedNotified = false
     private let maxConsecutiveFaults = 3
     private let queue = DispatchQueue(label: "nanoctl.dcvideo", qos: .userInteractive)
 
@@ -347,6 +348,13 @@ final class DCVideoReceiver {
             undetectedKeys += 1
             if undetectedKeys > 4 {
                 undetectedKeys = -1
+                queue.async { [weak self] in self?.onUnsupported() }
+            }
+            return nil
+        }
+        if detected == .av1, !VTAV1CoreDecoder.videoToolboxAvailable {
+            if !unsupportedNotified {
+                unsupportedNotified = true
                 queue.async { [weak self] in self?.onUnsupported() }
             }
             return nil
