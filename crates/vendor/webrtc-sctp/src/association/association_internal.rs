@@ -1160,7 +1160,9 @@ impl AssociationInternal {
                     //        packets that were retransmitted (and thus for which it is
                     //        ambiguous whether the reply was for the first instance of the
                     //        chunk or for a later instance)
-                    if c.nsent == 1 && sna32gte(c.tsn, self.min_tsn2measure_rtt) {
+                    // A cumulative SACK can also acknowledge FORWARD TSN.
+                    // An abandoned chunk may never have reached the receiver.
+                    if c.nsent == 1 && !c.abandoned() && sna32gte(c.tsn, self.min_tsn2measure_rtt) {
                         self.min_tsn2measure_rtt = self.my_next_tsn;
                         let rtt = match SystemTime::now().duration_since(c.since) {
                             Ok(rtt) => rtt,
@@ -1217,7 +1219,10 @@ impl AssociationInternal {
 
                         log::trace!("[{}] tsn={} has been sacked", self.name, c.tsn);
 
-                        if c.nsent == 1 {
+                        if c.nsent == 1
+                            && !c.abandoned()
+                            && sna32gte(c.tsn, self.min_tsn2measure_rtt)
+                        {
                             self.min_tsn2measure_rtt = self.my_next_tsn;
                             let rtt = match SystemTime::now().duration_since(c.since) {
                                 Ok(rtt) => rtt,

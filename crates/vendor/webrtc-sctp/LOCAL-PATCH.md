@@ -10,6 +10,9 @@ The local patch sets the minimum SCTP retransmission timeout to 200 ms. See
 It also cancels an old timeout callback when a SACK restarts the timer while
 holding the association lock. The bad-network gate records T3 timeout events
 with browser frame timestamps so transport stalls can be correlated.
+Only sample RTT from eligible DATA. A cumulative SACK can advance over abandoned
+chunks through FORWARD TSN, and gap acknowledgments share the cumulative path's
+limit of one RTT sample per flight.
 
 On a T3 timeout, expire timed DATA before building retransmissions. Advance
 FORWARD TSN in the same timeout so expired video does not use the reduced
