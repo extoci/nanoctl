@@ -277,6 +277,51 @@ struct ConnectView: View {
 
 // MARK: - Session
 
+struct ConnectProgressView: View {
+    let progress: ConnectProgress
+    private let stages: [ConnectStage] = [.signaling, .networking, .media]
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 7) {
+                ForEach(stages, id: \.self) { stage in
+                    step(stage)
+                    if stage != .media {
+                        Rectangle()
+                            .fill(stage.rawValue < progress.stage.rawValue ? Color.green : Color.white.opacity(0.2))
+                            .frame(width: 13, height: 1)
+                    }
+                }
+            }
+            Text(progress.detail)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            if let hint = progress.failureHint {
+                Text(hint)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    private func step(_ stage: ConnectStage) -> some View {
+        let complete = progress.stage == .live || stage.rawValue < progress.stage.rawValue
+        let current = stage.rawValue == progress.stage.rawValue
+        let failed = current && progress.failure != nil
+        return VStack(spacing: 4) {
+            Image(systemName: complete ? "checkmark.circle.fill" : failed ? "exclamationmark.triangle.fill" : current ? "circle.fill" : "circle")
+                .font(.system(size: 15))
+                .foregroundStyle(complete ? Color.green : failed ? Color.orange : current ? Color.blue : Color.white.opacity(0.3))
+            Text(stage.label)
+                .font(.caption2)
+                .foregroundStyle(current || complete ? Color.white : Color.white.opacity(0.45))
+        }
+        .frame(width: 72)
+    }
+}
+
 /// The desktop fills the whole screen; controls live in one glass button
 /// that expands on tap and gets out of the way otherwise.
 struct SessionView: View {
@@ -304,18 +349,13 @@ struct SessionView: View {
                 }
                 .foregroundStyle(.white.opacity(0.6))
                 .allowsHitTesting(false)
-            } else if !model.hasVideo {
+            } else if model.connectProgress.stage != .live {
                 VStack(spacing: 16) {
                     ProgressView()
                         .controlSize(.large)
-                    VStack(spacing: 4) {
-                        Text(model.hostName ?? "nanoctl")
-                            .font(.headline)
-                        Text(model.status)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
+                    Text(model.hostName ?? "nanoctl")
+                        .font(.headline)
+                    ConnectProgressView(progress: model.connectProgress)
                     Button("Cancel") { desktop.session.stop() }
                         .glassButton()
                 }

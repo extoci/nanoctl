@@ -140,6 +140,7 @@ final class Session {
     private(set) var track: RTCVideoTrack?
     private(set) var audioTrack: RTCAudioTrack?
     private(set) var state = "Disconnected"
+    private(set) var connectProgress = ConnectProgress()
     private(set) var transport: VideoTransport = .rtp
     private(set) var codec: String?
     private(set) var audioOutputs: [AudioOutput] = []
@@ -282,6 +283,7 @@ final class Session {
         connection = current
         sessionLog.info("connecting to \(endpoint.socket.absoluteString)")
         state = "Connecting…"
+        connectProgress = ConnectProgress()
         transport = .rtp
         sessionLog.notice("video transport switched to RTP")
         codec = nil
@@ -375,11 +377,13 @@ final class Session {
         sessionLog.error("connection failed: \(reason)")
         teardown()
         state = reason
+        connectProgress.fail(reason)
         onChange?()
         guard wantsConnection else { return }
         reconnectAttempts += 1
         let delay = min(30, reconnectAttempts == 1 ? 1 : reconnectAttempts * 3)
         state = "\(reason) Reconnecting in \(delay)s…"
+        connectProgress.detail = state
         onChange?()
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
@@ -622,6 +626,7 @@ final class Session {
             current.id = id
             current.host = host
             sessionLog.info("host hello: \(host.hostName) codecs=\(host.capabilities.codecs?.joined(separator: ",") ?? "?") audio=\(host.audioAvailable)")
+            connectProgress.advance(to: .signaling, detail: "Host answered. Negotiating stream…")
             audioOutputs = host.capabilities.audioOutputs ?? []
             if audioOutputs.isEmpty == false { _ = selectAudioOutput(nil) }
             try await negotiate(current, injectHevc: codecPreference.injectHevc && !forceH264)
@@ -661,6 +666,7 @@ final class Session {
                 }
                 try requireCurrent(current)
                 current.answered = true
+                connectProgress.advance(to: .networking, detail: "Checking network paths…")
                 codec = negotiated
                 sessionLog.info("negotiated video codec: \(negotiated ?? "none")")
                 let candidates = current.remoteCandidates
@@ -718,7 +724,7 @@ final class Session {
                 self.timeout?.cancel()
                 self.reconnectAttempts = 0
                 current.disconnectedSince = nil
-                self.state = "Live · \(current.host?.hostName ?? "nanoctl")"
+                self.connectProgress.advance(to: .media, detail: "Network connected. Opening media channels…")
                 self.onChange?()
             case .disconnected:
                 // ICE commonly flaps for a moment on Wi-Fi/cellular transitions.
@@ -872,6 +878,7 @@ final class Session {
         // offer carries the injected H265 payload.
         let wire = injectHevc ? (SDP.injectHevc(offer.sdp, order: codecOrder(for: current.host)) ?? offer.sdp) : offer.sdp
         try await publish(SignalPayload(type: "offer", sdp: wire), current)
+        connectProgress.advance(to: .signaling, detail: "Waiting for host answer…")
         current.offerSent = true
         flush(current)
     }
@@ -925,8 +932,12 @@ final class Session {
             // reliable IDR lane; the host accepts them on either channel.
             idr?.sendData(RTCDataBuffer(data: Data("KF".utf8), isBinary: false))
         }
-        receiver.onBuffer = { [weak self] buffer in
+        receiver.onBuffer = { [weak self, weak current] buffer in
             self?.pixelMailbox.put(buffer)
+            Task { @MainActor in
+                guard let self, let current, self.connection === current else { return }
+                self.markMediaLive(current, decodedFrames: 1)
+            }
         }
         receiver.onPersistentFault = { [weak self, weak current] in
             Task { @MainActor in
@@ -946,6 +957,7 @@ final class Session {
         current.dcVideo = receiver
         receiver.begin()
         transport = .dataChannel
+        connectProgress.advance(to: .media, detail: "Video channel open. Waiting for first frame…")
         sessionLog.info("data-channel video active: codec=\(receiver.codec?.rawValue ?? "pending")")
         // The agent suppresses delta-frame RTP writes automatically while the
         // video channel is open; IDRs still flow so RTCP feedback survives.
@@ -955,6 +967,13 @@ final class Session {
 
     func resetCodecFallback() {
         forceH264 = false
+    }
+
+    /// RTP frames share the thin keepalive leg while data-channel video is
+    /// active, so only the RTP transport may use them as first-media evidence.
+    func markRtpMediaLive() {
+        guard transport == .rtp, let connection else { return }
+        markMediaLive(connection, decodedFrames: 1)
     }
 
     /// Decoder failure is not a terminal UX state. If HEVC itself is the
@@ -999,6 +1018,13 @@ final class Session {
                 await self.collectStats(current)
             }
         }
+    }
+
+    private func markMediaLive(_ current: Connection, decodedFrames: Int) {
+        guard connection === current, decodedFrames > 0, connectProgress.stage != .live else { return }
+        connectProgress.advance(to: .live, detail: "Live")
+        state = "Live · \(current.host?.hostName ?? "nanoctl")"
+        onChange?()
     }
 
     private func statisticsReport(_ peer: RTCPeerConnection) async -> RTCStatisticsReport {
@@ -1051,6 +1077,7 @@ final class Session {
                 diagnostics.decoder = statString(inbound, "decoderImplementation")
                 let bytes = Int(statNumber(inbound, "bytesReceived") ?? 0)
                 let frames = Int(statNumber(inbound, "framesDecoded") ?? 0)
+                markMediaLive(current, decodedFrames: frames)
                 let received = Int(statNumber(inbound, "packetsReceived") ?? 0)
                 let lost = Int(statNumber(inbound, "packetsLost") ?? 0)
                 let now = Date()
@@ -1078,6 +1105,7 @@ final class Session {
         }
 
         let status = receiver.statusSnapshot()
+        markMediaLive(current, decodedFrames: status.decoded)
         let wire = status.stats
         let (loss, transit, frames) = receiver.takeLinkStats()
         // Receiver-measured loss is the host's only congestion signal while
