@@ -33,7 +33,7 @@ const tiers: Tier[] = [
     refs: 1,
   },
   { name: "tier2", preset: "veryfast", profile: "high", me: "umh", subme: 2, threads: 2, refs: 1 },
-  { name: "tier4", preset: "fast", profile: "high", me: "umh", subme: 6, threads: 1, refs: 4 },
+  { name: "tier4", preset: "fast", profile: "high", me: "umh", subme: 9, threads: 1, refs: 4 },
 ];
 
 type Packets = { first: number; delta: number };

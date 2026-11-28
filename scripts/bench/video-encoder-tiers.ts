@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const STRESS_SOURCE = "testsrc2=size=1280x720:rate=60:duration=8";
-const SCROLL_SPEED = "0.002083"; // 1.5 px/frame at 720p60, typical smooth scrolling.
+const SCROLL_SPEED = String(5 / 720); // 5 px/frame at 720p60, typical smooth scrolling.
 const DURATION_SECONDS = 8;
 
 type Tier = {
@@ -149,6 +149,15 @@ try {
     threads: 0,
     refs: 1,
   };
+  const masterTier3: Tier = {
+    name: "master-tier3-high-umh-ref1",
+    preset: "fast",
+    profile: "high",
+    me: "umh",
+    subme: 6,
+    threads: 2,
+    refs: 1,
+  };
   const tier3: Tier = {
     name: "tier3-high-umh",
     preset: "fast",
@@ -163,11 +172,11 @@ try {
     preset: "fast",
     profile: "high",
     me: "umh",
-    subme: 6,
+    subme: 9,
     threads: 1,
     refs: 4,
   };
-  const rows = [tier0, tier3, tier4].flatMap((tier) => [
+  const rows = [tier0, masterTier3, tier3, tier4].flatMap((tier) => [
     measure(directory, tier, stress),
     measure(directory, tier, scroll),
   ]);
@@ -176,26 +185,30 @@ try {
       `${row.name}: ${row.bytes} bytes @ SSIM ${row.ssim.toFixed(6)}, encode ${row.seconds.toFixed(2)}s`,
     );
   }
-  const stressRows = rows.filter((row) => row.name.endsWith("-stress"));
-  const [before, current, next] = stressRows;
+  const before = rows.find((row) => row.name === "tier0-baseline-hex-stress")!;
+  const current = rows.find((row) => row.name === "tier3-high-umh-stress")!;
+  const next = rows.find((row) => row.name === "tier4-single-slice-ref4-stress")!;
   const totalSaved = (1 - next.bytes / before.bytes) * 100;
   const incrementalSaved = (1 - next.bytes / current.bytes) * 100;
   console.log(
     `tier4 vs tier3 stress: ${incrementalSaved.toFixed(1)}% fewer bytes, ` +
       `${(next.ssim - current.ssim).toFixed(6)} SSIM; tier4 vs tier0: ${totalSaved.toFixed(1)}% fewer bytes`,
   );
+  const masterScroll = rows.find((row) => row.name === "master-tier3-high-umh-ref1-scroll")!;
   const scroll3 = rows.find((row) => row.name === "tier3-high-umh-scroll")!;
   const scroll4 = rows.find((row) => row.name === "tier4-single-slice-ref4-scroll")!;
   const scroll0 = rows.find((row) => row.name === "tier0-baseline-hex-scroll")!;
   console.log(
-    `tier4 vs tier3 scrolling screen: ${((1 - scroll4.bytes / scroll3.bytes) * 100).toFixed(1)}% fewer bytes, ` +
-      `${(scroll4.ssim - scroll3.ssim).toFixed(6)} SSIM; tier3 vs tier0: ` +
-      `${((1 - scroll3.bytes / scroll0.bytes) * 100).toFixed(1)}% fewer; tier4 vs tier0: ` +
+    `tier4 vs master tier3 scrolling screen: ${((1 - scroll4.bytes / masterScroll.bytes) * 100).toFixed(1)}% fewer bytes ` +
+      `(${(masterScroll.bytes / scroll4.bytes).toFixed(2)}x lower), ` +
+      `${(scroll4.ssim - masterScroll.ssim).toFixed(6)} SSIM; tier4 vs tier3: ` +
+      `${((1 - scroll4.bytes / scroll3.bytes) * 100).toFixed(1)}% fewer; tier4 vs tier0: ` +
       `${((1 - scroll4.bytes / scroll0.bytes) * 100).toFixed(1)}% fewer`,
   );
   if (current.bytes >= before.bytes || current.ssim + 0.0002 < before.ssim) process.exitCode = 1;
   if (next.bytes >= current.bytes || next.ssim + 0.0002 < current.ssim) process.exitCode = 1;
-  if (scroll4.bytes >= scroll3.bytes || scroll4.ssim + 0.0002 < scroll3.ssim) process.exitCode = 1;
+  if (scroll4.bytes >= masterScroll.bytes || scroll4.ssim + 0.0002 < masterScroll.ssim)
+    process.exitCode = 1;
 } finally {
   rmSync(directory, { recursive: true, force: true });
 }

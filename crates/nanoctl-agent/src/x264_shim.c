@@ -220,8 +220,9 @@ fail:
    incompressible content is encode-time-bound, and auto threads cut it ~40% at no
    measured quality cost there),
    1 = +CABAC/8x8 (high profile), 2 = +UMH, 3 = preset fast/subme6/reference frames,
-   4 = one slice thread and four reference frames (only reachable after a long
-   easy window). Env-pinned knobs are left alone. Returns 0 on a re-open, 1 when
+   4 = one slice thread, four references and subme9 (only reachable after
+   a long easy window). Env-pinned knobs are left alone.
+   Returns 0 on a re-open, 1 when
    the masked target already matches, -2 when adapt is disabled, -1 on failure
    (previous params restored). */
 int nano_x264_adapt(NanoX264 *context, int tier) {
@@ -234,7 +235,7 @@ int nano_x264_adapt(NanoX264 *context, int tier) {
     case 1: preset = "veryfast"; high = 1; me = X264_ME_HEX; subme = 2; threads = 2; refs = 1; break;
     case 2: preset = "veryfast"; high = 1; me = X264_ME_UMH; subme = 2; threads = 2; refs = 1; break;
     case 3: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 2; refs = 4; break;
-    case 4: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 6; threads = 1; refs = 4; break;
+    case 4: preset = "fast";     high = 1; me = X264_ME_UMH; subme = 9; threads = 1; refs = 4; break;
     default: return -1;
     }
     if (context->pins & 1) high = context->want_high;
