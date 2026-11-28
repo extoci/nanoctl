@@ -438,6 +438,27 @@ struct SessionView: View {
         }
         .disabled(model.external)
 
+        Menu {
+            Picker("Trackpad speed", selection: Binding(get: { model.pointerSensitivity }, set: {
+                desktop.setPointerSensitivity($0)
+            })) {
+                ForEach([0.5, 0.75, 1.0, 1.25, 1.5], id: \.self) { value in
+                    Text("\(Int(value * 100))%").tag(value)
+                }
+            }
+            .pickerStyle(.menu)
+            Picker("Scroll speed", selection: Binding(get: { model.scrollSpeed }, set: {
+                desktop.setScrollSpeed($0)
+            })) {
+                ForEach([0.5, 0.75, 1.0, 1.25, 1.5], id: \.self) { value in
+                    Text("\(Int(value * 100))%").tag(value)
+                }
+            }
+            .pickerStyle(.menu)
+        } label: {
+            Label("Input feel", systemImage: "hand.draw")
+        }
+
         Section {
             if model.audioAvailable {
                 Toggle(isOn: Binding(get: { model.audioEnabled }, set: {
@@ -485,12 +506,26 @@ struct SessionView: View {
 
         Section {
             Menu {
+                Picker("Preset", selection: Binding(
+                    get: { StreamPreset.infer(maxFps: model.maxFps, maxBitrateKbps: model.maxBitrateKbps) },
+                    set: { preset in
+                        guard let caps = preset.caps else { return }
+                        desktop.session.maxFps = caps.maxFps
+                        desktop.session.maxBitrateKbps = caps.maxBitrateKbps
+                        desktop.update()
+                    }
+                )) {
+                    ForEach(StreamPreset.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.menu)
                 Picker("Frame rate", selection: Binding(get: { model.maxFps }, set: {
                     desktop.session.maxFps = $0
                     desktop.update()
                 })) {
-                    Text("Host maximum").tag(Int?.none)
-                    ForEach([60, 30], id: \.self) { Text("\($0) fps").tag(Int?.some($0)) }
+                    Text("Display maximum").tag(Int?.none)
+                    ForEach(streamFrameRateOptions(displayMaximum: model.displayMaxFps), id: \.self) {
+                        Text("\($0) fps").tag(Int?.some($0))
+                    }
                 }
                 .pickerStyle(.menu)
                 Picker("Bitrate", selection: Binding(get: { model.maxBitrateKbps }, set: {

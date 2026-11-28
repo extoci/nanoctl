@@ -26,7 +26,30 @@ final class Stage: UIView {
         send: { [weak self] event in
             self?.desktop?.session.sendPointer(x: event.x, y: event.y, action: event.action, button: event.button,
                                                deltaX: event.deltaX, deltaY: event.deltaY)
-        })
+        },
+        pointerSensitivity: Self.inputScale(forKey: "inputPointerSensitivity"),
+        scrollSpeed: Self.inputScale(forKey: "inputScrollSpeed"))
+
+    private static func inputScale(forKey key: String) -> Double {
+        let value = UserDefaults.standard.double(forKey: key)
+        return value > 0 ? value : 1
+    }
+
+    var pointerSensitivity: Double {
+        get { gestures.pointerSensitivity }
+        set {
+            gestures.pointerSensitivity = newValue
+            UserDefaults.standard.set(newValue, forKey: "inputPointerSensitivity")
+        }
+    }
+
+    var scrollSpeed: Double {
+        get { gestures.scrollSpeed }
+        set {
+            gestures.scrollSpeed = newValue
+            UserDefaults.standard.set(newValue, forKey: "inputScrollSpeed")
+        }
+    }
 
     var touchMode: TouchMode {
         get { gestures.mode }

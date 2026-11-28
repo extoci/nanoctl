@@ -28,10 +28,13 @@ final class ViewerModel {
     var displays: [DisplayInfo] = []
     var toast: String?
     var touchMode = TouchMode.trackpad
+    var pointerSensitivity = 1.0
+    var scrollSpeed = 1.0
     var keyboardVisible = false
     var codec = CodecPreference.auto
     var maxFps: Int?
     var maxBitrateKbps: Int?
+    var displayMaxFps = 60
     var showStats = UserDefaults.standard.bool(forKey: "showStats") {
         didSet { UserDefaults.standard.set(showStats, forKey: "showStats") }
     }
@@ -106,9 +109,12 @@ final class Desktop {
         model.clipboard = host?.capabilities.clipboard == true && session.inputReady
         model.displays = host?.displayList ?? []
         model.touchMode = stage.touchMode
+        model.pointerSensitivity = stage.pointerSensitivity
+        model.scrollSpeed = stage.scrollSpeed
         model.codec = session.codecPreference
         model.maxFps = session.maxFps
         model.maxBitrateKbps = session.maxBitrateKbps
+        model.displayMaxFps = session.displayMaxFps
     }
 
     func connect(_ input: String) {
@@ -222,6 +228,16 @@ final class Desktop {
 
     func setTouchMode(_ mode: TouchMode) {
         stage.touchMode = mode
+        update()
+    }
+
+    func setPointerSensitivity(_ sensitivity: Double) {
+        stage.pointerSensitivity = sensitivity
+        update()
+    }
+
+    func setScrollSpeed(_ speed: Double) {
+        stage.scrollSpeed = speed
         update()
     }
 
