@@ -62,6 +62,9 @@ final class Desktop {
 
     init() {
         session.onChange = { [weak self] in self?.update() }
+        session.onClipboard = { [weak self] _ in
+            self?.show("Host clipboard copied to this device")
+        }
         gamepad.onStatuses = { [weak self] statuses in
             self?.model.gamepads = statuses
         }
