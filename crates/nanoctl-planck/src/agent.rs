@@ -3,8 +3,21 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentSnapshot {
@@ -104,7 +117,7 @@ pub fn inspect() -> AgentSnapshot {
     let config_path = config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
     let binary_path = binary_path();
     let version = binary_path.as_ref().and_then(|path| {
-        Command::new(path)
+        command(path)
             .arg("--version")
             .output()
             .ok()
@@ -156,7 +169,7 @@ fn set_host_lab_in_path(path: PathBuf, id: &str, enabled: bool) -> Result<()> {
 }
 
 fn run(binary: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new(binary)
+    let output = command(binary)
         .args(args)
         .output()
         .with_context(|| format!("cannot run {}", binary.display()))?;
@@ -182,9 +195,11 @@ fn run(binary: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn scheduled_task_exists() -> bool {
-    Command::new("powershell")
+    command("powershell")
         .args([
             "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
             "-Command",
             "if (Get-ScheduledTask -TaskName 'nanoctl Agent' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }",
         ])
@@ -193,9 +208,11 @@ fn scheduled_task_exists() -> bool {
 }
 
 fn start_scheduled_task() -> Result<()> {
-    let output = Command::new("powershell")
+    let output = command("powershell")
         .args([
             "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
             "-Command",
             "Start-ScheduledTask -TaskName 'nanoctl Agent'",
         ])
@@ -208,13 +225,22 @@ fn start_scheduled_task() -> Result<()> {
     }
 }
 
+fn wait_for_running() -> bool {
+    for _ in 0..80 {
+        if service_lock_held() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    service_lock_held()
+}
+
 pub fn start() -> Result<String> {
     let binary = binary_path().context("nanoctl agent is not installed")?;
     if scheduled_task_exists() {
         start_scheduled_task()?;
-        Ok("Agent start requested".to_owned())
     } else {
-        let mut command = Command::new(&binary);
+        let mut command = command(&binary);
         if let Some(root) = install_root() {
             std::fs::create_dir_all(&root).context("cannot create nanoctl data directory")?;
             command.arg("--ready-file").arg(root.join("agent.ready"));
@@ -223,7 +249,11 @@ pub fn start() -> Result<String> {
             .arg("run")
             .spawn()
             .context("cannot start nanoctl agent")?;
-        Ok("Agent starting".to_owned())
+    }
+    if wait_for_running() {
+        Ok("Agent running".to_owned())
+    } else {
+        Ok("Agent start requested; refresh if it does not appear".to_owned())
     }
 }
 
@@ -239,7 +269,7 @@ pub fn restart() -> Result<String> {
 }
 
 pub fn open_file(path: &Path) -> Result<()> {
-    Command::new("explorer")
+    command("explorer")
         .arg(path)
         .spawn()
         .context("cannot open path")?;
